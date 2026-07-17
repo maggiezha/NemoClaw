@@ -97,8 +97,8 @@ affinity: {}
 autoscaling:
   enabled: false
   minReplicas: 1
-  maxReplicas: 4
-  maxGpus: 4
+  maxReplicas: 8
+  maxGpus: 8
   # gpu (default) | performance | latency | resource
   # gpu: DCGM_FI_DEV_GPU_UTIL via Prometheus + prometheus-adapter (see install-hpa.sh)
   mode: gpu
