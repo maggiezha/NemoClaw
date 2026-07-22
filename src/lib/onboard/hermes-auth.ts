@@ -13,7 +13,9 @@ export const HERMES_NOUS_API_KEY_CREDENTIAL_ENV =
   hermesProviderAuth.HERMES_NOUS_API_KEY_CREDENTIAL_ENV || "NOUS_API_KEY";
 export const HERMES_NOUS_API_KEY_HELP_URL = "https://portal.nousresearch.com/manage-subscription";
 
-export function normalizeHermesAuthMethod(value: string | null | undefined): HermesAuthMethod | null {
+export function normalizeHermesAuthMethod(
+  value: string | null | undefined,
+): HermesAuthMethod | null {
   const normalized = String(value || "")
     .trim()
     .toLowerCase()
@@ -38,7 +40,14 @@ export function hermesAuthMethodLabel(method: HermesAuthMethod | null | undefine
   return method === HERMES_AUTH_METHOD_API_KEY ? "Nous API Key" : "Nous Portal OAuth";
 }
 
-export function getRequestedHermesAuthMethod(): HermesAuthMethod | null {
+export interface HermesAuthFailureBoundary {
+  error(message: string): void;
+  exitProcess(code: number): never;
+}
+
+export function getRequestedHermesAuthMethod(
+  boundary: HermesAuthFailureBoundary,
+): HermesAuthMethod | null {
   const raw =
     process.env.NEMOCLAW_HERMES_AUTH_METHOD ||
     process.env.NEMOCLAW_HERMES_AUTH ||
@@ -46,9 +55,9 @@ export function getRequestedHermesAuthMethod(): HermesAuthMethod | null {
     "";
   const method = normalizeHermesAuthMethod(raw);
   if (!raw || method) return method;
-  console.error(`  Unsupported Hermes Provider auth method: ${raw}`);
-  console.error("  Valid values: oauth, nous-portal-oauth, api-key, nous-api-key");
-  process.exit(1);
+  boundary.error(`  Unsupported Hermes Provider auth method: ${raw}`);
+  boundary.error("  Valid values: oauth, nous-portal-oauth, api-key, nous-api-key");
+  boundary.exitProcess(1);
 }
 
 export interface HermesAuthFlowDeps {
@@ -60,11 +69,16 @@ export interface HermesAuthFlowDeps {
   validateNvidiaApiKeyValue(value: string, envName: string): string | null;
   compactText(value: string): string;
   redact(value: unknown): string;
-  runOpenshell(args: string[], opts?: Record<string, unknown>): {
+  runOpenshell(
+    args: string[],
+    opts?: Record<string, unknown>,
+  ): {
     status?: number | null;
     stdout?: string | Buffer | null;
     stderr?: string | Buffer | null;
   };
+  error(message: string): void;
+  exitProcess(code: number): never;
   backToSelection: unknown;
 }
 
@@ -91,13 +105,14 @@ export function createHermesAuthHelpers(deps: HermesAuthFlowDeps): HermesAuthHel
         label: "Nous API Key (paste a key from the provider dashboard)",
       },
     ];
-    const requested = getRequestedHermesAuthMethod();
+    const requested = getRequestedHermesAuthMethod({
+      error: deps.error,
+      exitProcess: deps.exitProcess,
+    });
     if (deps.isNonInteractive()) {
       const method =
         requested ||
-        (resolveHermesNousApiKey()
-          ? HERMES_AUTH_METHOD_API_KEY
-          : HERMES_AUTH_METHOD_OAUTH);
+        (resolveHermesNousApiKey() ? HERMES_AUTH_METHOD_API_KEY : HERMES_AUTH_METHOD_OAUTH);
       deps.note(`  [non-interactive] Hermes auth: ${hermesAuthMethodLabel(method)}`);
       return method;
     }
@@ -109,7 +124,8 @@ export function createHermesAuthHelpers(deps: HermesAuthFlowDeps): HermesAuthHel
     });
     console.log("");
 
-    const defaultIdx = (requested ? methods.findIndex((method) => method.key === requested) : 0) + 1;
+    const defaultIdx =
+      (requested ? methods.findIndex((method) => method.key === requested) : 0) + 1;
     const choice = await deps.prompt(`  Choose [${defaultIdx}]: `);
     const navigation = deps.getNavigationChoice(choice);
     if (navigation === "back") return deps.backToSelection;
@@ -152,8 +168,8 @@ export function createHermesAuthHelpers(deps: HermesAuthFlowDeps): HermesAuthHel
     const key = normalizeCredentialValue(rawKey);
     const validationError = deps.validateNvidiaApiKeyValue(key, HERMES_NOUS_API_KEY_CREDENTIAL_ENV);
     if (validationError) {
-      console.error(validationError);
-      process.exit(1);
+      deps.error(validationError);
+      deps.exitProcess(1);
     }
     process.env[HERMES_NOUS_API_KEY_CREDENTIAL_ENV] = key;
     return key;

@@ -1,9 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type fs from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
+import {
+  blueprintWithPolicyAdditions,
+  minimalBlueprint,
+  resultForCommandFailure,
+  routedBlueprint,
+} from "./runner-test-fixtures.js";
 
 // ── In-memory filesystem ────────────────────────────────────────
 
@@ -71,9 +77,19 @@ vi.mock("execa", () => ({
   execa: (...args: unknown[]) => mockExeca(...args),
 }));
 
-vi.mock("./ssrf.js", () => ({
-  validateEndpointUrl: vi.fn(async (url: string) => ({ url, pinnedUrl: url })),
-}));
+vi.mock("./ssrf.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ssrf.js")>();
+  return {
+    ...actual,
+    validateEndpointUrl: vi.fn(async (url: string) => ({
+      url,
+      pinnedUrl: url,
+      protocol: url.startsWith("http:") ? "http:" : "https:",
+      hostname: new URL(url).hostname,
+      dnsResolved: false,
+    })),
+  };
+});
 
 const { validateEndpointUrl } = await import("./ssrf.js");
 const mockedValidateEndpoint = vi.mocked(validateEndpointUrl);
@@ -104,78 +120,8 @@ function capturedJsonOutput<T = unknown>(): T {
   return JSON.parse(json) as T;
 }
 
-function minimalBlueprint(overrides?: Record<string, unknown>): Record<string, unknown> {
-  return {
-    version: "1.0",
-    components: {
-      inference: {
-        profiles: {
-          default: {
-            provider_type: "openai",
-            provider_name: "my-provider",
-            endpoint: "https://api.example.com/v1",
-            model: "gpt-4",
-            credential_env: "MY_API_KEY",
-          },
-        },
-      },
-      sandbox: {
-        image: "openclaw",
-        name: "test-sandbox",
-        forward_ports: [18789],
-      },
-      policy: { additions: {} },
-    },
-    ...overrides,
-  };
-}
-
-function routedBlueprint(): Record<string, unknown> {
-  return {
-    version: "1.0",
-    components: {
-      inference: {
-        profiles: {
-          routed: {
-            provider_type: "openai",
-            provider_name: "nvidia-router",
-            endpoint: "http://localhost:4000/v1",
-            model: "routed",
-            credential_env: "NVIDIA_API_KEY",
-            credential_default: "router-local",
-            timeout_secs: 180,
-          },
-        },
-      },
-      sandbox: {
-        image: "openclaw",
-        name: "test-sandbox",
-        forward_ports: [18789],
-      },
-      router: {
-        enabled: true,
-        port: 4000,
-        pool_config_path: "router/pool-config.yaml",
-      },
-      policy: { additions: {} },
-    },
-  };
-}
-
 function seedBlueprintFile(bp?: Record<string, unknown>): void {
   addFile("blueprint.yaml", YAML.stringify(bp ?? minimalBlueprint()));
-}
-
-function blueprintWithPolicyAdditions(additions: Record<string, unknown>): Record<string, unknown> {
-  const bp = minimalBlueprint();
-  const components = bp.components as Record<string, unknown>;
-  return {
-    ...bp,
-    components: {
-      ...components,
-      policy: { additions },
-    },
-  };
 }
 
 function mockCurrentPolicy(stdout: string): void {
@@ -183,7 +129,7 @@ function mockCurrentPolicy(stdout: string): void {
     if (
       args[0] === "policy" &&
       args[1] === "get" &&
-      args[2] === "--full" &&
+      args[2] === "--base" &&
       args[3] === "test-sandbox"
     ) {
       return { exitCode: 0, stdout, stderr: "" };
@@ -448,6 +394,21 @@ describe("runner", () => {
       expect(() => loadBlueprint()).toThrow(/valid nested component shapes/);
     });
 
+    it("rejects a non-boolean router enabled flag (#6692)", () => {
+      addFile(
+        "blueprint.yaml",
+        YAML.stringify({
+          version: "2.0",
+          components: {
+            router: {
+              enabled: "yes",
+            },
+          },
+        }),
+      );
+      expect(() => loadBlueprint()).toThrow(/valid nested component shapes/);
+    });
+
     it("rejects non-plain policy additions values", () => {
       addFile(
         "blueprint.yaml",
@@ -553,17 +514,6 @@ describe("runner", () => {
       expect(plan.dry_run).toBe(true);
     });
 
-    it("validates and applies endpoint URL override", async () => {
-      captureStdout();
-      mockExeca.mockResolvedValue({ exitCode: 0 });
-
-      const plan = await actionPlan("default", minimalBlueprint(), {
-        endpointUrl: "https://override.example.com/v1",
-      });
-      expect(plan.inference.endpoint).toBe("https://override.example.com/v1");
-      expect(mockedValidateEndpoint).toHaveBeenCalledWith("https://override.example.com/v1");
-    });
-
     it("SSRF-validates the blueprint-defined endpoint even without --endpoint-url override", async () => {
       captureStdout();
       mockExeca.mockResolvedValue({ exitCode: 0 });
@@ -639,7 +589,72 @@ describe("runner", () => {
       );
     });
 
-    it("applies blueprint policy additions by merging into the live policy", async () => {
+    const hasPlanJson = (): boolean => [...store.keys()].some((k) => k.endsWith("plan.json"));
+
+    it("rejects without persisting a plan when provider create fails (#6703)", async () => {
+      const credential = "provider-secret-value";
+      process.env.MY_API_KEY = credential;
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(
+          args,
+          ["provider", "create"],
+          `provider setup failed\nOPENAI_API_KEY=${credential}\nAuthorization: Bearer opaque-bearer`,
+        ),
+      );
+
+      try {
+        const error = await actionApply("default", minimalBlueprint()).then(
+          () => new Error("expected provider creation to fail"),
+          (cause: unknown) => cause,
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(
+          /Failed to create inference provider 'my-provider'.*provider setup failed/i,
+        );
+        expect((error as Error).message).toContain("OPENAI_API_KEY=<REDACTED>");
+        expect((error as Error).message).toContain("Authorization: Bearer <REDACTED>");
+        expect((error as Error).message).not.toContain(credential);
+        expect((error as Error).message).not.toContain("opaque-bearer");
+        expect(hasPlanJson()).toBe(false);
+        expect(stdoutText()).not.toContain("Apply complete");
+        expect(stdoutText()).not.toContain("PROGRESS:70");
+        expect(stdoutText()).not.toContain("PROGRESS:100");
+      } finally {
+        delete process.env.MY_API_KEY;
+      }
+    });
+
+    it("reuses an already-existing provider instead of failing (#6703)", async () => {
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(
+          args,
+          ["provider", "create"],
+          "provider 'my-provider' already exists",
+        ),
+      );
+
+      // Matches the sandbox-create contract: already-existing is a reuse, so the
+      // apply proceeds and completes.
+      await actionApply("default", minimalBlueprint());
+      expect(hasPlanJson()).toBe(true);
+      expect(stdoutText()).toContain("Apply complete");
+    });
+
+    it("rejects without persisting a plan when inference set fails (#6703)", async () => {
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(args, ["inference", "set"], "inference route rejected"),
+      );
+
+      await expect(actionApply("default", minimalBlueprint())).rejects.toThrow(
+        /Failed to set inference route .*model 'gpt-4'.*inference route rejected/i,
+      );
+
+      expect(hasPlanJson()).toBe(false);
+      expect(stdoutText()).not.toContain("Apply complete");
+      expect(stdoutText()).not.toContain("PROGRESS:100");
+    });
+
+    it("applies blueprint policy additions by merging into the base policy", async () => {
       const bp = minimalBlueprint({
         components: {
           inference: {
@@ -674,12 +689,11 @@ describe("runner", () => {
           },
         },
       });
-
       mockExeca.mockImplementation(async (_cmd: string, args: string[]) => {
         if (
           args[0] === "policy" &&
           args[1] === "get" &&
-          args[2] === "--full" &&
+          args[2] === "--base" &&
           args[3] === "test-sandbox"
         ) {
           return {
@@ -775,7 +789,7 @@ describe("runner", () => {
       expect(policySetCalls).toEqual([]);
     });
 
-    it("fails closed when policy get --full does not include a policy document", async () => {
+    it("fails closed when policy get --base does not include a policy document", async () => {
       const bp = blueprintWithPolicyAdditions({
         nim_service: {
           name: "nim_service",
@@ -793,7 +807,7 @@ describe("runner", () => {
       expect(policySetCalls).toEqual([]);
     });
 
-    it("can merge policy additions into an empty policy document", async () => {
+    it("fails closed when policy get --base returns metadata without a policy document", async () => {
       const bp = blueprintWithPolicyAdditions({
         nim_service: {
           name: "nim_service",
@@ -802,20 +816,13 @@ describe("runner", () => {
       });
       mockCurrentPolicy(["Version: 1", "Hash: sha256:test", "---"].join("\n"));
 
-      await actionApply("default", bp);
-
-      const mergedPolicyKey = [...store.keys()].find(
-        (k) => k.endsWith("/merged-policy.yaml") || k.endsWith("\\merged-policy.yaml"),
+      await expect(actionApply("default", bp)).rejects.toThrow(
+        /does not contain a policy YAML document/i,
       );
-      if (!mergedPolicyKey) throw new Error("merged policy file not written");
-      const mergedEntry = store.get(mergedPolicyKey);
-      if (!mergedEntry?.content) throw new Error("merged policy file is empty");
-      const merged = YAML.parse(mergedEntry.content) as {
-        version?: number;
-        network_policies?: Record<string, unknown>;
-      };
-      expect(merged.version).toBe(1);
-      expect(merged.network_policies).toHaveProperty("nim_service");
+      const policySetCalls = mockExeca.mock.calls.filter(
+        (call) => Array.isArray(call[1]) && call[1][0] === "policy" && call[1][1] === "set",
+      );
+      expect(policySetCalls).toEqual([]);
     });
 
     it("skips policy commands when policy additions are empty", async () => {
@@ -1005,13 +1012,13 @@ describe("runner", () => {
       const prevMyApiKey = process.env.MY_API_KEY;
       const prevGithubToken = process.env.GITHUB_TOKEN;
       const prevAwsKey = process.env.AWS_ACCESS_KEY_ID;
-      const prevNvidiaKey = process.env.NVIDIA_API_KEY;
+      const prevNvidiaKey = process.env.NVIDIA_INFERENCE_API_KEY;
       const prevProxy = process.env.HTTPS_PROXY;
       const prevOsDebug = process.env.OPENSHELL_DEBUG;
       process.env.MY_API_KEY = "secret-key-123";
       process.env.GITHUB_TOKEN = "ghp_leaked";
       process.env.AWS_ACCESS_KEY_ID = "AKIA_leaked";
-      process.env.NVIDIA_API_KEY = "nvapi-leaked";
+      process.env.NVIDIA_INFERENCE_API_KEY = "nvapi-leaked";
       process.env.HTTPS_PROXY = "http://proxy.corp:8080";
       process.env.OPENSHELL_DEBUG = "1";
       try {
@@ -1029,7 +1036,7 @@ describe("runner", () => {
         // Secrets from the parent process must NOT be present
         expect(subEnv).not.toHaveProperty("GITHUB_TOKEN");
         expect(subEnv).not.toHaveProperty("AWS_ACCESS_KEY_ID");
-        expect(subEnv).not.toHaveProperty("NVIDIA_API_KEY");
+        expect(subEnv).not.toHaveProperty("NVIDIA_INFERENCE_API_KEY");
         expect(subEnv).not.toHaveProperty("MY_API_KEY");
 
         // Allowed system vars should still be present
@@ -1046,8 +1053,8 @@ describe("runner", () => {
         else process.env.GITHUB_TOKEN = prevGithubToken;
         if (prevAwsKey === undefined) delete process.env.AWS_ACCESS_KEY_ID;
         else process.env.AWS_ACCESS_KEY_ID = prevAwsKey;
-        if (prevNvidiaKey === undefined) delete process.env.NVIDIA_API_KEY;
-        else process.env.NVIDIA_API_KEY = prevNvidiaKey;
+        if (prevNvidiaKey === undefined) delete process.env.NVIDIA_INFERENCE_API_KEY;
+        else process.env.NVIDIA_INFERENCE_API_KEY = prevNvidiaKey;
         if (prevProxy === undefined) delete process.env.HTTPS_PROXY;
         else process.env.HTTPS_PROXY = prevProxy;
         if (prevOsDebug === undefined) delete process.env.OPENSHELL_DEBUG;
@@ -1081,9 +1088,28 @@ describe("runner", () => {
 
     it("validates and applies endpoint URL override", async () => {
       await actionApply("default", minimalBlueprint(), {
-        endpointUrl: "https://override.example.com/v1",
+        endpointUrl: "https://93.184.216.34/v1",
       });
-      expect(mockedValidateEndpoint).toHaveBeenCalledWith("https://override.example.com/v1");
+      expect(mockedValidateEndpoint).toHaveBeenCalledWith("https://93.184.216.34/v1");
+    });
+
+    it("fails closed before provider creation for DNS-backed HTTPS endpoint overrides", async () => {
+      mockedValidateEndpoint.mockResolvedValueOnce({
+        url: "https://override.example.com/v1",
+        pinnedUrl: "https://93.184.216.34/v1",
+        protocol: "https:",
+        hostname: "override.example.com",
+        dnsResolved: true,
+      });
+
+      await expect(
+        actionApply("default", minimalBlueprint(), {
+          endpointUrl: "https://override.example.com/v1",
+        }),
+      ).rejects.toThrow(/DNS-backed HTTPS endpoint/);
+      expect(
+        mockExeca.mock.calls.some((c) => Array.isArray(c[1]) && c[1].includes("provider")),
+      ).toBe(false);
     });
 
     it("passes --timeout when timeout_secs is set in profile", async () => {
@@ -1131,7 +1157,7 @@ describe("runner", () => {
     });
 
     it("passes endpoint as-is from blueprint (no rewriting)", async () => {
-      process.env.NVIDIA_API_KEY = "test-key";
+      process.env.NVIDIA_INFERENCE_API_KEY = "test-key";
       try {
         await actionApply("routed", routedBlueprint());
 
@@ -1144,7 +1170,7 @@ describe("runner", () => {
         );
         expect(configArg).toBe("OPENAI_BASE_URL=http://localhost:4000/v1");
       } finally {
-        delete process.env.NVIDIA_API_KEY;
+        delete process.env.NVIDIA_INFERENCE_API_KEY;
       }
     });
   });
@@ -1351,15 +1377,25 @@ describe("runner", () => {
       expect(store.has(`${runDir}/rolled_back`)).toBe(true);
     });
 
-    it("still writes marker when plan.json is missing", async () => {
+    it("throws when plan.json is missing", async () => {
       const runDir = `${RUNS_DIR}/nc-run-1`;
       addDir(runDir);
-      // No plan.json — should skip sandbox stop/remove but still mark rolled_back
 
-      await actionRollback("nc-run-1");
+      await expect(actionRollback("nc-run-1")).rejects.toThrow(/Cannot read rollback plan/);
 
       expect(mockExeca).not.toHaveBeenCalled();
-      expect(store.has(`${runDir}/rolled_back`)).toBe(true);
+      expect(store.has(`${runDir}/rolled_back`)).toBe(false);
+    });
+
+    it("throws when plan.json is corrupt", async () => {
+      const runDir = `${RUNS_DIR}/nc-run-1`;
+      addDir(runDir);
+      addFile(`${runDir}/plan.json`, "{");
+
+      await expect(actionRollback("nc-run-1")).rejects.toThrow(/Cannot read rollback plan/);
+
+      expect(mockExeca).not.toHaveBeenCalled();
+      expect(store.has(`${runDir}/rolled_back`)).toBe(false);
     });
 
     // ── Path traversal rejection ──────────────────────────────────
@@ -1375,18 +1411,17 @@ describe("runner", () => {
       await expect(actionRollback(rid)).rejects.toThrow(/Invalid run ID/);
     });
 
-    it("defaults sandbox_name to 'openclaw' when not in plan", async () => {
+    it("throws when rollback plan has no sandbox_name", async () => {
       const runDir = `${RUNS_DIR}/nc-run-1`;
       addDir(runDir);
       addFile(`${runDir}/plan.json`, JSON.stringify({}));
 
-      await actionRollback("nc-run-1");
-
-      expect(mockExeca).toHaveBeenCalledWith(
-        "openshell",
-        ["sandbox", "stop", "openclaw"],
-        expect.anything(),
+      await expect(actionRollback("nc-run-1")).rejects.toThrow(
+        /sandbox_name must be a non-empty string/,
       );
+
+      expect(mockExeca).not.toHaveBeenCalled();
+      expect(store.has(`${runDir}/rolled_back`)).toBe(false);
     });
   });
 

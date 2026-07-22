@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   __test,
   formatSandboxBridgeUnreachableMessage,
   isSandboxBridgeGatewayReachable,
-} from "../../../dist/lib/onboard/gateway-sandbox-reachability";
+  tryAutoApplyUfwRule,
+  verifySandboxBridgeGatewayReachableOrExit,
+} from "./gateway-sandbox-reachability";
 
 describe("gateway sandbox reachability route modeling", () => {
   it("parses Docker network IPAM config for subnet and gateway", () => {
@@ -123,7 +125,7 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.detail).toContain("operation not supported");
   });
 
-  it("does not misclassify unrelated 'veth' or 'operation not supported' output as veth_unsupported (#3630 CodeRabbit)", async () => {
+  it("does not misclassify unrelated 'veth' or 'operation not supported' output as veth_unsupported per CodeRabbit review (#3630)", async () => {
     // Generic veth status lines, or `operation not supported` from
     // other syscalls (mount, ioctl, etc.) must fall through to the
     // existing inconclusive path, not be reported as fatal Jetson veth.
@@ -213,7 +215,7 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.reason).toBe("tcp_failed");
   });
 
-  it("downgrades a slow-registry pre-pull timeout to probe_unavailable (not fatal probe_timeout) (#3630 codex review)", async () => {
+  it("downgrades a slow-registry pre-pull timeout to probe_unavailable instead of fatal probe_timeout per Codex review (#3630)", async () => {
     const result = await isSandboxBridgeGatewayReachable({
       inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
       usesHostGatewayRouteImpl: () => false,
@@ -229,7 +231,7 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.detail).toContain("timed out");
   });
 
-  it("classifies docker-daemon-connect failures from the probe run as fatal docker_daemon_unreachable (#3630 CodeRabbit)", async () => {
+  it("classifies docker-daemon-connect failures from the probe run as fatal docker_daemon_unreachable per CodeRabbit review (#3630)", async () => {
     // The image-cache pre-pull succeeded (or was bypassed), but the
     // actual `docker run` probe failed with the daemon-down signature.
     // This must surface as docker_daemon_unreachable (fatal), not slip
@@ -276,7 +278,7 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.reason).toBe("docker_daemon_unreachable");
   });
 
-  it("escalates inspect_unavailable to fatal docker_daemon_unreachable (#3630 codex review)", async () => {
+  it("escalates inspect_unavailable to fatal docker_daemon_unreachable per Codex review (#3630)", async () => {
     const result = await isSandboxBridgeGatewayReachable({
       inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
       usesHostGatewayRouteImpl: () => false,
@@ -292,7 +294,7 @@ describe("isSandboxBridgeGatewayReachable", () => {
     expect(result.detail).toContain("Cannot connect to the Docker daemon");
   });
 
-  it("uses inspect-specific fallback detail when inspect_unavailable has no details (#3630 CodeRabbit)", async () => {
+  it("uses inspect-specific fallback detail when inspect_unavailable has no details per CodeRabbit review (#3630)", async () => {
     const result = await isSandboxBridgeGatewayReachable({
       inspectNetworkImpl: () => ({ subnet: "172.19.0.0/16", gatewayIp: "172.19.0.1" }),
       usesHostGatewayRouteImpl: () => false,
@@ -392,7 +394,21 @@ describe("formatSandboxBridgeUnreachableMessage", () => {
     expect(msg).not.toContain("continuing");
   });
 
-  it("uses cliDisplayName() and cliName() in fatal messages instead of hardcoded NemoClaw branding (#3630 CodeRabbit)", () => {
+  it("emits the Docker Desktop WSL integration hint for WSL daemon access failures", () => {
+    const msg = formatSandboxBridgeUnreachableMessage(
+      {
+        ok: false,
+        reason: "docker_daemon_unreachable",
+        detail: "Cannot connect to the Docker daemon",
+      },
+      8787,
+      { isWsl: true },
+    );
+    expect(msg).toContain("Docker Desktop > Settings > Resources > WSL integration");
+    expect(msg).toContain("enable integration for this distro");
+  });
+
+  it("uses cliDisplayName() and cliName() in fatal messages instead of hardcoded branding per CodeRabbit review (#3630)", () => {
     const savedAgent = process.env.NEMOCLAW_AGENT;
     const savedInvoked = process.env.NEMOCLAW_INVOKED_AS;
     process.env.NEMOCLAW_AGENT = "hermes";
@@ -450,5 +466,347 @@ describe("formatSandboxBridgeUnreachableMessage", () => {
     });
     expect(msg).toContain("host-gateway");
     expect(msg).not.toContain("ufw allow");
+  });
+});
+
+describe("tryAutoApplyUfwRule (#4265)", () => {
+  type Call = { argv: readonly string[]; status: number; stdout?: string; stderr?: string };
+
+  function makeRunner(calls: Call[]) {
+    const recorded: string[][] = [];
+    const runImpl = (argv: readonly string[]) => {
+      recorded.push([...argv]);
+      const idx = recorded.length - 1;
+      const c = calls[idx];
+      if (!c) return { status: 0, stdout: "", stderr: "" };
+      return { status: c.status, stdout: c.stdout ?? "", stderr: c.stderr ?? "" };
+    };
+    return { runImpl, recorded };
+  }
+
+  const reach = {
+    ok: false as const,
+    reason: "tcp_failed" as const,
+    routeKind: "bridge_gateway" as const,
+    networkName: "openshell-docker",
+    subnet: "172.18.0.0/16",
+    gatewayIp: "172.18.0.1",
+  };
+
+  it("skips when the operator has not opted in", async () => {
+    const { runImpl, recorded } = makeRunner([]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: false });
+    expect(result).toEqual({ applied: false, reason: "not_opted_in" });
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("skips when gatewayIp is unknown", async () => {
+    const { runImpl, recorded } = makeRunner([]);
+    const result = await tryAutoApplyUfwRule(
+      { ...reach, gatewayIp: undefined },
+      { runImpl, optedIn: true },
+    );
+    expect(result).toEqual({ applied: false, reason: "no_subnet_or_gateway" });
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("skips when subnet is unknown", async () => {
+    const { runImpl, recorded } = makeRunner([]);
+    const result = await tryAutoApplyUfwRule(
+      { ...reach, subnet: undefined },
+      { runImpl, optedIn: true },
+    );
+    expect(result).toEqual({ applied: false, reason: "no_subnet_or_gateway" });
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("rejects malformed or overly broad UFW operands before sudo", async () => {
+    const { runImpl, recorded } = makeRunner([]);
+    const broadSubnet = await tryAutoApplyUfwRule(
+      { ...reach, subnet: "0.0.0.0/0" },
+      { runImpl, optedIn: true },
+    );
+    const outsideGateway = await tryAutoApplyUfwRule(
+      { ...reach, gatewayIp: "172.19.0.1" },
+      { runImpl, optedIn: true },
+    );
+    const invalidPort = await tryAutoApplyUfwRule(reach, {
+      runImpl,
+      optedIn: true,
+      port: 70000,
+    });
+    expect(broadSubnet.reason).toBe("invalid_rule_operand");
+    expect(outsideGateway.reason).toBe("invalid_rule_operand");
+    expect(invalidPort.reason).toBe("invalid_rule_operand");
+    expect(recorded).toHaveLength(0);
+  });
+
+  it("returns sudo_unavailable when passwordless sudo fails", async () => {
+    const { runImpl } = makeRunner([{ argv: ["sudo", "-n", "true"], status: 1 }]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: true });
+    expect(result.reason).toBe("sudo_unavailable");
+  });
+
+  it("returns ufw_missing when ufw is not on PATH", async () => {
+    const { runImpl } = makeRunner([
+      { argv: ["sudo", "-n", "true"], status: 0 },
+      { argv: ["sudo", "-n", "which", "ufw"], status: 1 },
+    ]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: true });
+    expect(result.reason).toBe("ufw_missing");
+  });
+
+  it("returns ufw_inactive when status reports inactive", async () => {
+    const { runImpl } = makeRunner([
+      { argv: ["sudo", "-n", "true"], status: 0 },
+      { argv: ["sudo", "-n", "which", "ufw"], status: 0, stdout: "/usr/sbin/ufw" },
+      { argv: ["sudo", "-n", "ufw", "status"], status: 0, stdout: "Status: inactive" },
+    ]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: true });
+    expect(result.reason).toBe("ufw_inactive");
+  });
+
+  it("returns ufw_rule_rejected when ufw exits non-zero on apply", async () => {
+    const { runImpl } = makeRunner([
+      { argv: ["sudo", "-n", "true"], status: 0 },
+      { argv: ["sudo", "-n", "which", "ufw"], status: 0, stdout: "/usr/sbin/ufw" },
+      { argv: ["sudo", "-n", "ufw", "status"], status: 0, stdout: "Status: active" },
+      { argv: [], status: 1, stderr: "ufw: rule rejected" },
+    ]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: true, port: 8080 });
+    expect(result.reason).toBe("ufw_rule_rejected");
+    expect(result.detail).toContain("rule rejected");
+  });
+
+  it("applies the narrow allow rule on the happy path", async () => {
+    const { runImpl, recorded } = makeRunner([
+      { argv: ["sudo", "-n", "true"], status: 0 },
+      { argv: ["sudo", "-n", "which", "ufw"], status: 0, stdout: "/usr/sbin/ufw" },
+      { argv: ["sudo", "-n", "ufw", "status"], status: 0, stdout: "Status: active" },
+      { argv: [], status: 0, stdout: "Rule added" },
+    ]);
+    const result = await tryAutoApplyUfwRule(reach, { runImpl, optedIn: true, port: 8080 });
+    expect(result).toEqual({ applied: true, reason: "applied", detail: "Rule added" });
+    expect(recorded[3]).toEqual([
+      "sudo",
+      "-n",
+      "ufw",
+      "allow",
+      "from",
+      "172.18.0.0/16",
+      "to",
+      "172.18.0.1",
+      "port",
+      "8080",
+      "proto",
+      "tcp",
+    ]);
+  });
+});
+
+describe("verifySandboxBridgeGatewayReachableOrExit host-gateway retry", () => {
+  const hostGatewayTcpFailure = {
+    ok: false as const,
+    reason: "tcp_failed" as const,
+    routeKind: "host_gateway" as const,
+    networkName: "openshell-docker",
+    gatewayIp: "192.168.65.254",
+  };
+
+  it("retries transient host-gateway tcp failures and returns when a later probe succeeds", async () => {
+    const reachabilityImpl = vi
+      .fn()
+      .mockResolvedValueOnce(hostGatewayTcpFailure)
+      .mockResolvedValueOnce({
+        ...hostGatewayTcpFailure,
+        ok: true as const,
+        reason: "ok" as const,
+      });
+    const sleepMsImpl = vi.fn().mockResolvedValue(undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await verifySandboxBridgeGatewayReachableOrExit(true, {
+        port: 19080,
+        reachabilityImpl,
+        retryAttempts: 3,
+        retryDelayMs: 25,
+        sleepMsImpl,
+      });
+      expect(reachabilityImpl).toHaveBeenCalledWith({ port: 19080 });
+      expect(reachabilityImpl).toHaveBeenCalledTimes(2);
+      expect(sleepMsImpl).toHaveBeenCalledTimes(1);
+      expect(sleepMsImpl).toHaveBeenCalledWith(25);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("probe attempt 1/3 failed (tcp_failed)"),
+      );
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("reachable on attempt 2/3"));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("fails after exhausting persistent host-gateway tcp failures", async () => {
+    const reachabilityImpl = vi.fn().mockResolvedValue(hostGatewayTcpFailure);
+    const sleepMsImpl = vi.fn().mockResolvedValue(undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        verifySandboxBridgeGatewayReachableOrExit(false, {
+          reachabilityImpl,
+          retryAttempts: 3,
+          retryDelayMs: 25,
+          sleepMsImpl,
+        }),
+      ).rejects.toThrow("sandbox-bridge unreachable");
+      expect(reachabilityImpl).toHaveBeenCalledTimes(3);
+      expect(sleepMsImpl).toHaveBeenCalledTimes(2);
+      expect(sleepMsImpl).toHaveBeenNthCalledWith(1, 25);
+      expect(sleepMsImpl).toHaveBeenNthCalledWith(2, 25);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("probe attempt 1/3 failed (tcp_failed)"),
+      );
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("probe attempt 2/3 failed (tcp_failed)"),
+      );
+      const message = error.mock.calls[0]?.[0] as string;
+      expect(message).toContain("host-gateway route");
+      expect(message).not.toContain("ufw allow");
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("uses the bounded production retry budget when retry options are not overridden", async () => {
+    const reachabilityImpl = vi.fn().mockResolvedValue(hostGatewayTcpFailure);
+    const sleepMsImpl = vi.fn().mockResolvedValue(undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        verifySandboxBridgeGatewayReachableOrExit(false, {
+          reachabilityImpl,
+          sleepMsImpl,
+        }),
+      ).rejects.toThrow("sandbox-bridge unreachable");
+      expect(reachabilityImpl).toHaveBeenCalledTimes(10);
+      expect(sleepMsImpl).toHaveBeenCalledTimes(9);
+      expect(sleepMsImpl).toHaveBeenCalledWith(1000);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("probe attempt 9/10 failed (tcp_failed)"),
+      );
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("does not retry bridge-gateway tcp failures so UFW remediation remains responsible", async () => {
+    const bridgeGatewayTcpFailure = {
+      ...hostGatewayTcpFailure,
+      routeKind: "bridge_gateway" as const,
+      subnet: "172.18.0.0/16",
+      gatewayIp: "172.18.0.1",
+    };
+    const reachabilityImpl = vi.fn().mockResolvedValue(bridgeGatewayTcpFailure);
+    const sleepMsImpl = vi.fn().mockResolvedValue(undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        verifySandboxBridgeGatewayReachableOrExit(false, {
+          autoApplyOptedInImpl: () => false,
+          reachabilityImpl,
+          retryAttempts: 3,
+          retryDelayMs: 25,
+          sleepMsImpl,
+        }),
+      ).rejects.toThrow("sandbox-bridge unreachable");
+      expect(reachabilityImpl).toHaveBeenCalledTimes(1);
+      expect(sleepMsImpl).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("ufw allow"));
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
+describe("verifySandboxBridgeGatewayReachableOrExit UFW auto-apply (#4265)", () => {
+  const tcpFailure = {
+    ok: false as const,
+    reason: "tcp_failed" as const,
+    routeKind: "bridge_gateway" as const,
+    networkName: "openshell-docker",
+    subnet: "172.18.0.0/16",
+    gatewayIp: "172.18.0.1",
+  };
+
+  it("does not auto-apply UFW when the bridge-gateway probe is unavailable", async () => {
+    const autoApplyImpl = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await verifySandboxBridgeGatewayReachableOrExit(false, {
+      autoApplyImpl,
+      autoApplyOptedInImpl: () => true,
+      reachabilityImpl: () => ({
+        ...tcpFailure,
+        reason: "probe_unavailable",
+        detail: "nc: bad address 'host.openshell.internal'",
+      }),
+    });
+    expect(autoApplyImpl).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("Could not verify"));
+    warn.mockRestore();
+  });
+
+  it("re-probes and returns cleanly after a successful UFW apply", async () => {
+    const reachabilityImpl = vi
+      .fn()
+      .mockResolvedValueOnce(tcpFailure)
+      .mockResolvedValueOnce({ ...tcpFailure, ok: true, reason: "ok" });
+    const autoApplyImpl = vi.fn().mockReturnValue({ applied: true, reason: "applied" });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await verifySandboxBridgeGatewayReachableOrExit(true, {
+      autoApplyImpl,
+      autoApplyOptedInImpl: () => true,
+      reachabilityImpl,
+    });
+    expect(autoApplyImpl).toHaveBeenCalledWith(tcpFailure);
+    expect(reachabilityImpl).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Applied UFW rule"));
+    log.mockRestore();
+  });
+
+  it("falls back to the manual message when apply succeeds but the re-probe still fails", async () => {
+    const reachabilityImpl = vi.fn().mockResolvedValue(tcpFailure);
+    const autoApplyImpl = vi.fn().mockReturnValue({ applied: true, reason: "applied" });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(
+      verifySandboxBridgeGatewayReachableOrExit(false, {
+        autoApplyImpl,
+        autoApplyOptedInImpl: () => true,
+        reachabilityImpl,
+      }),
+    ).rejects.toThrow("sandbox-bridge unreachable");
+    expect(reachabilityImpl).toHaveBeenCalledTimes(2);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("ufw allow"));
+    log.mockRestore();
+    error.mockRestore();
+  });
+
+  it("does not warn for unsupported UFW environments when auto-apply is opted in", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(
+      verifySandboxBridgeGatewayReachableOrExit(false, {
+        autoApplyImpl: () => ({ applied: false, reason: "ufw_inactive" }),
+        autoApplyOptedInImpl: () => true,
+        reachabilityImpl: () => tcpFailure,
+      }),
+    ).rejects.toThrow("sandbox-bridge unreachable");
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("ufw allow"));
+    warn.mockRestore();
+    error.mockRestore();
   });
 });

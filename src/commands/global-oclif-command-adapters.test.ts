@@ -14,8 +14,6 @@ const mocks = vi.hoisted(() => ({
   runInferenceGet: vi.fn(),
   runInferenceSet: vi.fn(),
   runOnboardAction: vi.fn(),
-  runSetupAction: vi.fn(),
-  runSetupSparkAction: vi.fn(),
   runUpgradeSandboxesAction: vi.fn(),
   showStatusCommand: vi.fn(),
 }));
@@ -39,8 +37,6 @@ vi.mock("../lib/actions/global", () => ({
   runBackupAllAction: mocks.runBackupAllAction,
   runGarbageCollectImagesAction: mocks.runGarbageCollectImagesAction,
   runOnboardAction: mocks.runOnboardAction,
-  runSetupAction: mocks.runSetupAction,
-  runSetupSparkAction: mocks.runSetupSparkAction,
   runUpgradeSandboxesAction: mocks.runUpgradeSandboxesAction,
 }));
 
@@ -70,16 +66,16 @@ vi.mock("../lib/actions/inference-get", () => ({
 
 import { InferenceGetError } from "../lib/actions/inference-get";
 import { InferenceSetError } from "../lib/actions/inference-set";
+import BackupAllCommand from "./backup-all";
+import GarbageCollectImagesCommand from "./gc";
 import InferenceGetCommand from "./inference/get";
 import InferenceSetCommand from "./inference/set";
 import ListCommand from "./list";
-import BackupAllCommand from "./backup-all";
-import GarbageCollectImagesCommand from "./gc";
-import UpgradeSandboxesCommand from "./upgrade-sandboxes";
 import OnboardCliCommand from "./onboard";
 import SetupCliCommand from "./setup";
 import SetupSparkCliCommand from "./setup-spark";
 import StatusCommand from "./status";
+import UpgradeSandboxesCommand from "./upgrade-sandboxes";
 
 const rootDir = process.cwd();
 
@@ -109,12 +105,59 @@ describe("global oclif command adapters", () => {
     await ListCommand.run([], rootDir);
 
     expect(mocks.buildListCommandDeps).toHaveBeenCalledWith();
-    expect(mocks.getSandboxInventory).toHaveBeenCalledWith({ getLiveInference: expect.any(Function) });
+    expect(mocks.getSandboxInventory).toHaveBeenCalledWith({
+      getLiveInference: expect.any(Function),
+    });
     expect(mocks.renderSandboxInventoryText).toHaveBeenCalledWith(
       { sandboxes: [] },
       expect.any(Function),
       null,
     );
+  });
+
+  it("keeps list --json stdout clean while inventory recovery prints progress", async () => {
+    const report = {
+      schemaVersion: 1,
+      defaultSandbox: null,
+      recovery: { recoveredFromSession: false, recoveredFromGateway: 0 },
+      lastOnboardedSandbox: null,
+      sandboxes: [],
+    };
+    mocks.getSandboxInventory.mockImplementationOnce(async () => {
+      process.stdout.write("  Starting OpenShell gateway\n");
+      return report;
+    });
+
+    const out: string[] = [];
+    const err: string[] = [];
+    const origOut = process.stdout.write;
+    const origErr = process.stderr.write;
+    process.stdout.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+      out.push(typeof chunk === "string" ? chunk : String(chunk));
+      const cb = rest.find((arg) => typeof arg === "function") as undefined | (() => void);
+      if (cb) cb();
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+      err.push(typeof chunk === "string" ? chunk : String(chunk));
+      const cb = rest.find((arg) => typeof arg === "function") as undefined | (() => void);
+      if (cb) cb();
+      return true;
+    }) as typeof process.stderr.write;
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    try {
+      await ListCommand.run(["--json"], rootDir);
+    } finally {
+      process.stdout.write = origOut;
+      process.stderr.write = origErr;
+    }
+
+    const stdout = out.join("");
+    expect(stdout).not.toContain("Starting OpenShell gateway");
+    expect(stdout).toBe("");
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toEqual(report);
+    expect(err.join("")).toContain("Starting OpenShell gateway");
   });
 
   it("runs status through status helpers", async () => {
@@ -164,14 +207,20 @@ describe("global oclif command adapters", () => {
     });
   });
 
-  it("maps onboard-family flags into the compatibility action arguments", async () => {
+  it("maps onboard-family flags directly into the shared typed action", async () => {
     await OnboardCliCommand.run(["--name", "alpha", "--resume"], rootDir);
-    await SetupCliCommand.run(["--fresh"], rootDir);
+    await SetupCliCommand.run(["--name", "alpha", "--resume"], rootDir);
     await SetupSparkCliCommand.run(["--control-ui-port", "18080"], rootDir);
 
-    expect(mocks.runOnboardAction).toHaveBeenCalledWith(["--resume", "--name", "alpha"]);
-    expect(mocks.runSetupAction).toHaveBeenCalledWith(["--fresh"]);
-    expect(mocks.runSetupSparkAction).toHaveBeenCalledWith(["--control-ui-port", "18080"]);
+    expect(mocks.runOnboardAction).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ name: "alpha", resume: true }),
+    );
+    expect(mocks.runOnboardAction.mock.calls[1]).toEqual(mocks.runOnboardAction.mock.calls[0]);
+    expect(mocks.runOnboardAction).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ "control-ui-port": 18080 }),
+    );
   });
 
   it("maps inference set flags into the inference action", async () => {
@@ -184,6 +233,12 @@ describe("global oclif command adapters", () => {
         "--sandbox",
         "alpha",
         "--no-verify",
+        "--endpoint-url",
+        "https://example.test/v1",
+        "--credential-env",
+        "COMPATIBLE_API_KEY",
+        "--inference-api",
+        "openai-completions",
       ],
       rootDir,
     );
@@ -193,11 +248,17 @@ describe("global oclif command adapters", () => {
       model: "nvidia/nemotron-3-super-120b-a12b",
       sandboxName: "alpha",
       noVerify: true,
+      endpointUrl: "https://example.test/v1",
+      credentialEnv: "COMPATIBLE_API_KEY",
+      inferenceApi: "openai-completions",
     });
   });
 
   it("maps inference get JSON output into oclif JSON handling", async () => {
-    mocks.runInferenceGet.mockResolvedValueOnce({ provider: "nvidia-prod", model: "nvidia/model-a" });
+    mocks.runInferenceGet.mockResolvedValueOnce({
+      provider: "nvidia-prod",
+      model: "nvidia/model-a",
+    });
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await InferenceGetCommand.run(["--json"], rootDir);
@@ -224,7 +285,10 @@ describe("global oclif command adapters", () => {
       expect(error).toHaveBeenCalledWith("route missing");
 
       await expect(
-        InferenceSetCommand.run(["--provider", "nvidia-prod", "--model", "nvidia/model-a"], rootDir),
+        InferenceSetCommand.run(
+          ["--provider", "nvidia-prod", "--model", "nvidia/model-a"],
+          rootDir,
+        ),
       ).resolves.toBeUndefined();
       expect(process.exitCode).toBe(4);
       expect(error).toHaveBeenCalledWith("route rejected");

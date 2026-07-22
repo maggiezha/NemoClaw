@@ -23,6 +23,10 @@ filesystem_policy:
   read_write:
     - /tmp
     - /dev/null
+    - /dev/pts                      # devpts PTY access for the tmux-session flow
+                                    # (#4513). Mirrors the baseline read_write so
+                                    # `shields down` does not remove a path
+                                    # (OpenShell rejects filesystem removals).
     - /sandbox/.openclaw
     - /sandbox/.nemoclaw
     - /home/linuxbrew
@@ -36,36 +40,10 @@ process:
 
 network_policies:
 
-  claude_code:
-    name: claude_code
-    endpoints:
-      - host: api.anthropic.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: full
-      - host: statsig.anthropic.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: full
-      - host: sentry.io
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: full
-    binaries:
-      - { path: "/**" }
-
   nvidia:
     name: nvidia
     endpoints:
       - host: integrate.api.nvidia.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: full
-      - host: inference-api.nvidia.com
         port: 443
         protocol: rest
         enforcement: enforce
@@ -96,6 +74,9 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
+        # TODO(#4104): Remove if ClawHub stops encoding scope separators or
+        # OpenShell can preserve this route without an endpoint-level opt-in.
+        allow_encoded_slash: true
         access: full
     binaries:
       - { path: "/**" }
@@ -336,6 +317,20 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
+        access: full
+    binaries:
+      - { path: "/**" }
+
+  # Shields-down policies intentionally keep full host and binary scope. The
+  # maintained Tavily preset and provider profiles constrain normal access.
+  tavily:
+    name: tavily
+    endpoints:
+      - host: api.tavily.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        request_body_credential_rewrite: true
         access: full
     binaries:
       - { path: "/**" }

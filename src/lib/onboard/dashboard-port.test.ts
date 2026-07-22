@@ -2,14 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 
+import { withGatewayRouteMutationLock } from "../inference/gateway-route-mutation-lock";
 import {
   findAvailableDashboardPort,
   findDashboardForwardOwner,
+  getRegistryOccupiedDashboardPorts,
   preflightDashboardPortRangeAvailability,
-} from "../../../dist/lib/onboard/dashboard-port";
+  resolveCreateSandboxDashboardPort,
+  withDashboardPortReservationLock,
+} from "./dashboard-port";
 
 describe("findDashboardForwardOwner", () => {
   it("parses openshell forward list column format (#2169)", () => {
@@ -95,6 +103,360 @@ describe("findAvailableDashboardPort port-conflict detection (#3260)", () => {
   });
 });
 
+describe("resolveCreateSandboxDashboardPort", () => {
+  it("lets --control-ui-port override CHAT_UI_URL, registry, agent, and default ports", () => {
+    let preferredSeen: number | null = null;
+    const result = resolveCreateSandboxDashboardPort({
+      sandboxName: "cursor",
+      controlUiPort: 19000,
+      chatUiUrlEnv: "http://127.0.0.1:18790",
+      persistedPort: 18791,
+      agentForwardPort: 18792,
+      defaultPort: 18793,
+      forwardListOutput: "",
+      findAvailablePort: (_sandboxName, preferredPort) => {
+        preferredSeen = preferredPort;
+        return preferredPort;
+      },
+    });
+
+    assert.equal(preferredSeen, 19000);
+    assert.equal(result.preferredPort, 19000);
+    assert.equal(result.effectivePort, 19000);
+    assert.equal(result.chatUiUrl, "http://127.0.0.1:19000");
+  });
+
+  it("uses CHAT_UI_URL port before registry and rewrites the URL to the allocated port", () => {
+    const warnings: string[] = [];
+    const result = resolveCreateSandboxDashboardPort({
+      sandboxName: "cursor",
+      controlUiPort: null,
+      chatUiUrlEnv: "https://chat.example.test:18790/ui/",
+      persistedPort: 18791,
+      agentForwardPort: 18792,
+      defaultPort: 18793,
+      forwardListOutput: "FORWARDS",
+      findAvailablePort: (sandboxName, preferredPort, forwardListOutput) => {
+        assert.equal(sandboxName, "cursor");
+        assert.equal(preferredPort, 18790);
+        assert.equal(forwardListOutput, "FORWARDS");
+        return 18794;
+      },
+      warn: (message) => warnings.push(message),
+    });
+
+    assert.equal(result.preferredPort, 18790);
+    assert.equal(result.effectivePort, 18794);
+    assert.equal(result.chatUiUrl, "https://chat.example.test:18794/ui");
+    assert.deepEqual(warnings, ["  ! Port 18790 is taken. Using port 18794 instead."]);
+  });
+
+  it("falls back through registry, agent, and default ports", () => {
+    const preferredPorts: number[] = [];
+    const resolve = (persistedPort: number | null, agentForwardPort: number | null | undefined) =>
+      resolveCreateSandboxDashboardPort({
+        sandboxName: "cursor",
+        controlUiPort: null,
+        chatUiUrlEnv: null,
+        persistedPort,
+        agentForwardPort,
+        defaultPort: 18793,
+        forwardListOutput: "",
+        findAvailablePort: (_sandboxName, preferredPort) => {
+          preferredPorts.push(preferredPort);
+          return preferredPort;
+        },
+      });
+
+    assert.equal(resolve(18791, 18792).preferredPort, 18791);
+    assert.equal(resolve(null, 18792).preferredPort, 18792);
+    assert.equal(resolve(null, null).preferredPort, 18793);
+    assert.deepEqual(preferredPorts, [18791, 18792, 18793]);
+  });
+
+  it("normalizes schemeless CHAT_UI_URL values before preserving their host", () => {
+    const result = resolveCreateSandboxDashboardPort({
+      sandboxName: "cursor",
+      controlUiPort: null,
+      chatUiUrlEnv: "remote.example.test:18790",
+      persistedPort: null,
+      agentForwardPort: null,
+      defaultPort: 18789,
+      forwardListOutput: "",
+      findAvailablePort: (_sandboxName, preferredPort) => preferredPort,
+    });
+
+    assert.equal(result.preferredPort, 18790);
+    assert.equal(result.chatUiUrl, "http://remote.example.test:18790");
+  });
+
+  it("ignores malformed CHAT_UI_URL when rewriting the dashboard URL", () => {
+    const result = resolveCreateSandboxDashboardPort({
+      sandboxName: "cursor",
+      controlUiPort: null,
+      chatUiUrlEnv: "https://example.test:abc",
+      persistedPort: 18791,
+      agentForwardPort: null,
+      defaultPort: 18789,
+      forwardListOutput: "",
+      findAvailablePort: (_sandboxName, preferredPort) => preferredPort,
+    });
+
+    assert.equal(result.preferredPort, 18791);
+    assert.equal(result.chatUiUrl, "http://127.0.0.1:18791");
+  });
+
+  it("ignores malformed CHAT_UI_URL when --control-ui-port supplies the URL", () => {
+    const result = resolveCreateSandboxDashboardPort({
+      sandboxName: "cursor",
+      controlUiPort: 19000,
+      chatUiUrlEnv: "https://example.test:abc",
+      persistedPort: 18791,
+      agentForwardPort: null,
+      defaultPort: 18789,
+      forwardListOutput: "",
+      findAvailablePort: (_sandboxName, preferredPort) => preferredPort,
+    });
+
+    assert.equal(result.preferredPort, 19000);
+    assert.equal(result.chatUiUrl, "http://127.0.0.1:19000");
+  });
+});
+
+describe("findAvailableDashboardPort multi-gateway registry occupancy", () => {
+  const stubBound = (...bound: number[]) => {
+    const set = new Set(bound);
+    return (port: number) => set.has(port);
+  };
+
+  it("treats ports persisted to sibling sandboxes in the registry as occupied even when the active gateway's forward list does not see them", () => {
+    const registryOccupied = new Map<string, string>([["18789", "instance-a"]]);
+
+    assert.equal(
+      findAvailableDashboardPort("instance-b", 18789, "", stubBound(), registryOccupied),
+      18790,
+    );
+  });
+
+  it("does not block the current sandbox from reusing its own registry-persisted port", () => {
+    const registryOccupied = new Map<string, string>([["18789", "instance-a"]]);
+
+    assert.equal(
+      findAvailableDashboardPort("instance-a", 18789, "", stubBound(), registryOccupied),
+      18789,
+    );
+  });
+
+  it("ignores registry entries with null or invalid dashboard ports", () => {
+    const noPorts = new Map<string, string>();
+
+    assert.equal(findAvailableDashboardPort("instance-b", 18789, "", stubBound(), noPorts), 18789);
+  });
+
+  it("includes registry-owned ports in the exhaustion error so the operator can see who holds them", () => {
+    const lines = ["SANDBOX  BIND  PORT  PID  STATUS"];
+    for (let p = 18789; p <= 18798; p++) {
+      lines.push(`forwarded${p}    127.0.0.1  ${p}  ${p}  running`);
+    }
+    const registryOccupied = new Map<string, string>([["18799", "instance-z"]]);
+
+    assert.throws(
+      () =>
+        findAvailableDashboardPort(
+          "instance-y",
+          18789,
+          lines.join("\n"),
+          stubBound(),
+          registryOccupied,
+        ),
+      /18799 → instance-z/,
+    );
+  });
+
+  it("lets the active gateway's forward-list entry win when both views see the same port", () => {
+    const forwardList = [
+      "SANDBOX  BIND  PORT  PID  STATUS",
+      "live     127.0.0.1  18789  111  running",
+    ].join("\n");
+    const registryOccupied = new Map<string, string>([["18789", "stale"]]);
+
+    assert.throws(
+      () => findAvailableDashboardPort("fresh", 18789, forwardList, () => true, registryOccupied),
+      /18789 → live/,
+    );
+  });
+});
+
+describe("getRegistryOccupiedDashboardPorts", () => {
+  it("aggregates a sibling gateway registry when host bind probes report the port free", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dashboard-host-index-"));
+    try {
+      vi.stubEnv("HOME", home);
+      const defaultRoot = path.join(home, ".nemoclaw");
+      const siblingRoot = path.join(defaultRoot, "gateways", "9123");
+      fs.mkdirSync(siblingRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(defaultRoot, "sandboxes.json"),
+        JSON.stringify({
+          defaultSandbox: "instance-b",
+          sandboxes: {
+            "instance-b": {
+              name: "instance-b",
+              gatewayName: "nemoclaw",
+              gatewayPort: 8080,
+              dashboardPort: 18790,
+            },
+          },
+        }),
+      );
+      fs.writeFileSync(
+        path.join(siblingRoot, "sandboxes.json"),
+        JSON.stringify({
+          defaultSandbox: "instance-a",
+          sandboxes: {
+            "instance-a": {
+              name: "instance-a",
+              gatewayName: "nemoclaw-9123",
+              gatewayPort: 9123,
+              dashboardPort: 18789,
+            },
+          },
+        }),
+      );
+
+      const occupied = getRegistryOccupiedDashboardPorts("instance-b");
+      assert.equal(occupied.get("18789"), "instance-a (gateway 9123)");
+      assert.equal(
+        findAvailableDashboardPort("instance-b", 18789, "", () => false, occupied),
+        18790,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a port→sandbox map for every sibling sandbox with a persisted dashboard port", () => {
+    const occupied = getRegistryOccupiedDashboardPorts("current", () => ({
+      sandboxes: [
+        { name: "alpha", dashboardPort: 18789 },
+        { name: "beta", dashboardPort: 18790 },
+        { name: "current", dashboardPort: 18791 },
+      ],
+    }));
+
+    assert.equal(occupied.size, 2);
+    assert.equal(occupied.get("18789"), "alpha");
+    assert.equal(occupied.get("18790"), "beta");
+    assert.equal(occupied.has("18791"), false);
+  });
+
+  it("skips sandboxes with null, undefined, or non-numeric dashboardPort values", () => {
+    const occupied = getRegistryOccupiedDashboardPorts("current", () => ({
+      sandboxes: [
+        { name: "alpha", dashboardPort: null },
+        { name: "beta", dashboardPort: undefined },
+        { name: "gamma" },
+        { name: "delta", dashboardPort: 18790 },
+      ],
+    }));
+
+    assert.equal(occupied.size, 1);
+    assert.equal(occupied.get("18790"), "delta");
+  });
+
+  it("propagates registry read errors so the allocator does not silently hand out a colliding port", () => {
+    assert.throws(
+      () =>
+        getRegistryOccupiedDashboardPorts("current", () => {
+          throw new Error("registry locked");
+        }),
+      /registry locked/,
+    );
+  });
+});
+
+describe("dashboard port reservation lock", () => {
+  it("serializes onboard and restore ownership across different gateways", async () => {
+    const stateDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "nemoclaw-dashboard-port-lock-"),
+    );
+    let releaseOnboard!: () => void;
+    const onboardReleased = new Promise<void>((resolve) => {
+      releaseOnboard = resolve;
+    });
+    let reportOnboardEntered!: () => void;
+    const onboardEntered = new Promise<void>((resolve) => {
+      reportOnboardEntered = resolve;
+    });
+    const events: string[] = [];
+    const options = { stateDir, pollIntervalMs: 1, timeoutMs: 5_000 };
+    try {
+      const onboard = withDashboardPortReservationLock(
+        () =>
+          withGatewayRouteMutationLock(
+            "gateway-a",
+            async () => {
+              events.push("onboard-gateway-a-select");
+              reportOnboardEntered();
+              await onboardReleased;
+              events.push("onboard-gateway-a-register");
+            },
+            options,
+          ),
+        options,
+      );
+      await onboardEntered;
+      const restore = withDashboardPortReservationLock(
+        () =>
+          withGatewayRouteMutationLock(
+            "gateway-b",
+            () => {
+              events.push("restore-gateway-b-select");
+              events.push("restore-gateway-b-register");
+            },
+            options,
+          ),
+        options,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(events, ["onboard-gateway-a-select"]);
+      releaseOnboard();
+      await Promise.all([onboard, restore]);
+      assert.deepEqual(events, [
+        "onboard-gateway-a-select",
+        "onboard-gateway-a-register",
+        "restore-gateway-b-select",
+        "restore-gateway-b-register",
+      ]);
+    } finally {
+      releaseOnboard();
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("releases a failed reservation so the next allocator can proceed", async () => {
+    const stateDir = await fsPromises.mkdtemp(
+      path.join(os.tmpdir(), "nemoclaw-dashboard-port-lock-"),
+    );
+    const options = { stateDir, pollIntervalMs: 1, timeoutMs: 5_000 };
+    try {
+      await assert.rejects(
+        withDashboardPortReservationLock(() => {
+          throw new Error("onboard allocation failed");
+        }, options),
+        /onboard allocation failed/,
+      );
+      assert.equal(
+        await withDashboardPortReservationLock(() => "restore acquired", options),
+        "restore acquired",
+      );
+    } finally {
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("preflightDashboardPortRangeAvailability (#3953)", () => {
   const allBound = (_p: number) => true;
   const noneBound = (_p: number) => false;
@@ -111,7 +473,9 @@ describe("preflightDashboardPortRangeAvailability (#3953)", () => {
     }) as (code?: number) => never;
     const stderrChunks: string[] = [];
     const origError = console.error;
-    console.error = (msg: string) => { stderrChunks.push(msg); };
+    console.error = (msg: string) => {
+      stderrChunks.push(msg);
+    };
     try {
       assert.throws(() => preflightDashboardPortRangeAvailability(allBound, exitFn), /__exit_1__/);
     } finally {

@@ -3,6 +3,7 @@
 
 import type { AgentDefinition } from "../agent/defs";
 import { loadAgent } from "../agent/defs";
+import { getVersion } from "../core/version";
 import { getNameValidationGuidance, NAME_ALLOWED_FORMAT } from "../name-validation";
 import { validateName } from "../runner";
 import type { SandboxEntry } from "../state/registry";
@@ -46,11 +47,15 @@ export function formatSandboxAgentName(agentName: string | null | undefined): st
   const normalized = normalizeSandboxAgentName(agentName);
   if (normalized === "openclaw") return "OpenClaw";
   if (normalized === "hermes") return "Hermes";
+  if (normalized === "langchain-deepagents-code") return "LangChain Deep Agents Code";
   return normalized;
 }
 
 export function getDefaultSandboxNameForAgent(agent: AgentDefinition | null | undefined): string {
-  return getRequestedSandboxAgentName(agent) === "hermes" ? "hermes" : "my-assistant";
+  const requestedAgent = getRequestedSandboxAgentName(agent);
+  if (requestedAgent === "hermes") return "hermes";
+  if (requestedAgent === "langchain-deepagents-code") return "deepagents-code";
+  return "my-assistant";
 }
 
 export function getSandboxPromptDefault(agent: AgentDefinition | null | undefined): string {
@@ -64,26 +69,54 @@ export function getSandboxPromptDefault(agent: AgentDefinition | null | undefine
   }
 }
 
-export function getEffectiveSandboxAgent(agent: AgentDefinition | null | undefined): AgentDefinition {
+export function getEffectiveSandboxAgent(
+  agent: AgentDefinition | null | undefined,
+): AgentDefinition {
   return agent || loadAgent("openclaw");
 }
 
-export function getAgentInferenceProviderOptions(agent: AgentDefinition | null | undefined): string[] {
+export function getAgentInferenceProviderOptions(
+  agent: AgentDefinition | null | undefined,
+): string[] {
   const effectiveAgent = agent?.name ? loadAgent(agent.name) : getEffectiveSandboxAgent(agent);
   return Array.isArray(effectiveAgent.inferenceProviderOptions)
     ? effectiveAgent.inferenceProviderOptions
     : [];
 }
 
+/**
+ * Resolve the running NemoClaw build fingerprint stamped onto a freshly created
+ * or rebuilt sandbox image. Falls back to null when the version cannot be
+ * resolved so a transient failure never blocks registration; image-drift
+ * detection is simply skipped for that sandbox until its next rebuild (#5026).
+ */
+export function getNemoclawBuildFingerprint(): string | null {
+  try {
+    return getVersion();
+  } catch {
+    return null;
+  }
+}
+
 export function getSandboxAgentRegistryFields(
   agent: AgentDefinition | null | undefined,
   agentVersionKnown = true,
-): Pick<SandboxEntry, "agent" | "agentVersion"> {
+): Pick<SandboxEntry, "agent" | "agentVersion" | "nemoclawVersion"> {
   const effectiveAgent = getEffectiveSandboxAgent(agent);
   const agentName = normalizeSandboxAgentName(effectiveAgent.name);
   return {
     agent: agentName === "openclaw" ? null : agentName,
     agentVersion: agentVersionKnown ? effectiveAgent.expectedVersion || null : null,
+    // Stamp the NemoClaw build that produced this image, but ONLY for
+    // NemoClaw-managed images. `agentVersionKnown` is `!fromDockerfile` at the
+    // onboard call sites, so it doubles as "this is a managed image."
+    // Custom-image sandboxes (`--from`) are not defined by NemoClaw's build and
+    // are intentionally left without a fingerprint, so `upgrade-sandboxes` never
+    // auto-rebuilds them onto the default image. The reuse path
+    // (updateReusedSandboxMetadata) picks only `.agent` from these fields, so a
+    // reused (un-rebuilt) sandbox keeps its original fingerprint rather than
+    // being silently re-stamped as current. (#5026)
+    nemoclawVersion: agentVersionKnown ? getNemoclawBuildFingerprint() : null,
   };
 }
 
@@ -111,6 +144,7 @@ export interface PromptSandboxNameDeps {
   promptOrDefault(question: string, envVar: string, defaultValue: string): Promise<string>;
   cliDisplayName(): string;
   isNonInteractive(): boolean;
+  checkpointSandboxName(sandboxName: string, agent: AgentDefinition | null): void;
   exit(code: number): never;
 }
 
@@ -126,40 +160,46 @@ export function createPromptValidatedSandboxName(deps: PromptSandboxNameDeps) {
       );
       const sandboxName = (nameAnswer || defaultSandboxName).trim();
 
+      let validatedSandboxName: string;
       try {
-        const validatedSandboxName = validateName(sandboxName, "sandbox name");
-        if (RESERVED_SANDBOX_NAMES.has(sandboxName)) {
-          console.error(`  Reserved name: '${sandboxName}' is a ${deps.cliDisplayName()} CLI command.`);
-          console.error("  Choose a different name to avoid routing conflicts.");
-          if (deps.isNonInteractive()) {
-            deps.exit(1);
-          }
-          if (attempt < MAX_ATTEMPTS - 1) {
-            console.error("  Please try again.\n");
-          }
-          continue;
-        }
-        return validatedSandboxName;
+        validatedSandboxName = validateName(sandboxName, "sandbox name");
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         console.error(`  ${errorMessage}`);
+        for (const line of getNameValidationGuidance("sandbox name", sandboxName, {
+          includeAllowedFormat: false,
+        })) {
+          console.error(`  ${line}`);
+        }
+
+        // Non-interactive runs cannot re-prompt — abort so the caller can fix the
+        // NEMOCLAW_SANDBOX_NAME env var and retry.
+        if (deps.isNonInteractive()) {
+          deps.exit(1);
+        }
+
+        if (attempt < MAX_ATTEMPTS - 1) {
+          console.error("  Please try again.\n");
+        }
+        continue;
       }
 
-      for (const line of getNameValidationGuidance("sandbox name", sandboxName, {
-        includeAllowedFormat: false,
-      })) {
-        console.error(`  ${line}`);
+      if (RESERVED_SANDBOX_NAMES.has(sandboxName)) {
+        console.error(
+          `  Reserved name: '${sandboxName}' is a ${deps.cliDisplayName()} CLI command.`,
+        );
+        console.error("  Choose a different name to avoid routing conflicts.");
+        if (deps.isNonInteractive()) {
+          deps.exit(1);
+        }
+        if (attempt < MAX_ATTEMPTS - 1) {
+          console.error("  Please try again.\n");
+        }
+        continue;
       }
 
-      // Non-interactive runs cannot re-prompt — abort so the caller can fix the
-      // NEMOCLAW_SANDBOX_NAME env var and retry.
-      if (deps.isNonInteractive()) {
-        deps.exit(1);
-      }
-
-      if (attempt < MAX_ATTEMPTS - 1) {
-        console.error("  Please try again.\n");
-      }
+      deps.checkpointSandboxName(validatedSandboxName, agent);
+      return validatedSandboxName;
     }
 
     console.error("  Too many invalid attempts.");

@@ -21,6 +21,7 @@ import {
 } from "./onboard/config.js";
 import { registerRuntimeContext } from "./runtime-context.js";
 import { scanForSecrets, isMemoryPath } from "./security/secret-scanner.js";
+import { safeResolvePath } from "./security/safe-resolve-path.js";
 
 type PluginScalar = string | number | boolean | null | undefined;
 type PluginValue = PluginScalar | PluginRecord | PluginValue[];
@@ -281,10 +282,12 @@ function registeredProviderForConfig(
   activeModel: string,
   providerCredentialEnv: string,
 ): ProviderPlugin {
-  const authLabel =
-    providerCredentialEnv === "NVIDIA_API_KEY"
-      ? `NVIDIA API Key (${providerCredentialEnv})`
-      : `OpenAI API Key (${providerCredentialEnv})`;
+  const isNvidiaCredential =
+    providerCredentialEnv === "NVIDIA_INFERENCE_API_KEY" ||
+    providerCredentialEnv === "NVIDIA_API_KEY";
+  const authLabel = isNvidiaCredential
+    ? `NVIDIA API Key (${providerCredentialEnv})`
+    : `OpenAI API Key (${providerCredentialEnv})`;
 
   return {
     id: "inference",
@@ -368,7 +371,7 @@ export default function register(api: OpenClawPluginApi): void {
   const bannerProvider = onboardCfg ? describeOnboardProvider(onboardCfg) : "NVIDIA Endpoints";
   const bannerModel = activeModel || DEFAULT_INFERENCE_MODEL;
 
-  const providerCredentialEnv = onboardCfg?.credentialEnv ?? "NVIDIA_API_KEY";
+  const providerCredentialEnv = onboardCfg?.credentialEnv ?? "NVIDIA_INFERENCE_API_KEY";
   api.registerProvider(registeredProviderForConfig(activeModel, providerCredentialEnv));
 
   // 3. Register before_tool_call hook to block secrets in memory writes (#1233)
@@ -391,8 +394,13 @@ export default function register(api: OpenClawPluginApi): void {
         const rawPath = event.params["file_path"] ?? event.params["path"];
         if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
         // Resolve symlinks and traversal before checking — prevents bypasses like
-        // /sandbox/project/../../.openclaw/memory/secrets.md
-        const filePath = api.resolvePath(rawPath);
+        // /sandbox/project/../../.openclaw/memory/secrets.md. The host's
+        // resolver may be missing or return undefined under embedded-fallback
+        // runtimes, so route through safeResolvePath which falls back to the
+        // raw path rather than crashing the hook. isMemoryPath knows how to
+        // classify both absolute resolved paths and canonical memory
+        // basenames written through a relative path.
+        const filePath = safeResolvePath(api, rawPath);
         if (!isMemoryPath(filePath)) return undefined;
 
         const content =
@@ -429,9 +437,9 @@ export default function register(api: OpenClawPluginApi): void {
     "  Slash:     /nemoclaw",
   ];
 
-  api.logger.info("");
+  process.stderr.write("\n");
   for (const line of renderBox(bannerLines)) {
-    api.logger.info(line);
+    process.stderr.write(`${line}\n`);
   }
-  api.logger.info("");
+  process.stderr.write("\n");
 }

@@ -15,15 +15,11 @@ export function parsePort(envVar: string, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
   const trimmed = String(raw).trim();
   if (!/^\d+$/.test(trimmed)) {
-    throw new Error(
-      `Invalid port: ${envVar}="${raw}" — must be an integer between 1024 and 65535`,
-    );
+    throw new Error(`Invalid port: ${envVar}="${raw}" — must be an integer between 1024 and 65535`);
   }
   const parsed = Number(trimmed);
   if (parsed < 1024 || parsed > 65535) {
-    throw new Error(
-      `Invalid port: ${envVar}="${raw}" — must be an integer between 1024 and 65535`,
-    );
+    throw new Error(`Invalid port: ${envVar}="${raw}" — must be an integer between 1024 and 65535`);
   }
   return parsed;
 }
@@ -36,6 +32,11 @@ export interface GatewayPortValidationOptions {
   ollamaPort: number;
   ollamaProxyPort: number;
   bedrockRuntimeAdapterPort: number;
+  openrouterRuntimeAdapterPort: number;
+}
+
+export interface RuntimeAdapterPortValidationOptions extends GatewayPortValidationOptions {
+  gatewayPort: number;
 }
 
 /**
@@ -58,16 +59,80 @@ export const VLLM_PORT = parsePort("NEMOCLAW_VLLM_PORT", 8000);
 export const OLLAMA_PORT = parsePort("NEMOCLAW_OLLAMA_PORT", 11434);
 /** Ollama auth proxy port (default 11435, override via NEMOCLAW_OLLAMA_PROXY_PORT). */
 export const OLLAMA_PROXY_PORT = parsePort("NEMOCLAW_OLLAMA_PROXY_PORT", 11435);
+/** Hermes OpenAI-compatible API port (manifest `forward_ports[1]` / start.sh `PUBLIC_PORT`); reserved — never a valid dashboard port, for any agent. (#4984) */
+export const HERMES_OPENAI_API_PORT = 8642;
 /** Bedrock Runtime adapter port (default 11436, override via NEMOCLAW_BEDROCK_RUNTIME_ADAPTER_PORT). */
 export const BEDROCK_RUNTIME_ADAPTER_PORT = parsePort(
   "NEMOCLAW_BEDROCK_RUNTIME_ADAPTER_PORT",
   11436,
+);
+/** OpenRouter header-injection adapter port (default 11437, override via NEMOCLAW_OPENROUTER_RUNTIME_ADAPTER_PORT). */
+export const OPENROUTER_RUNTIME_ADAPTER_PORT = parsePort(
+  "NEMOCLAW_OPENROUTER_RUNTIME_ADAPTER_PORT",
+  11437,
 );
 
 export function validateGatewayPort(
   envVar: string,
   port: number,
   options: GatewayPortValidationOptions,
+): void {
+  if (port >= options.dashboardRangeStart && port <= options.dashboardRangeEnd) {
+    throw new Error(
+      `Invalid port: ${envVar}="${port}" — must not overlap the ${options.dashboardRangeStart}-${options.dashboardRangeEnd} dashboard port range`,
+    );
+  }
+
+  const reservedDefaults = [
+    { label: "vLLM / NIM inference", port: 8000 },
+    { label: "Ollama inference", port: 11434 },
+    { label: "Ollama auth proxy", port: 11435 },
+    { label: "Bedrock Runtime adapter", port: 11436 },
+    { label: "OpenRouter Runtime adapter", port: 11437 },
+  ];
+  const reservedDefault = reservedDefaults.find((entry) => entry.port === port);
+  if (reservedDefault) {
+    throw new Error(
+      `Invalid port: ${envVar}="${port}" — must not overlap the ${reservedDefault.label} default port (${reservedDefault.port})`,
+    );
+  }
+
+  const conflicts = [
+    { envVar: "NEMOCLAW_DASHBOARD_PORT", port: options.dashboardPort },
+    { envVar: "NEMOCLAW_VLLM_PORT", port: options.vllmPort },
+    { envVar: "NEMOCLAW_OLLAMA_PORT", port: options.ollamaPort },
+    { envVar: "NEMOCLAW_OLLAMA_PROXY_PORT", port: options.ollamaProxyPort },
+    {
+      envVar: "NEMOCLAW_BEDROCK_RUNTIME_ADAPTER_PORT",
+      port: options.bedrockRuntimeAdapterPort,
+    },
+    {
+      envVar: "NEMOCLAW_OPENROUTER_RUNTIME_ADAPTER_PORT",
+      port: options.openrouterRuntimeAdapterPort,
+    },
+  ];
+  const conflict = conflicts.find((entry) => entry.port === port);
+  if (conflict) {
+    throw new Error(
+      `Invalid port: ${envVar}="${port}" — conflicts with ${conflict.envVar} (${conflict.port})`,
+    );
+  }
+}
+
+export function parseGatewayPort(
+  envVar: string,
+  fallback: number,
+  options: GatewayPortValidationOptions,
+): number {
+  const port = parsePort(envVar, fallback);
+  validateGatewayPort(envVar, port, options);
+  return port;
+}
+
+export function validateOpenRouterRuntimeAdapterPort(
+  envVar: string,
+  port: number,
+  options: RuntimeAdapterPortValidationOptions,
 ): void {
   if (port >= options.dashboardRangeStart && port <= options.dashboardRangeEnd) {
     throw new Error(
@@ -89,6 +154,7 @@ export function validateGatewayPort(
   }
 
   const conflicts = [
+    { envVar: "NEMOCLAW_GATEWAY_PORT", port: options.gatewayPort },
     { envVar: "NEMOCLAW_DASHBOARD_PORT", port: options.dashboardPort },
     { envVar: "NEMOCLAW_VLLM_PORT", port: options.vllmPort },
     { envVar: "NEMOCLAW_OLLAMA_PORT", port: options.ollamaPort },
@@ -106,18 +172,10 @@ export function validateGatewayPort(
   }
 }
 
-export function parseGatewayPort(
-  envVar: string,
-  fallback: number,
-  options: GatewayPortValidationOptions,
-): number {
-  const port = parsePort(envVar, fallback);
-  validateGatewayPort(envVar, port, options);
-  return port;
-}
-
+/** Default OpenShell gateway port when NEMOCLAW_GATEWAY_PORT is unset. */
+export const DEFAULT_GATEWAY_PORT = 8080;
 /** OpenShell gateway port (default 8080, override via NEMOCLAW_GATEWAY_PORT). */
-export const GATEWAY_PORT = parseGatewayPort("NEMOCLAW_GATEWAY_PORT", 8080, {
+export const GATEWAY_PORT = parseGatewayPort("NEMOCLAW_GATEWAY_PORT", DEFAULT_GATEWAY_PORT, {
   dashboardPort: DASHBOARD_PORT,
   dashboardRangeStart: DASHBOARD_PORT_RANGE_START,
   dashboardRangeEnd: DASHBOARD_PORT_RANGE_END,
@@ -125,4 +183,5 @@ export const GATEWAY_PORT = parseGatewayPort("NEMOCLAW_GATEWAY_PORT", 8080, {
   ollamaPort: OLLAMA_PORT,
   ollamaProxyPort: OLLAMA_PROXY_PORT,
   bedrockRuntimeAdapterPort: BEDROCK_RUNTIME_ADAPTER_PORT,
+  openrouterRuntimeAdapterPort: OPENROUTER_RUNTIME_ADAPTER_PORT,
 });

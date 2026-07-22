@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { type SpawnSyncOptionsWithStringEncoding, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -26,9 +26,7 @@ export type OpenshellInstallPinDeps = {
   error?: (message: string) => void;
 };
 
-export type OpenshellInstallEnvDirective =
-  | { env: NodeJS.ProcessEnv }
-  | { env: null };
+export type OpenshellInstallEnvDirective = { env: NodeJS.ProcessEnv } | { env: null };
 
 export type OpenshellInstallPinResult =
   | { kind: "pin"; version: string; latest: string | null; reason: "latest" | "max-cap" }
@@ -133,13 +131,14 @@ function listOpenshellReleaseTagsViaCurl(): string[] | null {
 export function resolveOpenshellInstallPin(
   deps: OpenshellInstallPinDeps,
 ): OpenshellInstallPinResult {
+  const minVersion = deps.getBlueprintMinOpenshellVersion?.() ?? null;
   const maxVersion = deps.getBlueprintMaxOpenshellVersion();
   if (!maxVersion) return { kind: "no-max" };
   const releases = (deps.listReleases ?? listOpenshellReleaseTags)();
   if (releases === null || releases.length === 0) return { kind: "no-max" };
   const resolution: OpenshellInstallVersionResolution = resolveOpenshellInstallVersion(
     releases,
-    { max: maxVersion },
+    { min: minVersion, max: maxVersion },
     { versionGte: deps.versionGte },
   );
   if (resolution.kind === "pin") {
@@ -170,7 +169,12 @@ export function computeOpenshellInstallEnv(
   baseEnv: NodeJS.ProcessEnv,
   deps: OpenshellInstallPinDeps,
 ): OpenshellInstallEnvDirective {
-  const pin = resolveOpenshellInstallPin(deps);
+  const channel = (baseEnv.NEMOCLAW_OPENSHELL_CHANNEL ?? "auto").trim();
+  // Dev installs already identify a non-stable build source. Stable release
+  // discovery must not block that current-main proof path merely because the
+  // next semver release has not been published yet.
+  const pin: OpenshellInstallPinResult =
+    channel === "dev" ? { kind: "no-max" } : resolveOpenshellInstallPin(deps);
   if (pin.kind === "incompatible") {
     const error = deps.error ?? ((m: string) => console.error(m));
     error("");
@@ -184,9 +188,12 @@ export function computeOpenshellInstallEnv(
   if (blueprintMin) overlay.NEMOCLAW_OPENSHELL_MIN_VERSION = blueprintMin;
   if (blueprintMax) overlay.NEMOCLAW_OPENSHELL_MAX_VERSION = blueprintMax;
   if (pin.kind === "pin") overlay.NEMOCLAW_OPENSHELL_PIN_VERSION = pin.version;
-  return Object.keys(overlay).length === 0
-    ? { env: baseEnv }
-    : { env: { ...baseEnv, ...overlay } };
+  if (channel === "dev") {
+    const env = { ...baseEnv, ...overlay };
+    delete env.NEMOCLAW_OPENSHELL_PIN_VERSION;
+    return { env };
+  }
+  return Object.keys(overlay).length === 0 ? { env: baseEnv } : { env: { ...baseEnv, ...overlay } };
 }
 
 export type RunOpenshellInstallDeps = OpenshellInstallPinDeps & {
@@ -206,16 +213,24 @@ export type RunOpenshellInstallDeps = OpenshellInstallPinDeps & {
 export function runOpenshellInstall(deps: RunOpenshellInstallDeps): OpenShellInstallResult {
   const { env } = computeOpenshellInstallEnv(process.env, deps);
   if (env === null) return { installed: false, localBin: null, futureShellPathHint: null };
+  const installEnv = { ...env };
+  for (const key of ["NEMOCLAW_OPENSHELL_GATEWAY_BIN", "NEMOCLAW_OPENSHELL_SANDBOX_BIN"] as const) {
+    const configured = installEnv[key]?.trim();
+    if (configured) installEnv[key] = path.resolve(configured);
+    else delete installEnv[key];
+  }
+  // Stream install-openshell.sh output live (info() progress + curl progress bar)
+  // so the in-onboard OpenShell upgrade shows progress instead of sitting silent
+  // for the whole download/verify (#4431). `inherit` keeps this call synchronous
+  // (no async ripple into the onboard entrypoint) while the child writes straight
+  // to the terminal in real time.
   const result = spawnSync("bash", [path.join(deps.scriptsDir, "install-openshell.sh")], {
     cwd: deps.cwd,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf-8",
+    env: installEnv,
+    stdio: ["ignore", "inherit", "inherit"],
     timeout: 300_000,
   });
   if (result.status !== 0) {
-    const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
-    if (output) console.error(output);
     return { installed: false, localBin: null, futureShellPathHint: null };
   }
   const localBin = process.env.XDG_BIN_HOME || path.join(process.env.HOME || "", ".local", "bin");

@@ -1,22 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../cli/branding";
-import { parseSandboxPhase } from "../../state/gateway";
 import {
   getNamedGatewayLifecycleState,
   recoverNamedGatewayRuntime,
 } from "../../gateway-runtime-action";
-const { pruneKnownHostsEntries } = require("../../onboard") as {
+import { assertNoOpenShellGatewayEndpointOverride } from "../../openshell-gateway-endpoint-guard";
+import { isTerminalSandboxPhase, parseSandboxPhase } from "../../state/gateway";
+import { selectSandboxOwningGateway } from "./gateway-select";
+import {
+  gatewayNamePattern,
+  getKnownSandboxTargetGatewayName,
+  getSandboxTargetGatewayName,
+} from "./gateway-target";
+
+const { pruneKnownHostsEntries } = require("../../onboard/known-hosts") as {
   pruneKnownHostsEntries: (contents: string) => string;
 };
-import * as onboardSession from "../../state/onboard-session";
-import type { Session } from "../../state/onboard-session";
+
 import { stripAnsi } from "../../adapters/openshell/client";
 import {
   detectOpenShellStateRpcPreflightIssue,
@@ -35,7 +41,13 @@ import {
   OPENSHELL_OPERATION_TIMEOUT_MS,
   OPENSHELL_PROBE_TIMEOUT_MS,
 } from "../../adapters/openshell/timeouts";
-import * as registry from "../../state/registry";
+import { D, R } from "../../cli/terminal-style";
+import {
+  type DockerDriverRecoveryResult,
+  recoverDockerDriverSandbox,
+} from "../../onboard/docker-driver-sandbox-recovery";
+import { getSandboxDockerRuntime } from "./docker-health";
+import { isDockerRuntimeDown, printDockerRuntimeDownGuidance } from "./gateway-failure-classifier";
 
 export type SandboxGatewayState = {
   state: string;
@@ -44,11 +56,43 @@ export type SandboxGatewayState = {
   recoveredGateway?: boolean;
   recoveryVia?: string | null;
   gatewayRecoveryFailed?: boolean;
+  /**
+   * True when active Docker-driver sandbox recovery (#4423 part 2)
+   * restarted the labeled sandbox container before the lookup
+   * returned `present`. Callers can surface this in user-facing
+   * output to explain why a previously-NotFound sandbox is now
+   * Ready.
+   */
+  recoveredSandbox?: boolean;
+  /**
+   * Stable identifier for which Docker-driver recovery branch fired,
+   * mirroring `DockerDriverRecoveryVia`. `null` when no Docker-side
+   * recovery was attempted or required.
+   */
+  recoverySandboxVia?: string | null;
 };
 
 type SandboxGatewayStateLookup = (
   sandboxName: string,
+  gatewayName?: string,
 ) => SandboxGatewayState | Promise<SandboxGatewayState>;
+
+function gatewayScopedArgs(args: string[], gatewayName?: string): string[] {
+  if (!gatewayName) return args;
+  return [...args.slice(0, 2), "-g", gatewayName, ...args.slice(2)];
+}
+
+function gatewayEndpointOverrideState(): SandboxGatewayState | null {
+  try {
+    assertNoOpenShellGatewayEndpointOverride();
+    return null;
+  } catch (error) {
+    return {
+      state: "gateway_endpoint_override",
+      output: `  Error: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
 
 function formatGatewaySchemaMismatchOutput(
   issue: OpenShellStateRpcIssue,
@@ -58,10 +102,7 @@ function formatGatewaySchemaMismatchOutput(
   return formatOpenShellStateRpcIssue(issue, { action, command }).join("\n");
 }
 
-export function mergeLivePolicyIntoSandboxOutput(
-  output: string,
-  livePolicyOutput: string,
-): string {
+export function mergeLivePolicyIntoSandboxOutput(output: string, livePolicyOutput: string): string {
   const rawLines = String(output).split("\n");
   const cleanLines = stripAnsi(String(output)).split("\n");
   const policyLineIdx = cleanLines.findIndex((line: string) => line.trim() === "Policy:");
@@ -95,8 +136,13 @@ export function mergeLivePolicyIntoSandboxOutput(
 }
 
 /** Query sandbox presence and return its output with the live enforced policy. */
-export function getSandboxGatewayState(sandboxName: string): SandboxGatewayState {
-  const preflightIssue = detectOpenShellStateRpcPreflightIssue();
+export function getSandboxGatewayState(
+  sandboxName: string,
+  gatewayName?: string,
+): SandboxGatewayState {
+  const endpointOverride = gatewayEndpointOverrideState();
+  if (endpointOverride) return endpointOverride;
+  const preflightIssue = detectOpenShellStateRpcPreflightIssue({ gatewayName });
   if (preflightIssue) {
     return {
       state: "gateway_schema_mismatch",
@@ -106,11 +152,11 @@ export function getSandboxGatewayState(sandboxName: string): SandboxGatewayState
       ),
     };
   }
-  const result = captureOpenshell(["sandbox", "get", sandboxName], {
+  const result = captureOpenshell(gatewayScopedArgs(["sandbox", "get", sandboxName], gatewayName), {
     timeout: OPENSHELL_PROBE_TIMEOUT_MS,
   });
   let output = result.output;
-  const resultIssue = detectOpenShellStateRpcResultIssue(result);
+  const resultIssue = detectOpenShellStateRpcResultIssue(result, { gatewayName });
   if (resultIssue) {
     return {
       state: "gateway_schema_mismatch",
@@ -120,16 +166,24 @@ export function getSandboxGatewayState(sandboxName: string): SandboxGatewayState
     };
   }
   if (result.status === 0) {
-    const livePolicy = captureOpenshell(["policy", "get", "--full", sandboxName], {
-      ignoreError: true,
-      timeout: OPENSHELL_PROBE_TIMEOUT_MS,
-    });
+    const livePolicy = captureOpenshell(
+      gatewayScopedArgs(["policy", "get", "--full", sandboxName], gatewayName),
+      {
+        ignoreError: true,
+        timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+      },
+    );
     if (livePolicy.status === 0 && livePolicy.output.trim()) {
       output = mergeLivePolicyIntoSandboxOutput(output, livePolicy.output);
     }
     return { state: "present", output };
   }
-  if (/\bNotFound\b|\bNot Found\b|sandbox not found/i.test(output)) {
+  // `sandbox has no spec` is the gRPC reply when the queried gateway does not
+  // know about this sandbox. On an unscoped lookup that can be an ambient
+  // sibling; an owner-scoped lookup means the sandbox is genuinely absent
+  // from its recorded gateway. Both remain `missing`, and reconciliation uses
+  // the presence of the explicit owner pin to distinguish those cases.
+  if (/\bNotFound\b|\bNot Found\b|sandbox not found|sandbox has no spec/i.test(output)) {
     return { state: "missing", output };
   }
   if (
@@ -144,9 +198,12 @@ export function getSandboxGatewayState(sandboxName: string): SandboxGatewayState
 
 export async function getSandboxGatewayStateForStatus(
   sandboxName: string,
+  gatewayName?: string,
 ): Promise<SandboxGatewayState> {
   const timeoutMs = getStatusProbeTimeoutMs();
-  const preflightIssue = detectOpenShellStateRpcPreflightIssue({ timeoutMs });
+  const endpointOverride = gatewayEndpointOverrideState();
+  if (endpointOverride) return endpointOverride;
+  const preflightIssue = detectOpenShellStateRpcPreflightIssue({ gatewayName, timeoutMs });
   if (preflightIssue) {
     return {
       state: "gateway_schema_mismatch",
@@ -157,11 +214,14 @@ export async function getSandboxGatewayStateForStatus(
       ),
     };
   }
-  const result = await captureOpenshellForStatus(["sandbox", "get", sandboxName], {
-    timeout: timeoutMs,
-  });
+  const result = await captureOpenshellForStatus(
+    gatewayScopedArgs(["sandbox", "get", sandboxName], gatewayName),
+    {
+      timeout: timeoutMs,
+    },
+  );
   let output = result.output;
-  const resultIssue = detectOpenShellStateRpcResultIssue(result, { timeoutMs });
+  const resultIssue = detectOpenShellStateRpcResultIssue(result, { gatewayName, timeoutMs });
   if (resultIssue) {
     return {
       state: "gateway_schema_mismatch",
@@ -178,16 +238,19 @@ export async function getSandboxGatewayStateForStatus(
     };
   }
   if (result.status === 0) {
-    const livePolicy = await captureOpenshellForStatus(["policy", "get", "--full", sandboxName], {
-      ignoreError: true,
-      timeout: timeoutMs,
-    });
+    const livePolicy = await captureOpenshellForStatus(
+      gatewayScopedArgs(["policy", "get", "--full", sandboxName], gatewayName),
+      {
+        ignoreError: true,
+        timeout: timeoutMs,
+      },
+    );
     if (!isCommandTimeout(livePolicy) && livePolicy.status === 0 && livePolicy.output.trim()) {
       output = mergeLivePolicyIntoSandboxOutput(output, livePolicy.output);
     }
     return { state: "present", output };
   }
-  if (/\bNotFound\b|\bNot Found\b|sandbox not found/i.test(output)) {
+  if (/\bNotFound\b|\bNot Found\b|sandbox not found|sandbox has no spec/i.test(output)) {
     return { state: "missing", output };
   }
   if (
@@ -205,21 +268,29 @@ export async function getSandboxGatewayStateForStatus(
  * When the active OpenShell gateway has drifted off nemoclaw, a NotFound is
  * ambiguous: the sandbox may actually be registered against the nemoclaw
  * gateway but invisible because some other gateway is currently active. This
- * helper self-heals by attempting `openshell gateway select nemoclaw` and
- * re-queries, or returns a `wrong_gateway_active` state so callers can surface
- * actionable guidance instead of destroying the registry entry.
+ * helper self-heals an unscoped lookup by attempting `openshell gateway select
+ * nemoclaw` and re-querying. When `pinnedGatewayName` is present, the NotFound
+ * already came from the recorded owner, so ambient selection is ignored and
+ * only the existing Docker-side recovery path is considered.
  */
 export function reconcileMissingAgainstNamedGateway(
   sandboxName: string,
   missingLookup: SandboxGatewayState,
+  pinnedGatewayName?: string,
 ): SandboxGatewayState {
-  const lifecycle = getNamedGatewayLifecycleState();
+  const targetGatewayName = pinnedGatewayName ?? getSandboxTargetGatewayName(sandboxName);
+  if (pinnedGatewayName) {
+    // The owner-scoped RPC reached this exact gateway and reported NotFound.
+    // Ambient selection is irrelevant and must not trigger a sibling retry.
+    return tryRecoverDockerDriverSandbox(sandboxName, missingLookup, pinnedGatewayName);
+  }
+  const lifecycle = getNamedGatewayLifecycleState(targetGatewayName);
   if (lifecycle.state === "connected_other") {
-    runOpenshell(["gateway", "select", "nemoclaw"], {
+    runOpenshell(["gateway", "select", targetGatewayName], {
       ignoreError: true,
       timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
     });
-    const retry = getSandboxGatewayState(sandboxName);
+    const retry = getSandboxGatewayState(sandboxName, targetGatewayName);
     if (retry.state === "present") {
       return { ...retry, recoveredGateway: true, recoveryVia: "select" };
     }
@@ -227,9 +298,22 @@ export function reconcileMissingAgainstNamedGateway(
       return retry;
     }
     if (retry.state === "missing") {
-      const after = getNamedGatewayLifecycleState();
+      const after = getNamedGatewayLifecycleState(targetGatewayName);
       if (after.state === "healthy_named") {
-        return retry;
+        // Even with the right gateway selected, the sandbox is
+        // still missing. Try Docker-side recovery before declaring
+        // the sandbox truly absent.
+        return tryRecoverDockerDriverSandbox(sandboxName, retry);
+      }
+      // The select moved the active gateway off, but the target gateway is
+      // now missing or unreachable. Surface that post-select state so the
+      // caller emits restart guidance, rather than `wrong_gateway_active`
+      // pointing at the now-irrelevant pre-select active gateway.
+      if (after.state === "missing_named") {
+        return { state: "gateway_missing_after_restart", output: after.status };
+      }
+      if (after.state === "named_unreachable" || after.state === "named_unhealthy") {
+        return { state: "gateway_unreachable_after_restart", output: after.status };
       }
     }
     return {
@@ -244,7 +328,47 @@ export function reconcileMissingAgainstNamedGateway(
   if (lifecycle.state === "named_unreachable" || lifecycle.state === "named_unhealthy") {
     return { state: "gateway_unreachable_after_restart", output: lifecycle.status };
   }
+  if (lifecycle.state === "healthy_named") {
+    // The gateway is healthy and we already see `missing`. This is
+    // the precise post-reboot precondition described in #4423: the
+    // gateway came back fresh (per #4580's user-systemd unit) with
+    // no sandbox memory, but Docker may still have the labeled
+    // container. Attempt active Docker-side recovery before falling
+    // through to non-destructive guidance.
+    return tryRecoverDockerDriverSandbox(sandboxName, missingLookup);
+  }
   return missingLookup;
+}
+
+/**
+ * Attempt Docker-driver sandbox recovery (#4423) and re-query the
+ * OpenShell gateway. Returns the new lookup with `recoveredSandbox`
+ * flags set when recovery succeeded; otherwise returns the original
+ * `missing` lookup unchanged so the caller's existing non-destructive
+ * guidance fires.
+ */
+function tryRecoverDockerDriverSandbox(
+  sandboxName: string,
+  missingLookup: SandboxGatewayState,
+  gatewayName?: string,
+): SandboxGatewayState {
+  let recovery: DockerDriverRecoveryResult;
+  try {
+    recovery = recoverDockerDriverSandbox(sandboxName);
+  } catch {
+    return missingLookup;
+  }
+  if (!recovery.recovered) {
+    return missingLookup;
+  }
+  // Recovery succeeded against Docker; re-query OpenShell so the
+  // returned state reflects what the gateway sees post-restart.
+  const retried = getSandboxGatewayState(sandboxName, gatewayName);
+  return {
+    ...retried,
+    recoveredSandbox: true,
+    recoverySandboxVia: recovery.via,
+  };
 }
 
 /**
@@ -256,14 +380,20 @@ export function printWrongGatewayActiveGuidance(
   sandboxName: string,
   activeGateway: string | null | undefined,
   writer: (message: string) => void = console.error,
+  // The command to re-run after switching gateways. Defaults to `connect`;
+  // callers in a different recovery flow (e.g. `rebuild`) pass their own so the
+  // guidance points back to the workflow the user actually invoked.
+  retryCommand = "connect",
 ): void {
-  const other = activeGateway && activeGateway !== "nemoclaw" ? activeGateway : "another gateway";
+  const targetGatewayName = getSandboxTargetGatewayName(sandboxName);
+  const other =
+    activeGateway && activeGateway !== targetGatewayName ? activeGateway : "another gateway";
   writer(
-    `  Sandbox '${sandboxName}' is registered against the ${CLI_DISPLAY_NAME} gateway, but the currently active OpenShell gateway is '${other}'. Your sandbox has NOT been removed.`,
+    `  Sandbox '${sandboxName}' is registered against the ${CLI_DISPLAY_NAME} gateway '${targetGatewayName}', but the currently active OpenShell gateway is '${other}'. Your sandbox has NOT been removed.`,
   );
   writer("  Switch gateways and retry:");
-  writer("      openshell gateway select nemoclaw");
-  writer(`  Then re-run: ${CLI_NAME} ${sandboxName} connect`);
+  writer(`      openshell gateway select ${targetGatewayName}`);
+  writer(`  Then re-run: ${CLI_NAME} ${sandboxName} ${retryCommand}`);
 }
 
 /** Print troubleshooting hints based on gateway lifecycle state in the output. */
@@ -273,12 +403,32 @@ export function printGatewayLifecycleHint(
   writer: (message: string) => void = console.error,
 ): void {
   const cleanOutput = stripAnsi(output);
+  const targetGatewayName = getSandboxTargetGatewayName(sandboxName);
+  // The gateway-side gRPC reply `sandbox has no spec` is returned when the
+  // active OpenShell gateway does not know about the sandbox — which on a
+  // multi-instance host typically means a sibling NemoClaw gateway (the one
+  // the sandbox was actually onboarded against) is the owner, and the
+  // current selection has to be switched back before the sandbox is
+  // reachable. Surface a concrete switch-gateway hint rather than letting
+  // the raw gRPC string be the last word.
+  if (/sandbox has no spec/i.test(cleanOutput)) {
+    writer(
+      `  Sandbox '${sandboxName}' is registered against the ${CLI_DISPLAY_NAME} gateway '${targetGatewayName}', but the currently active OpenShell gateway does not know about it.`,
+    );
+    writer(
+      "  On a multi-instance host, this usually means another NemoClaw gateway is the owner of this sandbox.",
+    );
+    writer(
+      `  Select the owning gateway and retry: \`openshell gateway select ${targetGatewayName}\`, then \`${CLI_NAME} ${sandboxName} connect\`.`,
+    );
+    return;
+  }
   if (/No gateway configured/i.test(cleanOutput)) {
     writer(
       `  The selected ${CLI_DISPLAY_NAME} gateway is no longer configured or its metadata/runtime has been lost.`,
     );
     writer(
-      "  Start the gateway again with `openshell gateway start --name nemoclaw` before expecting existing sandboxes to reconnect.",
+      `  Start the gateway again with \`openshell gateway start --name ${targetGatewayName}\` before expecting existing sandboxes to reconnect.`,
     );
     writer(
       "  If the gateway has to be rebuilt from scratch, recreate the affected sandbox afterward.",
@@ -287,14 +437,14 @@ export function printGatewayLifecycleHint(
   }
   if (
     /Connection refused|client error \(Connect\)|tcp connect error/i.test(cleanOutput) &&
-    /Gateway:\s+nemoclaw/i.test(cleanOutput)
+    gatewayNamePattern(targetGatewayName).test(cleanOutput)
   ) {
     writer(
       "  The selected NemoClaw gateway exists in metadata, but its API is refusing connections after restart.",
     );
     writer("  This usually means the gateway runtime did not come back cleanly after the restart.");
     writer(
-      "  Retry `openshell gateway start --name nemoclaw`; if it stays in this state, rebuild the gateway before expecting existing sandboxes to reconnect.",
+      `  Retry \`openshell gateway start --name ${targetGatewayName}\`; if it stays in this state, rebuild the gateway before expecting existing sandboxes to reconnect.`,
     );
     return;
   }
@@ -323,23 +473,54 @@ export function printGatewayLifecycleHint(
   }
 }
 
+export type GatewayRecoveryMode = "observe" | "recover";
+
 export async function getReconciledSandboxGatewayState(
   sandboxName: string,
-  opts: { getState?: SandboxGatewayStateLookup } = {},
+  opts: { getState?: SandboxGatewayStateLookup; gatewayRecovery?: GatewayRecoveryMode } = {},
 ): Promise<SandboxGatewayState> {
   const getState = opts.getState ?? getSandboxGatewayState;
-  const lookup = await getState(sandboxName);
+  const gatewayRecovery: GatewayRecoveryMode = opts.gatewayRecovery ?? "recover";
+  let targetGatewayName = getKnownSandboxTargetGatewayName(sandboxName) ?? undefined;
+  const endpointOverride = gatewayEndpointOverrideState();
+  if (endpointOverride) return endpointOverride;
+  if (targetGatewayName) {
+    // Keep OpenShell's active selection aligned for downstream operations, but
+    // never trust that process-global state for this lookup: another CLI can
+    // change it immediately after selection. The explicit gateway argument
+    // below is the per-subprocess authority for the status RPC.
+    const selection = selectSandboxOwningGateway(sandboxName);
+    if (selection.outcome !== "selected") {
+      const lifecycle = getNamedGatewayLifecycleState(targetGatewayName);
+      return {
+        state: "wrong_gateway_active",
+        activeGateway: lifecycle.activeGateway,
+        output:
+          lifecycle.status ||
+          `Failed to select owning gateway '${targetGatewayName}' for sandbox '${sandboxName}'.`,
+      };
+    }
+    // Selection resolves registry ownership internally. If that snapshot changed
+    // after the initial lookup, keep the subprocess-local RPC pin aligned with
+    // the gateway that was actually selected rather than querying the stale one.
+    targetGatewayName = selection.gatewayName;
+  }
+  const lookup = await getState(sandboxName, targetGatewayName);
   if (lookup.state === "present") {
     return lookup;
   }
   if (lookup.state === "missing") {
-    return reconcileMissingAgainstNamedGateway(sandboxName, lookup);
+    return reconcileMissingAgainstNamedGateway(sandboxName, lookup, targetGatewayName);
   }
 
   if (lookup.state === "gateway_error") {
-    const recovery = await recoverNamedGatewayRuntime();
+    if (gatewayRecovery === "observe") {
+      return lookup;
+    }
+    const recoveryGatewayName = targetGatewayName ?? getSandboxTargetGatewayName();
+    const recovery = await recoverNamedGatewayRuntime({ gatewayName: recoveryGatewayName });
     if (recovery.recovered) {
-      const retried = await getState(sandboxName);
+      const retried = await getState(sandboxName, recoveryGatewayName);
       if (retried.state === "present" || retried.state === "missing") {
         return { ...retried, recoveredGateway: true, recoveryVia: recovery.via || null };
       }
@@ -353,7 +534,7 @@ export async function getReconciledSandboxGatewayState(
       }
       return { ...retried, recoveredGateway: true, recoveryVia: recovery.via || null };
     }
-    const latestLifecycle = getNamedGatewayLifecycleState();
+    const latestLifecycle = getNamedGatewayLifecycleState(recoveryGatewayName);
     const latestStatus = stripAnsi(latestLifecycle.status || "");
     if (/No gateway configured/i.test(latestStatus)) {
       return {
@@ -363,7 +544,7 @@ export async function getReconciledSandboxGatewayState(
     }
     if (
       /Connection refused|client error \(Connect\)|tcp connect error/i.test(latestStatus) &&
-      /Gateway:\s+nemoclaw/i.test(latestStatus)
+      gatewayNamePattern(recoveryGatewayName).test(latestStatus)
     ) {
       return {
         state: "gateway_unreachable_after_restart",
@@ -387,20 +568,54 @@ export async function getReconciledSandboxGatewayState(
 
 export async function ensureLiveSandboxOrExit(
   sandboxName: string,
-  { allowNonReadyPhase = false }: { allowNonReadyPhase?: boolean } = {},
+  {
+    allowNonReadyPhase = false,
+    gatewayRecovery = "recover",
+  }: { allowNonReadyPhase?: boolean; gatewayRecovery?: GatewayRecoveryMode } = {},
 ): Promise<SandboxGatewayState> {
-  const lookup = await getReconciledSandboxGatewayState(sandboxName);
+  const lookup = await getReconciledSandboxGatewayState(sandboxName, { gatewayRecovery });
   if (lookup.state === "present") {
     const phase = parseSandboxPhase(lookup.output || "");
     if (!allowNonReadyPhase && phase && phase !== "Ready" && phase !== "Running") {
+      // Don't steer toward rebuild when the host Docker daemon is down: the
+      // sandbox is fine and recreating it cannot succeed until Docker is back
+      // (#4428). Terminal phases (Failed/Error/...) are settled failures and
+      // keep the rebuild guidance so a genuine failure is never masked.
+      if (!isTerminalSandboxPhase(phase) && isDockerRuntimeDown(sandboxName)) {
+        printDockerRuntimeDownGuidance(sandboxName);
+        process.exit(1);
+      }
+      const dockerRuntime = phase === "Error" ? getSandboxDockerRuntime(sandboxName) : null;
+      if (dockerRuntime?.paused && dockerRuntime.containerName) {
+        console.error(`  Sandbox '${sandboxName}' is stuck in '${phase}' phase.`);
+        console.error("");
+        console.error(
+          `  The Docker-driver container for '${sandboxName}' is paused: ${dockerRuntime.containerName}`,
+        );
+        console.error(
+          "  A paused container can report 'Phase: Error' even though the sandbox is intact.",
+        );
+        console.error("  Resume it to restore the running phase:");
+        console.error(`    ${D}docker unpause ${dockerRuntime.containerName}${R}`);
+        process.exit(1);
+      }
       console.error(`  Sandbox '${sandboxName}' is stuck in '${phase}' phase.`);
       console.error(
         "  This usually happens when a process crash inside the sandbox prevented clean startup.",
       );
       console.error("");
-      console.error(
-        `  Run \`${CLI_NAME} ${sandboxName} rebuild --yes\` to recreate the sandbox (--yes skips the confirmation prompt; workspace state will be preserved).`,
-      );
+      if (phase === "Error" && dockerRuntime?.containerName) {
+        console.error(
+          `  Run \`${CLI_NAME} ${sandboxName} start\` to restart the crashed container and recover the sandbox with workspace state preserved.`,
+        );
+        console.error(
+          `  (\`${CLI_NAME} ${sandboxName} rebuild --yes\` recreates the sandbox instead, but its pre-rebuild backup cannot snapshot a stopped container, so start it first.)`,
+        );
+      } else {
+        console.error(
+          `  Run \`${CLI_NAME} ${sandboxName} rebuild --yes\` to recreate the sandbox (--yes skips the confirmation prompt; workspace state will be preserved).`,
+        );
+      }
       process.exit(1);
     }
     return lookup;
@@ -410,7 +625,8 @@ export async function ensureLiveSandboxOrExit(
     process.exit(1);
   }
   if (lookup.state === "missing") {
-    const guard = getNamedGatewayLifecycleState();
+    const targetGatewayName = getSandboxTargetGatewayName(sandboxName);
+    const guard = getNamedGatewayLifecycleState(targetGatewayName);
     if (guard.state !== "healthy_named") {
       if (guard.state === "connected_other") {
         printWrongGatewayActiveGuidance(sandboxName, guard.activeGateway, console.error);
@@ -419,18 +635,23 @@ export async function ensureLiveSandboxOrExit(
       }
       process.exit(1);
     }
-    registry.removeSandbox(sandboxName);
-    const session = onboardSession.loadSession();
-    if (session && session.sandboxName === sandboxName) {
-      onboardSession.updateSession((state: Session) => {
-        state.sandboxName = null;
-        return state;
-      });
-    }
-    console.error(`  Sandbox '${sandboxName}' is not present in the live OpenShell gateway.`);
-    console.error("  Removed stale local registry entry.");
+    // The sandbox is absent from a healthy NemoClaw gateway, but the local
+    // registry entry still holds the metadata that `rebuild` / `onboard
+    // --recreate-sandbox` need to recover it. Removing it here would race with
+    // the recovery guidance `status` prints for a stuck/stale sandbox: a
+    // routine `connect` would delete the very state the recommended
+    // `rebuild --yes` depends on, so the rebuild then fails with "does not
+    // exist" (#4497). Preserve the entry and route intentional purges through
+    // the explicit `destroy` command instead of deleting state automatically.
     console.error(
-      `  Run \`${CLI_NAME} list\` to confirm the remaining sandboxes, or \`${CLI_NAME} onboard\` to create a new one.`,
+      `  Sandbox '${sandboxName}' is registered locally, but is not present in the live OpenShell gateway.`,
+    );
+    console.error("  Your local registry entry has been preserved — nothing was removed.");
+    console.error(
+      `  If the live sandbox is stuck mid-provision, retry \`${CLI_NAME} ${sandboxName} rebuild --yes\` once it reappears to recreate it (workspace state is preserved when the live sandbox still exists).`,
+    );
+    console.error(
+      `  If the sandbox was intentionally deleted, run \`${CLI_NAME} ${sandboxName} destroy\` to remove the stale local entry, or \`${CLI_NAME} onboard\` to create a new one.`,
     );
     process.exit(1);
   }
@@ -441,16 +662,14 @@ export async function ensureLiveSandboxOrExit(
   if (lookup.state === "identity_drift") {
     console.error("  Gateway SSH identity changed after restart — clearing stale host keys...");
     const knownHostsPath = path.join(os.homedir(), ".ssh", "known_hosts");
-    if (fs.existsSync(knownHostsPath)) {
-      try {
-        const kh = fs.readFileSync(knownHostsPath, "utf8");
-        const cleaned = pruneKnownHostsEntries(kh);
-        if (cleaned !== kh) fs.writeFileSync(knownHostsPath, cleaned);
-      } catch {
-        /* best-effort cleanup */
-      }
+    try {
+      const kh = fs.readFileSync(knownHostsPath, "utf8");
+      const cleaned = pruneKnownHostsEntries(kh);
+      if (cleaned !== kh) fs.writeFileSync(knownHostsPath, cleaned);
+    } catch {
+      /* best-effort cleanup */
     }
-    const retry = await getReconciledSandboxGatewayState(sandboxName);
+    const retry = await getReconciledSandboxGatewayState(sandboxName, { gatewayRecovery });
     if (retry.state === "present") {
       console.error("  ✓ Reconnected after clearing stale SSH host keys.");
       return retry;
@@ -474,10 +693,23 @@ export async function ensureLiveSandboxOrExit(
       console.error(lookup.output);
     }
     console.error(
-      "  Retry `openshell gateway start --name nemoclaw` and verify `openshell status` is healthy before reconnecting.",
+      `  Retry \`openshell gateway start --name ${getSandboxTargetGatewayName(sandboxName)}\` and verify \`openshell status\` is healthy before reconnecting.`,
     );
     console.error(
       "  If the gateway never becomes healthy, rebuild the gateway and then recreate the affected sandbox.",
+    );
+    process.exit(1);
+  }
+  if (lookup.state === "gateway_error" && gatewayRecovery === "observe") {
+    console.error(
+      `  Sandbox '${sandboxName}' cannot be verified: the OpenShell gateway RPC returned an error.`,
+    );
+    if (lookup.output) {
+      console.error(lookup.output);
+    }
+    printGatewayLifecycleHint(lookup.output, sandboxName);
+    console.error(
+      `  This sandbox-scoped command will not restart the shared host gateway. Run \`openshell status\` and \`openshell gateway start --name ${getSandboxTargetGatewayName(sandboxName)}\` before retrying.`,
     );
     process.exit(1);
   }
@@ -489,7 +721,7 @@ export async function ensureLiveSandboxOrExit(
       console.error(lookup.output);
     }
     console.error(
-      "  Start the gateway again with `openshell gateway start --name nemoclaw` before retrying.",
+      `  Start the gateway again with \`openshell gateway start --name ${getSandboxTargetGatewayName(sandboxName)}\` before retrying.`,
     );
     console.error(
       "  If the gateway had to be rebuilt from scratch, recreate the affected sandbox afterward.",

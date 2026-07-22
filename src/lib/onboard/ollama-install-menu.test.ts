@@ -2,14 +2,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
+import { MIN_OLLAMA_VERSION } from "../inference/ollama-version";
 import {
   assertOllamaUpgradeApplied,
   resolveOllamaInstallMenuEntry,
-} from "../../../dist/lib/onboard/ollama-install-menu";
-import { MIN_OLLAMA_VERSION } from "../../../dist/lib/inference/ollama-version";
+  resolveRunningOllamaMenuEntry,
+} from "./ollama-install-menu";
 
 const LINUX_NON_WSL = { platform: "linux" as const, isWsl: false };
+
+describe("resolveRunningOllamaMenuEntry", () => {
+  it("labels unsupported Windows-host Ollama without suggesting it", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: false,
+      ollamaRunning: true,
+      ollamaHost: "host.docker.internal",
+      isWsl: true,
+      ollamaPort: 11434,
+      windowsHostLabelSuffix: " (requires Docker Desktop WSL integration)",
+    });
+
+    expect(entry).toEqual({
+      key: "ollama",
+      label:
+        "Local Ollama (Windows host:11434) — running (requires Docker Desktop WSL integration)",
+    });
+  });
+
+  it("renders a start action for installed-but-stopped Ollama on WSL (#6750)", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: true,
+      ollamaRunning: false,
+      ollamaHost: null,
+      isWsl: true,
+      ollamaPort: 11434,
+    });
+
+    expect(entry).toEqual({ key: "ollama", label: "Start local Ollama (WSL:11434)" });
+  });
+
+  it("renders a start action for installed-but-stopped Ollama on non-WSL hosts (#6750)", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: true,
+      ollamaRunning: false,
+      ollamaHost: null,
+      isWsl: false,
+      ollamaPort: 11434,
+    });
+
+    expect(entry).toEqual({ key: "ollama", label: "Start local Ollama (localhost:11434)" });
+  });
+});
 
 describe("resolveOllamaInstallMenuEntry", () => {
   it("offers a fresh install when no Ollama is present", () => {

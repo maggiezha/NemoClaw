@@ -15,11 +15,25 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { HOST_ADVISORY_CHECKS } from "../advisories/checks/host";
+import { runAdvisories } from "../advisories/runner";
+import { failLine } from "../cli/terminal-style";
 import { DASHBOARD_PORT } from "../core/ports";
 import {
-  isWslDockerDesktopRuntime,
-  wslDockerDesktopGpuCompatibilityAction,
-} from "./wsl-docker-desktop-gpu";
+  MIN_RECOMMENDED_DOCKER_CPUS,
+  MIN_RECOMMENDED_DOCKER_MEM_GIB,
+} from "./container-runtime-resources";
+import { assessNvidiaCdiHost } from "./docker-cdi";
+import { printUnderProvisionedRuntimeWarning } from "./preflight-messages";
+import { printRemediationActions } from "./remediation";
+import { isWslDockerDesktopRuntime } from "./wsl-docker-desktop-gpu";
+
+export {
+  MIN_RECOMMENDED_DOCKER_CPUS,
+  MIN_RECOMMENDED_DOCKER_MEM_GIB,
+} from "./container-runtime-resources";
+export { buildContainerToolkitBootstrapCommands } from "./container-toolkit-bootstrap";
+export { getNvidiaCdiSpecPath, parseDockerCdiSpecDirs } from "./docker-cdi";
 export { isWslDockerDesktopRuntime } from "./wsl-docker-desktop-gpu";
 
 // runner.ts still uses CommonJS-style exports — use require here.
@@ -124,6 +138,14 @@ export interface HostAssessment {
   hasNvidiaGpu: boolean;
   dockerCdiSpecDirs: string[];
   cdiNvidiaGpuSpecMissing: boolean;
+  cdiNvidiaGpuSpecStale?: boolean;
+  cdiNvidiaGpuSpecMismatch?: string;
+  cdiNvidiaGpuRefreshUnhealthy?: boolean;
+  cdiNvidiaGpuSpecNeedsRepair?: boolean;
+  nvidiaCdiRefreshPathActive?: boolean | null;
+  nvidiaCdiRefreshPathEnabled?: boolean | null;
+  nvidiaCdiRefreshServiceEnabled?: boolean | null;
+  nvidiaCdiRefreshServiceFailed?: boolean | null;
   nvidiaContainerToolkitInstalled: boolean;
   notes: string[];
 }
@@ -136,6 +158,9 @@ export interface RemediationAction {
   commands: string[];
   blocking: boolean;
 }
+
+export const DOCKER_DESKTOP_WSL_INTEGRATION_HINT =
+  "If you use Docker Desktop from WSL, open Docker Desktop > Settings > Resources > WSL integration and enable integration for this distro.";
 
 export interface AssessHostOpts {
   platform?: NodeJS.Platform;
@@ -282,74 +307,6 @@ export function parseDockerUsesContainerdSnapshotter(info = ""): boolean {
   return /io\.containerd\.snapshotter\.v1/.test(info);
 }
 
-// Parses the Docker daemon's configured CDI spec directories from `docker
-// info --format '{{json .}}'` output. Docker 25+ surfaces these as
-// `"CDISpecDirs": ["/etc/cdi", "/var/run/cdi"]` whenever the daemon is built
-// with CDI support and `features.cdi=true` (the default on recent installs).
-// An empty list means CDI device injection is not enabled, so OpenShell will
-// fall back to the legacy `nvidia` runtime path and there is no spec gap to
-// worry about.
-export function parseDockerCdiSpecDirs(info = ""): string[] {
-  const match = info.match(/"CDISpecDirs"\s*:\s*\[([^\]]*)\]/);
-  if (!match) return [];
-  return Array.from(match[1].matchAll(/"([^"]+)"/g), (m) => m[1]).filter(Boolean);
-}
-
-function normalizeCdiSpecDir(specDir: string | undefined): string {
-  const trimmed = String(specDir || "/etc/cdi")
-    .trim()
-    .replace(/\/+$/, "");
-  return trimmed || "/etc/cdi";
-}
-
-export function getNvidiaCdiSpecPath(
-  assessment: Pick<HostAssessment, "dockerCdiSpecDirs">,
-): string {
-  return path.join(normalizeCdiSpecDir(assessment.dockerCdiSpecDirs[0]), "nvidia.yaml");
-}
-
-// True when at least one CDI spec under the configured directories declares
-// `kind: nvidia.com/gpu` (the device class OpenShell injects with `--gpu`).
-// Specs are typically YAML, but the JSON shape is also accepted because
-// `nvidia-ctk cdi generate --format=json` is supported. Errors reading any
-// individual file or directory are tolerated — a missing dir is the same
-// shape as "no spec found there".
-function hasNvidiaCdiSpec(
-  specDirs: readonly string[],
-  readdirImpl: (dir: string) => string[],
-  readFileImpl: (filePath: string, encoding: BufferEncoding) => string,
-): boolean {
-  // YAML keys are unquoted; JSON quotes the kind value. Anchor both patterns
-  // to the *exact* device-class string `nvidia.com/gpu` and require a value
-  // terminator (end of line, whitespace + comment, or whitespace + EOL) so a
-  // sibling spec like `nvidia.com/gpu-extra` does not silently satisfy the
-  // check and suppress the preflight warning. A comment that merely mentions
-  // `nvidia.com/gpu` is also rejected because `kindRe` only matches when the
-  // *whole* scalar value is the device class.
-  const kindRe =
-    /^[ \t]*kind[ \t]*:[ \t]*(?:"nvidia\.com\/gpu"|'nvidia\.com\/gpu'|nvidia\.com\/gpu)[ \t]*(?:#.*)?$/im;
-  const jsonRe = /"kind"\s*:\s*"nvidia\.com\/gpu"/;
-  for (const dir of specDirs) {
-    let entries: string[];
-    try {
-      entries = readdirImpl(dir);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!/\.(ya?ml|json)$/i.test(entry)) continue;
-      let raw: string;
-      try {
-        raw = readFileImpl(path.join(dir, entry), "utf-8");
-      } catch {
-        continue;
-      }
-      if (kindRe.test(raw) || jsonRe.test(raw)) return true;
-    }
-  }
-  return false;
-}
-
 export function parseDockerInfoCpus(info = ""): number | undefined {
   const jsonMatch = info.match(/"NCPU"\s*:\s*(\d+)/);
   if (jsonMatch) {
@@ -394,18 +351,64 @@ export function parseDockerInfoMemTotalBytes(info = ""): number | undefined {
   return undefined;
 }
 
-export const MIN_RECOMMENDED_DOCKER_CPUS = 4;
-export const MIN_RECOMMENDED_DOCKER_MEM_GIB = 8;
-
 export function isDockerUnderProvisioned(
   cpus: number | undefined,
   memTotalBytes: number | undefined,
 ): boolean {
   const cpuLow = typeof cpus === "number" && cpus < MIN_RECOMMENDED_DOCKER_CPUS;
   const memLow =
-    typeof memTotalBytes === "number" &&
-    memTotalBytes < MIN_RECOMMENDED_DOCKER_MEM_GIB * 1024 ** 3;
+    typeof memTotalBytes === "number" && memTotalBytes < MIN_RECOMMENDED_DOCKER_MEM_GIB * 1024 ** 3;
   return cpuLow || memLow;
+}
+
+export interface CheckContainerRuntimeResourcesOptions {
+  ignored: boolean;
+  nonInteractive: boolean;
+  confirm(): Promise<boolean>;
+  log?: (message: string) => void;
+  warn?: (message: string) => void;
+  error?: (message: string) => void;
+  exit?: (code: number) => never;
+}
+
+/** Report container capacity and gate interactive continuation when it is undersized. */
+export async function checkContainerRuntimeResources(
+  host: HostAssessment,
+  options: CheckContainerRuntimeResourcesOptions,
+): Promise<void> {
+  const log = options.log ?? console.log;
+  const warn = options.warn ?? console.warn;
+  const error = options.error ?? console.error;
+  const exit = options.exit ?? ((code: number): never => process.exit(code));
+  const detected: string[] = [];
+  if (typeof host.dockerCpus === "number") detected.push(`${host.dockerCpus} vCPU`);
+  if (typeof host.dockerMemTotalBytes === "number") {
+    detected.push(`${(host.dockerMemTotalBytes / 1024 ** 3).toFixed(1)} GiB`);
+  }
+  if (!host.isContainerRuntimeUnderProvisioned || options.ignored) {
+    if (host.dockerReachable && detected.length > 0) {
+      log(`  ✓ Container runtime resources: ${detected.join(" / ")}`);
+    }
+    return;
+  }
+
+  printUnderProvisionedRuntimeWarning(
+    {
+      detectedStr: detected.join(" / ") || "unknown",
+      runtime: host.runtime,
+      recommendedCpus: MIN_RECOMMENDED_DOCKER_CPUS,
+      recommendedMemGib: MIN_RECOMMENDED_DOCKER_MEM_GIB,
+    },
+    warn,
+  );
+  if (options.nonInteractive) {
+    warn("    WARNING: Non-interactive mode is continuing despite under-provisioned runtime.");
+    return;
+  }
+  if (!(await options.confirm())) {
+    error("  Aborted by user. Resize your container runtime and rerun `nemoclaw onboard`.");
+    exit(1);
+  }
 }
 
 function readDockerDefaultCgroupnsMode(
@@ -431,11 +434,46 @@ function isHeadlessLikely(env: NodeJS.ProcessEnv): boolean {
   return !env.DISPLAY && !env.WAYLAND_DISPLAY && !env.TERM_PROGRAM;
 }
 
-function detectNvidiaGpu(runCaptureImpl: RunCaptureFn): boolean {
-  if (!commandExists("nvidia-smi", runCaptureImpl)) {
+// lspci line shape: "<slot> <class label>: <vendor> <device> ...".
+// The slot token contains colons (e.g. "01:00.0"), so anchor on the class
+// label that follows it and ends at the first ": ".
+const LSPCI_LINE = /^\S+\s+([^:]+):\s*(.*)$/;
+// NVIDIA GPUs surface as display-class devices: "VGA compatible controller"
+// (graphics cards), "3D controller" (datacenter/Tesla parts), or the generic
+// "Display controller". Restricting to these classes prevents NVIDIA/Mellanox
+// NICs and other non-GPU NVIDIA PCI devices from being mistaken for a GPU.
+const PCI_DISPLAY_CLASS = /\b(?:vga compatible controller|3d controller|display controller)\b/i;
+
+function lspciLineIsNvidiaGpu(line: string): boolean {
+  const match = LSPCI_LINE.exec(line.trim());
+  if (!match) return false;
+  const [, classLabel, deviceDescription] = match;
+  return PCI_DISPLAY_CLASS.test(classLabel) && /nvidia/i.test(deviceDescription);
+}
+
+function detectNvidiaGpuHardware(runCaptureImpl: RunCaptureFn): boolean {
+  // PCI bus probe so a physically present NVIDIA GPU is still detected when the
+  // driver is not loaded (nvidia-smi unavailable). Mirrors the lspci hint used
+  // by the onboarding GPU-passthrough note.
+  if (!commandExists("lspci", runCaptureImpl)) {
     return false;
   }
-  return Boolean(String(runCaptureImpl(["nvidia-smi", "-L"], { ignoreError: true }) || "").trim());
+  const output = String(runCaptureImpl(["lspci"], { ignoreError: true }) || "");
+  return output.split("\n").some(lspciLineIsNvidiaGpu);
+}
+
+function detectNvidiaGpu(runCaptureImpl: RunCaptureFn): boolean {
+  if (
+    commandExists("nvidia-smi", runCaptureImpl) &&
+    Boolean(String(runCaptureImpl(["nvidia-smi", "-L"], { ignoreError: true }) || "").trim())
+  ) {
+    return true;
+  }
+  // The driver may be missing or unloaded (nvidia-smi absent/empty) even when
+  // NVIDIA GPU hardware is present. Fall back to a hardware probe so CDI/toolkit
+  // remediation still fires when the toolkit is missing and Docker CDI dirs are
+  // configured (#5489); otherwise preflight silently skips toolkit enforcement.
+  return detectNvidiaGpuHardware(runCaptureImpl);
 }
 
 function detectPackageManager(runCaptureImpl: RunCaptureFn): PackageManager {
@@ -464,35 +502,6 @@ function parseSystemctlState(value = ""): boolean | null {
   return null;
 }
 
-export function buildContainerToolkitBootstrapCommands(
-  packageManager: PackageManager | undefined,
-  generateCommands: readonly string[],
-): string[] {
-  const installGuide =
-    "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html";
-  if (packageManager === "apt") {
-    return [
-      "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
-      "curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list",
-      "sudo apt-get update",
-      "sudo apt-get install -y nvidia-container-toolkit",
-      ...generateCommands,
-    ];
-  }
-  if (packageManager === "dnf" || packageManager === "yum") {
-    const pmCommand = packageManager === "dnf" ? "dnf" : "yum";
-    return [
-      `curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo`,
-      `sudo ${pmCommand} install -y nvidia-container-toolkit`,
-      ...generateCommands,
-    ];
-  }
-  return [
-    `# Install nvidia-container-toolkit per NVIDIA's install guide: ${installGuide}`,
-    ...generateCommands,
-  ];
-}
-
 export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   const platform = opts.platform ?? process.platform;
   const env = opts.env ?? process.env;
@@ -511,7 +520,8 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   const nvidiaContainerToolkitInstalled =
     opts.commandExistsImpl?.("nvidia-ctk") ?? commandExists("nvidia-ctk", runCaptureImpl);
   const packageManager = detectPackageManager(runCaptureImpl);
-  const systemctlAvailable = commandExists("systemctl", runCaptureImpl);
+  const systemctlAvailable =
+    opts.commandExistsImpl?.("systemctl") ?? commandExists("systemctl", runCaptureImpl);
 
   let dockerInfoOutput = opts.dockerInfoOutput;
   let dockerReachable = false;
@@ -540,6 +550,7 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   if (dockerReachable && runtime === "unknown" && platform === "linux") {
     runtime = "docker";
   }
+  const isWslHost = detectWsl({ platform, env, release, procVersion });
   const dockerCgroupVersion = dockerReachable
     ? parseDockerCgroupVersion(dockerInfoOutput)
     : "unknown";
@@ -553,20 +564,19 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   const dockerMemTotalBytes = dockerReachable
     ? parseDockerInfoMemTotalBytes(dockerInfoOutput)
     : undefined;
-  // CDI spec gap: Docker 25+ on hosts with `nvidia-container-toolkit` installed
-  // typically advertises `"CDISpecDirs": ["/etc/cdi", "/var/run/cdi"]` in its
-  // info output. OpenShell's `gateway start --gpu` then opportunistically
-  // selects CDI mode and tries to inject `nvidia.com/gpu=all`. If no spec has
-  // been generated yet (`/etc/cdi/nvidia.yaml` is missing), the gateway start
-  // fails with `unresolvable CDI devices nvidia.com/gpu=all`. Detect this up
-  // front so preflight can point the user at `nvidia-ctk cdi generate` before
-  // we waste minutes downloading the gateway image. See issue #3152.
-  const dockerCdiSpecDirs = dockerReachable ? parseDockerCdiSpecDirs(dockerInfoOutput) : [];
-  const cdiNvidiaGpuSpecMissing =
-    platform === "linux" &&
-    hasNvidiaGpu &&
-    dockerCdiSpecDirs.length > 0 &&
-    !hasNvidiaCdiSpec(dockerCdiSpecDirs, readdirImpl, readFileImpl);
+  const cdiAssessment = assessNvidiaCdiHost({
+    dockerInfoOutput,
+    dockerReachable,
+    hasNvidiaGpu,
+    isWsl: isWslHost,
+    nvidiaContainerToolkitInstalled,
+    platform,
+    readFileImpl,
+    readdirImpl,
+    runCaptureImpl,
+    runtime,
+    systemctlAvailable,
+  });
   const isContainerRuntimeUnderProvisioned = isDockerUnderProvisioned(
     dockerCpus,
     dockerMemTotalBytes,
@@ -585,7 +595,6 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   // the user-confirmed reproducer. Engaging the auto-fix there could
   // build an unnecessary patched image; preferring to leave WSL alone
   // until we have a confirmed repro is the conservative call.
-  const isWslHost = detectWsl({ platform, env, release, procVersion });
   const hasNestedOverlayConflict =
     platform === "linux" &&
     !isWslHost &&
@@ -632,8 +641,7 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
     isUnsupportedRuntime: runtime === "podman",
     isHeadlessLikely: isHeadlessLikely(env),
     hasNvidiaGpu,
-    dockerCdiSpecDirs,
-    cdiNvidiaGpuSpecMissing,
+    ...cdiAssessment,
     nvidiaContainerToolkitInstalled,
     notes: [],
   };
@@ -651,206 +659,65 @@ export function assessHost(opts: AssessHostOpts = {}): HostAssessment {
   return assessment;
 }
 
+/**
+ * Decide whether onboarding must enforce a present-and-configured NVIDIA CDI
+ * spec (i.e. block on a missing/stale spec). The fix for #5489 makes
+ * `assessHost().hasNvidiaGpu` true via an lspci hardware probe when the driver
+ * is unloaded, which is what flags `cdiNvidiaGpuSpecMissing`. The onboard gate
+ * must enforce based on whether the operator *explicitly* opted out of GPU
+ * passthrough — NOT on whether sandbox GPU was *auto*-disabled because
+ * `nvidia-smi` is unavailable. Auto-disable was the bypass that let onboard skip
+ * the toolkit/CDI remediation in #5489; an explicit `--no-gpu` still skips it so
+ * a host with an unusable GPU can still onboard CPU-only.
+ */
+export function shouldEnforceCdiNvidiaGpuSpec(opts: {
+  cdiNvidiaGpuSpecMissing: boolean;
+  cdiNvidiaGpuSpecNeedsRepair: boolean;
+  explicitlyOptedOutGpuPassthrough: boolean;
+}): boolean {
+  if (opts.explicitlyOptedOutGpuPassthrough) return false;
+  return opts.cdiNvidiaGpuSpecNeedsRepair || opts.cdiNvidiaGpuSpecMissing;
+}
+
+export function assertCdiNvidiaGpuSpecPresent(
+  host: HostAssessment,
+  explicitlyOptedOutGpuPassthrough: boolean,
+  hostGpuPlatform: string | null | undefined = null,
+  exitProcess: (code: number) => never = (code) => process.exit(code),
+): void {
+  if (hostGpuPlatform === "jetson" || isWslDockerDesktopRuntime(host)) return;
+  if (
+    !shouldEnforceCdiNvidiaGpuSpec({
+      cdiNvidiaGpuSpecMissing: host.cdiNvidiaGpuSpecMissing,
+      cdiNvidiaGpuSpecNeedsRepair: host.cdiNvidiaGpuSpecNeedsRepair ?? false,
+      explicitlyOptedOutGpuPassthrough,
+    })
+  )
+    return;
+  console.error(
+    failLine(
+      "Docker is configured for CDI device injection (CDISpecDirs is set), but the NVIDIA GPU CDI spec is missing or stale. OpenShell GPU startup can fail until the CDI spec is refreshed.",
+    ),
+  );
+  printRemediationActions(planHostRemediation(host));
+  exitProcess(1);
+}
+
+export function planHostAdvisories(assessment: HostAssessment) {
+  return runAdvisories(HOST_ADVISORY_CHECKS, assessment, {
+    phase: "preflight.host",
+  }).advisories;
+}
+
 export function planHostRemediation(assessment: HostAssessment): RemediationAction[] {
-  const actions: RemediationAction[] = [];
-
-  if (!assessment.dockerInstalled) {
-    const installCommands: Record<PackageManager, string> = {
-      apt: "Install Docker Engine, then rerun `nemoclaw onboard`.",
-      dnf: "Install Docker Engine with your package manager, then rerun `nemoclaw onboard`.",
-      yum: "Install Docker Engine with your package manager, then rerun `nemoclaw onboard`.",
-      brew: "Install Docker Desktop or Colima, then rerun `nemoclaw onboard`.",
-      pacman: "Install Docker Engine with your package manager, then rerun `nemoclaw onboard`.",
-      unknown: "Install Docker, then rerun `nemoclaw onboard`.",
-    };
-    actions.push({
-      id: "install_docker",
-      title: "Install Docker",
-      kind: "manual",
-      reason: "Docker is required before onboarding can create a gateway or sandbox.",
-      commands:
-        assessment.platform === "darwin"
-          ? ["Install Docker Desktop or Colima, then rerun `nemoclaw onboard`."]
-          : [installCommands[assessment.packageManager ?? "unknown"]],
-      blocking: true,
-    });
-  } else if (!assessment.dockerReachable) {
-    // On Linux, if the systemd service is already active but the daemon is
-    // unreachable, the most likely cause is a permissions / docker-group issue
-    // rather than a stopped service.
-    const likelyGroupIssue =
-      assessment.platform === "linux" && assessment.dockerServiceActive === true;
-
-    if (likelyGroupIssue) {
-      actions.push({
-        id: "docker_group_permission",
-        title: "Add user to docker group",
-        kind: "sudo",
-        reason:
-          "Docker is installed and the service is running, but the current user cannot reach the daemon. " +
-          "This usually means your user is not in the docker group. " +
-          "NemoClaw needs Docker access. " +
-          "On personal Linux development machines, adding your user to the docker group is the standard way to run Docker without sudo. " +
-          "Docker group members can control the daemon with root-level impact, so grant this access only to trusted local accounts; on shared or managed systems, use your organization's approved Docker access path. " +
-          "Background: https://docs.docker.com/engine/security/#docker-daemon-attack-surface.",
-        commands: [
-          "sudo usermod -aG docker $USER",
-          "newgrp docker   # or log out and back in",
-          "nemoclaw onboard",
-        ],
-        blocking: true,
-      });
-    } else {
-      actions.push({
-        id: "start_docker",
-        title: "Start Docker",
-        kind: "manual",
-        reason: "Docker is installed but NemoClaw could not talk to the Docker daemon.",
-        commands:
-          assessment.platform === "darwin"
-            ? ["Start Docker Desktop or Colima, then rerun `nemoclaw onboard`."]
-            : assessment.systemctlAvailable
-              ? ["sudo systemctl start docker", "nemoclaw onboard"]
-              : ["Start the Docker daemon, then rerun `nemoclaw onboard`."],
-        blocking: true,
-      });
-    }
-  }
-
-  if (assessment.dockerReachable && assessment.isContainerRuntimeUnderProvisioned) {
-    const cpus = assessment.dockerCpus;
-    const memGiB =
-      typeof assessment.dockerMemTotalBytes === "number"
-        ? assessment.dockerMemTotalBytes / 1024 ** 3
-        : undefined;
-    const detected: string[] = [];
-    if (typeof cpus === "number") detected.push(`${cpus} vCPU`);
-    if (typeof memGiB === "number") detected.push(`${memGiB.toFixed(1)} GiB`);
-    const detectedStr = detected.length > 0 ? detected.join(" / ") : "unknown";
-    const recommendedStr = `${MIN_RECOMMENDED_DOCKER_CPUS} vCPU / ${MIN_RECOMMENDED_DOCKER_MEM_GIB} GiB`;
-    const isColima = assessment.runtime === "colima";
-    const isDockerDesktop = assessment.runtime === "docker-desktop";
-    const reason =
-      `Container runtime is under-provisioned (detected ${detectedStr}; recommended ${recommendedStr}). ` +
-      "Sandbox build will be slow and may stall when runtime resources are too low.";
-    const commands: string[] = [];
-    if (isColima) {
-      commands.push(
-        "colima stop",
-        `colima start --cpu ${MIN_RECOMMENDED_DOCKER_CPUS} --memory ${MIN_RECOMMENDED_DOCKER_MEM_GIB} --disk 100`,
-      );
-    } else if (isDockerDesktop) {
-      commands.push(
-        `Open Docker Desktop → Settings → Resources and raise CPUs to ≥ ${MIN_RECOMMENDED_DOCKER_CPUS} and memory to ≥ ${MIN_RECOMMENDED_DOCKER_MEM_GIB} GiB.`,
-      );
-    } else {
-      commands.push(
-        `Raise your container runtime's resource limits to ≥ ${MIN_RECOMMENDED_DOCKER_CPUS} vCPU and ≥ ${MIN_RECOMMENDED_DOCKER_MEM_GIB} GiB of memory before retrying.`,
-      );
-    }
-    actions.push({
-      id: "container_runtime_under_provisioned",
-      title: "Increase container runtime resources",
-      kind: "manual",
-      reason,
-      commands,
-      blocking: false,
-    });
-  }
-
-  if (assessment.isUnsupportedRuntime) {
-    actions.push({
-      id: "unsupported_runtime_warning",
-      title: "Use a supported Docker runtime if problems appear",
-      kind: "manual",
-      reason:
-        "OpenShell officially documents Docker-based runtimes. Podman may work in some environments, but it is not a supported runtime and behavior may vary.",
-      commands:
-        assessment.platform === "darwin"
-          ? ["If onboarding or sandbox lifecycle fails, switch to Docker Desktop or Colima."]
-          : ["If onboarding or sandbox lifecycle fails, switch to a Docker-supported runtime."],
-      blocking: false,
-    });
-  }
-
-  if (!assessment.nodeInstalled) {
-    actions.push({
-      id: "install_nodejs",
-      title: "Install Node.js",
-      kind: "manual",
-      reason: "NemoClaw requires Node.js for its CLI and plugin build steps.",
-      commands: ["Run the NemoClaw installer to install Node.js automatically."],
-      blocking: false,
-    });
-  }
-
-  if (!assessment.openshellInstalled) {
-    actions.push({
-      id: "install_openshell",
-      title: "Install OpenShell",
-      kind: "manual",
-      reason: "OpenShell is required before onboarding can create or manage a gateway.",
-      commands: ["Run the NemoClaw installer or `scripts/install-openshell.sh`."],
-      blocking: false,
-    });
-  }
-
-  if (assessment.isHeadlessLikely && !assessment.hasNvidiaGpu) {
-    actions.push({
-      id: "headless_remote_hint",
-      title: "Review remote/headless UI settings",
-      kind: "info",
-      reason:
-        "Headless Linux hosts often need explicit remote UI handling if you want browser access.",
-      commands: ["Set `CHAT_UI_URL` when remote browser access matters."],
-      blocking: false,
-    });
-  }
-
-  if (assessment.cdiNvidiaGpuSpecMissing) {
-    const specPath = getNvidiaCdiSpecPath(assessment);
-    const specDir = path.dirname(specPath);
-    const generateCommands = [
-      `sudo mkdir -p ${specDir}`,
-      `sudo nvidia-ctk cdi generate --output=${specPath}`,
-      "nvidia-ctk cdi list   # verify nvidia.com/gpu entries appear",
-      "nemoclaw onboard      # or rerun with --no-gpu to skip GPU passthrough",
-    ];
-    if (isWslDockerDesktopRuntime(assessment)) {
-      actions.push(wslDockerDesktopGpuCompatibilityAction());
-    } else if (assessment.nvidiaContainerToolkitInstalled) {
-      actions.push({
-        id: "generate_nvidia_cdi_spec",
-        title: "Generate NVIDIA CDI device specs",
-        kind: "sudo",
-        reason:
-          "Docker is configured for CDI device injection (CDISpecDirs is set) but no " +
-          "nvidia.com/gpu CDI spec is present on the host. OpenShell's `gateway start --gpu` " +
-          "will fail with `unresolvable CDI devices nvidia.com/gpu=all` until a spec is generated.",
-        commands: generateCommands,
-        blocking: true,
-      });
-    } else {
-      actions.push({
-        id: "install_nvidia_container_toolkit",
-        title: "Install NVIDIA Container Toolkit and generate CDI device specs",
-        kind: "sudo",
-        reason:
-          "Docker is configured for CDI device injection (CDISpecDirs is set) but the " +
-          "`nvidia-container-toolkit` package (which provides `nvidia-ctk`) is not installed " +
-          "on the host. OpenShell's `gateway start --gpu` will fail with " +
-          "`unresolvable CDI devices nvidia.com/gpu=all` until the toolkit is installed and a " +
-          "CDI spec is generated.",
-        commands: buildContainerToolkitBootstrapCommands(
-          assessment.packageManager,
-          generateCommands,
-        ),
-        blocking: true,
-      });
-    }
-  }
-
-  return actions;
+  return planHostAdvisories(assessment).map((advisory) => ({
+    id: advisory.id,
+    title: advisory.title,
+    kind: advisory.kind ?? "manual",
+    reason: advisory.reason,
+    commands: [...(advisory.commands ?? [])],
+    blocking: advisory.severity === "fatal" || advisory.severity === "blocking",
+  }));
 }
 
 // ── Port availability ────────────────────────────────────────────
@@ -1519,7 +1386,9 @@ function captureProbeExecution(
 }
 
 function probeCombinedOutput(execution: ReturnType<typeof normalizeProbeExecution>): string {
-  return [execution.stdout, execution.stderr].filter((part) => String(part || "").trim()).join("\n");
+  return [execution.stdout, execution.stderr]
+    .filter((part) => String(part || "").trim())
+    .join("\n");
 }
 
 function outputTail(output: string, maxLength = 400): string {
@@ -1903,6 +1772,198 @@ export function isFatalContainerDnsProbeFailure(result: DnsProbeResult): boolean
   // through `docker_daemon_unreachable` above; pull failures through the
   // image_pull_failed branch below.
   return result.reason === "image_pull_failed" && isRegistryResolutionFailure(result.details ?? "");
+}
+
+// ── Host DNS probe (#4784) ────────────────────────────────────────
+// `probeContainerDns` above only proves the *docker container* network
+// namespace can reach a resolver. A host whose OUTPUT chain drops
+// tcp/udp:53 (a corporate firewall, a VPN kill-switch, or a literal
+// `iptables -I OUTPUT -p udp --dport 53 -j DROP`) can still pass the
+// container probe — docker's embedded resolver at 127.0.0.11 and the
+// bridge NAT take a different egress path — while the NemoClaw CLI
+// process itself cannot resolve the provider endpoint. That gap let
+// onboarding print "Container DNS resolution works" and then fail much
+// later at NVIDIA Endpoints validation with the cryptic
+// `curl: (6) Could not resolve host: integrate.api.nvidia.com`. This
+// probe resolves the provider hostname from the host (CLI) process so
+// the blocked-DNS condition surfaces up front, distinct from the
+// container-DNS path.
+
+/** The NVIDIA Endpoints provider host onboarding validates by default. */
+export const DEFAULT_HOST_DNS_PROBE_HOSTNAME = "integrate.api.nvidia.com";
+
+/**
+ * Host DNS probe budget (ms). Shorter than the container probe: there is
+ * no image pull, just a c-ares round-trip to the system resolver.
+ */
+const HOST_DNS_PROBE_TIMEOUT_MS = 10_000;
+
+export interface HostDnsProbeResult {
+  ok: boolean;
+  hostname: string;
+  reason?: "servers_unreachable" | "resolution_failed" | "timeout" | "killed" | "error";
+  details?: string;
+}
+
+export interface ProbeHostDnsOpts {
+  /** Hostname to resolve (default: the NVIDIA Endpoints provider host). */
+  hostname?: string;
+  /** Override structured probe execution (test seam). */
+  runProbeImpl?: RunProbeFn;
+  /** Override the node executable used to run the resolver (test seam). */
+  nodeExecPath?: string;
+  /** Probe budget (ms). Defaults to HOST_DNS_PROBE_TIMEOUT_MS. */
+  timeoutMs?: number;
+}
+
+// getaddrinfo (and c-ares fallback) error codes meaning "the resolver
+// could not be reached at all": the UDP/TCP:53 egress is blocked. This is
+// the #4784 signature. `EAI_AGAIN` ("Temporary failure in name
+// resolution") is what getaddrinfo returns when the stub/upstream resolver
+// is unreachable.
+const HOST_DNS_UNREACHABLE_CODES = new Set([
+  "EAI_AGAIN",
+  "EAI_FAIL",
+  "ECONNREFUSED",
+  "ETIMEOUT",
+  "ETIMEDOUT",
+  "ESERVFAIL",
+  "ECONNRESET",
+  "EREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ECANCELLED",
+]);
+
+// Error codes meaning "the resolver answered but there is no usable
+// record". For a real, always-present provider host this still blocks
+// onboarding (provider validation cannot resolve it), so it is fatal too.
+const HOST_DNS_RESOLUTION_CODES = new Set([
+  "ENOTFOUND",
+  "ENODATA",
+  "EAI_NONAME",
+  "EAI_NODATA",
+  "ENXDOMAIN",
+  "EBADNAME",
+  "EBADRESP",
+]);
+
+/**
+ * Resolve `hostname` from the host (CLI) process to prove the host can
+ * reach a DNS resolver for the provider endpoint. Uses `dns.lookup`
+ * (getaddrinfo) — not `dns.resolve` — so it follows the *same* resolution
+ * path the later curl-based provider validation does: `/etc/hosts`,
+ * nsswitch, and the system resolver. That keeps it from false-failing
+ * hosts that reach the provider via an `/etc/hosts` entry. Runs `node -e`
+ * in a child process so the check stays synchronous like
+ * `probeContainerDns` and is fully injectable for tests. The hostname is
+ * passed as a process argument (never interpolated into the script body),
+ * so it cannot inject shell or JS tokens; we still validate it as a plain
+ * DNS name as defense in depth and to keep error output sane.
+ */
+export function probeHostDns(opts: ProbeHostDnsOpts = {}): HostDnsProbeResult {
+  const hostname = opts.hostname ?? DEFAULT_HOST_DNS_PROBE_HOSTNAME;
+  if (!/^[a-z0-9]([a-z0-9.-]{0,253})$/i.test(hostname)) {
+    throw new Error(
+      `hostname must be a plain DNS name (RFC 1035 label characters), got: ${JSON.stringify(hostname)}`,
+    );
+  }
+  const timeoutMs = opts.timeoutMs ?? HOST_DNS_PROBE_TIMEOUT_MS;
+  // Bound the c-ares query inside the child too, so a silently dropped
+  // UDP:53 (no RST / ICMP unreachable) cannot outlive the spawn timeout:
+  // print a stable marker and exit non-zero a beat before the outer
+  // budget so the marker (not a SIGTERM) classifies the failure.
+  const innerTimeoutMs = Math.max(1_000, timeoutMs - 1_000);
+  const script = [
+    "const dns=require('node:dns');",
+    "const host=process.argv[1];",
+    "let settled=false;",
+    `const t=setTimeout(()=>{if(settled)return;settled=true;process.stderr.write('HOSTDNS_TIMEOUT');process.exit(2);},${innerTimeoutMs});`,
+    "if(typeof t.unref==='function')t.unref();",
+    "dns.lookup(host,{all:false},(err,addr)=>{if(settled)return;settled=true;clearTimeout(t);",
+    "if(err){process.stderr.write('HOSTDNS_ERR '+(err.code||err.errno||err.message||'unknown'));process.exit(3);}",
+    "process.stdout.write('HOSTDNS_OK '+(addr||''));process.exit(0);});",
+  ].join("");
+  const nodeExec = opts.nodeExecPath ?? process.execPath;
+  const command = [nodeExec, "-e", script, hostname];
+
+  const runProbe = opts.runProbeImpl ?? defaultRunProbe;
+  let execution: ReturnType<typeof normalizeProbeExecution>;
+  try {
+    execution = normalizeProbeExecution(runProbe(command, { timeout: timeoutMs }));
+  } catch (e) {
+    return { ok: false, hostname, reason: "error", details: String((e as Error)?.message ?? e) };
+  }
+
+  const output = probeCombinedOutput(execution);
+
+  // Outer spawn timeout / kill signal dominate the exit code, so check
+  // them before parsing the resolver markers.
+  if (execution.timedOut) {
+    return {
+      ok: false,
+      hostname,
+      reason: "timeout",
+      details: probeExecutionDetails("host DNS probe", execution, timeoutMs, output),
+    };
+  }
+  if (execution.signal) {
+    return {
+      ok: false,
+      hostname,
+      reason: "killed",
+      details: probeExecutionDetails("host DNS probe", execution, timeoutMs, output),
+    };
+  }
+
+  if (execution.exitCode === 0 && /HOSTDNS_OK/.test(output)) {
+    return { ok: true, hostname };
+  }
+  if (/HOSTDNS_TIMEOUT/.test(output)) {
+    return {
+      ok: false,
+      hostname,
+      reason: "timeout",
+      details: probeExecutionDetails("host DNS probe", execution, timeoutMs, output),
+    };
+  }
+  const errMatch = output.match(/HOSTDNS_ERR\s+(\S+)/);
+  if (errMatch) {
+    const code = errMatch[1].toUpperCase();
+    const details = `dns.lookup ${hostname}: ${errMatch[1]}`;
+    if (HOST_DNS_UNREACHABLE_CODES.has(code)) {
+      return { ok: false, hostname, reason: "servers_unreachable", details };
+    }
+    if (HOST_DNS_RESOLUTION_CODES.has(code)) {
+      return { ok: false, hostname, reason: "resolution_failed", details };
+    }
+    return { ok: false, hostname, reason: "error", details };
+  }
+  // Couldn't run node / unexpected output — stay inconclusive so we
+  // never abort onboarding on a probe-infrastructure failure.
+  return {
+    ok: false,
+    hostname,
+    reason: "error",
+    details: output.trim() ? outputTail(output) : "host DNS probe produced no output",
+  };
+}
+
+/**
+ * A host DNS probe failure is fatal when the host genuinely cannot
+ * resolve the provider endpoint (resolver unreachable, NXDOMAIN/ENODATA,
+ * or the probe timed out / was killed mid-query). A generic `error`
+ * (could not even spawn the probe) stays inconclusive — the probe never
+ * proved host DNS is broken, so onboarding must not abort on it.
+ */
+export function isFatalHostDnsProbeFailure(result: HostDnsProbeResult): boolean {
+  if (result.ok) return false;
+  return (
+    result.reason === "servers_unreachable" ||
+    result.reason === "resolution_failed" ||
+    result.reason === "timeout" ||
+    result.reason === "killed"
+  );
 }
 
 export function probeDockerBridgeContainerStart(

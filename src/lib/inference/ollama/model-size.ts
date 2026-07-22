@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { buildValidatedCurlCommandArgs } from "../../adapters/http/curl-args";
 import { runCapture } from "../../runner";
 import { OLLAMA_DOWNLOAD_SIZE_FALLBACK_BYTES } from "../ollama-model-registry";
 
@@ -24,10 +25,16 @@ export interface SizeLookup {
   source: SizeSource;
 }
 
+const OLLAMA_REF_SEGMENT_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+
 function splitNamespaceAndTag(model: string): { namespace: string; tag: string } | null {
   const [name, tag = "latest"] = model.split(":", 2);
   if (!name || !tag) return null;
   const namespace = name.includes("/") ? name : `library/${name}`;
+  if (namespace.split("/").some((segment) => !OLLAMA_REF_SEGMENT_PATTERN.test(segment))) {
+    return null;
+  }
+  if (!OLLAMA_REF_SEGMENT_PATTERN.test(tag)) return null;
   return { namespace, tag };
 }
 
@@ -43,12 +50,13 @@ export function probeRegistrySize(model: string, capture: CaptureFn = runCapture
   const body = capture(
     [
       "curl",
-      "-sfL",
-      "--max-time",
-      String(PROBE_TIMEOUT_SECONDS),
-      "-H",
-      MANIFEST_ACCEPT_HEADER,
-      url,
+      ...buildValidatedCurlCommandArgs(
+        ["-sfL", "--max-time", String(PROBE_TIMEOUT_SECONDS), "-H", MANIFEST_ACCEPT_HEADER, url],
+        // Redirect-following is required because the public Ollama manifest
+        // registry responds with 307s; the URL is built from a hardcoded
+        // MANIFEST_HOST and a structurally validated model name.
+        { allowRedirects: true },
+      ),
     ],
     { ignoreError: true },
   );

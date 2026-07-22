@@ -1,18 +1,26 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Functional tests for scripts/generate-openclaw-config.py.
-// Runs the actual Python script with controlled env vars and asserts on
+// Functional tests for scripts/generate-openclaw-config.mts.
+// Runs the actual TypeScript script with controlled env vars and asserts on
 // the generated openclaw.json output.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-const SCRIPT_PATH = path.join(import.meta.dirname, "..", "scripts", "generate-openclaw-config.py");
+import { buildConfig, main } from "../scripts/generate-openclaw-config.mts";
+import {
+  applyMessagingAgentRenderToObject,
+  applyMessagingBuildPhase,
+  readMessagingBuildPlanFromEnv,
+} from "../src/lib/messaging/applier/build/messaging-build-applier.mts";
+import { withLegacyMessagingPlanEnvDirect } from "./messaging-plan-test-helper";
+
+const SCRIPT_PATH = path.join(import.meta.dirname, "..", "scripts", "generate-openclaw-config.mts");
+const SCRIPT_ARGS = ["--experimental-strip-types", SCRIPT_PATH];
 
 /** Minimal env vars required for a valid config generation run. */
 const BASE_ENV: Record<string, string> = {
@@ -30,17 +38,33 @@ const BASE_ENV: Record<string, string> = {
   NEMOCLAW_REASONING: "false",
   NEMOCLAW_AGENT_TIMEOUT: "600",
 };
+const STRUCTURED_TOOL_SEARCH = { mode: "tools", searchDefaultLimit: 8, maxSearchLimit: 20 };
 
 let tmpDir: string;
 
-function runConfigScriptRaw(envOverrides: Record<string, string> = {}) {
-  const env: Record<string, string> = {
-    PATH: process.env.PATH || "/usr/bin:/bin",
+function ensureFakeOpenClaw(): string {
+  const fakeOpenclaw = path.join(tmpDir, "openclaw");
+  fs.writeFileSync(fakeOpenclaw, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  return fakeOpenclaw;
+}
+
+function buildTestEnv(envOverrides: Record<string, string> = {}): Record<string, string> {
+  ensureFakeOpenClaw();
+  return {
+    PATH: `${tmpDir}:${process.env.PATH || "/usr/bin:/bin"}`,
     ...BASE_ENV,
     ...envOverrides,
     HOME: tmpDir,
   };
-  const result = spawnSync("python3", [SCRIPT_PATH], {
+}
+
+const CHANNELS_ENV = "NEMOCLAW_MESSAGING_CHANNELS_B64";
+const messagingEnv = (channels: string, env: Record<string, string> = {}) =>
+  withLegacyMessagingPlanEnvDirect(buildTestEnv({ ...env, [CHANNELS_ENV]: channels }), "openclaw");
+
+function runConfigScriptRaw(envOverrides: Record<string, string> = {}) {
+  const env = buildTestEnv(envOverrides);
+  const result = spawnSync("node", SCRIPT_ARGS, {
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
     env,
@@ -49,16 +73,106 @@ function runConfigScriptRaw(envOverrides: Record<string, string> = {}) {
   return result;
 }
 
+function withEnv<T>(env: Record<string, string>, fn: () => T): T {
+  const originalEnv = { ...process.env };
+  try {
+    for (const key of Object.keys(process.env)) {
+      delete process.env[key];
+    }
+    Object.assign(process.env, env);
+    return fn();
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+  }
+}
+
+function withConfigEnv<T>(envOverrides: Record<string, string>, fn: () => T): T {
+  return withEnv(buildTestEnv(envOverrides), fn);
+}
+
+function runMessagingPostInstall(env: Record<string, string>): void {
+  withEnv(env, () =>
+    applyMessagingBuildPhase(
+      readMessagingBuildPlanFromEnv(env, "openclaw"),
+      "post-agent-install",
+      env,
+    ),
+  );
+}
+
 function runConfigScript(envOverrides: Record<string, string> = {}): any {
-  const result = runConfigScriptRaw(envOverrides);
+  const env = buildTestEnv(envOverrides);
+  withEnv(env, () => main());
+  runMessagingPostInstall(env);
+  const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
+  return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+}
+
+const runMessagingConfig = async (channels: string, env: Record<string, string> = {}) =>
+  runConfigScript(await messagingEnv(channels, env));
+
+function runConfigSubprocess(envOverrides: Record<string, string> = {}): any {
+  const env = buildTestEnv(envOverrides);
+  const result = spawnSync("node", SCRIPT_ARGS, {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    env,
+    timeout: 10_000,
+  });
   if (result.status !== 0) {
     throw new Error(
-      `Script failed (exit ${result.status}):\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      `Script failed (exit ${result.status}):
+stdout: ${result.stdout}
+stderr: ${result.stderr}`,
     );
   }
+  runMessagingPostInstall(env);
 
   const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
   return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+}
+
+function buildBaseConfigDirect(envOverrides: Record<string, string> = {}): any {
+  return withConfigEnv(envOverrides, () => buildConfig());
+}
+
+const buildMessagingBaseConfig = async (channels: string, env: Record<string, string> = {}) =>
+  buildBaseConfigDirect(await messagingEnv(channels, env));
+
+function buildConfigDirect(envOverrides: Record<string, string> = {}): any {
+  const env = buildTestEnv(envOverrides);
+  return withEnv(env, () => {
+    const config = buildConfig();
+    applyMessagingAgentRenderToObject(
+      config,
+      readMessagingBuildPlanFromEnv(env, "openclaw"),
+      "openclaw.json",
+    );
+    return config;
+  });
+}
+
+const buildMessagingConfig = async (channels: string, env: Record<string, string> = {}) =>
+  buildConfigDirect(await messagingEnv(channels, env));
+
+function expectBuildConfigError(envOverrides: Record<string, string>, message: string | RegExp) {
+  expect(() => buildConfigDirect(envOverrides)).toThrow(message);
+}
+
+function runCapturingConsoleError<T>(fn: () => T): { result: T; stderr: string } {
+  const original = console.error;
+  const messages: string[] = [];
+  console.error = (...args: unknown[]) => {
+    messages.push(args.map(String).join(" "));
+  };
+  try {
+    return { result: fn(), stderr: messages.join("\n") };
+  } finally {
+    console.error = original;
+  }
 }
 
 function writeWeChatPluginMetadata(manifest: Record<string, unknown>) {
@@ -80,18 +194,21 @@ function writeWeChatNpmPackageMetadata(manifest: Record<string, unknown>) {
   fs.writeFileSync(path.join(pluginDir, "package.json"), JSON.stringify(manifest, null, 2));
 }
 
-function wechatExtensionPath(stateDir = path.join(tmpDir, ".openclaw")) {
-  return path.join(fs.realpathSync(stateDir), "extensions", "openclaw-weixin");
-}
-
-function wechatNpmPackagePath(stateDir = path.join(tmpDir, ".openclaw")) {
-  return path.join(
-    fs.realpathSync(stateDir),
+function writeWeChatNpmPluginMetadata(manifest: Record<string, unknown>) {
+  const pluginDir = path.join(
+    tmpDir,
+    ".openclaw",
     "npm",
     "node_modules",
     "@tencent-weixin",
     "openclaw-weixin",
   );
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(path.join(pluginDir, "openclaw.plugin.json"), JSON.stringify(manifest, null, 2));
+}
+
+function wechatExtensionPath(stateDir = path.join(tmpDir, ".openclaw")) {
+  return path.join(fs.realpathSync(stateDir), "extensions", "openclaw-weixin");
 }
 
 function writeRegistryManifest(
@@ -113,10 +230,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Phase 1: Extraction — behavior-preserving tests
-// ═══════════════════════════════════════════════════════════════════
-describe("generate-openclaw-config.py: config generation", () => {
+describe("generate-openclaw-config.mts: config generation", () => {
   it("generates valid JSON with minimal env vars", () => {
     const config = runConfigScript();
     expect(config).toBeDefined();
@@ -125,9 +239,71 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.agents).toBeDefined();
   });
 
+  it("runs as a node --experimental-strip-types executable", () => {
+    const config = runConfigSubprocess();
+    expect(config.gateway).toBeDefined();
+    expect(config.models).toBeDefined();
+  });
+
+  it("keeps OpenClaw OTEL diagnostics disabled by default", () => {
+    const config = runConfigScript();
+    expect(config.diagnostics).toBeUndefined();
+    expect(config.plugins.entries["diagnostics-otel"]).toBeUndefined();
+  });
+
+  it("enables traces-only OpenClaw OTEL diagnostics when requested", () => {
+    const config = buildConfigDirect({
+      NEMOCLAW_OPENCLAW_OTEL: "1",
+      NEMOCLAW_OPENCLAW_OTEL_ENDPOINT: "http://host.openshell.internal:4318",
+      NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME: "nemoclaw-local",
+      NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE: "0.5",
+    });
+
+    expect(config.plugins.entries["diagnostics-otel"]).toEqual({ enabled: true });
+    expect(config.diagnostics).toEqual({
+      enabled: true,
+      otel: {
+        enabled: true,
+        endpoint: "http://host.openshell.internal:4318",
+        protocol: "http/protobuf",
+        serviceName: "nemoclaw-local",
+        traces: true,
+        metrics: false,
+        logs: false,
+        sampleRate: 0.5,
+      },
+    });
+    expect(config.diagnostics.otel.captureContent).toBeUndefined();
+  });
+
+  it("rejects OTEL endpoints with embedded credentials", () => {
+    const result = runConfigScriptRaw({
+      NEMOCLAW_OPENCLAW_OTEL: "1",
+      NEMOCLAW_OPENCLAW_OTEL_ENDPOINT: "http://token@example.com:4318",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("NEMOCLAW_OPENCLAW_OTEL_ENDPOINT must not include credentials");
+  });
+
   it("sets dangerouslyDisableDeviceAuth to false for loopback URL", () => {
     const config = runConfigScript({ CHAT_UI_URL: "http://127.0.0.1:18789" });
     expect(config.gateway.controlUi.dangerouslyDisableDeviceAuth).toBe(false);
+  });
+
+  it("treats loopback-looking URL userinfo before a remote host as remote", () => {
+    const config = buildConfigDirect({ CHAT_UI_URL: "http://127.0.0.1:18789@evil.example" });
+    expect(config.gateway.controlUi.dangerouslyDisableDeviceAuth).toBe(true);
+    expect(config.gateway.controlUi.allowedOrigins).toContain("http://evil.example");
+    expect(config.gateway.controlUi.allowedOrigins).not.toContain(
+      "http://127.0.0.1:18789@evil.example",
+    );
+  });
+
+  it("treats localhost userinfo before a remote host as remote", () => {
+    const config = buildConfigDirect({ CHAT_UI_URL: "http://localhost@evil.example" });
+    expect(config.gateway.controlUi.dangerouslyDisableDeviceAuth).toBe(true);
+    expect(config.gateway.controlUi.allowedOrigins).toContain("http://evil.example");
   });
 
   it("sets dangerouslyDisableDeviceAuth to true when env var is '1'", () => {
@@ -145,6 +321,11 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.gateway.controlUi.allowInsecureAuth).toBe(false);
   });
 
+  it("falls back to text input when NEMOCLAW_INFERENCE_INPUTS is empty", () => {
+    const config = runConfigScript({ NEMOCLAW_INFERENCE_INPUTS: "" });
+    expect(config.models.providers["test-provider"].models[0].input).toEqual(["text"]);
+  });
+
   it("includes non-loopback origin in allowedOrigins", () => {
     const config = runConfigScript({
       CHAT_UI_URL: "https://nemoclaw0-xxx.brevlab.com:18789",
@@ -153,9 +334,7 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.gateway.controlUi.allowedOrigins).toContain(
       "https://nemoclaw0-xxx.brevlab.com:18789",
     );
-    expect(config.gateway.controlUi.allowedOrigins).toContain(
-      "https://nemoclaw0-xxx.brevlab.com",
-    );
+    expect(config.gateway.controlUi.allowedOrigins).toContain("https://nemoclaw0-xxx.brevlab.com");
   });
 
   it("includes only loopback origin for loopback URL", () => {
@@ -163,13 +342,13 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.gateway.controlUi.allowedOrigins).toEqual(["http://127.0.0.1:18789"]);
   });
 
-  it("#3256: emits gateway.port from a non-default CHAT_UI_URL port", () => {
+  it("emits gateway.port from a non-default CHAT_UI_URL port (#3256)", () => {
     const config = runConfigScript({ CHAT_UI_URL: "http://127.0.0.1:18790" });
     expect(config.gateway.port).toBe(18790);
     expect(config.gateway.controlUi.allowedOrigins).toEqual(["http://127.0.0.1:18790"]);
   });
 
-  it("#3256: lets NEMOCLAW_DASHBOARD_PORT drive gateway.port when set", () => {
+  it("lets NEMOCLAW_DASHBOARD_PORT drive gateway.port when set (#3256)", () => {
     const config = runConfigScript({
       CHAT_UI_URL: "",
       NEMOCLAW_DASHBOARD_PORT: "18790",
@@ -179,13 +358,37 @@ describe("generate-openclaw-config.py: config generation", () => {
   });
 
   it("rejects an invalid NEMOCLAW_DASHBOARD_PORT", () => {
-    const result = runConfigScriptRaw({ NEMOCLAW_DASHBOARD_PORT: "18790x" });
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("NEMOCLAW_DASHBOARD_PORT");
-    expect(result.stderr).toContain("1024 and 65535");
+    expectBuildConfigError(
+      { NEMOCLAW_DASHBOARD_PORT: "18790x" },
+      /NEMOCLAW_DASHBOARD_PORT.*1024 and 65535/,
+    );
   });
 
-  it("includes portless origin for reverse-proxy access (Fixes #3000)", () => {
+  it("rejects an out-of-range NEMOCLAW_DASHBOARD_PORT", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_DASHBOARD_PORT: "80" },
+      /NEMOCLAW_DASHBOARD_PORT.*1024 and 65535/,
+    );
+  });
+
+  it("falls back to the default gateway port when CHAT_UI_URL uses a reserved port", () => {
+    const config = buildConfigDirect({ CHAT_UI_URL: "http://127.0.0.1:81" });
+    expect(config.gateway.port).toBe(18789);
+    expect(config.gateway.controlUi.allowedOrigins).toEqual([
+      "http://127.0.0.1:18789",
+      "http://127.0.0.1:81",
+    ]);
+  });
+
+  it("normalizes schemeless CHAT_UI_URL values before parsing", () => {
+    const config = buildConfigDirect({ CHAT_UI_URL: "remote.example:18790" });
+    expect(config.gateway.port).toBe(18790);
+    expect(config.gateway.controlUi.dangerouslyDisableDeviceAuth).toBe(true);
+    expect(config.gateway.controlUi.allowedOrigins).toContain("http://remote.example:18790");
+    expect(config.gateway.controlUi.allowedOrigins).toContain("http://remote.example");
+  });
+
+  it("includes a portless origin for reverse-proxy access (#3000)", () => {
     const config = runConfigScript({
       CHAT_UI_URL: "https://nemoclaw0-abc123.brevlab.com:18789",
     });
@@ -214,24 +417,32 @@ describe("generate-openclaw-config.py: config generation", () => {
 
   it("does not crash on malformed port in CHAT_UI_URL", () => {
     const config = runConfigScript({
-      CHAT_UI_URL: "https://example.com:abc",
+      CHAT_UI_URL: "https://ilinkai.wechat.com.com:abc",
     });
     const origins = config.gateway.controlUi.allowedOrigins;
     expect(origins).toContain("http://127.0.0.1:18789");
-    expect(origins).not.toContain("https://example.com");
+    expect(origins).not.toContain("https://ilinkai.wechat.com.com");
   });
 
-  it("parses messaging channels from base64", () => {
+  it("leaves messaging render to the messaging build applier", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await buildMessagingBaseConfig(channels);
+    expect(config.channels.telegram).toBeUndefined();
+  });
+
+  it("parses messaging channels from base64", async () => {
+    const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
+    const config = await runMessagingConfig(channels);
     expect(config.channels).toBeDefined();
     expect(config.channels.telegram).toBeDefined();
   });
 
-  it("emits a tokenless WhatsApp config block for QR-paired channels", () => {
+  it("emits a tokenless WhatsApp config block for QR-paired channels", async () => {
     const channels = Buffer.from(JSON.stringify(["whatsapp"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await buildMessagingConfig(channels);
     expect(config.channels.whatsapp).toBeDefined();
+    expect(config.channels.whatsapp.enabled).toBe(true);
+    expect(config.plugins.entries.whatsapp).toEqual({ enabled: true });
     const account = config.channels.whatsapp.accounts.default;
     expect(account.enabled).toBe(true);
     expect(account.healthMonitor).toEqual({ enabled: false });
@@ -240,202 +451,100 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(account.appToken).toBeUndefined();
   });
 
-  it("keeps WhatsApp config alongside token-based channels in the same run", () => {
+  it("keeps WhatsApp config alongside token-based channels in the same run", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram", "whatsapp"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await buildMessagingConfig(channels);
+    expect(config.channels.telegram.enabled).toBe(true);
+    expect(config.plugins.entries.telegram).toEqual({ enabled: true });
     expect(config.channels.telegram.accounts.default.botToken).toBe(
       "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
     );
+    expect(config.channels.whatsapp.enabled).toBe(true);
+    expect(config.plugins.entries.whatsapp).toEqual({ enabled: true });
     expect(config.channels.whatsapp.accounts.default.enabled).toBe(true);
     expect(config.channels.whatsapp.accounts.default.botToken).toBeUndefined();
   });
 
-  it("emits groups with requireMention when TELEGRAM_REQUIRE_MENTION is true (#3022)", () => {
+  it("emits groups with requireMention when TELEGRAM_REQUIRE_MENTION is true (#3022)", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
     const telegramConfig = Buffer.from(JSON.stringify({ requireMention: true })).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_TELEGRAM_CONFIG_B64: telegramConfig,
     });
     expect(config.channels.telegram.accounts.default.groupPolicy).toBe("open");
     expect(config.channels.telegram.groups).toEqual({ "*": { requireMention: true } });
   });
 
-  it("keeps groupPolicy open with no groups stanza when requireMention is false (#3022)", () => {
+  it("keeps groupPolicy open with no groups stanza when requireMention is false (#3022)", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
-    const telegramConfig = Buffer.from(JSON.stringify({ requireMention: false })).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const telegramConfig = Buffer.from(JSON.stringify({ requireMention: false })).toString(
+      "base64",
+    );
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_TELEGRAM_CONFIG_B64: telegramConfig,
     });
     expect(config.channels.telegram.accounts.default.groupPolicy).toBe("open");
     expect(config.channels.telegram.groups).toBeUndefined();
   });
 
-  it("defaults Telegram groupPolicy to 'open' with no groups stanza when telegramConfig is empty (#3022)", () => {
+  it("defaults Telegram group replies to require mentions when telegramConfig is empty (#3022)", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
-    });
+    const config = await runMessagingConfig(channels);
     expect(config.channels.telegram.accounts.default.groupPolicy).toBe("open");
-    expect(config.channels.telegram.groups).toBeUndefined();
+    expect(config.channels.telegram.groups).toEqual({ "*": { requireMention: true } });
   });
 
-  it("does not seed channels.openclaw-weixin before the base plugin install registry exists", () => {
+  it("emits OpenClaw-valid Discord guild allowlist config when guilds are provided", async () => {
+    const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
+    const legacyGuilds = { "1234567890": { enabled: true, requireMention: true } };
+    const config = await buildMessagingConfig(channels, {
+      NEMOCLAW_DISCORD_GUILDS_B64: Buffer.from(JSON.stringify(legacyGuilds)).toString("base64"),
+    });
+
+    expect(config.channels.discord.groupPolicy).toBe("allowlist");
+    expect(config.channels.discord.guilds).toEqual({
+      "1234567890": { requireMention: true },
+    });
+    expect(config.channels.discord.guilds["1234567890"].enabled).toBeUndefined();
+  });
+
+  it("applies WeChat post-agent-install build-file outputs through the messaging applier", async () => {
     const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
     const wechatConfig = Buffer.from(
-      JSON.stringify({ accountId: "primary", baseUrl: "https://example", userId: "u1" }),
+      JSON.stringify({ accountId: "primary", baseUrl: "https://ilinkai.wechat.com", userId: "u1" }),
     ).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_WECHAT_CONFIG_B64: wechatConfig,
     });
-    expect(config.channels?.["openclaw-weixin"]).toBeUndefined();
-    // The "wechat" alias is the NemoClaw channel name, not an OpenClaw
-    // channel id — must never appear under channels.
-    expect(config.channels?.wechat).toBeUndefined();
-  });
 
-  it("seeds channels.openclaw-weixin when the base plugin install registry exists", () => {
-    const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
-    const installEntry = {
+    expect(config.plugins?.installs?.["openclaw-weixin"]).toEqual({
       source: "npm",
       spec: "@tencent-weixin/openclaw-weixin@2.4.3",
-    };
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(
-      configPath,
-      JSON.stringify({ plugins: { installs: { "openclaw-weixin": installEntry } } }),
+      installPath: "/sandbox/.openclaw/extensions/openclaw-weixin",
+    });
+    expect(config.plugins?.load?.paths ?? []).not.toContain(
+      "/sandbox/.openclaw/extensions/openclaw-weixin",
     );
-
-    const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
-    const wechatConfig = Buffer.from(
-      JSON.stringify({ accountId: "primary", baseUrl: "https://example", userId: "u1" }),
-    ).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
-      NEMOCLAW_WECHAT_CONFIG_B64: wechatConfig,
-    });
-
-    expect(config.plugins?.installs?.["openclaw-weixin"]).toEqual({
-      ...installEntry,
-      installPath: wechatExtensionPath(),
-    });
-    expect(config.plugins?.load?.paths).toEqual([wechatExtensionPath()]);
-    expect(config.channels?.["openclaw-weixin"]?.accounts?.primary).toEqual({
-      enabled: true,
-    });
-    expect(config.channels?.wechat).toBeUndefined();
-
-    const accountFile = path.join(
-      tmpDir,
-      ".openclaw",
-      "openclaw-weixin",
-      "accounts",
-      "primary.json",
-    );
-    const account = JSON.parse(fs.readFileSync(accountFile, "utf-8"));
-    expect(account).toMatchObject({
-      token: "openshell:resolve:env:WECHAT_BOT_TOKEN",
-      baseUrl: "https://example",
-      userId: "u1",
-    });
-  });
-
-  it("seeds channels.openclaw-weixin and restores install registry when installed WeChat plugin metadata exists", () => {
-    writeWeChatPluginMetadata({
-      id: "openclaw-weixin",
-      channels: ["openclaw-weixin"],
-      channelConfigs: { "openclaw-weixin": {} },
-    });
-
-    const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
-    const wechatConfig = Buffer.from(
-      JSON.stringify({ accountId: "primary", baseUrl: "https://example", userId: "u1" }),
-    ).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
-      NEMOCLAW_WECHAT_CONFIG_B64: wechatConfig,
-    });
-
-    expect(config.plugins?.installs?.["openclaw-weixin"]).toEqual({
-      source: "npm",
-      spec: "@tencent-weixin/openclaw-weixin@2.4.3",
-      installPath: wechatExtensionPath(),
-    });
-    expect(config.plugins?.load?.paths).toEqual([wechatExtensionPath()]);
-    expect(config.channels?.["openclaw-weixin"]?.accounts?.primary).toEqual({
-      enabled: true,
-    });
+    expect(config.plugins?.entries?.["openclaw-weixin"]?.enabled).toBe(true);
+    expect(config.channels?.["openclaw-weixin"]?.accounts?.primary).toEqual({ enabled: true });
     expect(config.channels?.wechat).toBeUndefined();
   });
 
-  it("uses the npm package path when installed WeChat package metadata exists without an extension dir", () => {
-    writeWeChatNpmPackageMetadata({
-      name: "@tencent-weixin/openclaw-weixin",
-      openclaw: { channels: ["vendor-weixin"] },
-    });
-
-    const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
-    const wechatConfig = Buffer.from(
-      JSON.stringify({ accountId: "primary", baseUrl: "https://example", userId: "u1" }),
-    ).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
-      NEMOCLAW_WECHAT_CONFIG_B64: wechatConfig,
-    });
-
-    expect(config.plugins?.installs?.["openclaw-weixin"]).toEqual({
-      source: "npm",
-      spec: "@tencent-weixin/openclaw-weixin@2.4.3",
-      installPath: wechatNpmPackagePath(),
-    });
-    expect(config.plugins?.load?.paths).toEqual([wechatNpmPackagePath()]);
-    expect(config.channels?.["vendor-weixin"]?.accounts?.primary).toEqual({
-      enabled: true,
-    });
-    expect(config.channels?.["openclaw-weixin"]?.accounts?.primary).toEqual({
-      enabled: true,
-    });
-    expect(config.channels?.wechat).toBeUndefined();
-    expect(fs.existsSync(wechatExtensionPath())).toBe(false);
-  });
-
-  it("seeds channels.openclaw-weixin when the Dockerfile marks the plugin preinstalled", () => {
-    const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
-    const wechatConfig = Buffer.from(
-      JSON.stringify({ accountId: "primary", baseUrl: "https://example", userId: "u1" }),
-    ).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
-      NEMOCLAW_WECHAT_CONFIG_B64: wechatConfig,
-      NEMOCLAW_OPENCLAW_WECHAT_PLUGIN_PREINSTALLED: "1",
-    });
-
-    expect(config.channels?.["openclaw-weixin"]?.accounts?.primary).toEqual({
-      enabled: true,
-    });
-    expect(config.channels?.wechat).toBeUndefined();
-  });
-
-  it("omits channels.openclaw-weixin when no accountId was captured", () => {
+  it("omits channels.openclaw-weixin when no accountId was captured", async () => {
     // No QR-login result → seed step bails on the empty accountId and
     // leaves openclaw.json untouched, so the bridge stays dormant.
     const channels = Buffer.from(JSON.stringify(["wechat"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await runMessagingConfig(channels);
     expect(config.channels?.["openclaw-weixin"]).toBeUndefined();
     expect(config.channels?.wechat).toBeUndefined();
   });
 
-  it("enables the openclaw-weixin plugin entry unconditionally", () => {
-    // The plugin ships in the base image, so we activate the entry on every
-    // build. With no seeded account, the upstream auth/accounts.ts no-ops
-    // and the bridge never starts.
+  it("omits the openclaw-weixin plugin entry until WeChat is active", () => {
     const config = runConfigScript({});
-    expect(config.plugins?.entries?.["openclaw-weixin"]?.enabled).toBe(true);
+    expect(config.plugins?.entries?.["openclaw-weixin"]).toBeUndefined();
   });
 
-  it("preserves base-image plugin install registry entries", () => {
+  it("preserves existing plugin install registry entries without enabling WeChat", () => {
     const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
     const installEntry = {
@@ -450,17 +559,33 @@ describe("generate-openclaw-config.py: config generation", () => {
     const config = runConfigScript({});
 
     expect(config.plugins?.installs?.["openclaw-weixin"]).toEqual(installEntry);
-    expect(config.plugins?.entries?.["openclaw-weixin"]?.enabled).toBe(true);
+    expect(config.plugins?.entries?.["openclaw-weixin"]).toBeUndefined();
   });
 
-  it("emits canonical placeholders and proxy routing for non-Slack channels", () => {
+  it("ignores malformed existing plugin install registries while regenerating config", () => {
+    const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+
+    for (const existing of [null, { plugins: null }, { plugins: { installs: {} } }]) {
+      fs.writeFileSync(configPath, JSON.stringify(existing));
+      const config = runConfigScript();
+      expect(config.plugins?.entries?.["openclaw-weixin"]).toBeUndefined();
+      expect(config.plugins?.installs).toBeUndefined();
+    }
+  });
+
+  it("emits canonical placeholders and proxy routing for non-Slack channels", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram", "discord"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await runMessagingConfig(channels);
     expect(config.proxy).toMatchObject({
       enabled: true,
       proxyUrl: "http://10.200.0.1:3128",
-      loopbackMode: "proxy",
+      loopbackMode: "gateway-only",
     });
+    expect(config.channels.telegram.enabled).toBe(true);
+    expect(config.plugins.entries.telegram).toEqual({ enabled: true });
+    expect(config.channels.discord.enabled).toBe(true);
+    expect(config.plugins.entries.discord).toEqual({ enabled: true });
     expect(config.channels.telegram.accounts.default.botToken).toBe(
       "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
     );
@@ -471,10 +596,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("#3894: routes Discord gateway traffic through OpenClaw's managed proxy", () => {
+  it("routes Discord gateway traffic through OpenClaw's managed proxy (#3894)", async () => {
     const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_PROXY_HOST: "10.201.0.9",
       NEMOCLAW_PROXY_PORT: "43128",
     });
@@ -482,7 +606,7 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.proxy).toEqual({
       enabled: true,
       proxyUrl: "http://10.201.0.9:43128",
-      loopbackMode: "proxy",
+      loopbackMode: "gateway-only",
     });
     expect(config.channels.discord.accounts.default).toMatchObject({
       token: "openshell:resolve:env:DISCORD_BOT_TOKEN",
@@ -491,10 +615,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("does not write a Discord account proxy when the managed proxy is configured", () => {
+  it("does not write a Discord account proxy when the managed proxy is configured", async () => {
     const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_PROXY_PORT: "43128",
     });
 
@@ -502,10 +625,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("can defer OpenClaw managed proxy config for build-time doctor", () => {
+  it("can defer OpenClaw managed proxy config for build-time doctor", async () => {
     const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_OPENCLAW_MANAGED_PROXY: "0",
     });
 
@@ -513,10 +635,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("ignores the OpenShell loopback proxy env var when using OpenClaw managed proxy", () => {
+  it("ignores the OpenShell loopback proxy env var when using OpenClaw managed proxy", async () => {
     const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       OPENSHELL_LOOPBACK_PROXY_URL: "http://127.0.0.1:45211",
       NEMOCLAW_DISCORD_PROXY_PORT: "43129",
     });
@@ -525,10 +646,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("keeps Telegram on the OpenShell proxy while Discord relies on the managed proxy", () => {
+  it("keeps Telegram on the OpenShell proxy while Discord relies on the managed proxy", async () => {
     const channels = Buffer.from(JSON.stringify(["telegram", "discord"])).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_PROXY_HOST: "10.201.0.9",
       NEMOCLAW_PROXY_PORT: "43128",
     });
@@ -538,9 +658,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.channels.discord.accounts.default.proxy).toBeUndefined();
   });
 
-  it("emits Bolt-shape placeholders for Slack so the SDK's prefix regex passes", () => {
+  it("emits Bolt-shape placeholders for Slack so the SDK's prefix regex passes", async () => {
     const channels = Buffer.from(JSON.stringify(["slack"])).toString("base64");
-    const config = runConfigScript({ NEMOCLAW_MESSAGING_CHANNELS_B64: channels });
+    const config = await runMessagingConfig(channels);
     expect(config.channels.slack.enabled).toBe(true);
     expect(config.plugins.entries.slack).toEqual({ enabled: true });
     const slack = config.channels.slack.accounts.default;
@@ -552,12 +672,41 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(slack.appToken).toMatch(/^xapp-[A-Za-z0-9_-]+$/);
   });
 
-  it("uses Slack allowed IDs for DMs and channel mention allowlisting (#3729)", () => {
+  it("marks Telegram and Discord channels enabled so OpenClaw loads the bridges (#4314, #4390)", async () => {
+    // Regression: OpenClaw 2026.5.22 no longer auto-starts a channel bridge
+    // from the account-level enabled flag alone. The Slack mitigation in
+    // PR #4222 added `channels.slack.enabled: true`; #4314 / #4390 reported
+    // the same silent failure for Telegram, and the symptom matches Discord
+    // too. Bake the top-level enabled marker for every credential-backed
+    // messaging channel.
+    const channels = Buffer.from(JSON.stringify(["telegram", "discord"])).toString("base64");
+    const config = await runMessagingConfig(channels);
+    expect(config.channels.telegram.enabled).toBe(true);
+    expect(config.channels.discord.enabled).toBe(true);
+    expect(config.channels.telegram.accounts.default.enabled).toBe(true);
+    expect(config.channels.discord.accounts.default.enabled).toBe(true);
+  });
+
+  it("uses Telegram allowed IDs for direct-message allowlisting (#4553)", async () => {
+    const allowedUsers = ["8388960805", "8388960806"];
+    const channels = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
+    const allowedIds = Buffer.from(JSON.stringify({ telegram: allowedUsers })).toString("base64");
+    const config = await runMessagingConfig(channels, {
+      NEMOCLAW_MESSAGING_ALLOWED_IDS_B64: allowedIds,
+    });
+    const telegram = config.channels.telegram.accounts.default;
+
+    expect(config.channels.telegram.enabled).toBe(true);
+    expect(config.plugins.entries.telegram).toEqual({ enabled: true });
+    expect(telegram.dmPolicy).toBe("allowlist");
+    expect(telegram.allowFrom).toEqual(allowedUsers);
+  });
+
+  it("uses Slack allowed IDs for DMs and channel mention allowlisting (#3729)", async () => {
     const allowedUsers = ["U01ABC2DEF3", "U04GHI5JKL6"];
     const channels = Buffer.from(JSON.stringify(["slack"])).toString("base64");
     const allowedIds = Buffer.from(JSON.stringify({ slack: allowedUsers })).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_MESSAGING_ALLOWED_IDS_B64: allowedIds,
     });
     const slack = config.channels.slack.accounts.default;
@@ -576,14 +725,13 @@ describe("generate-openclaw-config.py: config generation", () => {
     });
   });
 
-  it("uses Slack allowed channels to scope channel @mentions", () => {
+  it("uses Slack allowed channels to scope channel @mentions", async () => {
     const allowedUsers = ["U01ABC2DEF3", "U04GHI5JKL6"];
     const allowedChannels = ["C012AB3CD", "C987ZY6XW"];
     const channels = Buffer.from(JSON.stringify(["slack"])).toString("base64");
     const allowedIds = Buffer.from(JSON.stringify({ slack: allowedUsers })).toString("base64");
     const slackConfig = Buffer.from(JSON.stringify({ allowedChannels })).toString("base64");
-    const config = runConfigScript({
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channels,
+    const config = await runMessagingConfig(channels, {
       NEMOCLAW_MESSAGING_ALLOWED_IDS_B64: allowedIds,
       NEMOCLAW_SLACK_CONFIG_B64: slackConfig,
     });
@@ -606,9 +754,9 @@ describe("generate-openclaw-config.py: config generation", () => {
     });
   });
 
-  it("enables native OpenClaw Tool Search by default", () => {
+  it("enables structured OpenClaw Tool Search by default", () => {
     const config = runConfigScript();
-    expect(config.tools?.toolSearch).toBe(true);
+    expect(config.tools?.toolSearch).toEqual(STRUCTURED_TOOL_SEARCH);
   });
 
   it("enables keyless web_fetch through the trusted env proxy by default", () => {
@@ -620,29 +768,35 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.tools?.web?.search).toBeUndefined();
   });
 
-  it("enables web search when env is '1'", () => {
+  it("defaults enabled web search to Brave using the current plugin schema", () => {
     const config = runConfigScript({ NEMOCLAW_WEB_SEARCH_ENABLED: "1" });
-    expect(config.tools?.toolSearch).toBe(true);
-    expect(config.tools?.web?.search).toEqual({
+    expect(config.tools?.toolSearch).toEqual(STRUCTURED_TOOL_SEARCH);
+    // #5266: apiKey lives under plugins.entries.brave.config (not inline on
+    // tools.web.search) so build-time `openclaw plugins install` validates.
+    expect(config.tools?.web?.search).toEqual({ enabled: true, provider: "brave" });
+    expect(config.plugins?.entries?.brave).toEqual({
       enabled: true,
-      provider: "brave",
-      apiKey: "openshell:resolve:env:BRAVE_API_KEY",
+      config: { webSearch: { apiKey: "openshell:resolve:env:BRAVE_API_KEY" } },
     });
-    expect(config.tools?.web?.fetch).toEqual({
-      enabled: true,
-      useTrustedEnvProxy: true,
-    });
+    expect(config.tools?.web?.fetch).toEqual({ enabled: true, useTrustedEnvProxy: true });
   });
 
   it("omits web search when env is not set", () => {
     const config = runConfigScript();
-    expect(config.tools?.toolSearch).toBe(true);
+    expect(config.tools?.toolSearch).toEqual(STRUCTURED_TOOL_SEARCH);
     expect(config.tools?.web?.search).toBeUndefined();
   });
 
   it("propagates agent timeout", () => {
     const config = runConfigScript({ NEMOCLAW_AGENT_TIMEOUT: "300" });
     expect(config.agents.defaults.timeoutSeconds).toBe(300);
+  });
+
+  it("rejects invalid agent timeout values", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_AGENT_TIMEOUT: "forever" },
+      "NEMOCLAW_AGENT_TIMEOUT must be a positive integer",
+    );
   });
 
   it("omits heartbeat when NEMOCLAW_AGENT_HEARTBEAT_EVERY is unset", () => {
@@ -662,18 +816,17 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.agents.defaults.heartbeat).toEqual({ every: "30m" });
   });
 
-  it("disables heartbeat when set to 0m (NemoClaw#2880)", () => {
+  it("disables heartbeat when set to 0m (#2880)", () => {
     const config = runConfigScript({ NEMOCLAW_AGENT_HEARTBEAT_EVERY: "0m" });
     expect(config.agents.defaults.heartbeat).toEqual({ every: "0m" });
   });
 
   it("rejects malformed heartbeat values, preserves OpenClaw default, and warns on stderr", () => {
-    const result = runConfigScriptRaw({ NEMOCLAW_AGENT_HEARTBEAT_EVERY: "5 minutes" });
-    expect(result.status).toBe(0);
-    const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    const { result: config, stderr } = runCapturingConsoleError(() =>
+      buildConfigDirect({ NEMOCLAW_AGENT_HEARTBEAT_EVERY: "5 minutes" }),
+    );
     expect(config.agents.defaults.heartbeat).toBeUndefined();
-    expect(result.stderr).toMatch(
+    expect(stderr).toMatch(
       /\[SECURITY\] NEMOCLAW_AGENT_HEARTBEAT_EVERY must match \^\\d\+\(s\|m\|h\)\$, got "5 minutes"/,
     );
   });
@@ -687,6 +840,323 @@ describe("generate-openclaw-config.py: config generation", () => {
     const config = runConfigScript();
     expect(config.agents.defaults.thinkingDefault).toBe("off");
   });
+
+  // ─── agents.list bake ─────────────────────────────────────────────────────
+  // Even with no NEMOCLAW_EXTRA_AGENTS_JSON_B64 set, agents.list must exist
+  // with the canonical main entry pinned as default. Otherwise a wholesale
+  // list overwrite could leave OpenClaw resolving default to agents[0]
+  // without "main" present.
+
+  const TOOLS_OK = { profile: "minimal", allow: ["read"], deny: ["exec"] };
+
+  function makeExtra(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: "research",
+      workspace: "/sandbox/.openclaw/workspace-research",
+      agentDir: "/sandbox/.openclaw/agents/research",
+      tools: TOOLS_OK,
+      ...overrides,
+    };
+  }
+
+  function extraAgentsB64(extras: unknown): string {
+    return Buffer.from(JSON.stringify(extras)).toString("base64");
+  }
+
+  it("always writes agents.list with a default 'main' entry first", () => {
+    const config = runConfigScript();
+    expect(Array.isArray(config.agents.list)).toBe(true);
+    expect(config.agents.list).toHaveLength(1);
+    expect(config.agents.list[0]).toEqual({ id: "main", default: true });
+  });
+
+  it("appends NEMOCLAW_EXTRA_AGENTS_JSON_B64 entries after main", () => {
+    const extras = [
+      makeExtra({ id: "research" }),
+      makeExtra({
+        id: "writing",
+        workspace: "/sandbox/.openclaw/workspace-writing",
+        agentDir: "/sandbox/.openclaw/agents/writing",
+      }),
+    ];
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64(extras),
+    });
+    expect(config.agents.list).toHaveLength(3);
+    expect(config.agents.list[0]).toEqual({ id: "main", default: true });
+    expect(config.agents.list[1]).toMatchObject({ id: "research" });
+    expect(config.agents.list[2]).toMatchObject({ id: "writing" });
+  });
+
+  it("keeps 'main' as the default even when extras are present", () => {
+    // Wholesale list replacement would leave agents[0] = first extra, so
+    // resolveDefaultAgentId would silently re-elect the first extra as
+    // default. The bake must always emit { id: "main", default: true } first.
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra()]),
+    });
+    const defaultEntries = config.agents.list.filter(
+      (entry: { default?: boolean }) => entry.default === true,
+    );
+    expect(defaultEntries).toHaveLength(1);
+    expect(defaultEntries[0].id).toBe("main");
+    expect(config.agents.list[0].id).toBe("main");
+  });
+
+  it("rejects extras that claim id 'main'", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ id: "main" })]) },
+      /reserved for the primary agent/,
+    );
+  });
+
+  it("rejects extras that set default: true", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ default: true })]) },
+      /default cannot be true/,
+    );
+  });
+
+  it("rejects extras with duplicate ids", () => {
+    const extras = [
+      makeExtra(),
+      makeExtra({
+        workspace: "/sandbox/.openclaw/workspace-research-2",
+        agentDir: "/sandbox/.openclaw/agents/research-2",
+      }),
+    ];
+    expectBuildConfigError(
+      { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64(extras) },
+      /is duplicated/,
+    );
+  });
+
+  it("rejects extras whose ids violate the regex", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ id: "Research" })]) },
+      /\.id must match/,
+    );
+  });
+
+  it("rejects extras with relative paths", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ workspace: "workspace-research" }),
+        ]),
+      },
+      /must be an absolute path/,
+    );
+  });
+
+  it("rejects extras whose paths escape the sandbox state root", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ workspace: "/etc/openclaw/workspace-research" }),
+        ]),
+      },
+      /workspace must equal "\/sandbox\/\.openclaw\/workspace-research"/,
+    );
+  });
+
+  it("rejects extras that smuggle dot-segments past the sandbox state root prefix", () => {
+    // /sandbox/.openclaw/../../tmp/research resolves to /tmp/research; a raw
+    // startsWith() check on the prefix would accept it. The validator must
+    // normalise before containment.
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ workspace: "/sandbox/.openclaw/../../tmp/research" }),
+        ]),
+      },
+      /workspace must equal "\/sandbox\/\.openclaw\/workspace-research"/,
+    );
+  });
+
+  it("rejects extras whose workspace points anywhere but the canonical workspace-<id> slot", () => {
+    // The runtime startup script provisions /sandbox/.openclaw/workspace-<id>
+    // as the per-agent workspace. Pointing at sibling paths (gateway state,
+    // openclaw.json, credentials/) blurs that isolation boundary.
+    for (const workspace of [
+      "/sandbox/.openclaw",
+      "/sandbox/.openclaw/openclaw.json",
+      "/sandbox/.openclaw/credentials",
+      "/sandbox/.openclaw/workspace",
+      "/sandbox/.openclaw/workspace-other",
+    ]) {
+      expectBuildConfigError(
+        { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ workspace })]) },
+        /workspace must equal "\/sandbox\/\.openclaw\/workspace-research"/,
+      );
+    }
+  });
+
+  it("rejects extras whose agentDir points anywhere but the canonical agents/<id> slot", () => {
+    for (const agentDir of [
+      "/sandbox/.openclaw",
+      "/sandbox/.openclaw/agents",
+      "/sandbox/.openclaw/agents/other",
+      "/sandbox/.openclaw/openclaw.json",
+    ]) {
+      expectBuildConfigError(
+        { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ agentDir })]) },
+        /agentDir must equal "\/sandbox\/\.openclaw\/agents\/research"/,
+      );
+    }
+  });
+
+  it("rejects extras that lack a tools policy", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ tools: undefined })]),
+      },
+      /\.tools must be an object/,
+    );
+  });
+
+  it("rejects extras whose tools policy lacks allow[] and deny[]", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ tools: { profile: "minimal" } }),
+        ]),
+      },
+      /must declare a non-empty allow\[\] or deny\[\]/,
+    );
+  });
+
+  it("treats subagents as optional and omits it when absent or empty", () => {
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra()]),
+    });
+    expect(config.agents.list[1]).not.toHaveProperty("subagents");
+  });
+
+  it("rejects per-agent subagents.maxSpawnDepth with a migration hint", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ subagents: { maxSpawnDepth: 2 } }),
+        ]),
+      },
+      /maxSpawnDepth is not accepted per-agent.*defaults\.subagents\.maxSpawnDepth/,
+    );
+  });
+
+  it("rejects extras when the payload is neither array nor object", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64("not-a-list") },
+      /must decode to a JSON array of agent objects or an object with/,
+    );
+  });
+
+  it("rejects extras that include unsupported top-level fields (no implicit pass-through)", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ apiKey: "leaking-secret-disguised-as-config" }),
+        ]),
+      },
+      /contains unsupported field\(s\): apiKey/,
+    );
+  });
+
+  it("rejects extras that smuggle credential-like keys inside tools", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+          makeExtra({ tools: { ...TOOLS_OK, apiKey: "x" } }),
+        ]),
+      },
+      /\.tools contains unsupported field\(s\): apiKey/,
+    );
+  });
+
+  it("rejects extras that smuggle credential-like keys inside subagents", () => {
+    expectBuildConfigError(
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([makeExtra({ subagents: { token: "x" } })]),
+      },
+      /\.subagents contains unsupported field\(s\): token/,
+    );
+  });
+
+  it("emits canonical paths for workspace/agentDir even when operator input contains dot segments", () => {
+    // Resolves to the canonical /sandbox/.openclaw/workspace-research path,
+    // but the operator-supplied string is the dot-segment form. The bake
+    // must write the canonical string so the runtime
+    // `provision_agent_workspaces` parser (which only matches direct
+    // `/sandbox/.openclaw/workspace-*`) still recognises it.
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+        makeExtra({
+          workspace: "/sandbox/.openclaw/foo/../workspace-research",
+          agentDir: "/sandbox/.openclaw/bar/../agents/research",
+        }),
+      ]),
+    });
+    expect(config.agents.list[1].workspace).toBe("/sandbox/.openclaw/workspace-research");
+    expect(config.agents.list[1].agentDir).toBe("/sandbox/.openclaw/agents/research");
+  });
+
+  it("strips operator entries to the allowlist when writing agents.list", () => {
+    // The validator must drop unknown keys at every nesting level before
+    // they reach the baked image. (The previous tests confirm unknown
+    // fields fail; this test guards against an allowlist drift where an
+    // unknown field is accepted but a known one is dropped.)
+    const subagentsInput = {
+      delegationMode: "prefer",
+      allowAgents: ["analyst"],
+      requireAgentId: true,
+    };
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+        {
+          id: "research",
+          workspace: "/sandbox/.openclaw/workspace-research",
+          agentDir: "/sandbox/.openclaw/agents/research",
+          tools: TOOLS_OK,
+          subagents: subagentsInput,
+          description: "Researches things",
+        },
+      ]),
+    });
+    expect(config.agents.list[1]).toEqual({
+      id: "research",
+      workspace: "/sandbox/.openclaw/workspace-research",
+      agentDir: "/sandbox/.openclaw/agents/research",
+      tools: TOOLS_OK,
+      subagents: subagentsInput,
+      description: "Researches things",
+    });
+  });
+
+  it("matches OpenClaw's resolveDefaultAgentId fallback shape for the baked list", () => {
+    // OpenClaw's resolver: pick the first entry with default === true; if
+    // none, fall back to agents[0]. Simulate that locally over the baked
+    // list to prove the bake satisfies the upstream contract today. The
+    // authoritative resolver still lives in the openclaw npm package; see
+    // agents/openclaw/manifest.yaml -> expected_version for the pinned tag.
+    const config = runConfigScript({
+      NEMOCLAW_EXTRA_AGENTS_JSON_B64: extraAgentsB64([
+        makeExtra({ id: "research" }),
+        makeExtra({
+          id: "writing",
+          workspace: "/sandbox/.openclaw/workspace-writing",
+          agentDir: "/sandbox/.openclaw/agents/writing",
+        }),
+      ]),
+    });
+    const list: Array<{ id: string; default?: boolean }> = config.agents.list;
+    const resolved = list.find((entry) => entry.default === true)?.id ?? list[0]?.id;
+    expect(resolved).toBe("main");
+  });
+
+  // ─── agents-manifest extensions ───────────────────────────────────────────
+  // The v1 `{agents,defaults?,main?}` payload shape covered by
+  // test/generate-openclaw-config-agents-manifest.test.ts to keep this file
+  // under the legacy size budget.
 
   it("keeps compatible endpoints on the managed inference.local OpenClaw provider", () => {
     const config = runConfigScript({
@@ -710,6 +1180,27 @@ describe("generate-openclaw-config.py: config generation", () => {
     });
     expect(config.agents.defaults.model.primary).toBe("inference/deepseek-ai/DeepSeek-V4-Flash");
     expect(config.models.providers.deepinfra).toBeUndefined();
+  });
+
+  it("propagates ollama-local streaming usage compat through the managed inference route (#3947)", () => {
+    const config = runConfigScript({
+      NEMOCLAW_MODEL: "qwen3.6:35b",
+      NEMOCLAW_PROVIDER_KEY: "inference",
+      NEMOCLAW_PRIMARY_MODEL_REF: "inference/qwen3.6:35b",
+      NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+      NEMOCLAW_INFERENCE_API: "openai-completions",
+      NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from(
+        JSON.stringify({ supportsUsageInStreaming: true }),
+      ).toString("base64"),
+    });
+
+    expect(Object.keys(config.models.providers)).toEqual(["inference"]);
+    expect(config.models.providers.inference.models[0]).toMatchObject({
+      id: "qwen3.6:35b",
+      name: "inference/qwen3.6:35b",
+      compat: { supportsUsageInStreaming: true },
+    });
+    expect(config.agents.defaults.model.primary).toBe("inference/qwen3.6:35b");
   });
 
   it("adds Kimi K2.6 compat for managed inference.local chat completions", () => {
@@ -748,12 +1239,19 @@ describe("generate-openclaw-config.py: config generation", () => {
       NEMOCLAW_INFERENCE_API: "openai-completions",
       NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from("null").toString("base64"),
     });
-
     expect(config.models.providers.inference.models[0].compat).toEqual({
+      supportsStore: false,
       requiresStringContent: true,
       maxTokensField: "max_tokens",
       requiresToolResultName: true,
     });
+  });
+
+  it("rejects inference compat blobs that decode to non-object JSON", () => {
+    expectBuildConfigError(
+      { NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from('"not-an-object"').toString("base64") },
+      "NEMOCLAW_INFERENCE_COMPAT_B64 must decode to a JSON object or null",
+    );
   });
 
   // #2747: Ollama's OpenAI-compatible streaming API omits the usage chunk
@@ -766,9 +1264,9 @@ describe("generate-openclaw-config.py: config generation", () => {
   it("enables supportsUsageInStreaming for Ollama provider keys (#2747)", () => {
     for (const providerKey of ["ollama", "ollama-local"]) {
       const config = runConfigScript({
-        NEMOCLAW_MODEL: "qwen2.5:7b",
+        NEMOCLAW_MODEL: "qwen3.5:9b",
         NEMOCLAW_PROVIDER_KEY: providerKey,
-        NEMOCLAW_PRIMARY_MODEL_REF: "qwen2.5:7b",
+        NEMOCLAW_PRIMARY_MODEL_REF: "qwen3.5:9b",
         NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
         NEMOCLAW_INFERENCE_API: "openai-completions",
       });
@@ -808,9 +1306,9 @@ describe("generate-openclaw-config.py: config generation", () => {
   // ollama-keyed default — including when a manifest opts the flag *off*.
   it("respects existing supportsUsageInStreaming from inference compat (#2747)", () => {
     const config = runConfigScript({
-      NEMOCLAW_MODEL: "qwen2.5:7b",
+      NEMOCLAW_MODEL: "qwen3.5:9b",
       NEMOCLAW_PROVIDER_KEY: "ollama",
-      NEMOCLAW_PRIMARY_MODEL_REF: "qwen2.5:7b",
+      NEMOCLAW_PRIMARY_MODEL_REF: "qwen3.5:9b",
       NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
       NEMOCLAW_INFERENCE_API: "openai-completions",
       NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from(
@@ -845,103 +1343,251 @@ describe("generate-openclaw-config.py: config generation", () => {
       expect(providerConfig.models[0].compat).toEqual({ supportsStore: false });
       expect(config.plugins.entries["nemoclaw-kimi-inference-compat"]).toBeUndefined();
       expect(config.plugins.load).toBeUndefined();
-      expect(config.tools?.toolSearch).toBe(true);
+      expect(config.tools?.toolSearch).toEqual(STRUCTURED_TOOL_SEARCH);
+    }
+  }, 20_000);
+  // #4780: keep false safeguards until live search can replace the direct-tool fallback.
+  it("keeps Tool Search disabled for Nemotron managed inference (#4780)", () => {
+    for (const model of [
+      "nvidia/nemotron-3-super-120b-a12b",
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "nvidia/nvidia/nemotron-3-ultra",
+    ]) {
+      const config = runConfigScript({
+        NEMOCLAW_MODEL: model,
+        NEMOCLAW_PROVIDER_KEY: "inference",
+        NEMOCLAW_PRIMARY_MODEL_REF: `inference/${model}`,
+        NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+        NEMOCLAW_INFERENCE_API: "openai-completions",
+      });
+      expect(config.tools?.toolSearch, model).toBe(false);
+    }
+  });
+  it("keeps structured Tool Search for non-matching Nemotron routes (#4780)", () => {
+    const cases = [
+      { NEMOCLAW_MODEL: "nvidia/nemotron-3-nano:30b" },
+      { NEMOCLAW_PROVIDER_KEY: "nvidia" },
+      { NEMOCLAW_INFERENCE_API: "responses" },
+      { NEMOCLAW_INFERENCE_BASE_URL: "https://integrate.api.nvidia.com/v1" },
+    ];
+
+    for (const envCase of cases) {
+      const config = runConfigScript({
+        NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
+        NEMOCLAW_PROVIDER_KEY: "inference",
+        NEMOCLAW_PRIMARY_MODEL_REF: "inference/nvidia/nemotron-3-super-120b-a12b",
+        NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+        NEMOCLAW_INFERENCE_API: "openai-completions",
+        ...envCase,
+      });
+
+      expect(config.tools?.toolSearch).toEqual(STRUCTURED_TOOL_SEARCH);
     }
   }, 20_000);
 
   it("rejects model-specific setup manifests without a known agent", () => {
     const blueprintDir = path.join(tmpDir, "fixture-blueprint");
-    const registryDir = writeRegistryManifest(
-      blueprintDir,
-      "openclaw/missing-agent.json",
-      {
-        id: "missing-agent",
-        description: "Invalid manifest",
-        match: { modelIds: ["test-model"] },
-        effects: { openclawCompat: {} },
-      },
-    );
-
-    const result = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
+    const registryDir = writeRegistryManifest(blueprintDir, "openclaw/missing-agent.json", {
+      id: "missing-agent",
+      description: "Invalid manifest",
+      match: { modelIds: ["test-model"] },
+      effects: { openclawCompat: {} },
     });
 
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("field 'agent' is required");
-
-    const unknownRegistryDir = writeRegistryManifest(
-      blueprintDir,
-      "openclaw/unknown-agent.json",
-      {
-        id: "unknown-agent",
-        agent: "sidecar",
-        description: "Invalid manifest",
-        match: { modelIds: ["test-model"] },
-        effects: { openclawCompat: {} },
-      },
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir },
+      "field 'agent' is required",
     );
+
+    const unknownRegistryDir = writeRegistryManifest(blueprintDir, "openclaw/unknown-agent.json", {
+      id: "unknown-agent",
+      agent: "sidecar",
+      description: "Invalid manifest",
+      match: { modelIds: ["test-model"] },
+      effects: { openclawCompat: {} },
+    });
     fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "missing-agent.json"));
 
-    const unknownResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: unknownRegistryDir,
-    });
-
-    expect(unknownResult.status).not.toBe(0);
-    expect(unknownResult.stderr).toContain("unknown agent 'sidecar'");
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: unknownRegistryDir },
+      "unknown agent 'sidecar'",
+    );
   }, 20_000);
 
   it("rejects empty match objects and invalid explicit registry overrides", () => {
     const missingRegistry = path.join(tmpDir, "missing-registry");
-    const missingRegistryResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: missingRegistry,
-    });
-
-    expect(missingRegistryResult.status).not.toBe(0);
-    expect(missingRegistryResult.stderr).toContain(
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: missingRegistry },
       "NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR must point to an existing directory",
     );
 
     const blueprintDir = path.join(tmpDir, "fixture-blueprint");
-    const registryDir = writeRegistryManifest(
-      blueprintDir,
-      "openclaw/empty-match.json",
-      {
-        id: "empty-match",
-        agent: "openclaw",
-        description: "Invalid match",
-        match: {},
-        effects: { openclawCompat: {} },
-      },
-    );
-
-    const emptyMatchResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
+    const registryDir = writeRegistryManifest(blueprintDir, "openclaw/empty-match.json", {
+      id: "empty-match",
+      agent: "openclaw",
+      description: "Invalid match",
+      match: {},
+      effects: { openclawCompat: {} },
     });
 
-    expect(emptyMatchResult.status).not.toBe(0);
-    expect(emptyMatchResult.stderr).toContain("field 'match' must be a non-empty object");
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir },
+      "field 'match' must be a non-empty object",
+    );
+  });
+
+  it("rejects malformed model-specific setup manifest fields independently", () => {
+    const validManifest = {
+      id: "fixture",
+      agent: "openclaw",
+      description: "Fixture manifest",
+      match: { modelIds: ["test-model"] },
+      effects: { openclawCompat: {} },
+    };
+    const cases = [
+      {
+        name: "non-object root",
+        manifest: null,
+        message: "manifest must be a JSON object",
+      },
+      {
+        name: "missing id",
+        manifest: { ...validManifest, id: "" },
+        message: "field 'id' must be a non-empty string",
+      },
+      {
+        name: "missing description",
+        manifest: { ...validManifest, description: "" },
+        message: "field 'description' must be a non-empty string",
+      },
+      {
+        name: "non-object match",
+        manifest: { ...validManifest, match: null },
+        message: "field 'match' must be an object",
+      },
+      {
+        name: "unknown match key",
+        manifest: { ...validManifest, match: { modelIds: ["test-model"], family: "kimi" } },
+        message: "unknown match keys: family",
+      },
+      {
+        name: "empty modelIds",
+        manifest: { ...validManifest, match: { modelIds: [] } },
+        message: "match.modelIds must be a non-empty string array",
+      },
+      {
+        name: "empty providerKey",
+        manifest: { ...validManifest, match: { providerKey: "" } },
+        message: "match.providerKey must be a non-empty string",
+      },
+      {
+        name: "missing effects",
+        manifest: { ...validManifest, effects: null },
+        message: "field 'effects' must be a non-empty object",
+      },
+      {
+        name: "non-object openclawCompat",
+        manifest: { ...validManifest, effects: { openclawCompat: false } },
+        message: "effects.openclawCompat must be an object",
+      },
+      {
+        name: "non-object openclawTools",
+        manifest: { ...validManifest, effects: { openclawTools: false } },
+        message: "effects.openclawTools must be an object",
+      },
+      {
+        name: "unknown openclawTools key",
+        manifest: { ...validManifest, effects: { openclawTools: { webSearch: true } } },
+        message: "unknown effects.openclawTools keys: webSearch",
+      },
+      {
+        name: "non-array openclawPlugins",
+        manifest: { ...validManifest, effects: { openclawPlugins: {} } },
+        message: "effects.openclawPlugins must be an array",
+      },
+      {
+        name: "non-object openclaw plugin",
+        manifest: { ...validManifest, effects: { openclawPlugins: ["plugin"] } },
+        message: "effects.openclawPlugins[0] must be an object",
+      },
+      {
+        name: "missing openclaw plugin id",
+        manifest: {
+          ...validManifest,
+          effects: {
+            openclawPlugins: [
+              {
+                id: "",
+                path: "openclaw-plugins/fixture",
+                loadPath: "/usr/local/share/nemoclaw/openclaw-plugins/fixture",
+              },
+            ],
+          },
+        },
+        message: "effects.openclawPlugins[0].id must be a non-empty string",
+      },
+      {
+        name: "absolute openclaw plugin source path",
+        manifest: {
+          ...validManifest,
+          effects: {
+            openclawPlugins: [
+              {
+                id: "fixture-plugin",
+                path: "/tmp/plugin",
+                loadPath: "/usr/local/share/nemoclaw/openclaw-plugins/fixture",
+              },
+            ],
+          },
+        },
+        message: "must be relative to nemoclaw-blueprint",
+      },
+      {
+        name: "parent-relative openclaw plugin source path",
+        manifest: {
+          ...validManifest,
+          effects: {
+            openclawPlugins: [
+              {
+                id: "fixture-plugin",
+                path: "../plugin",
+                loadPath: "/usr/local/share/nemoclaw/openclaw-plugins/fixture",
+              },
+            ],
+          },
+        },
+        message: "must be relative to nemoclaw-blueprint",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const blueprintDir = path.join(
+        tmpDir,
+        `fixture-blueprint-${testCase.name.replaceAll(" ", "-")}`,
+      );
+      const registryDir = writeRegistryManifest(
+        blueprintDir,
+        "openclaw/manifest.json",
+        testCase.manifest as any,
+      );
+      expectBuildConfigError({ NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir }, testCase.message);
+    }
   });
 
   it("rejects unknown OpenClaw effect keys and missing plugin source paths", () => {
     const blueprintDir = path.join(tmpDir, "fixture-blueprint");
-    const registryDir = writeRegistryManifest(
-      blueprintDir,
-      "openclaw/bad-effect.json",
-      {
-        id: "bad-effect",
-        agent: "openclaw",
-        description: "Invalid OpenClaw effect",
-        match: { modelIds: ["test-model"] },
-        effects: { hermesCompat: {} },
-      },
-    );
-
-    const result = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
+    const registryDir = writeRegistryManifest(blueprintDir, "openclaw/bad-effect.json", {
+      id: "bad-effect",
+      agent: "openclaw",
+      description: "Invalid OpenClaw effect",
+      match: { modelIds: ["test-model"] },
+      effects: { hermesCompat: {} },
     });
 
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("unknown effects for agent 'openclaw': hermesCompat");
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir },
+      "unknown effects for agent 'openclaw': hermesCompat",
+    );
 
     fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "bad-effect.json"));
     const missingPluginRegistryDir = writeRegistryManifest(
@@ -964,12 +1610,10 @@ describe("generate-openclaw-config.py: config generation", () => {
       },
     );
 
-    const missingPluginResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: missingPluginRegistryDir,
-    });
-
-    expect(missingPluginResult.status).not.toBe(0);
-    expect(missingPluginResult.stderr).toContain("path does not exist");
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: missingPluginRegistryDir },
+      "path does not exist",
+    );
 
     fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "missing-plugin.json"));
     const badToolRegistryDir = writeRegistryManifest(
@@ -980,16 +1624,14 @@ describe("generate-openclaw-config.py: config generation", () => {
         agent: "openclaw",
         description: "Invalid tool override",
         match: { modelIds: ["test-model"] },
-        effects: { openclawTools: { toolSearch: "false" } },
+        effects: { openclawTools: { toolSearch: { mode: "tools" } } },
       },
     );
 
-    const badToolResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: badToolRegistryDir,
-    });
-
-    expect(badToolResult.status).not.toBe(0);
-    expect(badToolResult.stderr).toContain("effects.openclawTools.toolSearch must be a boolean");
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: badToolRegistryDir },
+      "effects.openclawTools.toolSearch must be a boolean override",
+    );
 
     fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "bad-tool-effect.json"));
     fs.mkdirSync(path.join(blueprintDir, "openclaw-plugins", "fixture"), { recursive: true });
@@ -1013,12 +1655,8 @@ describe("generate-openclaw-config.py: config generation", () => {
       },
     );
 
-    const badLoadPathResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: badLoadPathRegistryDir,
-    });
-
-    expect(badLoadPathResult.status).not.toBe(0);
-    expect(badLoadPathResult.stderr).toContain(
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: badLoadPathRegistryDir },
       "effects.openclawPlugins[0].loadPath must be " +
         "'/usr/local/share/nemoclaw/openclaw-plugins/fixture'",
     );
@@ -1027,37 +1665,53 @@ describe("generate-openclaw-config.py: config generation", () => {
   it("rejects conflicting OpenClaw compat effects and duplicate plugin ids", () => {
     const blueprintDir = path.join(tmpDir, "fixture-blueprint");
     fs.mkdirSync(path.join(blueprintDir, "openclaw-plugins", "fixture"), { recursive: true });
-    const registryDir = writeRegistryManifest(
-      blueprintDir,
-      "openclaw/conflicting-compat.json",
-      {
-        id: "conflicting-compat",
-        agent: "openclaw",
-        description: "Conflicting compat",
-        match: { modelIds: ["test-model"] },
-        effects: {
-          openclawCompat: {
-            supportsStore: true,
-          },
+    const registryDir = writeRegistryManifest(blueprintDir, "openclaw/conflicting-compat.json", {
+      id: "conflicting-compat",
+      agent: "openclaw",
+      description: "Conflicting compat",
+      match: { modelIds: ["test-model"] },
+      effects: {
+        openclawCompat: {
+          supportsStore: true,
         },
       },
-    );
-
-    const conflictResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
-      NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from(
-        JSON.stringify({ supportsStore: false }),
-      ).toString("base64"),
     });
 
-    expect(conflictResult.status).not.toBe(0);
-    expect(conflictResult.stderr).toContain(
+    expectBuildConfigError(
+      {
+        NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
+        NEMOCLAW_INFERENCE_COMPAT_B64: Buffer.from(
+          JSON.stringify({ supportsStore: false }),
+        ).toString("base64"),
+      },
       "model-specific setup 'conflicting-compat' conflicts with inference compat key 'supportsStore'",
     );
 
     fs.rmSync(
       path.join(blueprintDir, "model-specific-setup", "openclaw", "conflicting-compat.json"),
     );
+    writeRegistryManifest(blueprintDir, "openclaw/tool-a.json", {
+      id: "tool-a",
+      agent: "openclaw",
+      description: "First tool override",
+      match: { modelIds: ["test-model"] },
+      effects: { openclawTools: { toolSearch: false } },
+    });
+    writeRegistryManifest(blueprintDir, "openclaw/tool-b.json", {
+      id: "tool-b",
+      agent: "openclaw",
+      description: "Conflicting tool override",
+      match: { modelIds: ["test-model"] },
+      effects: { openclawTools: { toolSearch: true } },
+    });
+
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir },
+      "model-specific setup 'tool-b' conflicts with OpenClaw tools key 'toolSearch'",
+    );
+
+    fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "tool-a.json"));
+    fs.rmSync(path.join(blueprintDir, "model-specific-setup", "openclaw", "tool-b.json"));
     writeRegistryManifest(blueprintDir, "openclaw/plugin-a.json", {
       id: "plugin-a",
       agent: "openclaw",
@@ -1089,12 +1743,8 @@ describe("generate-openclaw-config.py: config generation", () => {
       },
     });
 
-    const duplicateResult = runConfigScriptRaw({
-      NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir,
-    });
-
-    expect(duplicateResult.status).not.toBe(0);
-    expect(duplicateResult.stderr).toContain(
+    expectBuildConfigError(
+      { NEMOCLAW_MODEL_SPECIFIC_SETUP_DIR: registryDir },
       "model-specific setup 'plugin-b' declares duplicate OpenClaw plugin 'fixture-plugin'",
     );
   });
@@ -1104,37 +1754,38 @@ describe("generate-openclaw-config.py: config generation", () => {
     expect(config.gateway.auth.token).toBe("");
   });
 
-  it("disables bundled acpx runtime staging by default", () => {
+  it("disables bundled bonjour in sandbox config by default", () => {
     const config = runConfigScript();
-    expect(config.plugins.entries.acpx.enabled).toBe(false);
-    expect(config.plugins.entries.acpx.config).toBeUndefined();
+    expect(config.plugins.entries.bonjour.enabled).toBe(false);
+    expect(config.plugins.entries.bonjour.config).toBeUndefined();
   });
 
-  it("disables unused bundled provider plugins with staged runtime deps", () => {
+  it("omits stale disabled entries for optional bundled plugins", () => {
     const config = runConfigScript({ NEMOCLAW_PROVIDER_KEY: "inference" });
-    expect(config.plugins.entries["amazon-bedrock"].enabled).toBe(false);
-    expect(config.plugins.entries["amazon-bedrock-mantle"].enabled).toBe(false);
-    expect(config.plugins.entries.anthropic.enabled).toBe(false);
-    expect(config.plugins.entries["anthropic-vertex"].enabled).toBe(false);
-    expect(config.plugins.entries.fireworks.enabled).toBe(false);
-    expect(config.plugins.entries.google.enabled).toBe(false);
-    expect(config.plugins.entries.kimi.enabled).toBe(false);
-    expect(config.plugins.entries.lmstudio.enabled).toBe(false);
-    expect(config.plugins.entries.ollama.enabled).toBe(false);
-    expect(config.plugins.entries.openai.enabled).toBe(false);
-    expect(config.plugins.entries.xai.enabled).toBe(false);
+    expect(Object.keys(config.plugins.entries)).toEqual(["bonjour"]);
   });
 
   it("keeps the selected bundled provider plugin available", () => {
     const config = runConfigScript({ NEMOCLAW_PROVIDER_KEY: "anthropic" });
     expect(config.plugins.entries.anthropic).toBeUndefined();
-    expect(config.plugins.entries.google.enabled).toBe(false);
+    expect(config.plugins.entries.google).toBeUndefined();
   });
 
   it("keeps the selected OpenAI bundled provider plugin available", () => {
     const config = runConfigScript({ NEMOCLAW_PROVIDER_KEY: "openai" });
     expect(config.plugins.entries.openai).toBeUndefined();
-    expect(config.plugins.entries.xai.enabled).toBe(false);
+    expect(config.plugins.entries.xai).toBeUndefined();
+  });
+
+  it("enables the discord plugin entry when Discord is configured (#4246)", async () => {
+    const channels = Buffer.from(JSON.stringify(["discord"])).toString("base64");
+    const config = await runMessagingConfig(channels);
+    expect(config.plugins.entries.discord).toEqual({ enabled: true });
+  });
+
+  it("omits the discord plugin entry when Discord is not configured (#4246)", () => {
+    const config = runConfigScript();
+    expect(config.plugins.entries.discord).toBeUndefined();
   });
 
   it("creates file with 0600 permissions", () => {
@@ -1146,10 +1797,7 @@ describe("generate-openclaw-config.py: config generation", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Phase 2: Auto-disable device auth for non-loopback URLs
-// ═══════════════════════════════════════════════════════════════════
-describe("generate-openclaw-config.py: non-loopback auto-disable device auth", () => {
+describe("generate-openclaw-config.mts: non-loopback auto-disable device auth", () => {
   it("auto-disables device auth for Brev Launchable URL", () => {
     const config = runConfigScript({
       CHAT_UI_URL: "https://nemoclaw0-xxx.brevlab.com:18789",
@@ -1196,27 +1844,25 @@ describe("generate-openclaw-config.py: non-loopback auto-disable device auth", (
   });
 });
 
-describe("generate-openclaw-config.py: empty-string env vars fall back to defaults", () => {
+describe("generate-openclaw-config.mts: empty-string env vars fall back to defaults", () => {
   it("treats empty CHAT_UI_URL as unset and uses the loopback default", () => {
     const config = runConfigScript({ CHAT_UI_URL: "" });
     expect(config.gateway.controlUi.dangerouslyDisableDeviceAuth).toBe(false);
     expect(config.gateway.controlUi.allowedOrigins).toEqual(["http://127.0.0.1:18789"]);
   });
 
-  it("treats empty NEMOCLAW_PROXY_HOST as unset and uses the documented default", () => {
+  it("treats empty NEMOCLAW_PROXY_HOST as unset and uses the documented default", async () => {
     const channelB64 = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
-    const cfg = runConfigScript({
+    const cfg = await runMessagingConfig(channelB64, {
       NEMOCLAW_PROXY_HOST: "",
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channelB64,
     });
     expect(cfg.channels.telegram.accounts.default.proxy).toBe("http://10.200.0.1:3128");
   });
 
-  it("treats empty NEMOCLAW_PROXY_PORT as unset and uses the documented default", () => {
+  it("treats empty NEMOCLAW_PROXY_PORT as unset and uses the documented default", async () => {
     const channelB64 = Buffer.from(JSON.stringify(["telegram"])).toString("base64");
-    const cfg = runConfigScript({
+    const cfg = await runMessagingConfig(channelB64, {
       NEMOCLAW_PROXY_PORT: "",
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channelB64,
     });
     expect(cfg.channels.telegram.accounts.default.proxy).toBe("http://10.200.0.1:3128");
   });
@@ -1232,33 +1878,13 @@ describe("generate-openclaw-config.py: empty-string env vars fall back to defaul
   });
 });
 
-describe("generate-openclaw-config.py: numeric env var validation", () => {
+describe("generate-openclaw-config.mts: numeric env var validation", () => {
   function runCapturingStderr(envOverrides: Record<string, string>): {
     config: any;
     stderr: string;
   } {
-    const env: Record<string, string> = {
-      PATH: process.env.PATH || "/usr/bin:/bin",
-      ...BASE_ENV,
-      ...envOverrides,
-      HOME: tmpDir,
-    };
-    const result = spawnSync("python3", [SCRIPT_PATH], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-      timeout: 10_000,
-    });
-    if (result.status !== 0) {
-      throw new Error(
-        `Script failed (exit ${result.status}):\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
-      );
-    }
-    const configPath = path.join(tmpDir, ".openclaw", "openclaw.json");
-    return {
-      config: JSON.parse(fs.readFileSync(configPath, "utf-8")),
-      stderr: result.stderr,
-    };
+    const { result, stderr } = runCapturingConsoleError(() => buildConfigDirect(envOverrides));
+    return { config: result, stderr };
   }
 
   it("skips non-numeric NEMOCLAW_CONTEXT_WINDOW and falls back to the default", () => {
@@ -1301,13 +1927,13 @@ describe("generate-openclaw-config.py: numeric env var validation", () => {
     expect(stderr).toMatch(/NEMOCLAW_MAX_TOKENS must be a positive integer/);
   });
 
-  it("skips NEMOCLAW_CONTEXT_WINDOW that exceeds Python's int-string digit limit", () => {
+  it("skips NEMOCLAW_CONTEXT_WINDOW that exceeds the safe integer guard", () => {
     const { config, stderr } = runCapturingStderr({ NEMOCLAW_CONTEXT_WINDOW: "9".repeat(10000) });
     expect(config.models.providers["test-provider"].models[0].contextWindow).toBe(131072);
     expect(stderr).toMatch(/NEMOCLAW_CONTEXT_WINDOW must be a positive integer/);
   });
 
-  it("skips NEMOCLAW_MAX_TOKENS that exceeds Python's int-string digit limit", () => {
+  it("skips NEMOCLAW_MAX_TOKENS that exceeds the safe integer guard", () => {
     const { config, stderr } = runCapturingStderr({ NEMOCLAW_MAX_TOKENS: "9".repeat(10000) });
     expect(config.models.providers["test-provider"].models[0].maxTokens).toBe(4096);
     expect(stderr).toMatch(/NEMOCLAW_MAX_TOKENS must be a positive integer/);

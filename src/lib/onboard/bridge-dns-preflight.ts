@@ -2,16 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Bridge + DNS preflight gate, extracted from `onboard.ts` so it can be
- * reused as a `--resume` backstop without growing the top-level file
- * past the `onboard-entrypoint-budget` CI ceiling.
- *
- * - `assertDockerBridgeAndContainerDnsHealthy(host)` runs the bridge
- *   container start probe (#3508 Jetson veth) and the DNS-from-inside-
- *   container probe (#3630), and exits with platform-aware remediation
- *   on the fatal reasons described in `[[isFatalContainerDnsProbeFailure]]`.
+ * Bridge + DNS preflight gate extracted from `onboard.ts` for reuse as a
+ * `--resume` backstop. It validates bridge container start (#3508 Jetson veth)
+ * and container DNS (#3630), with platform-aware remediation on fatal results.
  */
 
+import { failLine, warnLine } from "../cli/terminal-style";
 import { cliDisplayName, cliName } from "./branding";
 
 interface DaemonJsonDnsPatchOpts {
@@ -30,19 +26,14 @@ interface DaemonJsonDnsPatchOpts {
 }
 
 /**
- * Print a copy-pastable shell snippet that adds a `dns` key to the
- * given daemon.json safely. The snippet:
- *  - creates the containing directory,
- *  - backs up the existing daemon.json,
- *  - requires `jq` (prints an install hint and aborts if missing — no
- *    bare-echo fallback that would clobber an existing daemon.json),
- *  - merges into an existing JSON object via `jq '. + {...}'`,
- *  - creates a new JSON object via `jq -n {...}` when daemon.json is
- *    absent,
- *  - refuses to write if the existing file is not parseable, asking
- *    the user to fix it manually first.
+ * Print a copy-pastable shell snippet that creates the config directory, backs
+ * up daemon.json, requires `jq`, merges or creates the `dns` key, and refuses
+ * to write invalid JSON.
  *
- * The snippet is printed verbatim; nothing here executes it.
+ * Source boundary: this is privileged, platform-owned Docker configuration.
+ * Unprivileged onboarding cannot safely mutate it or restart Docker without
+ * explicit user consent, so the commands stay plain and nothing executes them.
+ * Remove this only when Docker/OpenShell exposes a managed daemon-DNS API.
  */
 function printDaemonJsonDnsPatch(opts: DaemonJsonDnsPatchOpts): void {
   const { daemonJsonPath, configDir, dnsValue, sudo, installJqHint, indent } = opts;
@@ -75,22 +66,28 @@ function printDaemonJsonDnsPatch(opts: DaemonJsonDnsPatchOpts): void {
   ].join(" ");
   console.error(`${indent}${sudoPrefix}sh -c '${shBody.replace(/'/g, "'\"'\"'")}'`);
 }
+
 import {
   BUSYBOX_PROBE_IMAGE,
+  DEFAULT_HOST_DNS_PROBE_HOSTNAME,
+  DOCKER_DESKTOP_WSL_INTEGRATION_HINT,
   type DockerBridgeContainerStartProbeResult,
   getDockerBridgeGatewayIp,
   type HostAssessment,
   isFatalContainerDnsProbeFailure,
+  isFatalHostDnsProbeFailure,
   probeContainerDns,
   probeDockerBridgeContainerStart,
+  probeHostDns,
 } from "./preflight";
 
 type Host = HostAssessment;
 
 export function printDockerBridgeContainerStartFailure(
   result: DockerBridgeContainerStartProbeResult,
+  host?: Pick<Host, "isWsl">,
 ): void {
-  console.error("  ✗ Docker could not start a bridge-network test container.");
+  console.error(failLine("Docker could not start a bridge-network test container."));
   if (result.details) {
     for (const line of String(result.details).split("\n").slice(-4)) {
       if (line.trim()) console.error(`    ${line.trim()}`);
@@ -98,9 +95,7 @@ export function printDockerBridgeContainerStartFailure(
   }
   console.error("");
   if (result.reason === "veth_unsupported") {
-    console.error(
-      "  Docker reported that creating the container veth pair is not supported.",
-    );
+    console.error("  Docker reported that creating the container veth pair is not supported.");
     console.error(
       "  This matches the Jetson kernel/Docker bridge failure seen before long sandbox builds.",
     );
@@ -110,9 +105,14 @@ export function printDockerBridgeContainerStartFailure(
     console.error("  a host whose Docker bridge networking can create veth interfaces.");
   } else if (result.reason === "timeout" || result.reason === "killed") {
     console.error("  Docker did not complete a minimal bridge container start probe in time.");
-    console.error("  Restart Docker and check for stuck container/network operations before retrying.");
+    console.error(
+      "  Restart Docker and check for stuck container/network operations before retrying.",
+    );
   } else if (result.reason === "docker_daemon_unreachable") {
     console.error("  The Docker CLI cannot reach the Docker daemon (dockerd is down or wedged).");
+    if (host?.isWsl) {
+      console.error(`  ${DOCKER_DESKTOP_WSL_INTEGRATION_HINT}`);
+    }
     console.error(
       "  Restart the Docker daemon (`sudo systemctl restart docker`, or restart Docker Desktop/Colima)",
     );
@@ -140,7 +140,11 @@ export function printDockerBridgeContainerStartFailure(
  * wall (mirroring the [[assertCdiNvidiaGpuSpecPresent]] resume backstop
  * pattern at #3152).
  */
-export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
+export function assertDockerBridgeAndContainerDnsHealthy(
+  host: Host,
+  nonInteractive = false,
+  exitProcess: (code: number) => never = (code) => process.exit(code),
+): void {
   // A minimal bridge-backed container start catches Docker/kernel failures
   // (notably Jetson veth "operation not supported") before longer gateway or
   // sandbox build work starts. Only veth/timeout/killed/daemon-unreachable
@@ -157,11 +161,13 @@ export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
     bridgeStart.reason === "killed" ||
     bridgeStart.reason === "docker_daemon_unreachable"
   ) {
-    printDockerBridgeContainerStartFailure(bridgeStart);
-    process.exit(1);
+    printDockerBridgeContainerStartFailure(bridgeStart, host);
+    exitProcess(1);
   } else {
     console.warn(
-      `  ⚠ Bridge container start probe inconclusive (reason: ${bridgeStart.reason ?? "unknown"}).`,
+      warnLine(
+        `Bridge container start probe inconclusive (reason: ${bridgeStart.reason ?? "unknown"}).`,
+      ),
     );
     if (bridgeStart.details) {
       for (const line of String(bridgeStart.details).split("\n").slice(-3)) {
@@ -170,6 +176,15 @@ export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
     }
     console.warn("    Continuing to DNS probe for more specific diagnosis.");
   }
+
+  // Host-side DNS (#4784). The container DNS probe below only proves the
+  // docker network namespace can resolve names; a host OUTPUT chain that
+  // drops tcp/udp:53 still lets that pass while the CLI process itself
+  // cannot resolve the provider endpoint, so later NVIDIA Endpoints
+  // validation dies with `curl: (6) Could not resolve host: ...`. Catch
+  // that here, before provider validation, and keep it distinct from the
+  // container-DNS line.
+  assertHostDnsHealthy(host, { nonInteractive });
 
   // DNS resolution from inside containers (#2101). A corp firewall that
   // blocks outbound UDP:53 to public resolvers leaves the sandbox build
@@ -185,14 +200,16 @@ export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
   if (!dnsIsFatal) {
     if (dns.reason === "image_pull_failed") {
       console.warn(
-        "  ⚠ Container DNS probe inconclusive: docker couldn't pull the busybox test image.",
+        warnLine("Container DNS probe inconclusive: docker couldn't pull the busybox test image."),
       );
       console.warn("    This usually means the docker daemon itself can't reach Docker Hub,");
       console.warn(
         "    but doesn't prove container DNS is broken — the sandbox build may still succeed.",
       );
     } else {
-      console.warn(`  ⚠ Container DNS probe inconclusive (reason: ${dns.reason ?? "unknown"}).`);
+      console.warn(
+        warnLine(`Container DNS probe inconclusive (reason: ${dns.reason ?? "unknown"}).`),
+      );
     }
     if (dns.details) {
       for (const line of String(dns.details).split("\n").slice(-3)) {
@@ -204,33 +221,43 @@ export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
   }
 
   if (dns.reason === "veth_unsupported") {
-    printDockerBridgeContainerStartFailure({
-      ok: false,
-      reason: "veth_unsupported",
-      details: dns.details,
-      timedOut: dns.timedOut,
-      exitCode: dns.exitCode,
-      signal: dns.signal,
-    });
-    process.exit(1);
+    printDockerBridgeContainerStartFailure(
+      {
+        ok: false,
+        reason: "veth_unsupported",
+        details: dns.details,
+        timedOut: dns.timedOut,
+        exitCode: dns.exitCode,
+        signal: dns.signal,
+      },
+      host,
+    );
+    exitProcess(1);
   }
   if (dns.reason === "docker_daemon_unreachable") {
-    printDockerBridgeContainerStartFailure({
-      ok: false,
-      reason: "docker_daemon_unreachable",
-      details: dns.details,
-      timedOut: dns.timedOut,
-      exitCode: dns.exitCode,
-      signal: dns.signal,
-    });
-    process.exit(1);
+    printDockerBridgeContainerStartFailure(
+      {
+        ok: false,
+        reason: "docker_daemon_unreachable",
+        details: dns.details,
+        timedOut: dns.timedOut,
+        exitCode: dns.exitCode,
+        signal: dns.signal,
+      },
+      host,
+    );
+    exitProcess(1);
   }
   if (dns.reason === "timeout" || dns.reason === "killed") {
-    console.error("  ✗ Container DNS probe did not complete.");
+    console.error(failLine("Container DNS probe did not complete."));
   } else if (dns.reason === "image_pull_failed") {
-    console.error("  ✗ Docker could not resolve or pull the DNS probe image.");
+    console.error(failLine("Docker could not resolve or pull the DNS probe image."));
+  } else if (dns.reason === "resolution_failed") {
+    console.error(
+      failLine("Container DNS server is reachable but rejected the query (NXDOMAIN/REFUSED)."),
+    );
   } else {
-    console.error("  ✗ DNS resolution from inside a docker container failed.");
+    console.error(failLine("DNS resolution from inside a docker container failed."));
   }
   if (dns.details) {
     for (const line of String(dns.details).split("\n").slice(-4)) {
@@ -238,8 +265,235 @@ export function assertDockerBridgeAndContainerDnsHealthy(host: Host): void {
     }
   }
   console.error("");
-  printContainerDnsRemediation(host);
-  process.exit(1);
+  // `servers_unreachable` (UDP:53 dropped) and `resolution_failed` (the resolver
+  // answered but returned NXDOMAIN/REFUSED) need different fixes: the former is
+  // the #2101 systemd-resolved/daemon.json remediation, the latter is a resolver
+  // config problem. Routing both to the UDP:53 block sent NXDOMAIN/REFUSED users
+  // down an irrelevant path (#6149).
+  if (dns.reason === "resolution_failed") {
+    printContainerDnsResolutionFailedRemediation(host);
+  } else {
+    printContainerDnsRemediation(host);
+  }
+  exitProcess(1);
+}
+
+/**
+ * Environment escape hatch for the host DNS preflight. Air-gapped or
+ * local-inference-only hosts that intentionally cannot resolve public
+ * provider endpoints can set this to skip the check rather than abort.
+ */
+export const SKIP_HOST_DNS_PREFLIGHT_ENV = "NEMOCLAW_SKIP_HOST_DNS_PREFLIGHT";
+
+function hostDnsPreflightSkipped(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env[SKIP_HOST_DNS_PREFLIGHT_ENV];
+  return value === "1" || String(value || "").toLowerCase() === "true";
+}
+
+// `NEMOCLAW_PROVIDER` keys that resolve to NVIDIA-hosted endpoints
+// (integrate.api.nvidia.com). Mirrors the aliases in
+// `onboard/providers.ts::getNonInteractiveProvider`. Local/custom and
+// other hosted providers (ollama, vllm, openai, anthropic, nim-local, …)
+// do not need this host, so the NVIDIA host DNS probe must not gate them.
+const NVIDIA_ENDPOINT_PROVIDER_KEYS = new Set(["build", "cloud", "routed"]);
+
+/**
+ * Whether onboarding's effective inference provider is NVIDIA Endpoints,
+ * so the `integrate.api.nvidia.com` host DNS probe is relevant.
+ *
+ * `NEMOCLAW_PROVIDER` is honored only in non-interactive mode (mirroring
+ * `getRequestedProviderHint`), where an unset value defaults to NVIDIA
+ * Endpoints. A fresh interactive run hits preflight *before* the provider
+ * menu, so it returns false and is never blocked on NVIDIA-domain DNS — an
+ * interactive user can still pick a local provider (codex #4784 P2).
+ */
+function usesNvidiaEndpointProvider(
+  env: NodeJS.ProcessEnv = process.env,
+  nonInteractive = false,
+): boolean {
+  if (!nonInteractive) return false;
+  const envKey = String(env.NEMOCLAW_PROVIDER || "")
+    .trim()
+    .toLowerCase();
+  if (!envKey) return true;
+  return NVIDIA_ENDPOINT_PROVIDER_KEYS.has(envKey);
+}
+
+/**
+ * Whether the provider host is reached through a configured HTTPS/ALL
+ * proxy (honoring NO_PROXY). When it is, the later curl-based provider
+ * validation hands the hostname to the proxy and never resolves it
+ * locally, so a direct host DNS probe would false-fail valid corporate /
+ * proxied setups (codex #4784 P2). Skip the probe in that case.
+ */
+function providerHostProxied(env: NodeJS.ProcessEnv, hostname: string): boolean {
+  const proxy = env.HTTPS_PROXY || env.https_proxy || env.ALL_PROXY || env.all_proxy || "";
+  if (!String(proxy).trim()) return false;
+  const noProxy = String(env.NO_PROXY || env.no_proxy || "");
+  const host = hostname.trim().toLowerCase();
+  const bypassed = noProxy
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .some((entry) => {
+      if (entry === "*") return true;
+      const e = entry.replace(/^\*?\./, "");
+      return host === e || host.endsWith(`.${e}`);
+    });
+  return !bypassed;
+}
+
+export interface AssertHostDnsHealthyOpts {
+  /** Whether onboarding is running non-interactively (default NVIDIA path). */
+  nonInteractive?: boolean;
+  /** Inject a host DNS probe result (test seam). */
+  probeHostDnsImpl?: typeof probeHostDns;
+  /** Override the skip-env decision (test seam). */
+  env?: NodeJS.ProcessEnv;
+  /** Override process exit (test seam). */
+  exit?: (code: number) => void;
+}
+
+/**
+ * Host DNS gate (#4784). Resolves the provider endpoint from the CLI
+ * process and prints a `Host DNS resolution` line distinct from the
+ * `Container DNS resolution` line. A fatal failure (resolver unreachable
+ * or the name cannot be resolved) exits early with host-DNS remediation;
+ * an inconclusive probe (could not even spawn) warns and continues so a
+ * probe-infrastructure hiccup never blocks onboarding.
+ */
+export function assertHostDnsHealthy(host: Host, opts: AssertHostDnsHealthyOpts = {}): void {
+  const env = opts.env ?? process.env;
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  const probe = opts.probeHostDnsImpl ?? probeHostDns;
+
+  if (hostDnsPreflightSkipped(env)) {
+    console.log(`  ⓘ Host DNS resolution check skipped (${SKIP_HOST_DNS_PREFLIGHT_ENV} is set)`);
+    return;
+  }
+
+  // The probe resolves the NVIDIA Endpoints host, so only run it when that
+  // is the effective provider. A user who explicitly selected a local or
+  // non-NVIDIA provider — or who hasn't chosen one yet in interactive mode —
+  // must not be blocked by NVIDIA-domain DNS.
+  if (!usesNvidiaEndpointProvider(env, opts.nonInteractive ?? false)) {
+    return;
+  }
+
+  // When the provider host is reached through a configured proxy, curl-based
+  // provider validation never resolves it locally, so a direct DNS probe
+  // would false-fail. Skip and let provider validation use the proxy route.
+  if (providerHostProxied(env, DEFAULT_HOST_DNS_PROBE_HOSTNAME)) {
+    console.log(
+      "  ⓘ Host DNS resolution check skipped (HTTPS proxy configured; provider reached via proxy)",
+    );
+    return;
+  }
+
+  const result = probe();
+  if (result.ok) {
+    console.log("  ✓ Host DNS resolution works");
+    return;
+  }
+  if (!isFatalHostDnsProbeFailure(result)) {
+    console.warn(warnLine(`Host DNS probe inconclusive (reason: ${result.reason ?? "unknown"}).`));
+    if (result.details) {
+      console.warn(`    ${String(result.details).trim()}`);
+    }
+    console.warn(
+      "    Proceeding; provider validation will surface a clearer error if DNS is broken.",
+    );
+    return;
+  }
+
+  if (result.reason === "timeout" || result.reason === "killed") {
+    console.error(
+      failLine(`Host DNS probe did not complete (could not resolve ${result.hostname}).`),
+    );
+  } else if (result.reason === "resolution_failed") {
+    console.error(
+      failLine(`Host could not resolve ${result.hostname} (resolver answered, no record).`),
+    );
+  } else {
+    console.error(failLine(`Host DNS resolution failed (could not resolve ${result.hostname}).`));
+  }
+  if (result.details) {
+    console.error(`    ${String(result.details).trim()}`);
+  }
+  console.error("");
+  printHostDnsRemediation(host, result.hostname);
+  exit(1);
+}
+
+export function printHostDnsRemediation(
+  host: Pick<Host, "platform" | "isWsl">,
+  hostname: string = DEFAULT_HOST_DNS_PROBE_HOSTNAME,
+): void {
+  console.error(`  ${cliDisplayName()} could not resolve ${hostname} from this host.`);
+  console.error("  Container DNS may still look healthy, but the CLI itself cannot reach a DNS");
+  console.error("  resolver, so provider validation will later fail with");
+  console.error(`  \`curl: (6) Could not resolve host: ${hostname}\`. See issue #4784.`);
+  console.error("");
+  console.error("  Common causes and fixes:");
+  console.error("");
+  console.error("  1. A firewall is dropping outbound DNS (tcp/udp port 53). On Linux, check the");
+  console.error("     OUTPUT chain and remove any port-53 DROP/REJECT rules:");
+  console.error("       sudo iptables -S OUTPUT | grep -- '--dport 53'");
+  console.error("       sudo nft list ruleset | grep -- 53   # if you use nftables");
+  console.error("  2. A VPN or corporate split-DNS / kill-switch is blocking public DNS — connect");
+  console.error("     to the VPN (or disconnect it) so the host can resolve provider endpoints.");
+  console.error("  3. The system resolver is misconfigured — verify /etc/resolv.conf points at a");
+  console.error("     reachable nameserver, then retry.");
+  if (host.platform === "win32" || host.isWsl) {
+    console.error("  4. On Windows/WSL, check Windows Firewall and any VPN client DNS settings.");
+  }
+  console.error("");
+  console.error(`  If this host is intentionally air-gapped or uses only local inference, set`);
+  console.error(`  ${SKIP_HOST_DNS_PREFLIGHT_ENV}=1 to skip this check.`);
+  console.error("");
+  console.error("  Verify the fix worked:");
+  console.error(
+    `    node -e "require('node:dns').resolve('${hostname}', (e,a)=>{if(e)throw e;console.log(a)})"`,
+  );
+  console.error(`    curl -sS https://${hostname}/v1/models -o /dev/null && echo reachable`);
+}
+
+/**
+ * Remediation for the `resolution_failed` container-DNS reason: the docker
+ * DNS server *answered* the probe (so it is reachable) but returned
+ * NXDOMAIN/REFUSED for the name. The sandbox build's `npm ci` would then fail
+ * to resolve registry.npmjs.org. This is a different failure from
+ * `servers_unreachable` (UDP:53 dropped), so it must NOT print the
+ * systemd-resolved / UDP:53 remediation, which recommends changes that are
+ * irrelevant when the resolver is already reachable (#6149).
+ */
+export function printContainerDnsResolutionFailedRemediation(
+  host: Pick<Host, "platform" | "isWsl">,
+): void {
+  console.error("  The DNS server your docker daemon uses is reachable — it answered the probe —");
+  console.error("  but it refused or could not resolve the name (NXDOMAIN/REFUSED). The sandbox");
+  console.error("  build runs `npm ci` inside a container and must resolve registry.npmjs.org, so");
+  console.error("  onboarding cannot continue until that name resolves. See issue #6149.");
+  console.error("");
+  console.error("  This is NOT the UDP:53-blocked case — your resolver is up. Check its config:");
+  console.error("");
+  console.error(
+    "  1. If the docker daemon points at a local/forwarding resolver (dnsmasq, Pi-hole,",
+  );
+  console.error("     unbound, systemd-resolved), make sure it forwards public names and has no");
+  console.error("     blocklist/ACL rejecting registry.npmjs.org (e.g. a dnsmasq");
+  console.error("     `address=/registry.npmjs.org/` or `server=` override, or a REFUSED ACL).");
+  console.error("  2. Confirm the resolver's own upstream is healthy and not returning");
+  console.error("     NXDOMAIN/REFUSED for public names.");
+  const daemonJsonHint =
+    host.platform === "linux" && !host.isWsl
+      ? "/etc/docker/daemon.json, then restart docker"
+      : "your docker daemon.json (Docker Desktop → Settings → Docker Engine on macOS/Windows), then restart it";
+  console.error("  3. Or point the docker daemon at a DNS server that resolves public names — add");
+  console.error(`     { "dns": ["<working-dns-ip>"] } in ${daemonJsonHint}.`);
+  console.error("");
+  console.error("  Verify the fix worked:");
+  console.error(`    docker run --rm ${BUSYBOX_PROBE_IMAGE} nslookup registry.npmjs.org`);
 }
 
 export function printContainerDnsRemediation(host: Host): void {
@@ -257,8 +511,7 @@ export function printContainerDnsRemediation(host: Host): void {
   // hosts configure DNS through Docker Desktop's GUI or a
   // platform-specific daemon.json path, so we avoid printing shell
   // commands that would mislead those users.
-  const isLinuxWithSystemd =
-    host.platform === "linux" && !host.isWsl && host.systemctlAvailable;
+  const isLinuxWithSystemd = host.platform === "linux" && !host.isWsl && host.systemctlAvailable;
 
   const printLinuxFix = (bridgeIp: string, note: string | null) => {
     if (note) console.error(note);
@@ -316,9 +569,7 @@ export function printContainerDnsRemediation(host: Host): void {
         indent: "       ",
       });
       console.error("       osascript -e 'quit app \"Docker\"' && sleep 3 && open -a Docker");
-      console.error(
-        "     (or do the same via the Docker Desktop UI: Settings → Docker Engine)",
-      );
+      console.error("     (or do the same via the Docker Desktop UI: Settings → Docker Engine)");
     } else {
       console.error("  Configure your container runtime's DNS (macOS):");
       console.error("     - Docker Desktop (jq required for safe daemon.json merge):");
@@ -368,7 +619,9 @@ export function printContainerDnsRemediation(host: Host): void {
       // print steps that depend on it. Show the daemon.json safe-merge
       // and a non-systemctl restart hint instead.
       if (wslBridgeNote) console.error(wslBridgeNote);
-      console.error("     Merge the dns key into /etc/docker/daemon.json (jq required for safe merge):");
+      console.error(
+        "     Merge the dns key into /etc/docker/daemon.json (jq required for safe merge):",
+      );
       printDaemonJsonDnsPatch({
         daemonJsonPath: "/etc/docker/daemon.json",
         configDir: "/etc/docker",
@@ -378,7 +631,9 @@ export function printContainerDnsRemediation(host: Host): void {
         indent: "       ",
       });
       console.error("     Restart the Docker daemon however your WSL distro launches it");
-      console.error("     (e.g. `sudo service docker restart`, or stop the dockerd process and rerun it).");
+      console.error(
+        "     (e.g. `sudo service docker restart`, or stop the dockerd process and rerun it).",
+      );
     }
   } else {
     console.error("  Configure your docker daemon to use a DNS server that accepts UDP:53.");

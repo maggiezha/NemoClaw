@@ -7,12 +7,19 @@ const mocks = vi.hoisted(() => ({
   prompt: vi.fn().mockResolvedValue("yes"),
   recoverNamedGatewayRuntime: vi.fn().mockResolvedValue({ recovered: true }),
   runOpenshellProviderCommand: vi.fn(),
+  recordExtraProvider: vi.fn(),
+  forgetExtraProvider: vi.fn(),
 }));
 
-vi.mock("../lib/credentials/store", () => ({ prompt: mocks.prompt }));
+vi.mock("../lib/credentials/store", () => ({
+  KNOWN_CREDENTIAL_ENV_KEYS: ["NVIDIA_INFERENCE_API_KEY"],
+  prompt: mocks.prompt,
+}));
 vi.mock("../lib/actions/global", () => ({
   recoverNamedGatewayRuntime: mocks.recoverNamedGatewayRuntime,
   runOpenshellProviderCommand: mocks.runOpenshellProviderCommand,
+  recordExtraProvider: mocks.recordExtraProvider,
+  forgetExtraProvider: mocks.forgetExtraProvider,
 }));
 
 import CredentialsCommand from "./credentials";
@@ -49,11 +56,14 @@ describe("credentials oclif adapter source coverage", () => {
     await CredentialsListCommand.run([], rootDir);
 
     expect(mocks.recoverNamedGatewayRuntime).toHaveBeenCalledWith();
-    expect(mocks.runOpenshellProviderCommand).toHaveBeenCalledWith(["provider", "list", "--names"], {
-      ignoreError: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 30_000,
-    });
+    expect(mocks.runOpenshellProviderCommand).toHaveBeenCalledWith(
+      ["provider", "list", "--names"],
+      {
+        ignoreError: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 30_000,
+      },
+    );
     const output = log.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
     log.mockRestore();
     expect(output).toContain("nvidia-prod");
@@ -68,11 +78,14 @@ describe("credentials oclif adapter source coverage", () => {
     await CredentialsResetCommand.run(["nvidia-prod", "--yes"], rootDir);
 
     expect(mocks.prompt).not.toHaveBeenCalled();
-    expect(mocks.runOpenshellProviderCommand).toHaveBeenCalledWith(["provider", "delete", "nvidia-prod"], {
-      ignoreError: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 30_000,
-    });
+    expect(mocks.runOpenshellProviderCommand).toHaveBeenCalledWith(
+      ["provider", "delete", "nvidia-prod"],
+      {
+        ignoreError: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 30_000,
+      },
+    );
     const output = log.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
     log.mockRestore();
     expect(output).toContain("Removed provider 'nvidia-prod'");

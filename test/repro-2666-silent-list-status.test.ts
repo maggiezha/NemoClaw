@@ -24,13 +24,14 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import {
-  type ListSandboxesCommandDeps,
   getSandboxInventory,
+  type ListSandboxesCommandDeps,
   renderSandboxInventoryText,
-} from "../dist/lib/inventory/index.js";
-import { recoverRegistryEntriesWithFallback } from "../dist/lib/list-command-deps.js";
+} from "../src/lib/inventory/index.js";
+import { recoverRegistryEntriesWithFallback } from "../src/lib/list-command-deps.js";
+import { nemoclawStateRoot } from "../src/lib/state/state-root.js";
+import { testTimeoutOptions } from "./helpers/timeouts";
 
 const CLI = path.join(import.meta.dirname, "..", "bin", "nemoclaw.js");
 
@@ -67,7 +68,7 @@ function buildDepsWithThrowingRecovery(): ListSandboxesCommandDeps {
   };
 }
 
-describe("#2666 — silent empty output regression", () => {
+describe("silent empty output regression (#2666)", () => {
   it("nemoclaw list renders the registry-only listing when recovery fails", async () => {
     const deps = buildDepsWithThrowingRecovery();
     const inventory = await getSandboxInventory(deps);
@@ -90,7 +91,7 @@ describe("#2666 — silent empty output regression", () => {
   });
 });
 
-describe("#2666 — list-command-deps resilience wrapper", () => {
+describe("list-command-deps resilience wrapper (#2666)", () => {
   // Exercises the actual exported `recoverRegistryEntriesWithFallback` from
   // src/lib/list-command-deps.ts, not a parallel re-implementation. If the
   // production wrapper regresses, these tests fail.
@@ -121,7 +122,13 @@ describe("#2666 — list-command-deps resilience wrapper", () => {
     });
     const fallback = vi.fn(() => ({
       sandboxes: [
-        { name: "my-assist", model: "test-model", provider: "test-provider", gpuEnabled: false, policies: [] },
+        {
+          name: "my-assist",
+          model: "test-model",
+          provider: "test-provider",
+          gpuEnabled: false,
+          policies: [],
+        },
       ],
       defaultSandbox: "my-assist",
     }));
@@ -139,7 +146,7 @@ describe("#2666 — list-command-deps resilience wrapper", () => {
   });
 });
 
-describe("#2666 — subprocess regression: simulated (container-stopped + foreign-port-holder)", () => {
+describe("simulated container-stopped and foreign-port-holder subprocess regression (#2666)", () => {
   // End-to-end test that runs the real `nemoclaw` binary against a fake
   // `openshell` shell script simulating the bug repro: the openshell sandbox
   // container is stopped AND a foreign listener holds port 8080. In that
@@ -167,7 +174,7 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
       path.join(binDir, "openshell"),
       [
         "#!/usr/bin/env bash",
-        "case \"$*\" in",
+        'case "$*" in',
         "  status)",
         "    cat <<'EOF'",
         "Status: Disconnected",
@@ -180,7 +187,7 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
         "    echo 'Gateway: nemoclaw'",
         "    exit 0",
         "    ;;",
-        '  "sandbox get my-assist")',
+        '  "sandbox get my-assist"|"sandbox get -g nemoclaw my-assist")',
         "    echo 'transport error: client error (Connect)' >&2",
         "    exit 1",
         "    ;;",
@@ -200,31 +207,17 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
       { mode: 0o755 },
     );
 
-    const registryDir = path.join(home, ".nemoclaw");
-    fs.mkdirSync(registryDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(registryDir, "sandboxes.json"),
-      JSON.stringify({
-        sandboxes: {
-          "my-assist": {
-            name: "my-assist",
-            model: "test-model",
-            provider: "nvidia-prod",
-            gpuEnabled: false,
-            policies: [],
-          },
-        },
-        defaultSandbox: "my-assist",
-      }),
-      { mode: 0o600 },
-    );
+    seedRegistry(path.join(home, ".nemoclaw"));
   });
 
   afterEach(() => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  function runCli(args: string[]): { code: number; stdout: string; stderr: string } {
+  function runCli(
+    args: string[],
+    envOverrides: NodeJS.ProcessEnv = {},
+  ): { code: number; stdout: string; stderr: string } {
     const result = spawnSync(process.execPath, [CLI, ...args], {
       encoding: "utf-8",
       timeout: 30_000,
@@ -236,6 +229,8 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
         NEMOCLAW_HEALTH_POLL_INTERVAL: "0",
         NEMOCLAW_STATUS_PROBE_TIMEOUT_MS: "2000",
         NEMOCLAW_TEST_NO_SLEEP: "1",
+        NEMOCLAW_GATEWAY_PORT: "",
+        ...envOverrides,
       },
     });
     return {
@@ -251,6 +246,26 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
 
   function writeFakeOpenshell(lines: string[]): void {
     fs.writeFileSync(path.join(binDir, "openshell"), lines.join("\n"), { mode: 0o755 });
+  }
+
+  function seedRegistry(stateDir: string, model = "test-model"): void {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "sandboxes.json"),
+      JSON.stringify({
+        sandboxes: {
+          "my-assist": {
+            name: "my-assist",
+            model,
+            provider: "nvidia-prod",
+            gpuEnabled: false,
+            policies: [],
+          },
+        },
+        defaultSandbox: "my-assist",
+      }),
+      { mode: 0o600 },
+    );
   }
 
   function expectLayerBefore(combined: string, layer: string, laterText: string): void {
@@ -274,16 +289,56 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
     expect(code).toBe(0);
   });
 
-  it("nemoclaw <name> status never produces silent empty output when openshell is broken", () => {
-    const { code, stdout, stderr } = runCli(["my-assist", "status"]);
+  it("nemoclaw list reads the registry scoped to a non-default gateway port (#3053)", () => {
+    const port = 9123;
+    seedRegistry(path.join(home, ".nemoclaw"), "default-root-model");
+    seedRegistry(nemoclawStateRoot(home, port), "selected-port-model");
+
+    const { code, stdout, stderr } = runCli(["list"], {
+      NEMOCLAW_GATEWAY_PORT: String(port),
+    });
     const combined = `${stdout}\n${stderr}`;
-    // Must include the sandbox header AND an actionable hint.
-    expect(combined.trim().length).toBeGreaterThan(0);
+
+    expect(code).toBe(0);
     expect(combined).toContain("my-assist");
-    // `status` must exit non-zero when the live gateway can't be verified
-    // — that's the contract a watchdog wrapping the command relies on.
-    expect(code).not.toBe(0);
+    expect(combined).toContain("selected-port-model");
+    expect(combined).not.toContain("default-root-model");
   });
+
+  it(
+    "nemoclaw <name> status reads only the registry scoped to a non-default gateway port (#3053)",
+    testTimeoutOptions(30_000),
+    () => {
+      const port = 9123;
+      seedRegistry(path.join(home, ".nemoclaw"), "default-root-model");
+      seedRegistry(nemoclawStateRoot(home, port), "selected-port-model");
+
+      const { code, stdout, stderr } = runCli(["my-assist", "status"], {
+        NEMOCLAW_GATEWAY_PORT: String(port),
+      });
+      const combined = `${stdout}\n${stderr}`;
+
+      expect(code).not.toBe(0);
+      expect(combined).toContain("my-assist");
+      expect(combined).toContain("selected-port-model");
+      expect(combined).not.toContain("default-root-model");
+    },
+  );
+
+  it(
+    "nemoclaw <name> status never produces silent empty output when openshell is broken",
+    testTimeoutOptions(30_000),
+    () => {
+      const { code, stdout, stderr } = runCli(["my-assist", "status"]);
+      const combined = `${stdout}\n${stderr}`;
+      // Must include the sandbox header AND an actionable hint.
+      expect(combined.trim().length).toBeGreaterThan(0);
+      expect(combined).toContain("my-assist");
+      // `status` must exit non-zero when the live gateway can't be verified
+      // — that's the contract a watchdog wrapping the command relies on.
+      expect(code).not.toBe(0);
+    },
+  );
 
   it("nemoclaw <name> status prints the classifier header before gateway_unreachable_after_restart guidance", () => {
     writeFakeDocker([
@@ -294,9 +349,13 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
     ]);
     writeFakeOpenshell([
       "#!/usr/bin/env bash",
-      "case \"$*\" in",
+      'case "$*" in',
       '  "sandbox get my-assist")',
       "    echo 'Error: sandbox not found' >&2",
+      "    exit 1",
+      "    ;;",
+      '  "sandbox get -g nemoclaw my-assist")',
+      "    echo 'client error (Connect): tcp connect error: Connection refused (os error 61)' >&2",
       "    exit 1",
       "    ;;",
       "  status)",
@@ -327,14 +386,18 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
     writeFakeDocker([
       "#!/usr/bin/env bash",
       "if [ \"$1\" = info ]; then echo 'Server Version: 24.0.0'; exit 0; fi",
-      "if [ \"$1\" = ps ]; then exit 0; fi",
+      'if [ "$1" = ps ]; then exit 0; fi',
       "exit 0",
     ]);
     writeFakeOpenshell([
       "#!/usr/bin/env bash",
-      "case \"$*\" in",
+      'case "$*" in',
       '  "sandbox get my-assist")',
       "    echo 'Error: sandbox not found' >&2",
+      "    exit 1",
+      "    ;;",
+      '  "sandbox get -g nemoclaw my-assist")',
+      "    echo 'transport error: no gateway configured' >&2",
       "    exit 1",
       "    ;;",
       "  status)",
@@ -369,6 +432,8 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
     const listener = net.createServer();
     await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
     const port = (listener.address() as { port: number }).port;
+    fs.rmSync(path.join(home, ".nemoclaw", "sandboxes.json"), { force: true });
+    seedRegistry(nemoclawStateRoot(home, port));
 
     try {
       // Fake docker: info OK, ps shows nothing running, ps -a shows the
@@ -376,8 +441,8 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
       writeFakeDocker([
         "#!/usr/bin/env bash",
         "if [ \"$1\" = info ]; then echo 'Server Version: 24.0.0'; exit 0; fi",
-        "if [ \"$1\" = ps ] && [ \"$2\" = -a ]; then echo 'openshell-cluster-nemoclaw'; exit 0; fi",
-        "if [ \"$1\" = ps ]; then exit 0; fi",
+        'if [ "$1" = ps ] && [ "$2" = -a ]; then echo \'openshell-cluster-nemoclaw\'; exit 0; fi',
+        'if [ "$1" = ps ]; then exit 0; fi',
         "exit 0",
       ]);
 
@@ -386,8 +451,8 @@ describe("#2666 — subprocess regression: simulated (container-stopped + foreig
       // branch where the classifier runs (rather than a recovery-hint branch).
       writeFakeOpenshell([
         "#!/usr/bin/env bash",
-        "case \"$*\" in",
-        '  "sandbox get my-assist")',
+        'case "$*" in',
+        '  "sandbox get my-assist"|"sandbox get -g nemoclaw my-assist")',
         "    echo 'transport error: unexpected EOF' >&2",
         "    exit 1",
         "    ;;",

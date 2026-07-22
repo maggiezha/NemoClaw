@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
   class GatewayTokenCommandError extends Error {
@@ -28,7 +28,9 @@ const mocks = vi.hoisted(() => {
   }
 
   return {
-    buildVersionedUninstallUrl: vi.fn((version: string) => `https://example.test/${version}/uninstall.sh`),
+    buildVersionedUninstallUrl: vi.fn(
+      (version: string) => `https://example.test/${version}/uninstall.sh`,
+    ),
     fetchGatewayAuthTokenFromSandbox: vi.fn(() => "token"),
     getVersion: vi.fn(() => "1.2.3"),
     captureOpenshellCommand: vi.fn(() => ({ status: 0, output: "alpha\n" })),
@@ -69,7 +71,9 @@ vi.mock("../lib/actions/global", () => ({
   showRootHelp: mocks.showRootHelp,
   showVersion: mocks.showVersion,
 }));
-vi.mock("../lib/adapters/openshell/client", () => ({ captureOpenshellCommand: mocks.captureOpenshellCommand }));
+vi.mock("../lib/adapters/openshell/client", () => ({
+  captureOpenshellCommand: mocks.captureOpenshellCommand,
+}));
 vi.mock("../lib/state/registry", () => ({ listSandboxes: mocks.listSandboxes }));
 vi.mock("../lib/adapters/openshell/resolve", () => ({ resolveOpenshell: mocks.resolveOpenshell }));
 vi.mock("../lib/tunnel/services", () => ({ startAll: mocks.startAll, stopAll: mocks.stopAll }));
@@ -83,14 +87,19 @@ vi.mock("../lib/uninstall-command", () => ({
 }));
 vi.mock("../lib/core/version", () => ({ getVersion: mocks.getVersion }));
 
+import { log } from "../lib/cli/logger";
 import DebugCliCommand from "./debug";
 import DeployCliCommand from "./deploy";
-import DashboardUrlCliCommand, { setDashboardUrlRuntimeBridgeFactoryForTest } from "./sandbox/dashboard-url";
-import GatewayTokenCliCommand, { setGatewayTokenRuntimeBridgeFactoryForTest } from "./sandbox/gateway/token";
-import DeprecatedStartCommand from "./start";
-import DeprecatedStopCommand from "./stop";
 import RootHelpCommand from "./root/help";
 import VersionCommand from "./root/version";
+import DashboardUrlCliCommand, {
+  setDashboardUrlRuntimeBridgeFactoryForTest,
+} from "./sandbox/dashboard-url";
+import GatewayTokenCliCommand, {
+  setGatewayTokenRuntimeBridgeFactoryForTest,
+} from "./sandbox/gateway/token";
+import DeprecatedStartCommand from "./start";
+import DeprecatedStopCommand from "./stop";
 import TunnelStartCommand from "./tunnel/start";
 import TunnelStopCommand from "./tunnel/stop";
 import UninstallCliCommand from "./uninstall";
@@ -102,15 +111,38 @@ describe("simple global oclif adapters", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("maps debug and deploy parser output to actions", async () => {
-    await DebugCliCommand.run(["--quick", "--output", "/tmp/debug.tar.gz", "--sandbox", "alpha"], rootDir);
+    await DebugCliCommand.run(
+      ["--quick", "--output", "/tmp/debug.tar.gz", "--sandbox", "alpha"],
+      rootDir,
+    );
     await DeployCliCommand.run(["gpu-alpha"], rootDir);
 
     expect(mocks.runDebugCommandWithOptions).toHaveBeenCalledWith(
       { quick: true, output: "/tmp/debug.tar.gz", sandboxName: "alpha" },
-      expect.objectContaining({ getDefaultSandbox: expect.any(Function), runDebug: expect.any(Function) }),
+      expect.objectContaining({
+        getDefaultSandbox: expect.any(Function),
+        runDebug: expect.any(Function),
+      }),
     );
     expect(mocks.runDeployAction).toHaveBeenCalledWith("gpu-alpha");
+  });
+
+  it("keeps debug -q scoped to quick diagnostics instead of global quiet mode", async () => {
+    const configure = vi.spyOn(log, "configure").mockImplementation(() => undefined);
+
+    await DebugCliCommand.run(["-q"], rootDir);
+
+    expect(mocks.runDebugCommandWithOptions).toHaveBeenCalledWith(
+      { quick: true },
+      expect.objectContaining({ runDebug: expect.any(Function) }),
+    );
+    expect(configure).toHaveBeenCalledWith({ debug: false, quiet: false });
+    expect(configure).not.toHaveBeenCalledWith({ debug: false, quiet: true });
   });
 
   it("builds debug defaults from the sandbox registry and OpenShell liveness", async () => {
@@ -131,9 +163,12 @@ describe("simple global oclif adapters", () => {
 
   it("maps gateway-token flags to the gateway token action", async () => {
     const getSandboxAgent = vi.fn(() => "openclaw");
+    const fetchToken = mocks.fetchGatewayAuthTokenFromSandbox;
+    const agentExposesToken = vi.fn(() => true);
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
-      fetchGatewayAuthTokenFromSandbox: mocks.fetchGatewayAuthTokenFromSandbox,
+      fetchToken,
       getSandboxAgent,
+      agentExposesToken,
     }));
 
     await GatewayTokenCliCommand.run(["alpha", "--quiet"], rootDir);
@@ -141,7 +176,7 @@ describe("simple global oclif adapters", () => {
     expect(mocks.runGatewayTokenCommand).toHaveBeenCalledWith(
       "alpha",
       { quiet: true },
-      { fetchToken: mocks.fetchGatewayAuthTokenFromSandbox, getSandboxAgent },
+      { fetchToken, getSandboxAgent, agentExposesToken },
     );
   });
 
@@ -175,8 +210,9 @@ describe("simple global oclif adapters", () => {
       throw new mocks.GatewayTokenCommandError("not applicable");
     });
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
-      fetchGatewayAuthTokenFromSandbox: mocks.fetchGatewayAuthTokenFromSandbox,
+      fetchToken: mocks.fetchGatewayAuthTokenFromSandbox,
       getSandboxAgent: () => "hermes",
+      agentExposesToken: () => false,
     }));
     const previousExitCode = process.exitCode;
     process.exitCode = undefined;
@@ -188,13 +224,50 @@ describe("simple global oclif adapters", () => {
     }
   });
 
+  it("renders every line of a multi-line Hermes diagnostic to stderr without leaking an oclif stack trace", async () => {
+    // PRA-T3 on #5252: when the helper throws a multi-line
+    // GatewayTokenCommandError for a Hermes sandbox, the wrapper must
+    // (a) write every line via console.error, (b) signal failure via
+    // process.exitCode, and (c) leak no @oclif/core ExitError stack trace.
+    const hermesLines = [
+      "  gateway-token is not applicable for sandbox 'hermes': it uses the 'hermes' agent, which does not expose a gateway auth token. This command only supports the OpenClaw agent.",
+      "  For Hermes dashboard access, run: nemohermes hermes dashboard-url",
+      "  Hermes dashboard auth is read from the in-sandbox config (~/.hermes/config.yaml), not a gateway token.",
+    ];
+    mocks.runGatewayTokenCommand.mockImplementationOnce(() => {
+      throw new mocks.GatewayTokenCommandError(hermesLines, 1);
+    });
+    setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
+      fetchToken: mocks.fetchGatewayAuthTokenFromSandbox,
+      getSandboxAgent: () => "hermes",
+      agentExposesToken: () => false,
+    }));
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await expect(GatewayTokenCliCommand.run(["hermes"], rootDir)).resolves.toBeUndefined();
+      expect(process.exitCode).toBe(1);
+      for (const line of hermesLines) {
+        expect(errorSpy).toHaveBeenCalledWith(line);
+      }
+      const combined = errorSpy.mock.calls.map((args) => args.join(" ")).join("\n");
+      expect(combined).not.toMatch(/ExitError|@oclif\/core|at Object\.exit/);
+    } finally {
+      process.exitCode = previousExitCode;
+      errorSpy.mockRestore();
+    }
+  });
+
   it("clears a stale non-zero process.exitCode on a successful gateway-token run", async () => {
     // CodeRabbit #3182: if a prior run() left process.exitCode = 1, a later
     // successful invocation must still report success. Always overwrite.
     mocks.runGatewayTokenCommand.mockReturnValueOnce(undefined);
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
-      fetchGatewayAuthTokenFromSandbox: mocks.fetchGatewayAuthTokenFromSandbox,
+      fetchToken: mocks.fetchGatewayAuthTokenFromSandbox,
       getSandboxAgent: () => "openclaw",
+      agentExposesToken: () => true,
     }));
     const previousExitCode = process.exitCode;
     process.exitCode = 1;
@@ -228,6 +301,12 @@ describe("simple global oclif adapters", () => {
     expect(mocks.runStopCommand).toHaveBeenCalledWith(
       expect.objectContaining({ listSandboxes: expect.any(Function), stopAll: mocks.stopAll }),
     );
+    expect(mocks.runStopCommand.mock.calls).toEqual(
+      expect.arrayContaining([
+        [expect.not.objectContaining({ releaseGatewayPort: true })],
+        [expect.objectContaining({ releaseGatewayPort: true })],
+      ]),
+    );
   });
 
   it("passes uninstall runtime dependencies to the uninstall action", async () => {
@@ -247,5 +326,17 @@ describe("simple global oclif adapters", () => {
         exit: expect.any(Function),
       }),
     );
+  });
+
+  it("forwards uninstall flags without assigning host logging semantics", async () => {
+    const configure = vi.spyOn(log, "configure").mockImplementation(() => undefined);
+
+    await UninstallCliCommand.run(["--yes", "--debug"], rootDir);
+
+    expect(mocks.runUninstallCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ args: ["--yes", "--debug"] }),
+    );
+    expect(configure).toHaveBeenCalledWith({ debug: false, quiet: false });
+    expect(configure).not.toHaveBeenCalledWith({ debug: true, quiet: false });
   });
 });

@@ -19,7 +19,7 @@ import {
 const store = new Map<string, string>();
 
 vi.mock("node:fs", async (importOriginal) => {
-  const original = await importOriginal();
+  const original = await importOriginal<typeof import("node:fs")>();
   return {
     ...original,
     existsSync: (p: string) => store.has(p),
@@ -45,7 +45,7 @@ function makeConfig(overrides: Partial<NemoClawOnboardConfig> = {}): NemoClawOnb
     ncpPartner: null,
     model: "nvidia/nemotron-3-super-120b-a12b",
     profile: "default",
-    credentialEnv: "NVIDIA_API_KEY",
+    credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     onboardedAt: "2026-03-01T00:00:00.000Z",
     ...overrides,
   };
@@ -88,10 +88,10 @@ describe("onboard/config", () => {
 
     it("handles non-URL endpoint strings gracefully", () => {
       const config = makeConfig({
-        endpointType: "local",
+        endpointType: "custom",
         endpointUrl: "not-a-url",
       });
-      expect(describeOnboardEndpoint(config)).toBe("local (not-a-url)");
+      expect(describeOnboardEndpoint(config)).toBe("custom (not-a-url)");
     });
   });
 

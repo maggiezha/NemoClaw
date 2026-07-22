@@ -31,7 +31,6 @@
 /spark-install.md                   @NVIDIA/nemoclaw-engineer
 
 # ── Agent skills catalog ──
-/.agents/catalog-skills.yaml        @NVIDIA/nemoclaw-maintainer @NVIDIA/nemoclaw-engineer
 /.agents/skills/                    @NVIDIA/nemoclaw-maintainer @NVIDIA/nemoclaw-engineer
 /skills/                            @NVIDIA/nemoclaw-maintainer @NVIDIA/nemoclaw-engineer
 
@@ -41,6 +40,7 @@
 
 # ── Tests ──
 /test/                              @NVIDIA/nemoclaw-engineer
+/test/e2e/mock-parity.json          @NVIDIA/nemoclaw-maintainer @NVIDIA/nemoclaw-engineer
 
 # ── CI / GitHub config ──
 /.github/                           @NVIDIA/nemoclaw-maintainer

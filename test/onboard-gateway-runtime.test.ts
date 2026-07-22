@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { hasOpenShellVmDriverChildProcessFromPsOutput } from "../dist/lib/onboard/vm-driver-process.js";
+import { hasOpenShellVmDriverChildProcessFromPsOutput } from "../src/lib/onboard/vm-driver-process.js";
 
 const {
   areRequiredDockerDriverBinariesPresent,
@@ -19,7 +19,7 @@ const {
   parseDockerCdiSpecDirs,
   shouldAllowOpenshellAboveBlueprintMax,
   shouldRequireDockerDriverEnv,
-} = require("../dist/lib/onboard") as {
+} = require("../src/lib/onboard") as {
   areRequiredDockerDriverBinariesPresent: (
     platform?: NodeJS.Platform,
     binaries?: {
@@ -77,7 +77,10 @@ describe("onboard gateway runtime helpers", () => {
     const linuxEnv = getDockerDriverGatewayEnv("openshell 0.0.37", "linux");
     expect(linuxEnv.OPENSHELL_DRIVERS).toBe("docker");
     expect(linuxEnv.OPENSHELL_BIND_ADDRESS).toBe("127.0.0.1");
-    expect(linuxEnv.OPENSHELL_GRPC_ENDPOINT).toBe("http://127.0.0.1:8080");
+    expect(linuxEnv.OPENSHELL_GRPC_ENDPOINT).toBe("https://127.0.0.1:8080");
+    expect(linuxEnv.OPENSHELL_LOCAL_TLS_DIR).toContain(
+      path.join("nemoclaw", "openshell-docker-gateway", "tls"),
+    );
     expect(linuxEnv.OPENSHELL_SSH_GATEWAY_HOST).toBe("127.0.0.1");
     expect(linuxEnv.OPENSHELL_CLUSTER_IMAGE).toBeUndefined();
     expect(linuxEnv.OPENSHELL_DOCKER_SUPERVISOR_IMAGE).toContain(":0.0.37");
@@ -85,7 +88,10 @@ describe("onboard gateway runtime helpers", () => {
     const darwinEnv = getDockerDriverGatewayEnv("openshell 0.0.37", "darwin");
     expect(darwinEnv.OPENSHELL_DRIVERS).toBe("docker");
     expect(darwinEnv.OPENSHELL_BIND_ADDRESS).toBe("127.0.0.1");
-    expect(darwinEnv.OPENSHELL_GRPC_ENDPOINT).toBe("http://127.0.0.1:8080");
+    expect(darwinEnv.OPENSHELL_GRPC_ENDPOINT).toBe("https://127.0.0.1:8080");
+    expect(darwinEnv.OPENSHELL_LOCAL_TLS_DIR).toContain(
+      path.join("nemoclaw", "openshell-docker-gateway", "tls"),
+    );
     expect(darwinEnv.OPENSHELL_SSH_GATEWAY_HOST).toBe("127.0.0.1");
     expect(darwinEnv.OPENSHELL_DOCKER_SUPERVISOR_IMAGE).toContain(":0.0.37");
     expect(darwinEnv.OPENSHELL_DOCKER_SUPERVISOR_BIN).toBeUndefined();
@@ -215,8 +221,7 @@ describe("onboard gateway runtime helpers", () => {
       getDockerDriverGatewayRuntimeDriftFromSnapshot({
         processEnv: {
           ...desiredEnv,
-          OPENSHELL_DOCKER_SUPERVISOR_IMAGE:
-            "ghcr.io/nvidia/openshell/supervisor:0.0.36",
+          OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "ghcr.io/nvidia/openshell/supervisor:0.0.36",
         },
         processExe: gatewayBin,
         desiredEnv,
@@ -255,6 +260,34 @@ describe("onboard gateway runtime helpers", () => {
     ).toContain("process environment");
   });
 
+  it("reuses a healthy containerized-compat gateway whose parent is /usr/bin/docker (#4520)", () => {
+    const desiredEnv = getDockerDriverGatewayEnv("openshell 0.0.37", "linux");
+
+    // The compat gateway is a `docker run ... /opt/nemoclaw/openshell-gateway`
+    // parent, so /proc/<pid>/exe is /usr/bin/docker. The runtime identity sets
+    // driftGatewayBin=null to skip the executable comparison; with that null
+    // preserved, a healthy compat gateway is NOT judged stale.
+    expect(
+      getDockerDriverGatewayRuntimeDriftFromSnapshot({
+        processEnv: desiredEnv,
+        processExe: "/usr/bin/docker",
+        desiredEnv,
+        gatewayBin: null,
+      }),
+    ).toBeNull();
+
+    // Regression guard: if a caller coalesces the null back to the host binary
+    // (the old `?? gatewayBin` bug), the same healthy gateway is falsely stale.
+    expect(
+      getDockerDriverGatewayRuntimeDriftFromSnapshot({
+        processEnv: desiredEnv,
+        processExe: "/usr/bin/docker",
+        desiredEnv,
+        gatewayBin: "/home/user/.local/bin/openshell-gateway",
+      })?.reason,
+    ).toMatch(/^executable=.* \(expected \/home\/user\/\.local\/bin\/openshell-gateway\)$/);
+  });
+
   it("recognizes an existing Docker-driver gateway listener on Docker-driver platforms", () => {
     const opts = {
       platform: "linux" as NodeJS.Platform,
@@ -269,9 +302,9 @@ describe("onboard gateway runtime helpers", () => {
     expect(
       isDockerDriverGatewayPortListener({ ok: false, process: "openshell-", pid: 1234 }, opts),
     ).toBe(true);
-    expect(
-      isDockerDriverGatewayPortListener({ ok: false, process: "node", pid: 1234 }, opts),
-    ).toBe(false);
+    expect(isDockerDriverGatewayPortListener({ ok: false, process: "node", pid: 1234 }, opts)).toBe(
+      false,
+    );
     expect(
       isDockerDriverGatewayPortListener(
         { ok: false, process: "openshell", pid: 1234 },
@@ -328,9 +361,7 @@ describe("onboard gateway runtime helpers", () => {
       const specPath = path.join(cdiDir, "gpu-devices.yaml");
       fs.writeFileSync(
         specPath,
-        ["cdiVersion: 0.6.0", "kind: nvidia.com/gpu", "devices:", "  - name: all", ""].join(
-          "\n",
-        ),
+        ["cdiVersion: 0.6.0", "kind: nvidia.com/gpu", "devices:", "  - name: all", ""].join("\n"),
       );
       expect(findReadableNvidiaCdiSpecFiles([emptyDir, cdiDir])).toEqual([specPath]);
     } finally {

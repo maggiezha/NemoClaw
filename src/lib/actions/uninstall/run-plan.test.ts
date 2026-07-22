@@ -7,7 +7,7 @@ import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { buildRunPlan, runUninstallPlan, type RunResult } from "./run-plan";
+import { buildRunPlan, type RunResult, runUninstallPlan, type UninstallRunDeps } from "./run-plan";
 
 function ok(stdout = ""): RunResult {
   return { status: 0, stdout, stderr: "" };
@@ -18,11 +18,12 @@ function notFound(): RunResult {
 }
 
 const PROXY_CMDLINE = "/usr/bin/node /opt/nemoclaw/scripts/ollama-auth-proxy.js\n";
+// Real-world: model-router is a Python venv script so the OS interposes the
+// interpreter — args[0]=python, args[1]=model-router (issue #5169).
+const MODEL_ROUTER_CMDLINE =
+  "/home/test/.nemoclaw/model-router-venv/bin/python /home/test/.nemoclaw/model-router-venv/bin/model-router proxy --port 4000\n";
 
-function psStub(
-  pidStr: string,
-  opts: { exited: Set<number>; cmdline?: string; owner?: string },
-) {
+function psStub(pidStr: string, opts: { exited: Set<number>; cmdline?: string; owner?: string }) {
   return (args: readonly string[]): RunResult | null => {
     if (args[0] !== "-p" || args[1] !== pidStr || args[2] !== "-o") return null;
     const pid = Number(pidStr);
@@ -43,6 +44,11 @@ describe("uninstall run plan", () => {
         env: { HOME: "/home/test", TMPDIR: "/tmp/test" } as NodeJS.ProcessEnv,
         fs: {
           lstatSync: (() => ({ isFile: () => false, isSymbolicLink: () => true })) as never,
+          openSync: (() => {
+            const error = new Error("symlink") as NodeJS.ErrnoException;
+            error.code = "ELOOP";
+            throw error;
+          }) as never,
         },
       },
     );
@@ -73,7 +79,11 @@ describe("uninstall run plan", () => {
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: () => true,
-        env: { HOME: "/tmp/nemoclaw-uninstall-test", TMPDIR: "/tmp/nemoclaw-uninstall-test" } as NodeJS.ProcessEnv,
+        env: {
+          HOME: "/tmp/nemoclaw-uninstall-test",
+          NEMOCLAW_AGENT: "",
+          TMPDIR: "/tmp/nemoclaw-uninstall-test",
+        } as NodeJS.ProcessEnv,
         existsSync: () => false,
         isTty: false,
         kill: () => true,
@@ -90,8 +100,15 @@ describe("uninstall run plan", () => {
     expect(logs).toContain("[3/6] NemoClaw CLI");
     expect(logs).toContain("Removed global NemoClaw CLI package");
     expect(logs).toContain("Claws retracted. Until next time.");
-    expect(dockerCalls).toEqual(expect.arrayContaining([["rm", "-f", "abc"], ["rmi", "-f", "img1"]]));
-    expect(dockerCalls.some((args) => args.join(" ") === "volume rm -f openshell-cluster-nemoclaw")).toBe(true);
+    expect(dockerCalls).toEqual(
+      expect.arrayContaining([
+        ["rm", "-f", "abc"],
+        ["rmi", "-f", "img1"],
+      ]),
+    );
+    expect(
+      dockerCalls.some((args) => args.join(" ") === "volume rm -f openshell-cluster-nemoclaw"),
+    ).toBe(true);
   });
 
   it("removes all managed OpenShell helper binaries from the writable user bin", () => {
@@ -112,7 +129,11 @@ describe("uninstall run plan", () => {
       const result = runUninstallPlan(
         { assumeYes: true, deleteModels: false, keepOpenShell: false },
         {
-          commandExists: (command) => command !== "docker" && command !== "lsof" && command !== "openshell" && command !== "pgrep",
+          commandExists: (command) =>
+            command !== "docker" &&
+            command !== "lsof" &&
+            command !== "openshell" &&
+            command !== "pgrep",
           env: { HOME: tmpHome } as NodeJS.ProcessEnv,
           existsSync: (target) => existing.has(target),
           isTty: false,
@@ -136,6 +157,93 @@ describe("uninstall run plan", () => {
       );
       expect(logs).toContain(`Removed ${path.join(userBin, "openshell-gateway")}`);
       expect(logs).toContain(`Removed ${path.join(userBin, "openshell-sandbox")}`);
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("removes agent-alias CLI shims (nemohermes, nemo-deepagents) (#6098)", () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-alias-shims-"));
+    const userBin = path.join(tmpHome, ".local", "bin");
+    fs.mkdirSync(userBin, { recursive: true });
+    const hermesShim = path.join(userBin, "nemohermes");
+    const deepagentsShim = path.join(userBin, "nemo-deepagents");
+    // Installer-managed symlinks → classified as managed-symlink → removed.
+    fs.symlinkSync("/tmp/prefix/bin/nemohermes", hermesShim);
+    fs.symlinkSync("/tmp/prefix/bin/nemo-deepagents", deepagentsShim);
+
+    const removed: string[] = [];
+    try {
+      const result = runUninstallPlan(
+        { assumeYes: true, deleteModels: false, keepOpenShell: false },
+        {
+          commandExists: (command) =>
+            command !== "docker" &&
+            command !== "lsof" &&
+            command !== "openshell" &&
+            command !== "pgrep",
+          env: { HOME: tmpHome } as NodeJS.ProcessEnv,
+          existsSync: (target) => target === hermesShim || target === deepagentsShim,
+          isTty: false,
+          log: () => {},
+          rmSync: vi.fn((target: fs.PathLike) => {
+            removed.push(String(target));
+          }),
+          run: vi.fn(() => ok()),
+          runDocker: () => ok(""),
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(removed).toEqual(expect.arrayContaining([hermesShim, deepagentsShim]));
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("removes agent-alias wrapper shims via binName-aware fd-read classification (#6098)", () => {
+    // Symlinks classify via the metadata fast path. Wrapper scripts go through
+    // classifyShimPath's fd-read branch which reads the file and matches the
+    // wrapper contract with the per-alias binName. Both paths must remove.
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-alias-wrapper-"));
+    const userBin = path.join(tmpHome, ".local", "bin");
+    fs.mkdirSync(userBin, { recursive: true });
+    const hermesShim = path.join(userBin, "nemohermes");
+    const deepagentsShim = path.join(userBin, "nemo-deepagents");
+    const managedWrapper = (binName: string) =>
+      [
+        "#!/usr/bin/env bash",
+        'export PATH="/tmp/node-bin:$PATH"',
+        `exec "/tmp/prefix/bin/${binName}" "$@"`,
+        "",
+      ].join("\n");
+    fs.writeFileSync(hermesShim, managedWrapper("nemohermes"), { mode: 0o755 });
+    fs.writeFileSync(deepagentsShim, managedWrapper("nemo-deepagents"), { mode: 0o755 });
+
+    const removed: string[] = [];
+    try {
+      const result = runUninstallPlan(
+        { assumeYes: true, deleteModels: false, keepOpenShell: false },
+        {
+          commandExists: (command) =>
+            command !== "docker" &&
+            command !== "lsof" &&
+            command !== "openshell" &&
+            command !== "pgrep",
+          env: { HOME: tmpHome } as NodeJS.ProcessEnv,
+          existsSync: (target) => target === hermesShim || target === deepagentsShim,
+          isTty: false,
+          log: () => {},
+          rmSync: vi.fn((target: fs.PathLike) => {
+            removed.push(String(target));
+          }),
+          run: vi.fn(() => ok()),
+          runDocker: () => ok(""),
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(removed).toEqual(expect.arrayContaining([hermesShim, deepagentsShim]));
     } finally {
       fs.rmSync(tmpHome, { recursive: true, force: true });
     }
@@ -190,7 +298,7 @@ describe("uninstall run plan", () => {
     const result = runUninstallPlan(
       { assumeYes: false, deleteModels: false, keepOpenShell: true },
       {
-        env: { HOME: "/tmp/nemoclaw-uninstall-test" } as NodeJS.ProcessEnv,
+        env: { HOME: "/tmp/nemoclaw-uninstall-test", NEMOCLAW_AGENT: "" } as NodeJS.ProcessEnv,
         existsSync: () => false,
         isTty: true,
         log: (line) => logs.push(line),
@@ -225,14 +333,61 @@ describe("uninstall run plan", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("explains how to proceed when stdin yields no input at the confirm prompt", () => {
+    const logs: string[] = [];
+    const run = vi.fn();
+    const result = runUninstallPlan(
+      { assumeYes: false, deleteModels: false, keepOpenShell: true },
+      {
+        env: { HOME: "/tmp/nemoclaw-uninstall-test" } as NodeJS.ProcessEnv,
+        log: (line) => logs.push(line),
+        readLine: () => null,
+        run,
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(logs).toContain(
+      "No input available on stdin (closed or non-interactive); re-run with --yes to skip this prompt.",
+    );
+    expect(logs).toContain("Aborted.");
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("builds the default runtime without touching process.stdin (#5188)", () => {
+    const stdinGet = vi.spyOn(process, "stdin", "get");
+    try {
+      const result = runUninstallPlan(
+        { assumeYes: true, deleteModels: false, keepOpenShell: true },
+        {
+          commandExists: () => false,
+          env: { HOME: "/tmp/nemoclaw-uninstall-test" } as NodeJS.ProcessEnv,
+          existsSync: () => false,
+          kill: () => true,
+          log: () => {},
+          rmSync: vi.fn(),
+          run: vi.fn(() => ok()),
+          runDocker: () => ok(""),
+          // isTty/readLine intentionally not injected: the default
+          // isStdinTty/readLineFromStdin pair must never instantiate
+          // process.stdin, which would flip fd 0 non-blocking (#5188).
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(stdinGet).not.toHaveBeenCalled();
+    } finally {
+      stdinGet.mockRestore();
+    }
+  });
+
   it("kills the Ollama auth proxy via the persisted PID file (#2759)", () => {
     const logs: string[] = [];
     const killed: number[] = [];
     const exited = new Set<number>();
     // Simulate the persisted PID file under ~/.nemoclaw/.
-    const tmpHome = "/tmp/nemoclaw-uninstall-test-2759-pidfile";
-    const pidFile = `${tmpHome}/.nemoclaw/ollama-auth-proxy.pid`;
-    fs.mkdirSync(`${tmpHome}/.nemoclaw`, { recursive: true });
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-test-2759-pidfile-"));
+    const pidFile = path.join(tmpHome, ".nemoclaw", "ollama-auth-proxy.pid");
+    fs.mkdirSync(path.join(tmpHome, ".nemoclaw"), { recursive: true });
     fs.writeFileSync(pidFile, "44321\n");
 
     try {
@@ -278,7 +433,10 @@ describe("uninstall run plan", () => {
     const logs: string[] = [];
     const killed: number[] = [];
     const exited = new Set<number>();
-    const stub = psStub("55678", { exited });
+    const stub = psStub("55678", {
+      exited,
+      cmdline: "/usr/bin/node /opt/nemoclaw/scripts/ollama-auth-proxy.mts\n",
+    });
     const result = runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
@@ -408,13 +566,15 @@ describe("uninstall run plan", () => {
     expect(logs).toContain("Stopped Ollama auth proxy 33333");
   });
 
-  it("never kills a process on :11435 whose cmdline is not the auth proxy", () => {
+  it.each([
+    "ollama-auth-proxy-helper.mjs",
+    "ollama-auth-proxy.mts.backup",
+  ])("never kills the near-named %s process on :11435", (scriptName) => {
     const logs: string[] = [];
     const killed: number[] = [];
-    // Same owner, different cmdline — exercises the cmdline gate specifically.
     const stub = psStub("99999", {
       exited: new Set(),
-      cmdline: "/usr/sbin/nginx -g daemon off;\n",
+      cmdline: `/usr/bin/node /opt/nemoclaw/scripts/${scriptName}\n`,
     });
     const result = runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
@@ -453,13 +613,202 @@ describe("uninstall run plan", () => {
     expect(logs).toContain("No Ollama auth proxy processes found");
   });
 
+  it("kills the model router via onboard-session routerPid (#5169)", () => {
+    const logs: string[] = [];
+    const killed: number[] = [];
+    const exited = new Set<number>();
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-test-5169-session-"));
+    const stateDir = path.join(tmpHome, ".nemoclaw");
+    const sessionFile = path.join(stateDir, "onboard-session.json");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(sessionFile, JSON.stringify({ routerPid: 55432 }));
+
+    try {
+      const stub = psStub("55432", { exited, cmdline: MODEL_ROUTER_CMDLINE });
+      const result = runUninstallPlan(
+        { assumeYes: true, deleteModels: false, keepOpenShell: true },
+        {
+          commandExists: () => true,
+          env: { HOME: tmpHome, LOGNAME: "testuser" } as NodeJS.ProcessEnv,
+          existsSync: () => false,
+          isTty: false,
+          kill: (pid, _signal) => {
+            killed.push(pid);
+            exited.add(pid);
+            return true;
+          },
+          log: (line) => logs.push(line),
+          rmSync: vi.fn(),
+          run: (command, args) => {
+            if (command === "ps") {
+              const result = stub(args);
+              if (result) return result;
+            }
+            if (command === "lsof") return ok("");
+            if (args[0] === "-c") return ok("/fake/bin/tool\n");
+            if (args[0] === "-f") return ok("");
+            return ok();
+          },
+          runDocker: () => ok(""),
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(killed).toContain(55432);
+      expect(logs).toContain("Stopped model router 55432");
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("kills an orphan model router via lsof :4000 when onboard-session is gone", () => {
+    const logs: string[] = [];
+    const killed: number[] = [];
+    const exited = new Set<number>();
+    const stub = psStub("55679", { exited, cmdline: MODEL_ROUTER_CMDLINE });
+    const result = runUninstallPlan(
+      { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      {
+        commandExists: () => true,
+        env: {
+          HOME: "/tmp/nemoclaw-uninstall-test-5169-lsof",
+          LOGNAME: "testuser",
+        } as NodeJS.ProcessEnv,
+        existsSync: () => false,
+        isTty: false,
+        kill: (pid, _signal) => {
+          killed.push(pid);
+          exited.add(pid);
+          return true;
+        },
+        log: (line) => logs.push(line),
+        rmSync: vi.fn(),
+        run: (command, args) => {
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":4000") {
+            return ok("55679\n");
+          }
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":11435") {
+            return ok("");
+          }
+          if (command === "ps") {
+            const result = stub(args);
+            if (result) return result;
+          }
+          if (args[0] === "-c") return ok("/fake/bin/tool\n");
+          if (args[0] === "-f") return ok("");
+          return ok();
+        },
+        runDocker: () => ok(""),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(killed).toContain(55679);
+    expect(logs).toContain("Stopped model router 55679");
+  });
+
+  it("never stops a foreign-owned model router on :4000 even if cmdline matches", () => {
+    const logs: string[] = [];
+    const killed: number[] = [];
+    const stub = psStub("77888", {
+      exited: new Set(),
+      owner: "someone-else",
+      cmdline: MODEL_ROUTER_CMDLINE,
+    });
+    const result = runUninstallPlan(
+      { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      {
+        commandExists: () => true,
+        env: {
+          HOME: "/tmp/nemoclaw-uninstall-test-5169-foreign-owner",
+          LOGNAME: "testuser",
+        } as NodeJS.ProcessEnv,
+        existsSync: () => false,
+        isTty: false,
+        kill: (pid) => {
+          killed.push(pid);
+          return true;
+        },
+        log: (line) => logs.push(line),
+        rmSync: vi.fn(),
+        run: (command, args) => {
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":4000") {
+            return ok("77888\n");
+          }
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":11435") {
+            return ok("");
+          }
+          if (command === "ps") {
+            const result = stub(args);
+            if (result) return result;
+          }
+          if (args[0] === "-c") return ok("/fake/bin/tool\n");
+          if (args[0] === "-f") return ok("");
+          return ok();
+        },
+        runDocker: () => ok(""),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(killed).not.toContain(77888);
+    expect(logs).toContain("No model router processes found");
+  });
+
+  it("never kills a process on :4000 whose cmdline is not the model router", () => {
+    const logs: string[] = [];
+    const killed: number[] = [];
+    const stub = psStub("88888", {
+      exited: new Set(),
+      cmdline: "/usr/sbin/nginx -g daemon off;\n",
+    });
+    const result = runUninstallPlan(
+      { assumeYes: true, deleteModels: false, keepOpenShell: true },
+      {
+        commandExists: () => true,
+        env: {
+          HOME: "/tmp/nemoclaw-uninstall-test-5169-foreign-cmdline",
+          LOGNAME: "testuser",
+        } as NodeJS.ProcessEnv,
+        existsSync: () => false,
+        isTty: false,
+        kill: (pid) => {
+          killed.push(pid);
+          return true;
+        },
+        log: (line) => logs.push(line),
+        rmSync: vi.fn(),
+        run: (command, args) => {
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":4000") {
+            return ok("88888\n");
+          }
+          if (command === "lsof" && args[0] === "-ti" && args[1] === ":11435") {
+            return ok("");
+          }
+          if (command === "ps") {
+            const result = stub(args);
+            if (result) return result;
+          }
+          if (args[0] === "-c") return ok("/fake/bin/tool\n");
+          if (args[0] === "-f") return ok("");
+          return ok();
+        },
+        runDocker: () => ok(""),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(killed).not.toContain(88888);
+    expect(logs).toContain("No model router processes found");
+  });
+
   it("escalates to SIGKILL and reports failure when SIGTERM is ignored", () => {
     const logs: string[] = [];
     const warnings: string[] = [];
     const signals: NodeJS.Signals[] = [];
-    const tmpHome = "/tmp/nemoclaw-uninstall-test-2759-stuck";
-    const pidFile = `${tmpHome}/.nemoclaw/ollama-auth-proxy.pid`;
-    fs.mkdirSync(`${tmpHome}/.nemoclaw`, { recursive: true });
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-test-2759-stuck-"));
+    const pidFile = path.join(tmpHome, ".nemoclaw", "ollama-auth-proxy.pid");
+    fs.mkdirSync(path.join(tmpHome, ".nemoclaw"), { recursive: true });
     fs.writeFileSync(pidFile, "44322\n");
 
     try {
@@ -564,9 +913,17 @@ describe("uninstall run plan", () => {
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
         commandExists: (command) => command !== "docker" && command !== "pgrep",
-        env: { HOME: "/home/test", TMPDIR: "/tmp/test" } as NodeJS.ProcessEnv,
+        // Neutralize NEMOCLAW_NON_INTERACTIVE: the runtime merges the real
+        // process.env, so a developer shell exporting it would silently flip
+        // this interactive scenario onto the non-interactive path.
+        env: {
+          HOME: "/home/test",
+          NEMOCLAW_NON_INTERACTIVE: "",
+          TMPDIR: "/tmp/test",
+        } as NodeJS.ProcessEnv,
         error: (line) => warnings.push(line),
-        existsSync: (target) => target === "/swapfile" || target === "/home/test/.nemoclaw/managed_swap",
+        existsSync: (target) =>
+          target === "/swapfile" || target === "/home/test/.nemoclaw/managed_swap",
         isTty: true,
         log: (line) => logs.push(line),
         rmSync: vi.fn(),
@@ -583,11 +940,7 @@ describe("uninstall run plan", () => {
     expect(logs).not.toContain("Swap file removed");
   });
 
-  it("#3456 sub-bug #4: gateway destroy no-op uses the 'already removed' wording, not 'Destroyed ... skipped'", () => {
-    // When `openshell gateway destroy -g nemoclaw` returns non-zero (gateway
-    // already gone), the previous code printed `Destroyed gateway 'nemoclaw'
-    // skipped` — self-contradictory. The fix routes this branch to an onSkip
-    // message that describes the actual state.
+  it("uses the 'already removed' wording for gateway remove no-ops, sub-bug 4 (#3456)", () => {
     const warnings: string[] = [];
     const logs: string[] = [];
     const result = runUninstallPlan(
@@ -601,8 +954,8 @@ describe("uninstall run plan", () => {
         log: (line) => logs.push(line),
         rmSync: vi.fn(),
         run: (command, args) => {
-          if (command === "openshell" && args[0] === "gateway" && args[1] === "destroy") {
-            return notFound();
+          if (command === "openshell" && args[0] === "gateway" && args[1] === "remove") {
+            return { status: 1, stdout: "", stderr: "gateway not found" };
           }
           if (args[0] === "-c") return ok("/fake/bin/tool\n");
           return ok();
@@ -618,9 +971,439 @@ describe("uninstall run plan", () => {
     );
   });
 
+  describe("user-data preservation under ~/.nemoclaw/", () => {
+    function setupStateDir(): { tmpHome: string; stateDir: string } {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-preserve-"));
+      const stateDir = path.join(tmpHome, ".nemoclaw");
+      fs.mkdirSync(path.join(stateDir, "rebuild-backups", "sb1", "20260101"), { recursive: true });
+      fs.writeFileSync(
+        path.join(stateDir, "rebuild-backups", "sb1", "20260101", "manifest.json"),
+        "{}",
+      );
+      fs.mkdirSync(path.join(stateDir, "backups", "20260320-120000"), { recursive: true });
+      fs.writeFileSync(path.join(stateDir, "backups", "20260320-120000", "USER.md"), "hello");
+      fs.writeFileSync(
+        path.join(stateDir, "sandboxes.json"),
+        JSON.stringify({
+          defaultSandbox: "sb1",
+          sandboxes: { sb1: { name: "sb1", gatewayName: "nemoclaw", gatewayPort: 8080 } },
+        }),
+      );
+      fs.writeFileSync(path.join(stateDir, "ollama-auth-proxy.pid"), "1234");
+      fs.writeFileSync(path.join(stateDir, "openrouter-runtime-adapter.pid"), "1235");
+      fs.writeFileSync(path.join(stateDir, "openrouter-runtime-adapter.json"), "{}");
+      fs.writeFileSync(path.join(stateDir, "openrouter-runtime-adapter.lock"), "lock");
+      fs.writeFileSync(path.join(stateDir, "openrouter-runtime-adapter.log"), "{}\n");
+      fs.mkdirSync(path.join(stateDir, "source"));
+      return { tmpHome, stateDir };
+    }
+
+    function tempScopedExistsSync(tmpHome: string): (target: string) => boolean {
+      return (target: string) => target.startsWith(tmpHome) && fs.existsSync(target);
+    }
+
+    function preserveCaseDeps(
+      tmpHome: string,
+      logs: string[],
+      opts: {
+        envOverrides?: Record<string, string>;
+        isTty?: boolean;
+        readLine?: UninstallRunDeps["readLine"];
+      } = {},
+    ): UninstallRunDeps {
+      return {
+        commandExists: () => false,
+        env: {
+          HOME: tmpHome,
+          NEMOCLAW_NON_INTERACTIVE: "",
+          NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "",
+          ...(opts.envOverrides ?? {}),
+        } as NodeJS.ProcessEnv,
+        existsSync: tempScopedExistsSync(tmpHome),
+        isTty: opts.isTty ?? false,
+        log: (line) => logs.push(line),
+        ...(opts.readLine ? { readLine: opts.readLine } : {}),
+        run: vi.fn(() => ok()),
+        runDocker: () => ok(""),
+      };
+    }
+
+    function expectPreservedEntries(stateDir: string): void {
+      expect(
+        fs.existsSync(path.join(stateDir, "rebuild-backups", "sb1", "20260101", "manifest.json")),
+      ).toBe(true);
+      expect(fs.existsSync(path.join(stateDir, "backups", "20260320-120000", "USER.md"))).toBe(
+        true,
+      );
+      expect(fs.existsSync(path.join(stateDir, "sandboxes.json"))).toBe(true);
+    }
+
+    function expectNoPreserveSignals(logs: string[]): void {
+      expect(logs.every((line) => !line.startsWith("Preserving "))).toBe(true);
+      expect(logs.every((line) => !line.includes("preserved:"))).toBe(true);
+    }
+
+    it("preserves rebuild-backups/, backups/, and sandboxes.json by default in non-interactive runs", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expectPreservedEntries(stateDir);
+        expect(fs.existsSync(path.join(stateDir, "ollama-auth-proxy.pid"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "openrouter-runtime-adapter.pid"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "openrouter-runtime-adapter.json"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "openrouter-runtime-adapter.lock"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "openrouter-runtime-adapter.log"))).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "source"))).toBe(false);
+        expect(logs).toContain(
+          `Preserving rebuild-backups, backups, sandboxes.json under ${stateDir}.`,
+        );
+        expect(
+          logs.some((line) => line.includes("preserved: rebuild-backups, backups, sandboxes.json")),
+        ).toBe(true);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("purges the whole state dir when NEMOCLAW_UNINSTALL_DESTROY_USER_DATA=1 is set", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            envOverrides: { NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "1" },
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain(`Removed ${stateDir}`);
+        expect(logs).toContain(
+          "NEMOCLAW_UNINSTALL_DESTROY_USER_DATA=1 set; purging user data under ~/.nemoclaw/.",
+        );
+        expectNoPreserveSignals(logs);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("purges the whole state dir when destroyUserData is set, even with --yes on a non-TTY", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, destroyUserData: true, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain(`Removed ${stateDir}`);
+        expect(logs).toContain("--destroy-user-data set; purging user data under ~/.nemoclaw/.");
+        expectNoPreserveSignals(logs);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("destroyUserData purges on a TTY without prompting", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      const readLine = vi.fn(() => "y");
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, destroyUserData: true, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, { isTty: true, readLine }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain("--destroy-user-data set; purging user data under ~/.nemoclaw/.");
+        expect(logs.every((line) => line !== "Also remove them? [y/N]")).toBe(true);
+        expect(readLine).not.toHaveBeenCalled();
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("destroyUserData without --yes renders a purge-aware global confirmation and skips the user-data prompt", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, destroyUserData: true, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, { isTty: true, readLine: () => "y" }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain(
+          "  · ~/.nemoclaw (removes rebuild-backups/, backups/, sandboxes.json: --destroy-user-data set)",
+        );
+        expect(
+          logs.every(
+            (line) =>
+              line !==
+              "  · ~/.nemoclaw (preserves rebuild-backups/, backups/, sandboxes.json by default)",
+          ),
+        ).toBe(true);
+        expect(logs.every((line) => line !== "Also remove them? [y/N]")).toBe(true);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("env var without --yes renders a purge-aware global confirmation", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            envOverrides: { NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "1" },
+            isTty: true,
+            readLine: () => "y",
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain(
+          "  · ~/.nemoclaw (removes rebuild-backups/, backups/, sandboxes.json: NEMOCLAW_UNINSTALL_DESTROY_USER_DATA=1)",
+        );
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("destroyUserData takes precedence over NEMOCLAW_UNINSTALL_DESTROY_USER_DATA env var", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, destroyUserData: true, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            envOverrides: { NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "1" },
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain("--destroy-user-data set; purging user data under ~/.nemoclaw/.");
+        expect(
+          logs.every(
+            (line) =>
+              line !==
+              "NEMOCLAW_UNINSTALL_DESTROY_USER_DATA=1 set; purging user data under ~/.nemoclaw/.",
+          ),
+        ).toBe(true);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("non-interactive hint mentions --destroy-user-data alongside the env var on non-TTY without --yes", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, { readLine: () => "y" }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expectPreservedEntries(stateDir);
+        expect(
+          logs.some(
+            (line) =>
+              line.includes("--destroy-user-data") &&
+              line.includes("NEMOCLAW_UNINSTALL_DESTROY_USER_DATA=1"),
+          ),
+        ).toBe(true);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("purges via interactive y/N prompt when user answers yes", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const replies = ["yes", "y"];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            isTty: true,
+            readLine: () => replies.shift() ?? null,
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain("Also remove them? [y/N]");
+        expect(logs).toContain("Acknowledged; purging user data.");
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps user data when interactive prompt is declined", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      try {
+        const logs: string[] = [];
+        const replies = ["yes", ""];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            isTty: true,
+            readLine: () => replies.shift() ?? null,
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expectPreservedEntries(stateDir);
+        expect(logs).toContain("Keeping user data.");
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("preserves entries on a TTY when NEMOCLAW_NON_INTERACTIVE=1 is set instead of --yes", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      const readLine = vi.fn(() => "yes");
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: false, deleteModels: false, keepOpenShell: true },
+          preserveCaseDeps(tmpHome, logs, {
+            envOverrides: { NEMOCLAW_NON_INTERACTIVE: "1" },
+            isTty: true,
+            readLine,
+          }),
+        );
+
+        expect(result.exitCode).toBe(0);
+        expectPreservedEntries(stateDir);
+        expect(logs).toContain(
+          `Preserving rebuild-backups, backups, sandboxes.json under ${stateDir}.`,
+        );
+        expect(logs.every((line) => line !== "Also remove them? [y/N]")).toBe(true);
+        expect(readLine).toHaveBeenCalledTimes(1);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed before cleanup when ~/.nemoclaw cannot be inspected", () => {
+      const { tmpHome, stateDir } = setupStateDir();
+      const realLstat = fs.lstatSync;
+      const lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation((p: fs.PathLike) => {
+        if (String(p) === stateDir) {
+          const err = new Error("permission denied") as NodeJS.ErrnoException;
+          err.code = "EACCES";
+          throw err;
+        }
+        return realLstat(p);
+      });
+      try {
+        const logs: string[] = [];
+        const warnings: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          {
+            ...preserveCaseDeps(tmpHome, logs),
+            error: (line) => warnings.push(line),
+          },
+        );
+
+        expect(result.exitCode).toBe(1);
+        expect(warnings.some((line) => line.includes("permission denied"))).toBe(true);
+        expect(logs).not.toContain("Claws retracted. Until next time.");
+        expect(
+          fs.existsSync(path.join(stateDir, "rebuild-backups", "sb1", "20260101", "manifest.json")),
+        ).toBe(true);
+      } finally {
+        lstatSpy.mockRestore();
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+
+    it("removes ~/.nemoclaw wholesale when it is a symlink rather than a real directory", () => {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-preserve-"));
+      const realTarget = fs.mkdtempSync(
+        path.join(os.tmpdir(), "nemoclaw-uninstall-preserve-target-"),
+      );
+      const stateDir = path.join(tmpHome, ".nemoclaw");
+      fs.symlinkSync(realTarget, stateDir);
+      // Symlink target intentionally non-empty so that following it would
+      // tempt the selective-wipe path; lstat must short-circuit that.
+      fs.writeFileSync(path.join(realTarget, "rebuild-backups"), "should not be followed");
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          {
+            commandExists: () => false,
+            env: { HOME: tmpHome } as NodeJS.ProcessEnv,
+            existsSync: (target: string) => target.startsWith(tmpHome) && fs.existsSync(target),
+            isTty: false,
+            log: (line) => logs.push(line),
+            run: vi.fn(() => ok()),
+            runDocker: () => ok(""),
+          },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(fs.existsSync(realTarget)).toBe(true);
+        expect(logs).toContain(`Removed ${stateDir}`);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+        fs.rmSync(realTarget, { recursive: true, force: true });
+      }
+    });
+
+    it("skips the preservation notice when no protected entries exist on disk", () => {
+      const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-preserve-"));
+      const stateDir = path.join(tmpHome, ".nemoclaw");
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.writeFileSync(path.join(stateDir, "ollama-auth-proxy.pid"), "1234");
+      try {
+        const logs: string[] = [];
+        const result = runUninstallPlan(
+          { assumeYes: true, deleteModels: false, keepOpenShell: true },
+          {
+            commandExists: () => false,
+            env: { HOME: tmpHome } as NodeJS.ProcessEnv,
+            existsSync: tempScopedExistsSync(tmpHome),
+            isTty: false,
+            log: (line) => logs.push(line),
+            run: vi.fn(() => ok()),
+            runDocker: () => ok(""),
+          },
+        );
+
+        expect(result.exitCode).toBe(0);
+        expect(fs.existsSync(stateDir)).toBe(false);
+        expect(logs).toContain(`Removed ${stateDir}`);
+        expect(logs.every((line) => !line.startsWith("Preserving "))).toBe(true);
+      } finally {
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("kills host openshell-gateway process during uninstall (#3516)", () => {
     const logs: string[] = [];
     const killed: number[] = [];
+    const exited = new Set<number>();
     const result = runUninstallPlan(
       { assumeYes: true, deleteModels: false, keepOpenShell: true },
       {
@@ -630,13 +1413,23 @@ describe("uninstall run plan", () => {
         isTty: false,
         kill: (pid) => {
           killed.push(pid);
+          exited.add(pid);
           return true;
         },
         log: (line) => logs.push(line),
         rmSync: vi.fn(),
         run: (command, args) => {
-          if (command === "pgrep" && args.includes("openshell-gateway")) {
-            return { status: 0, stdout: "99887\n", stderr: "" };
+          const psResult = psStub("9999887", {
+            cmdline: "/home/test/.local/bin/openshell-gateway --port 8080\n",
+            exited,
+          })(args);
+          if (psResult) return psResult;
+          if (
+            command === "pgrep" &&
+            args[0] === "-f" &&
+            String(args[1]).includes("openshell-gateway")
+          ) {
+            return { status: 0, stdout: "9999887\n", stderr: "" };
           }
           if (command === "lsof") return ok("");
           if (args[0] === "-c") return ok("/fake/bin/tool\n");
@@ -648,8 +1441,7 @@ describe("uninstall run plan", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(killed).toContain(99887);
-    expect(logs).toContain("Stopped host openshell-gateway processes 99887");
-
+    expect(killed).toContain(9999887);
+    expect(logs).toContain("Stopped host openshell-gateway process 9999887");
   });
 });

@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 version: "0.1.0"
-min_openshell_version: "0.0.44"
-max_openshell_version: "0.0.44"
+# Requires OpenShell MCP/JSON-RPC L7 policy support from NVIDIA/OpenShell#1865.
+min_openshell_version: "0.0.85"
+max_openshell_version: "0.0.85"
 min_openclaw_version: "2026.3.11"
 # Mirrors the components.sandbox.image manifest digest below. Lets a
 # downstream consumer (or release tooling) verify the blueprint declares
@@ -62,7 +63,7 @@ components:
         provider_name: "nvidia-ncp"
         endpoint: ""
         model: "nvidia/nemotron-3-super-120b-a12b"
-        credential_env: "NVIDIA_API_KEY"
+        credential_env: "NVIDIA_INFERENCE_API_KEY"
         dynamic_endpoint: true
 
       nim-local:
@@ -89,7 +90,7 @@ components:
         provider_name: "nvidia-router"
         endpoint: "http://localhost:4000/v1"
         model: "nvidia-routed"
-        credential_env: "NVIDIA_API_KEY"
+        credential_env: "NVIDIA_INFERENCE_API_KEY"
         timeout_secs: 180
 
   router:

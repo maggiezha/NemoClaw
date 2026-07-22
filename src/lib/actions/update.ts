@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { type SpawnSyncReturns, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { resolveAgentNameAlias } from "../agent/aliases";
 import { versionGte } from "../domain/installer/version";
 
 export const NEMOCLAW_INSTALLER_URL = "https://www.nvidia.com/nemoclaw.sh";
 export const NEMOCLAW_REPO_URL = "https://github.com/NVIDIA/NemoClaw.git";
 export const NEMOCLAW_UPDATE_COMMAND = `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | bash`;
+export const NEMOCLAW_MAINTAINED_INSTALL_TAG = "lkg";
 
 type LogFn = (message?: string) => void;
 type PromptFn = (question: string) => Promise<string>;
@@ -22,6 +24,13 @@ type SpawnSyncFn = (
 
 export interface RunUpdateOptions {
   check?: boolean;
+  /**
+   * Reinstall the maintained build even when already up to date. The installer
+   * re-clones `~/.nemoclaw/source`, so this repairs a broken-but-current
+   * install. Does not reset onboarding state (distinct from the installer's
+   * onboard-scoped `--fresh`/`NEMOCLAW_FRESH`).
+   */
+  fresh?: boolean;
   yes?: boolean;
 }
 
@@ -56,12 +65,23 @@ function trimOutput(value: string | Buffer | null | undefined): string {
   return String(value ?? "").trim();
 }
 
+const UPDATE_BRANDING_AGENTS = ["openclaw", "hermes", "langchain-deepagents-code"] as const;
+
 function updateBranding(env: NodeJS.ProcessEnv): UpdateBranding {
-  if (env.NEMOCLAW_AGENT === "hermes") {
+  const agent =
+    resolveAgentNameAlias(env.NEMOCLAW_AGENT, UPDATE_BRANDING_AGENTS) ?? env.NEMOCLAW_AGENT;
+  if (agent === "hermes") {
     return {
       cliName: "nemohermes",
       displayName: "NemoHermes",
       maintainedUpdateCommand: `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | NEMOCLAW_AGENT=hermes bash`,
+    };
+  }
+  if (agent === "langchain-deepagents-code") {
+    return {
+      cliName: "nemo-deepagents",
+      displayName: "NemoDeepAgents",
+      maintainedUpdateCommand: `curl -fsSL ${NEMOCLAW_INSTALLER_URL} | NEMOCLAW_AGENT=langchain-deepagents-code bash`,
     };
   }
   return {
@@ -105,7 +125,7 @@ export function isSourceCheckout(rootDir: string, env: NodeJS.ProcessEnv = proce
   return detectInstallType(rootDir, env) === "source";
 }
 
-export function getLatestNemoClawVersionFromGitLatestTag(
+export function getMaintainedNemoClawVersionFromGitTag(
   deps: {
     env?: NodeJS.ProcessEnv;
     gitCommand?: string;
@@ -119,8 +139,8 @@ export function getLatestNemoClawVersionFromGitLatestTag(
       "ls-remote",
       "--tags",
       deps.repoUrl ?? NEMOCLAW_REPO_URL,
-      "refs/tags/latest",
-      "refs/tags/latest^{}",
+      `refs/tags/${NEMOCLAW_MAINTAINED_INSTALL_TAG}`,
+      `refs/tags/${NEMOCLAW_MAINTAINED_INSTALL_TAG}^{}`,
       "refs/tags/v*",
     ],
     {
@@ -132,18 +152,21 @@ export function getLatestNemoClawVersionFromGitLatestTag(
   if (result.error || (result.status ?? 1) !== 0) return null;
 
   const versionsBySha = new Map<string, string>();
-  let latestSha: string | null = null;
+  let maintainedSha: string | null = null;
   for (const line of trimOutput(result.stdout).split(/\r?\n/)) {
     const [sha, ref] = line.trim().split(/\s+/, 2);
     if (!sha || !ref) continue;
-    if (ref === "refs/tags/latest^{}" || (ref === "refs/tags/latest" && !latestSha)) {
-      latestSha = sha;
+    if (
+      ref === `refs/tags/${NEMOCLAW_MAINTAINED_INSTALL_TAG}^{}` ||
+      (ref === `refs/tags/${NEMOCLAW_MAINTAINED_INSTALL_TAG}` && !maintainedSha)
+    ) {
+      maintainedSha = sha;
       continue;
     }
     const match = /^refs\/tags\/v(.+?)(\^\{\})?$/.exec(ref);
     if (match?.[1]) versionsBySha.set(sha, match[1]);
   }
-  return latestSha ? versionsBySha.get(latestSha) ?? null : null;
+  return maintainedSha ? (versionsBySha.get(maintainedSha) ?? null) : null;
 }
 
 function updateAvailable(currentVersion: string, latestVersion: string | null): boolean | null {
@@ -160,7 +183,9 @@ function printStatus(input: {
   updateAvailable: boolean | null;
 }): void {
   input.log(`  Current ${input.branding.displayName} version: ${input.currentVersion}`);
-  input.log(`  Latest maintained version:${input.latestVersion ? ` ${input.latestVersion}` : " unknown"}`);
+  input.log(
+    `  Latest maintained version:${input.latestVersion ? ` ${input.latestVersion}` : " unknown"}`,
+  );
   const installTypeLabel =
     input.installType === "source"
       ? "source checkout"
@@ -180,6 +205,7 @@ function updateInstallerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const next = { ...env };
   delete next.BASH_ENV;
   delete next.ENV;
+  delete next.NEMOCLAW_FRESH;
   delete next.NEMOCLAW_INSTALL_REF;
   delete next.NEMOCLAW_INSTALL_TAG;
   return next;
@@ -195,7 +221,9 @@ export async function runUpdateAction(
   const rootDir = deps.rootDir ?? process.cwd();
   const currentVersion = deps.currentVersion();
   const branding = updateBranding(env);
-  const latestVersion = (deps.getLatestVersion ?? (() => getLatestNemoClawVersionFromGitLatestTag({ env })))();
+  const latestVersion = (
+    deps.getLatestVersion ?? (() => getMaintainedNemoClawVersionFromGitTag({ env }))
+  )();
   const installType = deps.isSourceCheckout
     ? deps.isSourceCheckout()
       ? "source"
@@ -203,7 +231,14 @@ export async function runUpdateAction(
     : detectInstallType(rootDir, env);
   const available = updateAvailable(currentVersion, latestVersion);
 
-  printStatus({ branding, currentVersion, installType, latestVersion, log, updateAvailable: available });
+  printStatus({
+    branding,
+    currentVersion,
+    installType,
+    latestVersion,
+    log,
+    updateAvailable: available,
+  });
 
   if (options.check) {
     return {
@@ -229,7 +264,7 @@ export async function runUpdateAction(
     };
   }
 
-  if (available === false) {
+  if (available === false && !options.fresh) {
     log(`  ${branding.displayName} is already up to date.`);
     return {
       currentVersion,
@@ -255,7 +290,9 @@ export async function runUpdateAction(
     }
     const prompt = deps.prompt;
     if (!prompt) {
-      error("  Refusing to run the installer without confirmation. Re-run with --yes for non-interactive update.");
+      error(
+        "  Refusing to run the installer without confirmation. Re-run with --yes for non-interactive update.",
+      );
       return {
         currentVersion,
         installType,
@@ -265,7 +302,9 @@ export async function runUpdateAction(
         updateAvailable: available,
       };
     }
-    const answer = (await prompt(`  Run the maintained ${branding.displayName} installer now? [y/N]: `))
+    const answer = (
+      await prompt(`  Run the maintained ${branding.displayName} installer now? [y/N]: `)
+    )
       .trim()
       .toLowerCase();
     if (answer !== "y" && answer !== "yes") {
@@ -281,14 +320,29 @@ export async function runUpdateAction(
     }
   }
 
+  // Only announce the --fresh reinstall once the user has actually confirmed
+  // (or passed --yes): before this point the run could still be declined, and
+  // claiming a reinstall was happening would be untrue (CodeRabbit review #5963).
+  if (available === false && options.fresh) {
+    log(
+      `  ${branding.displayName} is already up to date; reinstalling anyway (--fresh) for a clean re-clone.`,
+    );
+  }
+
   log(`  Running maintained ${branding.displayName} installer...`);
-  const result = (deps.spawnSyncImpl ?? spawnSync)("bash", ["-o", "pipefail", "-lc", NEMOCLAW_UPDATE_COMMAND], {
-    env: updateInstallerEnv(env),
-    stdio: "inherit",
-  });
+  const result = (deps.spawnSyncImpl ?? spawnSync)(
+    "bash",
+    ["-o", "pipefail", "-lc", NEMOCLAW_UPDATE_COMMAND],
+    {
+      env: updateInstallerEnv(env),
+      stdio: "inherit",
+    },
+  );
   const status = result.status ?? 1;
   if (status === 0) {
-    log(`  Installer completed. Run \`${branding.cliName} upgrade-sandboxes --check\` to verify sandbox state.`);
+    log(
+      `  Installer completed. Run \`${branding.cliName} upgrade-sandboxes --check\` to verify sandbox state.`,
+    );
   } else {
     error(`  Installer failed with exit ${status}.`);
   }

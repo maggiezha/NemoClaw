@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "fs";
+import os from "os";
+import path from "path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { checkLocalMountWritable } from "../dist/lib/share-command.js";
+import { checkLocalMountWritable } from "../src/lib/share-command.js";
 
 describe("checkLocalMountWritable (#3192)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it("returns writable=true when mkdirSync and accessSync both succeed", () => {
@@ -23,7 +26,9 @@ describe("checkLocalMountWritable (#3192)", () => {
   });
 
   it("reports a read-only filesystem when mkdirSync raises EROFS", () => {
-    const err = new Error("EROFS: read-only file system, mkdir '/ro/mount'") as NodeJS.ErrnoException;
+    const err = new Error(
+      "EROFS: read-only file system, mkdir '/ro/mount'",
+    ) as NodeJS.ErrnoException;
     err.code = "EROFS";
     vi.spyOn(fs, "mkdirSync").mockImplementation(() => {
       throw err;
@@ -36,7 +41,9 @@ describe("checkLocalMountWritable (#3192)", () => {
   });
 
   it("reports permission denied when mkdirSync raises EACCES", () => {
-    const err = new Error("EACCES: permission denied, mkdir '/restricted'") as NodeJS.ErrnoException;
+    const err = new Error(
+      "EACCES: permission denied, mkdir '/restricted'",
+    ) as NodeJS.ErrnoException;
     err.code = "EACCES";
     vi.spyOn(fs, "mkdirSync").mockImplementation(() => {
       throw err;
@@ -114,7 +121,9 @@ describe("checkLocalMountWritable (#3192)", () => {
     });
 
     it("reports 'parent filesystem is read-only' when non-recursive mkdir on an existing parent raises EROFS", () => {
-      const err = new Error("EROFS: read-only file system, mkdir '/ro/mnt'") as NodeJS.ErrnoException;
+      const err = new Error(
+        "EROFS: read-only file system, mkdir '/ro/mnt'",
+      ) as NodeJS.ErrnoException;
       err.code = "EROFS";
       vi.spyOn(fs, "existsSync").mockReturnValue(true);
       vi.spyOn(fs, "mkdirSync").mockImplementation(() => {
@@ -128,7 +137,9 @@ describe("checkLocalMountWritable (#3192)", () => {
     });
 
     it("treats EEXIST from non-recursive mkdir as success when the existing path is a directory", () => {
-      const err = new Error("EEXIST: file already exists, mkdir '/parent/mnt'") as NodeJS.ErrnoException;
+      const err = new Error(
+        "EEXIST: file already exists, mkdir '/parent/mnt'",
+      ) as NodeJS.ErrnoException;
       err.code = "EEXIST";
       vi.spyOn(fs, "existsSync").mockReturnValue(true);
       vi.spyOn(fs, "mkdirSync").mockImplementation(() => {
@@ -142,7 +153,9 @@ describe("checkLocalMountWritable (#3192)", () => {
     });
 
     it("rejects an existing non-directory mount target instead of silently passing the writability check", () => {
-      const err = new Error("EEXIST: file already exists, mkdir '/parent/file'") as NodeJS.ErrnoException;
+      const err = new Error(
+        "EEXIST: file already exists, mkdir '/parent/file'",
+      ) as NodeJS.ErrnoException;
       err.code = "EEXIST";
       vi.spyOn(fs, "existsSync").mockReturnValue(true);
       vi.spyOn(fs, "mkdirSync").mockImplementation(() => {
@@ -157,5 +170,35 @@ describe("checkLocalMountWritable (#3192)", () => {
       });
       expect(accessSpy).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe.skipIf(process.platform === "win32")("checkLocalMountWritable symlink safety", () => {
+  it.each([
+    ["gateways", 1],
+    ["selected port", 2],
+    ["mounts", 3],
+    ["mount target", 4],
+  ] as const)("rejects a symlinked %s path component", (_label, symlinkIndex) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-share-home-"));
+    const controlled = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-share-target-"));
+    const components = [".nemoclaw", "gateways", "9123", "mounts", "alpha"];
+    const localMount = path.join(home, ...components);
+    const symlinkPath = path.join(home, ...components.slice(0, symlinkIndex + 1));
+    vi.stubEnv("HOME", home);
+
+    try {
+      fs.mkdirSync(path.dirname(symlinkPath), { recursive: true });
+      fs.symlinkSync(controlled, symlinkPath, "dir");
+
+      expect(checkLocalMountWritable(localMount)).toMatchObject({
+        writable: false,
+        reason: expect.stringMatching(/symbolic link/i),
+      });
+      expect(fs.readdirSync(controlled)).toEqual([]);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(controlled, { recursive: true, force: true });
+    }
   });
 });

@@ -5,6 +5,7 @@
 // Provider metadata, lookup helpers, and gateway provider CRUD.
 
 const { redact } = require("../runner");
+const { normalizeCredentialValue } = require("../credentials/store");
 const {
   DEFAULT_CLOUD_MODEL,
   DEFAULT_HERMES_PROVIDER_MODEL,
@@ -12,8 +13,10 @@ const {
   VLLM_LOCAL_CREDENTIAL_ENV,
   getSandboxInferenceConfig,
 } = require("../inference/config");
+const openrouter = require("../inference/openrouter");
 const { isSafeModelId } = require("../validation");
 const { compactText } = require("../core/url-utils");
+const { readGatewayProviderMetadata } = require("./gateway-provider-metadata");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -22,15 +25,78 @@ const OPENAI_ENDPOINT_URL = "https://api.openai.com/v1";
 const ANTHROPIC_ENDPOINT_URL = "https://api.anthropic.com";
 const GEMINI_ENDPOINT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
 const HERMES_INFERENCE_ENDPOINT_URL = "https://inference-api.nousresearch.com/v1";
+const HOSTED_INFERENCE_SOURCE_ENV = "NVIDIA_INFERENCE_API_KEY";
+const HOSTED_INFERENCE_PROVIDER_KEY_ENV = "NEMOCLAW_PROVIDER_KEY";
+const HOSTED_INFERENCE_CREDENTIAL_ENV = "COMPATIBLE_API_KEY";
+const HOSTED_INFERENCE_ENDPOINT_URL = "https://inference-api.nvidia.com/v1";
+const MODEL_ENV = "NEMOCLAW_MODEL";
+// Compatibility for the NVIDIA QA non-interactive Ollama invocation tracked
+// in #6869. Remove after that workflow migrates to NEMOCLAW_MODEL.
+const PROVIDER_MODEL_ENV = "NEMOCLAW_PROVIDER_MODEL";
+// Private CI-compatible Inference Hub endpoint model IDs use the
+// provider/namespace/model convention. This endpoint is staged as a custom
+// OpenAI-compatible provider, not as the public build.nvidia.com provider.
+const HOSTED_INFERENCE_MODEL = "nvidia/nvidia/nemotron-3-ultra";
+const NON_INTERACTIVE_PROVIDER_ALIASES = {
+  cloud: "build",
+  nim: "nim-local",
+  vllm: "vllm",
+  "open-router": "openrouter",
+  openrouterai: "openrouter",
+  anthropiccompatible: "anthropicCompatible",
+  hermes: "hermesProvider",
+  "hermes-provider": "hermesProvider",
+  hermesprovider: "hermesProvider",
+  nous: "hermesProvider",
+  "nous-portal": "hermesProvider",
+};
+const NON_INTERACTIVE_PROVIDER_KEYS = new Set([
+  "build",
+  "openrouter",
+  "openai",
+  "anthropic",
+  "anthropicCompatible",
+  "gemini",
+  "hermesProvider",
+  "ollama",
+  "custom",
+  "nim-local",
+  "vllm",
+  "routed",
+  "install-vllm",
+  "install-ollama",
+  "install-windows-ollama",
+  "start-windows-ollama",
+]);
+const NON_INTERACTIVE_PROVIDER_VALID_VALUES =
+  "Valid values: build, openrouter, openai, anthropic, anthropicCompatible, gemini, hermes-provider, ollama, custom, nim-local, vllm, routed, install-vllm, install-ollama, install-windows-ollama, start-windows-ollama";
+const PROVIDER_KEY_ROUTE_VALUES = new Set(
+  [
+    "inference",
+    ...Object.keys(NON_INTERACTIVE_PROVIDER_ALIASES),
+    ...Array.from(NON_INTERACTIVE_PROVIDER_KEYS),
+  ].map((value) => value.toLowerCase()),
+);
 
 const REMOTE_PROVIDER_CONFIG = {
   build: {
     label: "NVIDIA Endpoints",
     providerName: "nvidia-prod",
     providerType: "nvidia",
-    credentialEnv: "NVIDIA_API_KEY",
+    credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     endpointUrl: BUILD_ENDPOINT_URL,
     helpUrl: "https://build.nvidia.com/settings/api-keys",
+    modelMode: "catalog",
+    defaultModel: DEFAULT_CLOUD_MODEL,
+    skipVerify: true,
+  },
+  openrouter: {
+    label: "OpenRouter",
+    providerName: openrouter.OPENROUTER_PROVIDER_NAME,
+    providerType: openrouter.OPENROUTER_PROVIDER_TYPE,
+    credentialEnv: openrouter.OPENROUTER_CREDENTIAL_ENV,
+    endpointUrl: openrouter.OPENROUTER_ENDPOINT_URL,
+    helpUrl: openrouter.OPENROUTER_HELP_URL,
     modelMode: "catalog",
     defaultModel: DEFAULT_CLOUD_MODEL,
     skipVerify: true,
@@ -77,8 +143,15 @@ const REMOTE_PROVIDER_CONFIG = {
     defaultModel: "gemini-2.5-flash",
     skipVerify: true,
   },
+  // Hermes Provider is a single menu entry by design: every model family it
+  // serves (Moonshot, Z-AI, MiniMax, Qwen, Xiaomi, Tencent, StepFun, xAI,
+  // Arcee) routes through the same Nous portal endpoint and the same
+  // credential. After this entry is selected, the model picker lists the
+  // family options via nousModels.getHermesProviderModelOptions(). The label
+  // names all nine families so QA scripts and operators can discover them
+  // without first selecting the entry.
   hermesProvider: {
-    label: "Hermes Provider",
+    label: "Hermes Provider (Moonshot, Z-AI, MiniMax, Qwen, Xiaomi, Tencent, StepFun, xAI, Arcee)",
     providerName: "hermes-provider",
     providerType: "openai",
     credentialEnv: "OPENAI_API_KEY",
@@ -159,53 +232,108 @@ function getEffectiveProviderName(providerKey) {
 
 // ── Non-interactive helpers ──────────────────────────────────────
 
-function getNonInteractiveProvider() {
+function getNonInteractiveProvider(allowHostedInferenceStaging = true) {
+  if (allowHostedInferenceStaging) stageHostedInferenceSourceSecretEnv();
   const providerKey = (process.env.NEMOCLAW_PROVIDER || "").trim().toLowerCase();
   if (!providerKey) return null;
-  const aliases = {
-    cloud: "build",
-    nim: "nim-local",
-    vllm: "vllm",
-    anthropiccompatible: "anthropicCompatible",
-    hermes: "hermesProvider",
-    "hermes-provider": "hermesProvider",
-    hermesprovider: "hermesProvider",
-    nous: "hermesProvider",
-    "nous-portal": "hermesProvider",
-  };
-  const normalized = aliases[providerKey] || providerKey;
-  const validProviders = new Set([
-    "build",
-    "openai",
-    "anthropic",
-    "anthropicCompatible",
-    "gemini",
-    "hermesProvider",
-    "ollama",
-    "custom",
-    "nim-local",
-    "vllm",
-    "routed",
-    "install-vllm",
-    "install-ollama",
-    "install-windows-ollama",
-    "start-windows-ollama",
-  ]);
-  if (!validProviders.has(normalized)) {
+  const normalized = NON_INTERACTIVE_PROVIDER_ALIASES[providerKey] || providerKey;
+  if (!NON_INTERACTIVE_PROVIDER_KEYS.has(normalized)) {
     console.error(`  Unsupported NEMOCLAW_PROVIDER: ${providerKey}`);
-    console.error(
-      "  Valid values: build, openai, anthropic, anthropicCompatible, gemini, hermes-provider, ollama, custom, nim-local, vllm, routed, install-vllm, install-ollama, install-windows-ollama, start-windows-ollama",
-    );
+    console.error(`  ${NON_INTERACTIVE_PROVIDER_VALID_VALUES}`);
     process.exit(1);
   }
   return normalized;
 }
 
+function stageHostedInferenceSourceSecretEnv() {
+  const agentName = (process.env.NEMOCLAW_AGENT || "").trim().toLowerCase();
+  let providerKeySource = "";
+  if (agentName === "langchain-deepagents-code") {
+    const rawProviderKeySource = normalizeCredentialValue(
+      // check-direct-credential-env-ignore -- Deep Agents provider-key alias is immediately route-filtered and restaged as COMPATIBLE_API_KEY.
+      process.env[HOSTED_INFERENCE_PROVIDER_KEY_ENV] ?? "",
+    );
+    // Deep Agents contract: NEMOCLAW_PROVIDER_KEY is a permanent
+    // hosted-compatible credential alias for langchain-deepagents-code only.
+    // It repairs the external env contract where older automation supplied
+    // the hosted credential through the provider-key slot; selector-like
+    // values remain source-of-truth provider choices and are rejected by the
+    // invariant tied to NON_INTERACTIVE_PROVIDER_* below.
+    providerKeySource = isHostedInferenceProviderKeyCredentialCandidate(rawProviderKeySource)
+      ? rawProviderKeySource
+      : "";
+  }
+  const hostedInferenceSourceKey = normalizeCredentialValue(
+    // check-direct-credential-env-ignore -- hosted inference staging migrates this source env into COMPATIBLE_API_KEY.
+    process.env[HOSTED_INFERENCE_SOURCE_ENV] ?? "",
+  );
+  const sourceKey = hostedInferenceSourceKey || providerKeySource;
+  if (!sourceKey) return false;
+
+  const rawProvider = (process.env.NEMOCLAW_PROVIDER || "").trim().toLowerCase();
+  const normalizedProvider = NON_INTERACTIVE_PROVIDER_ALIASES[rawProvider] || rawProvider;
+  const hostedFlag = (process.env.NEMOCLAW_E2E_USE_HOSTED_INFERENCE || "").trim() === "1";
+  const compatibleKey = normalizeCredentialValue(
+    // check-direct-credential-env-ignore -- read-only guard to avoid overwriting an explicit compatible endpoint key.
+    process.env[HOSTED_INFERENCE_CREDENTIAL_ENV] ?? "",
+  );
+  const explicitHostedCustom =
+    normalizedProvider === "custom" &&
+    (hostedFlag || (!compatibleKey && !sourceKey.startsWith("nvapi-")));
+  const implicitHostedCustom =
+    !normalizedProvider && (hostedFlag || !sourceKey.startsWith("nvapi-"));
+  const shouldStage = explicitHostedCustom || implicitHostedCustom;
+
+  if (!shouldStage) return false;
+
+  if (!normalizedProvider) {
+    process.env.NEMOCLAW_PROVIDER = "custom";
+  }
+  process.env.NEMOCLAW_ENDPOINT_URL =
+    (process.env.NEMOCLAW_ENDPOINT_URL || "").trim() || HOSTED_INFERENCE_ENDPOINT_URL;
+  const model =
+    getRequestedModelFromEnv() ||
+    (process.env.NEMOCLAW_COMPAT_MODEL || "").trim() ||
+    (process.env.NEMOCLAW_CLOUD_EXPERIMENTAL_MODEL || "").trim() ||
+    HOSTED_INFERENCE_MODEL;
+  process.env[MODEL_ENV] = model;
+  process.env.NEMOCLAW_COMPAT_MODEL = (process.env.NEMOCLAW_COMPAT_MODEL || "").trim() || model;
+  process.env.NEMOCLAW_PREFERRED_API =
+    (process.env.NEMOCLAW_PREFERRED_API || "").trim() || "openai-completions";
+  process.env[HOSTED_INFERENCE_CREDENTIAL_ENV] = sourceKey;
+  return true;
+}
+
+function isHostedInferenceProviderKeyCredentialCandidate(value) {
+  if (!value) return false;
+  return !PROVIDER_KEY_ROUTE_VALUES.has(value.trim().toLowerCase());
+}
+
+const isProviderKeyCredentialCandidate = isHostedInferenceProviderKeyCredentialCandidate;
+
+/**
+ * Resolve the requested model from the preferred env var or its compatibility fallback.
+ */
+function getRequestedModelEnv(env = process.env) {
+  const model = (env[MODEL_ENV] || "").trim();
+  if (model) return { value: model, source: MODEL_ENV };
+  const providerModel = (env[PROVIDER_MODEL_ENV] || "").trim();
+  if (providerModel) return { value: providerModel, source: PROVIDER_MODEL_ENV };
+  return { value: "", source: null };
+}
+
+/**
+ * Return the requested model value without exposing which env var supplied it.
+ */
+function getRequestedModelFromEnv(env = process.env) {
+  return getRequestedModelEnv(env).value || null;
+}
+
 function getNonInteractiveModel(providerKey) {
-  const model = (process.env.NEMOCLAW_MODEL || "").trim();
+  const { value: model, source } = getRequestedModelEnv();
   if (!model) return null;
   if (!isSafeModelId(model)) {
-    console.error(`  Invalid NEMOCLAW_MODEL for provider '${providerKey}': ${model}`);
+    console.error(`  Invalid ${source || MODEL_ENV} for provider '${providerKey}': ${model}`);
     console.error("  Model values may only contain letters, numbers, '.', '_', ':', '/', and '-'.");
     process.exit(1);
   }
@@ -213,13 +341,14 @@ function getNonInteractiveModel(providerKey) {
 }
 
 // No default for nonInteractive — onboard.ts wrapper supplies isNonInteractive().
-function getRequestedProviderHint(nonInteractive) {
-  return nonInteractive ? getNonInteractiveProvider() : null;
+function getRequestedProviderHint(nonInteractive, allowHostedInferenceStaging = true) {
+  return nonInteractive ? getNonInteractiveProvider(allowHostedInferenceStaging) : null;
 }
 
-function getRequestedModelHint(nonInteractive) {
+function getRequestedModelHint(nonInteractive, allowHostedInferenceStaging = true) {
   if (!nonInteractive) return null;
-  const providerKey = getRequestedProviderHint(nonInteractive) || "cloud";
+  const providerKey =
+    getRequestedProviderHint(nonInteractive, allowHostedInferenceStaging) || "cloud";
   return getNonInteractiveModel(providerKey);
 }
 
@@ -234,13 +363,23 @@ function getRequestedModelHint(nonInteractive) {
  * @param {string} type - Provider type (e.g. "openai", "anthropic", "generic").
  * @param {string} credentialEnv - Credential environment variable name.
  * @param {string|null} baseUrl - Optional base URL for API-compatible endpoints.
+ * @param {{ includeCredential?: boolean }} [opts] - When `includeCredential` is
+ *   false, the `--credential` flag is omitted from the args. Used on the
+ *   `provider update` path when the host env does not carry the credential and
+ *   the gateway already holds it (no rotation needed). OpenShell's CLI rejects
+ *   `--credential KEY` when the local env var is empty, so passing the flag
+ *   would fail before reaching the gateway.
  * @returns {string[]} Argument array for runOpenshell().
  */
-function buildProviderArgs(action, name, type, credentialEnv, baseUrl) {
+function buildProviderArgs(action, name, type, credentialEnv, baseUrl, opts = {}) {
+  const { includeCredential = true } = opts;
   const args =
     action === "create"
-      ? ["provider", "create", "--name", name, "--type", type, "--credential", credentialEnv]
-      : ["provider", "update", name, "--credential", credentialEnv];
+      ? ["provider", "create", "--name", name, "--type", type]
+      : ["provider", "update", name];
+  if (includeCredential) {
+    args.push("--credential", credentialEnv);
+  }
   if (baseUrl && type === "openai") {
     args.push("--config", `OPENAI_BASE_URL=${baseUrl}`);
   } else if (baseUrl && type === "anthropic") {
@@ -290,20 +429,30 @@ function providerExistsInGateway(name, _runOpenshell) {
 function upsertProvider(name, type, credentialEnv, baseUrl, env, _runOpenshell, options = {}) {
   const exists = providerExistsInGateway(name, _runOpenshell);
   if (exists && options.replaceExisting) {
-    const deleteResult = _runOpenshell(["provider", "delete", name], {
-      ignoreError: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (deleteResult.status !== 0) {
-      const output =
-        compactText(redact(`${deleteResult.stderr || ""}`)) ||
-        compactText(redact(`${deleteResult.stdout || ""}`)) ||
+    const { deleteProviderWithRecovery } = require("./sandbox-provider-cleanup");
+    const r = deleteProviderWithRecovery(name, { runOpenshell: _runOpenshell });
+    if (!r.ok) {
+      const base =
+        compactText(redact(r.stderr)) ||
+        compactText(redact(r.stdout)) ||
         `Failed to replace provider '${name}'.`;
-      return { ok: false, status: deleteResult.status || 1, message: output };
+      const detail =
+        r.recoveryFailures.length > 0
+          ? ` (detach failures: ${r.recoveryFailures.map((f) => `${f.sandbox}: ${compactText(redact(f.output))}`).join("; ")})`
+          : "";
+      return { ok: false, status: r.status || 1, message: `${base}${detail}` };
     }
   }
   const action = exists && !options.replaceExisting ? "update" : "create";
-  const args = buildProviderArgs(action, name, type, credentialEnv, baseUrl);
+  // On the update path, the OpenShell CLI's `--credential KEY` form reads the
+  // value from the host env and aborts when empty. If the caller did not stage
+  // a credential value (rebuild after `channels add` with the original env
+  // unset), drop the flag so `provider update` becomes a no-op merge — the
+  // gateway already holds the secret.
+  const credentialValueAvailable =
+    !!credentialEnv && typeof env[credentialEnv] === "string" && env[credentialEnv].length > 0;
+  const includeCredential = action === "create" || credentialValueAvailable;
+  const args = buildProviderArgs(action, name, type, credentialEnv, baseUrl, { includeCredential });
   const runOpts = { ignoreError: true, env, stdio: ["ignore", "pipe", "pipe"] };
   const result = _runOpenshell(args, runOpts);
   if (result.status !== 0) {
@@ -319,19 +468,22 @@ function upsertProvider(name, type, credentialEnv, baseUrl, env, _runOpenshell, 
 /**
  * Upsert all messaging providers that have tokens configured.
  * Returns the list of provider names that were successfully created/updated.
- * Exits the process if any upsert fails.
+ * Exits the process if any upsert fails unless `options.bestEffort` is true.
  *
  * Pass `options.replaceExisting` true only when every entry is guaranteed
  * detached from any live sandbox (post-sandbox-delete on the recreate path);
  * reuse paths must omit it because `provider delete` fails for attached
- * providers.
+ * providers. Pass `options.bestEffort` only from rollback paths that must
+ * continue restoring registry state and report residual gateway work instead
+ * of terminating the CLI.
  * @param {Array<{name: string, envKey: string, token: string|null, providerType?: string}>} tokenDefs
  * @param {Function} _runOpenshell - Injected runOpenshell from onboard.ts.
- * @param {{replaceExisting?: boolean}} options - Forwarded to every upsertProvider call.
+ * @param {{replaceExisting?: boolean, bestEffort?: boolean}} options - Forwarded to every upsertProvider call.
  * @returns {string[]} Provider names that were upserted.
  */
 function upsertMessagingProviders(tokenDefs, _runOpenshell, options = {}) {
   const upserted = [];
+  const failures = [];
   for (const { name, envKey, token, providerType } of tokenDefs) {
     if (!token) continue;
     const result = upsertProvider(
@@ -344,10 +496,17 @@ function upsertMessagingProviders(tokenDefs, _runOpenshell, options = {}) {
       { replaceExisting: Boolean(options.replaceExisting) },
     );
     if (!result.ok) {
+      if (options.bestEffort) {
+        failures.push(`${name}: ${result.message}`);
+        continue;
+      }
       console.error(`\n  ✗ Failed to create messaging provider '${name}': ${result.message}`);
       process.exit(1);
     }
     upserted.push(name);
+  }
+  if (failures.length > 0) {
+    throw new Error(failures.join("; "));
   }
   return upserted;
 }
@@ -362,15 +521,25 @@ module.exports = {
   OLLAMA_PROXY_CREDENTIAL_ENV,
   VLLM_LOCAL_CREDENTIAL_ENV,
   DISCORD_SNOWFLAKE_RE,
+  HOSTED_INFERENCE_SOURCE_ENV,
+  HOSTED_INFERENCE_CREDENTIAL_ENV,
+  HOSTED_INFERENCE_ENDPOINT_URL,
+  HOSTED_INFERENCE_MODEL,
+  NON_INTERACTIVE_PROVIDER_ALIASES,
+  NON_INTERACTIVE_PROVIDER_KEYS,
   getProviderLabel,
   getEffectiveProviderName,
+  stageHostedInferenceSourceSecretEnv,
   getNonInteractiveProvider,
   getNonInteractiveModel,
+  getRequestedModelFromEnv,
   getRequestedProviderHint,
   getRequestedModelHint,
+  isProviderKeyCredentialCandidate,
   buildProviderArgs,
   upsertProvider,
   providerExistsInGateway,
+  readGatewayProviderMetadata,
   upsertMessagingProviders,
   getSandboxInferenceConfig,
 };

@@ -10,10 +10,22 @@
  * diagnosis; a plain helper container on the bridge is not equivalent.
  */
 
+import os from "node:os";
+
 import { dockerCapture, dockerRun } from "../adapters/docker/run";
+import { failLine, warnLine } from "../cli/terminal-style";
 import { GATEWAY_PORT } from "../core/ports";
 import { cliDisplayName, cliName } from "./branding";
-import { ensureProbeImageCached, isDockerDaemonUnreachable } from "./preflight";
+import {
+  DOCKER_DESKTOP_WSL_INTEGRATION_HINT,
+  ensureProbeImageCached,
+  isDockerDaemonUnreachable,
+} from "./preflight";
+import type { UfwAutoApplyResult } from "./ufw-auto-apply";
+import { isUfwAutoApplyOptedIn, tryAutoApplyUfwRule } from "./ufw-auto-apply";
+
+export type { UfwAutoApplyOptions, UfwAutoApplyResult } from "./ufw-auto-apply";
+export { tryAutoApplyUfwRule } from "./ufw-auto-apply";
 
 const DEFAULT_PROBE_IMAGE =
   "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662";
@@ -22,6 +34,8 @@ const HOST_INTERNAL_NAME = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL_NAME = "host.docker.internal";
 const DEFAULT_PROBE_TIMEOUT_SEC = 5;
 const PROBE_RUN_OVERHEAD_MS = 10_000;
+const DEFAULT_HOST_GATEWAY_RETRY_ATTEMPTS = 10;
+const DEFAULT_HOST_GATEWAY_RETRY_DELAY_MS = 1000;
 
 export type SandboxBridgeReachabilityReason =
   | "ok"
@@ -77,6 +91,14 @@ export interface SandboxBridgeReachabilityOptions {
   usesHostGatewayRouteImpl?: () => boolean;
   /** Inject a precomputed image-cache result; bypasses real pre-pull. */
   ensureImageCachedOverride?: import("./preflight").EnsureProbeImageCachedResult;
+}
+
+export interface FormatSandboxBridgeUnreachableMessageOptions {
+  isWsl?: boolean;
+}
+
+function isRunningInWsl(env: NodeJS.ProcessEnv = process.env, release = os.release()): boolean {
+  return Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP || /microsoft/i.test(release));
 }
 
 function parseDockerNetworkIpamConfig(raw: string): DockerBridgeNetworkInfo | undefined {
@@ -379,45 +401,56 @@ export async function isSandboxBridgeGatewayReachable(
 export function formatSandboxBridgeUnreachableMessage(
   result: SandboxBridgeReachabilityResult,
   port: number = GATEWAY_PORT,
+  opts: FormatSandboxBridgeUnreachableMessageOptions = {},
 ): string {
   if (result.ok) return "";
+  const includeWslIntegrationHint = opts.isWsl ?? isRunningInWsl();
   if (result.reason === "probe_unavailable") {
     return [
-      "  ⚠ Could not verify sandbox bridge reachability.",
+      warnLine("Could not verify sandbox bridge reachability."),
       "    This does not prove the gateway is unreachable; continuing.",
       result.detail ? `    ${result.detail}` : undefined,
-    ].filter((line): line is string => Boolean(line)).join("\n");
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
   }
 
   if (result.reason === "veth_unsupported") {
     return [
-      "  ✗ Docker could not create the sandbox bridge veth pair.",
+      failLine("Docker could not create the sandbox bridge veth pair."),
       result.detail ? `    ${result.detail}` : undefined,
       "    This matches Jetson kernel/Docker bridge environments where veth creation returns `operation not supported`.",
       `    Update the host kernel/Docker bridge networking support, or run ${cliDisplayName()} on a host whose Docker bridge networking can create veth interfaces.`,
-    ].filter((line): line is string => Boolean(line)).join("\n");
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
   }
 
   if (result.reason === "probe_timeout") {
     return [
-      "  ✗ Docker-driver sandbox bridge reachability probe timed out.",
+      failLine("Docker-driver sandbox bridge reachability probe timed out."),
       result.detail ? `    ${result.detail}` : undefined,
       `    Restart Docker and check for stuck container/network operations before retrying \`${cliName()} onboard\`.`,
-    ].filter((line): line is string => Boolean(line)).join("\n");
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
   }
 
   if (result.reason === "docker_daemon_unreachable") {
     return [
-      "  ✗ Docker daemon is not reachable for the sandbox bridge probe.",
+      failLine("Docker daemon is not reachable for the sandbox bridge probe."),
       result.detail ? `    ${result.detail}` : undefined,
+      includeWslIntegrationHint ? `    ${DOCKER_DESKTOP_WSL_INTEGRATION_HINT}` : undefined,
       "    Restart the Docker daemon (e.g. `sudo systemctl restart docker`, or restart Docker Desktop/Colima)",
       `    and re-run \`${cliName()} onboard\`.`,
-    ].filter((line): line is string => Boolean(line)).join("\n");
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
   }
 
   if (result.routeKind === "host_gateway") {
     return [
-      `  ✗ Sandbox containers cannot reach the gateway at ${HOST_INTERNAL_NAME}:${port}.`,
+      failLine(`Sandbox containers cannot reach the gateway at ${HOST_INTERNAL_NAME}:${port}.`),
       "    The probe used Docker's host-gateway route, matching Docker Desktop/VM-backed Docker.",
       `    Restart Docker and the OpenShell gateway, then re-run \`${cliName()} onboard\`.`,
     ].join("\n");
@@ -436,7 +469,7 @@ export function formatSandboxBridgeUnreachableMessage(
     ? `${HOST_INTERNAL_NAME}:${port} (${result.gatewayIp}:${port})`
     : `${HOST_INTERNAL_NAME}:${port}`;
   return [
-    `  ✗ Sandbox containers cannot reach the gateway at ${target}.`,
+    failLine(`Sandbox containers cannot reach the gateway at ${target}.`),
     "    A host firewall may be blocking traffic from the OpenShell Docker bridge.",
     "    To allow it:",
     allowCmd,
@@ -444,18 +477,100 @@ export function formatSandboxBridgeUnreachableMessage(
   ].join("\n");
 }
 
+interface SandboxBridgeVerifierOptions {
+  skip?: boolean;
+  port?: number;
+  reachabilityImpl?: (options?: {
+    port: number;
+  }) => Promise<SandboxBridgeReachabilityResult> | SandboxBridgeReachabilityResult;
+  autoApplyImpl?: (
+    reach: SandboxBridgeReachabilityResult,
+  ) => Promise<UfwAutoApplyResult> | UfwAutoApplyResult;
+  autoApplyOptedInImpl?: () => boolean;
+  retryAttempts?: number;
+  retryDelayMs?: number;
+  sleepMsImpl?: (ms: number) => Promise<void>;
+}
+
+const SILENT_UFW_AUTO_APPLY_REASONS = new Set<UfwAutoApplyResult["reason"]>([
+  "not_opted_in",
+  "ufw_missing",
+  "ufw_inactive",
+]);
+
+function isRetriableHostGatewayFailure(reach: SandboxBridgeReachabilityResult): boolean {
+  return reach.routeKind === "host_gateway" && reach.reason === "tcp_failed";
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
 export async function verifySandboxBridgeGatewayReachableOrExit(
   exitOnFailure: boolean,
-  options: { skip?: boolean } = {},
+  options: SandboxBridgeVerifierOptions = {},
 ): Promise<void> {
   if (options.skip) {
-    console.log("  Docker-driver GPU host networking active; skipping sandbox bridge gateway reachability probe.");
+    console.log(
+      "  Docker-driver GPU host networking active; skipping sandbox bridge gateway reachability probe.",
+    );
     return;
   }
-  const reach = await isSandboxBridgeGatewayReachable();
-  if (reach.ok) return;
+  const port = options.port ?? GATEWAY_PORT;
+  const reachability = options.reachabilityImpl ?? isSandboxBridgeGatewayReachable;
+  const autoApplyOptedIn = options.autoApplyOptedInImpl ?? isUfwAutoApplyOptedIn;
+  const autoApply =
+    options.autoApplyImpl ??
+    ((result: SandboxBridgeReachabilityResult) =>
+      tryAutoApplyUfwRule(result, { optedIn: true, port }));
 
-  const message = formatSandboxBridgeUnreachableMessage(reach);
+  let reach = await reachability({ port });
+  if (reach.ok) return;
+  const retryAttempts = options.retryAttempts ?? DEFAULT_HOST_GATEWAY_RETRY_ATTEMPTS;
+  const retryDelayMs = options.retryDelayMs ?? DEFAULT_HOST_GATEWAY_RETRY_DELAY_MS;
+  const sleep = options.sleepMsImpl ?? sleepMs;
+  for (
+    let attempt = 2;
+    attempt <= retryAttempts && isRetriableHostGatewayFailure(reach);
+    attempt += 1
+  ) {
+    console.log(
+      `  Docker-driver sandbox bridge probe attempt ${attempt - 1}/${retryAttempts} failed (${reach.reason}); retrying in ${retryDelayMs} ms...`,
+    );
+    await sleep(retryDelayMs);
+    reach = await reachability({ port });
+    if (reach.ok) {
+      console.log(
+        `  ✓ Docker-driver sandbox bridge reachable on attempt ${attempt}/${retryAttempts}`,
+      );
+      return;
+    }
+  }
+
+  // #4265: when operator opts in and the probe proved a bridge TCP failure,
+  // try to auto-apply the firewall rule and re-probe before surfacing the
+  // manual-fix message. Do not mutate firewall state for probe helper/DNS
+  // failures, even if route metadata is present.
+  if (reach.routeKind === "bridge_gateway" && reach.reason === "tcp_failed" && autoApplyOptedIn()) {
+    const autoApplyResult = await autoApply(reach);
+    if (autoApplyResult.applied) {
+      const ruleDescription =
+        reach.subnet && reach.gatewayIp
+          ? `allow from ${reach.subnet} to ${reach.gatewayIp}:${port}/tcp`
+          : `allow sandbox bridge traffic to port ${port}/tcp`;
+      console.log(`  ✓ Applied UFW rule (NEMOCLAW_AUTO_FIX_FIREWALL=1): ${ruleDescription}`);
+      reach = await reachability({ port });
+      if (reach.ok) return;
+    } else if (!SILENT_UFW_AUTO_APPLY_REASONS.has(autoApplyResult.reason)) {
+      console.warn(
+        warnLine(
+          `NEMOCLAW_AUTO_FIX_FIREWALL=1 set but could not auto-apply UFW rule (${autoApplyResult.reason}${autoApplyResult.detail ? `: ${autoApplyResult.detail}` : ""}); falling back to manual instructions.`,
+        ),
+      );
+    }
+  }
+
+  const message = formatSandboxBridgeUnreachableMessage(reach, port);
   if (reach.reason === "probe_unavailable") {
     console.warn(message);
     return;
@@ -471,5 +586,6 @@ export async function verifySandboxBridgeGatewayReachableOrExit(
 export const __test = {
   buildOpenShellDockerRoute,
   buildProbeArgs,
+  isRunningInWsl,
   parseDockerNetworkIpamConfig,
 };

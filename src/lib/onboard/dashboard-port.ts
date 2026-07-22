@@ -14,12 +14,47 @@
  */
 
 import { spawnSync } from "node:child_process";
+import os from "node:os";
 
-import { DASHBOARD_PORT_RANGE_END, DASHBOARD_PORT_RANGE_START } from "../core/ports";
+import {
+  DASHBOARD_PORT,
+  DASHBOARD_PORT_RANGE_END,
+  DASHBOARD_PORT_RANGE_START,
+  GATEWAY_PORT,
+} from "../core/ports";
+import { listHostGatewayRegistryEntries } from "../state/gateway-registry";
+import { type McpLifecycleLockOptions, withMcpLifecycleLock } from "../state/mcp-lifecycle-lock";
 
 // runner.ts is still CommonJS — use require so module shape matches.
 const { runCapture } = require("../runner");
 type RunCaptureFn = typeof import("../runner").runCapture;
+
+type SandboxRegistryEntry = {
+  name: string;
+  dashboardPort?: number | null;
+  scopeGatewayPort?: number;
+};
+
+export type ListSandboxesFn = () => { sandboxes: SandboxRegistryEntry[] };
+
+const DASHBOARD_PORT_RESERVATION_LOCK = "dashboard-port-reservation:host";
+
+/**
+ * Serialize host-wide dashboard-port selection through durable ownership.
+ *
+ * OpenShell forward listings are gateway-scoped while dashboard ports and the
+ * NemoClaw registry are host-scoped. Holding one cross-process lease across
+ * allocation and registration prevents onboard or snapshot restores on
+ * different gateways from selecting the same currently-free port.
+ * Callers that also need lifecycle locks must use the shared order:
+ * sandbox mutation → this host reservation → gateway route mutation.
+ */
+export function withDashboardPortReservationLock<T>(
+  operation: () => Promise<T> | T,
+  options: McpLifecycleLockOptions = {},
+): Promise<T> {
+  return withMcpLifecycleLock(DASHBOARD_PORT_RESERVATION_LOCK, operation, options);
+}
 
 // Match the broader pattern used by onboard.ts (covers CSI, OSC, and Fe escapes)
 // so colorised `openshell forward list` output parses correctly.
@@ -146,13 +181,94 @@ export function findDashboardForwardOwner(
   return getOccupiedPorts(forwardListOutput ?? null).get(portToStop) ?? null;
 }
 
+/**
+ * Merge per-gateway forward-list occupancy with cross-gateway registry
+ * occupancy. `openshell forward list` only reports forwards owned by the
+ * currently selected gateway, so a second NemoClaw gateway on a different
+ * `NEMOCLAW_GATEWAY_PORT` cannot see the first gateway's dashboard forwards
+ * and would happily re-allocate the same dashboard port to a fresh sandbox.
+ * The host-level bind probe also misses Docker-mediated forwards on macOS,
+ * which is exactly the scenario reported on multi-instance hosts.
+ *
+ * The registry persists `dashboardPort` per sandbox. Allocation aggregates
+ * the default registry plus bounded real directories under `gateways/*`, so
+ * the view remains host-wide after gateway state becomes port-scoped. The
+ * forward-list value still wins for sandboxes whose forward exists on the
+ * currently selected gateway.
+ */
+function mergeOccupiedPorts(
+  forwardOccupied: Map<string, string>,
+  registryOccupied: ReadonlyMap<string, string> | undefined,
+): Map<string, string> {
+  if (!registryOccupied) return forwardOccupied;
+  for (const [port, sandbox] of registryOccupied.entries()) {
+    if (!forwardOccupied.has(port)) {
+      forwardOccupied.set(port, sandbox);
+    }
+  }
+  return forwardOccupied;
+}
+
+/**
+ * Build a cross-gateway occupancy map (port → owning sandbox name) from the
+ * persisted sandbox registries, excluding the current sandbox only in the
+ * selected gateway scope. `openshell forward list` only knows about the
+ * currently selected gateway's forwards, so a fresh onboard against a second
+ * `NEMOCLAW_GATEWAY_PORT` gateway needs this host-wide view.
+ *
+ * Production enumeration is bounded and rejects symlinked, malformed, or
+ * unreadable registry state. Errors propagate so the allocator fails closed
+ * instead of silently handing out a colliding port.
+ *
+ * `listSandboxesFn` is an injectable seam for tests; production callers
+ * leave it at the host-wide default.
+ */
+export function getRegistryOccupiedDashboardPorts(
+  currentSandboxName: string,
+  listSandboxesFn?: ListSandboxesFn,
+): Map<string, string> {
+  const occupied = new Map<string, string>();
+  const list =
+    listSandboxesFn ??
+    (() => ({
+      sandboxes: listHostGatewayRegistryEntries(process.env.HOME || os.homedir()).map(
+        ({ entry, gatewayPort }) => ({
+          name: entry.name,
+          dashboardPort: entry.dashboardPort,
+          scopeGatewayPort: gatewayPort,
+        }),
+      ),
+    }));
+  for (const entry of list().sandboxes) {
+    if (
+      entry.name === currentSandboxName &&
+      (entry.scopeGatewayPort === undefined || entry.scopeGatewayPort === GATEWAY_PORT)
+    )
+      continue;
+    const port = entry.dashboardPort;
+    if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) continue;
+    const owner =
+      entry.scopeGatewayPort !== undefined && entry.scopeGatewayPort !== GATEWAY_PORT
+        ? `${entry.name} (gateway ${String(entry.scopeGatewayPort)})`
+        : entry.name;
+    occupied.set(String(port), owner);
+  }
+  return occupied;
+}
+
 export function findAvailableDashboardPort(
   sandboxName: string,
   preferredPort: number,
   forwardListOutput: string | null,
   isPortBoundCheck: (port: number) => boolean = isPortBoundOnHost,
+  // Default to an empty map so unit tests of this allocator do not become
+  // dependent on whatever sandboxes happen to live in the caller's real
+  // `~/.nemoclaw/sandboxes.json`. Production wrappers
+  // (`resolveCreateSandboxDashboardPort`, `ensureDashboardForward`) pass an
+  // explicit `getRegistryOccupiedDashboardPorts(sandboxName)` result.
+  registryOccupiedPorts: ReadonlyMap<string, string> = new Map(),
 ): number {
-  const occupied = getOccupiedPorts(forwardListOutput);
+  const occupied = mergeOccupiedPorts(getOccupiedPorts(forwardListOutput), registryOccupiedPorts);
   const hostBoundPorts: number[] = [];
   // Try the preferred port first (it may be outside the dashboard range when
   // a caller passes --control-ui-port), then the rest of the range. Each port
@@ -188,6 +304,95 @@ export function findAvailableDashboardPort(
     `All dashboard ports in range ${DASHBOARD_PORT_RANGE_START}-${DASHBOARD_PORT_RANGE_END} are occupied:\n${lines}\n` +
       `Free a sandbox or use --control-ui-port <N> with a port outside this range.`,
   );
+}
+
+export interface CreateSandboxDashboardPortInput {
+  sandboxName: string;
+  controlUiPort: number | null;
+  chatUiUrlEnv: string | null | undefined;
+  persistedPort: number | null;
+  agentForwardPort: number | null | undefined;
+  forwardListOutput: string | null;
+  defaultPort?: number;
+  findAvailablePort?: typeof findAvailableDashboardPort;
+  warn?: (message: string) => void;
+  // Cross-gateway occupancy view derived from the sandbox registry. Lets the
+  // allocator avoid handing out a dashboard port that already belongs to a
+  // sandbox on a different `NEMOCLAW_GATEWAY_PORT`, which the per-gateway
+  // forward-list view cannot see.
+  registryOccupiedPorts?: ReadonlyMap<string, string>;
+}
+
+export interface CreateSandboxDashboardPortResult {
+  preferredPort: number;
+  effectivePort: number;
+  chatUiUrl: string;
+}
+
+function normalizeChatUiUrlForParsing(chatUiUrl: string): string {
+  return chatUiUrl.includes("://") ? chatUiUrl : `http://${chatUiUrl}`;
+}
+
+function parseChatUiUrlPort(chatUiUrlEnv: string | null | undefined): number | null {
+  if (!chatUiUrlEnv) return null;
+  try {
+    const parsed = new URL(normalizeChatUiUrlForParsing(chatUiUrlEnv));
+    const port = Number(parsed.port);
+    return port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildCreateSandboxChatUiUrl(
+  chatUiUrlEnv: string | null | undefined,
+  controlUiPort: number | null,
+  effectivePort: number,
+): string {
+  if (chatUiUrlEnv && controlUiPort == null) {
+    try {
+      const parsed = new URL(normalizeChatUiUrlForParsing(chatUiUrlEnv));
+      parsed.port = String(effectivePort);
+      return parsed.toString().replace(/\/$/, "");
+    } catch {
+      /* malformed URL - keep the local default */
+    }
+  }
+  return `http://127.0.0.1:${effectivePort}`;
+}
+
+export function resolveCreateSandboxDashboardPort(
+  input: CreateSandboxDashboardPortInput,
+): CreateSandboxDashboardPortResult {
+  const preferredPort =
+    input.controlUiPort ??
+    parseChatUiUrlPort(input.chatUiUrlEnv) ??
+    input.persistedPort ??
+    input.agentForwardPort ??
+    input.defaultPort ??
+    DASHBOARD_PORT;
+  // When a caller does not supply an explicit cross-gateway view, read the
+  // persisted registry here so the allocator never silently hands out a
+  // dashboard port that already belongs to a sibling sandbox on a different
+  // NemoClaw gateway. The allocator itself defaults to an empty map to keep
+  // its unit tests independent of the caller's real `~/.nemoclaw/` state.
+  const registryOccupiedPorts =
+    input.registryOccupiedPorts ?? getRegistryOccupiedDashboardPorts(input.sandboxName);
+  const effectivePort = (input.findAvailablePort ?? findAvailableDashboardPort)(
+    input.sandboxName,
+    preferredPort,
+    input.forwardListOutput,
+    undefined,
+    registryOccupiedPorts,
+  );
+  if (effectivePort !== preferredPort) {
+    input.warn?.(`  ! Port ${preferredPort} is taken. Using port ${effectivePort} instead.`);
+  }
+  return {
+    preferredPort,
+    effectivePort,
+    chatUiUrl: buildCreateSandboxChatUiUrl(input.chatUiUrlEnv, input.controlUiPort, effectivePort),
+  };
 }
 
 /**

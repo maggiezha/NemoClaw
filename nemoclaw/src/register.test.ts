@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { OpenClawPluginApi } from "./index.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -32,6 +32,17 @@ const mockedReadFileSync = vi.mocked(readFileSync);
 const mockedLoadOnboardConfig = vi.mocked(loadOnboardConfig);
 const originalReadFileSync = (await vi.importActual<typeof import("node:fs")>("node:fs"))
   .readFileSync;
+let stderrWrite: MockInstance<typeof process.stderr.write>;
+
+function mockStderrWrite(): void {
+  stderrWrite = vi
+    .spyOn(process.stderr, "write")
+    .mockImplementation((() => true) as typeof process.stderr.write);
+}
+
+function stderrOutput(): string {
+  return stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join("");
+}
 
 function mockMissingOpenClawConfig(): void {
   mockedReadFileSync.mockReset();
@@ -64,13 +75,18 @@ function createMockApi(): OpenClawPluginApi {
   };
 }
 
-describe("plugin registration", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockMissingOpenClawConfig();
-    mockedLoadOnboardConfig.mockReturnValue(null);
-  });
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockStderrWrite();
+  mockMissingOpenClawConfig();
+  mockedLoadOnboardConfig.mockReturnValue(null);
+});
 
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("plugin registration", () => {
   it("registers a slash command", () => {
     const api = createMockApi();
     register(api);
@@ -117,7 +133,7 @@ describe("plugin registration", () => {
       ncpPartner: null,
       model: "nvidia/stale-model",
       profile: "default",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
       onboardedAt: "2026-03-01T00:00:00.000Z",
     });
     mockedReadFileSync.mockReset();
@@ -140,8 +156,15 @@ describe("plugin registration", () => {
     expect(providerArg.models?.chat).toEqual([
       expect.objectContaining({ id: "inference/nvidia/live-model", label: "nvidia/live-model" }),
     ]);
-    const logLines = vi.mocked(api.logger.info).mock.calls.map(([message]) => message);
-    expect(logLines.some((line) => line.includes("Model:     nvidia/live-model"))).toBe(true);
+    expect(stderrOutput()).toContain("Model:     nvidia/live-model");
+  });
+
+  it("writes the registration banner to stderr instead of plugin info logs", () => {
+    const api = createMockApi();
+    register(api);
+
+    expect(stderrOutput()).toContain("NemoClaw registered");
+    expect(api.logger.info).not.toHaveBeenCalled();
   });
 
   it("falls back to onboard config when openclaw.json has no primary model", () => {
@@ -151,7 +174,7 @@ describe("plugin registration", () => {
       ncpPartner: null,
       model: "nvidia/custom-model",
       profile: "default",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
       onboardedAt: "2026-03-01T00:00:00.000Z",
     });
     mockedReadFileSync.mockReset();
@@ -178,22 +201,14 @@ describe("plugin registration", () => {
       expect.objectContaining({ id: "nvidia/nemotron-3-nano-30b-a3b" }),
     ]);
 
-    const logLines = vi.mocked(api.logger.info).mock.calls.map(([message]) => message);
-    expect(logLines.some((line) => line.includes("Endpoint:  build.nvidia.com"))).toBe(true);
-    expect(logLines.some((line) => line.includes("Provider:  NVIDIA Endpoints"))).toBe(true);
-    expect(
-      logLines.some((line) => line.includes("Model:     nvidia/nemotron-3-super-120b-a12b")),
-    ).toBe(true);
+    const stderr = stderrOutput();
+    expect(stderr).toContain("Endpoint:  build.nvidia.com");
+    expect(stderr).toContain("Provider:  NVIDIA Endpoints");
+    expect(stderr).toContain("Model:     nvidia/nemotron-3-super-120b-a12b");
   });
 });
 
 describe("before_tool_call secret scanner hook (#1233)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mockMissingOpenClawConfig();
-    mockedLoadOnboardConfig.mockReturnValue(null);
-  });
-
   function getHookHandler(api: OpenClawPluginApi) {
     register(api);
     const onCalls = vi.mocked(api.on).mock.calls;
@@ -326,6 +341,64 @@ describe("before_tool_call secret scanner hook (#1233)", () => {
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("[SECURITY] Blocked memory write"),
     );
+  });
+
+  it("does not throw when the host resolver returns undefined", () => {
+    const api = createMockApi();
+    (api.resolvePath as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      undefined as unknown as string,
+    );
+    const handler = getHookHandler(api);
+    expect(() =>
+      handler({
+        toolName: "write",
+        params: {
+          file_path: "IDENTITY.md",
+          content: "# IDENTITY.md - Who Am I?\nhello",
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it("blocks a relative workspace basename when the host resolver is unavailable", () => {
+    const api = createMockApi();
+    (api.resolvePath as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      undefined as unknown as string,
+    );
+    const handler = getHookHandler(api);
+    const fakeKey = "nvapi-" + "abcdefghijklmnopqrstuvwxyz";
+    const result = handler({
+      toolName: "write",
+      params: {
+        file_path: "IDENTITY.md",
+        content: `api key: ${fakeKey}`,
+      },
+    });
+    expect(result).toMatchObject({ block: true });
+  });
+
+  it("blocks normalized relative memory paths when the host resolver is unavailable", () => {
+    const api = createMockApi();
+    (api.resolvePath as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      undefined as unknown as string,
+    );
+    const handler = getHookHandler(api);
+    const fakeKey = "nvapi-" + "abcdefghijklmnopqrstuvwxyz";
+
+    for (const path of [
+      "./memory/2026-05-29.md",
+      "foo/../memory/2026-05-29.md",
+      "workspace-main/memory/2026-05-29.md",
+    ]) {
+      const result = handler({
+        toolName: "write",
+        params: {
+          path,
+          content: `api key: ${fakeKey}`,
+        },
+      });
+      expect(result).toMatchObject({ block: true });
+    }
   });
 });
 

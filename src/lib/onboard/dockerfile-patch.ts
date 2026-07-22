@@ -1,12 +1,47 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-
 import { getSandboxInferenceConfig } from "../inference/config";
-import type { WebSearchConfig } from "../inference/web-search";
+import { MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
+import {
+  isWebSearchEnabled,
+  type WebSearchConfig,
+  webSearchProviderForConfig,
+} from "../inference/web-search";
+import { hydrateDerivedSandboxMessagingPlanFields, MessagingSetupApplier } from "../messaging";
+import { parseSandboxMessagingPlan } from "../messaging/plan-validation";
+import {
+  formatSandboxBaseImageResolutionLabels,
+  type SandboxBaseImageResolutionMetadata,
+} from "../sandbox-base-image";
+import {
+  DEFAULT_TOOL_DISCLOSURE,
+  normalizeToolDisclosure,
+  type ToolDisclosure,
+} from "../tool-disclosure";
+import {
+  CORPORATE_CA_EXPLICIT_ENV,
+  encodeCorporateCaArg,
+  resolveCorporateCa,
+} from "./corporate-ca";
+import {
+  DCODE_AUTO_APPROVAL_BUILD_ARG,
+  type DcodeAutoApprovalMode,
+  isDcodeAutoApprovalMode,
+} from "./dcode-auto-approval";
+import * as remoteDashboardBindContract from "./dockerfile-remote-dashboard-bind-contract";
+import {
+  dockerfileInstructions,
+  readDockerfilePatchSnapshot,
+  replaceDockerfilePatchSnapshot,
+  validateToolDisclosureDockerfileContract,
+} from "./dockerfile-tool-disclosure-contract";
+
+export { assertToolDisclosureDockerfileContract } from "./dockerfile-tool-disclosure-contract";
 
 const SANDBOX_BASE_IMAGE = "ghcr.io/nvidia/nemoclaw/sandbox-base";
+const NODE_RUNTIME_REFRESH_INSTRUCTION =
+  "COPY --from=builder /usr/local/bin/node /usr/local/bin/node";
 const PROXY_HOST_RE = /^[A-Za-z0-9._-]+$/;
 const POSITIVE_INT_RE = /^[1-9][0-9]*$/;
 
@@ -24,6 +59,60 @@ function encodeSanitizedDockerJsonArg(value: unknown): string {
   return sanitizeDockerArg(encodeDockerJsonArg(value));
 }
 
+function normalizeOptionalEndpointUrlArg(value: string | null | undefined, name: string): string {
+  if (value === null || value === undefined || value.trim() === "") return "";
+  if (/[\p{Cc}\p{Cf}]/u.test(value)) {
+    throw new Error(`${name} must not contain control characters.`);
+  }
+  const text = value.trim();
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error(`${name} must be a valid URL.`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${name} must use HTTP or HTTPS.`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${name} must not include credentials.`);
+  }
+  if (url.search || url.hash) {
+    throw new Error(`${name} must not include query strings or fragments.`);
+  }
+  return url.href;
+}
+
+export type DockerfileBuildIdPolicy = "preserve" | "rewrite";
+
+export interface PatchStagedDockerfileOptions {
+  buildIdPolicy?: DockerfileBuildIdPolicy;
+  toolDisclosure?: ToolDisclosure;
+  requireToolDisclosureContract?: boolean;
+  trustedManagedDockerfile?: boolean;
+  baseImageResolutionMetadata?: SandboxBaseImageResolutionMetadata | null;
+  dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
+  upstreamEndpointUrl?: string | null;
+  wslDashboardExposure?: boolean;
+}
+
+export function patchDcodeAutoApprovalDockerArg(
+  dockerfile: string,
+  mode: DcodeAutoApprovalMode,
+): string {
+  if (!isDcodeAutoApprovalMode(mode)) {
+    throw new Error("Invalid DCode auto-approval mode; refusing to patch the Dockerfile.");
+  }
+  const instruction = new RegExp(`^ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=[^\\r\\n]*$`, "gm");
+  const matches = dockerfile.match(instruction) ?? [];
+  if (matches.length !== 1) {
+    throw new Error(
+      `Dockerfile must contain exactly one ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=... instruction; found ${matches.length}.`,
+    );
+  }
+  return dockerfile.replace(instruction, `ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=${mode}`);
+}
+
 export function isValidProxyHost(value: string): boolean {
   return PROXY_HOST_RE.test(value);
 }
@@ -34,6 +123,10 @@ export function isValidProxyPort(value: string): boolean {
   return port >= 1 && port <= 65535;
 }
 
+export type PatchedDockerfileMetadata = { dashboardRemoteBindPrepared: boolean };
+
+export { hasPreparedRemoteDashboardBind } from "./dockerfile-remote-dashboard-bind-contract";
+
 export function patchStagedDockerfile(
   dockerfilePath: string,
   model: string,
@@ -42,17 +135,12 @@ export function patchStagedDockerfile(
   provider: string | null = null,
   preferredInferenceApi: string | null = null,
   webSearchConfig: WebSearchConfig | null = null,
-  messagingChannels: string[] = [],
-  messagingAllowedIds: LooseObject = {},
-  discordGuilds: LooseObject = {},
   baseImageRef: string | null = null,
-  telegramConfig: LooseObject = {},
-  wechatConfig: LooseObject = {},
   darwinVmCompat = false,
   inferenceBaseUrlOverride: string | null = null,
   hermesToolGateways: string[] = [],
-  slackConfig: LooseObject = {},
-): void {
+  options: PatchStagedDockerfileOptions = {},
+): PatchedDockerfileMetadata {
   const sanitizedModel = sanitizeDockerArg(model);
   const sandboxInference = getSandboxInferenceConfig(
     sanitizedModel,
@@ -64,7 +152,20 @@ export function patchStagedDockerfile(
     inferenceBaseUrlOverride && inferenceBaseUrlOverride.trim()
       ? inferenceBaseUrlOverride
       : sandboxInference.inferenceBaseUrl;
-  let dockerfile = fs.readFileSync(dockerfilePath, "utf8");
+  const patchSnapshot = readDockerfilePatchSnapshot(dockerfilePath);
+  let dockerfile = patchSnapshot.content;
+  const toolDisclosure = normalizeToolDisclosure(options.toolDisclosure) ?? DEFAULT_TOOL_DISCLOSURE;
+  const toolDisclosureInstruction = options.requireToolDisclosureContract
+    ? validateToolDisclosureDockerfileContract(dockerfile, toolDisclosure)
+    : dockerfileInstructions(dockerfile).find((instruction) =>
+        /^ARG\s+NEMOCLAW_TOOL_DISCLOSURE\s*=/.test(instruction.text),
+      );
+  if (toolDisclosureInstruction) {
+    dockerfile = `${dockerfile.slice(0, toolDisclosureInstruction.start)}ARG NEMOCLAW_TOOL_DISCLOSURE=${sanitizeDockerArg(toolDisclosure)}${dockerfile.slice(toolDisclosureInstruction.end)}`;
+  }
+  if (options.dcodeAutoApprovalMode !== undefined) {
+    dockerfile = patchDcodeAutoApprovalDockerArg(dockerfile, options.dcodeAutoApprovalMode);
+  }
   // Pin the base image to a specific digest when available (#1904).
   // The ref must come from pullAndResolveBaseImageDigest() — never from
   // blueprint.yaml, whose digest belongs to a different registry.
@@ -86,13 +187,60 @@ export function patchStagedDockerfile(
       },
     );
   }
+  // A source=local resolution is built from this checkout's Dockerfile.base,
+  // whose Node image pin is kept identical to the managed Dockerfile builder.
+  // Copying that same 125 MB binary into the final image creates a redundant
+  // export layer. Keep the checked-in COPY as the safe default for published
+  // and legacy bases, and elide it only for this trusted, authoritative local
+  // base path. Custom Dockerfiles never receive trusted resolution metadata.
+  if (
+    options.trustedManagedDockerfile === true &&
+    options.baseImageResolutionMetadata?.imageName === SANDBOX_BASE_IMAGE &&
+    options.baseImageResolutionMetadata.source === "local" &&
+    sanitizedBaseImageRef === options.baseImageResolutionMetadata.ref
+  ) {
+    const instructionCount = dockerfile
+      .split(/\r?\n/)
+      .filter((line) => line.trim() === NODE_RUNTIME_REFRESH_INSTRUCTION).length;
+    if (instructionCount !== 1) {
+      throw new Error(
+        `Managed OpenClaw Dockerfile must contain exactly one ${NODE_RUNTIME_REFRESH_INSTRUCTION} instruction; found ${instructionCount}.`,
+      );
+    }
+    dockerfile = dockerfile.replace(
+      NODE_RUNTIME_REFRESH_INSTRUCTION,
+      "# Node runtime refresh omitted: authoritative local base already uses the builder pin.",
+    );
+  }
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_MODEL=.*$/m,
     `ARG NEMOCLAW_MODEL=${sanitizedModel}`,
   );
   dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_INFERENCE_PROVIDER_ID=.*$/m,
+    `ARG NEMOCLAW_INFERENCE_PROVIDER_ID=${sanitizeDockerArg(providerKey)}`,
+  );
+  dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_PROVIDER_KEY=.*$/m,
     `ARG NEMOCLAW_PROVIDER_KEY=${sanitizeDockerArg(providerKey)}`,
+  );
+  // Carry the user-selected upstream provider name separately from the
+  // managed route key, so Hermes' _nemoclaw_upstream annotation can record
+  // the upstream the user actually picked (nvidia-prod, hermes-provider,
+  // etc.) rather than the proxy-routing key. The replace is a silent no-op
+  // when the staged Dockerfile predates this ARG (e.g. OpenClaw).
+  const upstreamProvider = provider && provider.trim() ? provider : providerKey;
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_UPSTREAM_PROVIDER=.*$/m,
+    `ARG NEMOCLAW_UPSTREAM_PROVIDER=${sanitizeDockerArg(upstreamProvider)}`,
+  );
+  const upstreamEndpointUrl = normalizeOptionalEndpointUrlArg(
+    options.upstreamEndpointUrl,
+    "NEMOCLAW_UPSTREAM_ENDPOINT_URL",
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_UPSTREAM_ENDPOINT_URL=.*$/m,
+    `ARG NEMOCLAW_UPSTREAM_ENDPOINT_URL=${upstreamEndpointUrl}`,
   );
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_PRIMARY_MODEL_REF=.*$/m,
@@ -102,6 +250,28 @@ export function patchStagedDockerfile(
     /^ARG CHAT_UI_URL=.*$/m,
     `ARG CHAT_UI_URL=${sanitizeDockerArg(chatUiUrl)}`,
   );
+  if (options.wslDashboardExposure !== undefined) {
+    const wslDashboardExposureArg = /^ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE=.*$/m;
+    const hasWslDashboardExposureArg = wslDashboardExposureArg.test(dockerfile);
+    if (options.wslDashboardExposure && !hasWslDashboardExposureArg) {
+      throw new Error(
+        "Dockerfile is missing ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE; cannot record WSL dashboard exposure.",
+      );
+    }
+    if (hasWslDashboardExposureArg) {
+      dockerfile = dockerfile.replace(
+        wslDashboardExposureArg,
+        `ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE=${options.wslDashboardExposure ? "1" : "0"}`,
+      );
+    }
+  }
+  const remoteDashboardBind = remoteDashboardBindContract.patchRequestedRemoteDashboardBindContract(
+    dockerfile,
+    process.env.NEMOCLAW_DASHBOARD_BIND,
+    options.trustedManagedDockerfile === true,
+  );
+  dockerfile = remoteDashboardBind.dockerfile;
+  const { dashboardRemoteBindPrepared } = remoteDashboardBind;
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_INFERENCE_BASE_URL=.*$/m,
     `ARG NEMOCLAW_INFERENCE_BASE_URL=${sanitizeDockerArg(inferenceBaseUrl)}`,
@@ -114,10 +284,15 @@ export function patchStagedDockerfile(
     /^ARG NEMOCLAW_INFERENCE_COMPAT_B64=.*$/m,
     `ARG NEMOCLAW_INFERENCE_COMPAT_B64=${encodeSanitizedDockerJsonArg(inferenceCompat)}`,
   );
-  dockerfile = dockerfile.replace(
-    /^ARG NEMOCLAW_BUILD_ID=.*$/m,
-    `ARG NEMOCLAW_BUILD_ID=${sanitizeDockerArg(buildId)}`,
-  );
+  // Rewriting is the compatibility-safe default for custom and legacy
+  // Dockerfiles. Only callers with explicit knowledge of a managed stock
+  // Dockerfile may preserve the declaration to keep warm builds cacheable.
+  if (options.buildIdPolicy !== "preserve") {
+    dockerfile = dockerfile.replace(
+      /^ARG NEMOCLAW_BUILD_ID=.*$/m,
+      `ARG NEMOCLAW_BUILD_ID=${sanitizeDockerArg(buildId)}`,
+    );
+  }
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_DARWIN_VM_COMPAT=.*$/m,
     `ARG NEMOCLAW_DARWIN_VM_COMPAT=${sanitizeDockerArg(darwinVmCompat ? "1" : "0")}`,
@@ -125,7 +300,15 @@ export function patchStagedDockerfile(
   // Honor NEMOCLAW_CONTEXT_WINDOW / NEMOCLAW_MAX_TOKENS / NEMOCLAW_REASONING
   // so the user can tune model metadata without editing the Dockerfile.
   const contextWindow = process.env.NEMOCLAW_CONTEXT_WINDOW;
-  if (contextWindow && POSITIVE_INT_RE.test(contextWindow)) {
+  // Validate the ceiling as well as the format: POSITIVE_INT_RE alone would let
+  // an implausibly large value (which the auto-detect/probe paths reject) bake
+  // into the image ARG. Match the auto-detect ceiling. See PR #6293 PRA-4
+  // (Nemotron).
+  if (
+    contextWindow &&
+    POSITIVE_INT_RE.test(contextWindow) &&
+    Number(contextWindow) <= MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW
+  ) {
     dockerfile = dockerfile.replace(
       /^ARG NEMOCLAW_CONTEXT_WINDOW=.*$/m,
       `ARG NEMOCLAW_CONTEXT_WINDOW=${sanitizeDockerArg(contextWindow)}`,
@@ -177,9 +360,9 @@ export function patchStagedDockerfile(
     );
   }
   // Honor NEMOCLAW_PROXY_HOST / NEMOCLAW_PROXY_PORT exported in the host
-  // shell so the sandbox-side nemoclaw-start.sh sees them via $ENV at runtime.
-  // Without this, the host export is silently dropped at image build time and
-  // the sandbox falls back to the default 10.200.0.1:3128 proxy. See #1409.
+  // shell. Agent Dockerfiles consume these validated build args; dcode pins
+  // them into root-owned image files so untrusted runtime env cannot redirect
+  // its managed inference traffic. See #1409 and #6191.
   const proxyHostEnv = process.env.NEMOCLAW_PROXY_HOST;
   if (proxyHostEnv && isValidProxyHost(proxyHostEnv)) {
     dockerfile = dockerfile.replace(
@@ -196,48 +379,43 @@ export function patchStagedDockerfile(
   }
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_WEB_SEARCH_ENABLED=.*$/m,
-    `ARG NEMOCLAW_WEB_SEARCH_ENABLED=${sanitizeDockerArg(webSearchConfig ? "1" : "0")}`,
+    `ARG NEMOCLAW_WEB_SEARCH_ENABLED=${sanitizeDockerArg(isWebSearchEnabled(webSearchConfig) ? "1" : "0")}`,
   );
-  // Onboard flow expects immediate dashboard access without device pairing,
-  // so disable device auth for images built during onboard (see #1217).
   dockerfile = dockerfile.replace(
-    /^ARG NEMOCLAW_DISABLE_DEVICE_AUTH=.*$/m,
-    `ARG NEMOCLAW_DISABLE_DEVICE_AUTH=${sanitizeDockerArg("1")}`,
+    /^ARG NEMOCLAW_WEB_SEARCH_PROVIDER=.*$/m,
+    `ARG NEMOCLAW_WEB_SEARCH_PROVIDER=${sanitizeDockerArg(webSearchProviderForConfig(webSearchConfig))}`,
   );
-  if (messagingChannels.length > 0) {
-    dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_MESSAGING_CHANNELS_B64=.*$/m,
-      `ARG NEMOCLAW_MESSAGING_CHANNELS_B64=${encodeSanitizedDockerJsonArg(messagingChannels)}`,
-    );
+  for (const envKey of [
+    "NEMOCLAW_OPENCLAW_OTEL",
+    "NEMOCLAW_OPENCLAW_OTEL_ENDPOINT",
+    "NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME",
+    "NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE",
+  ]) {
+    const rawValue = process.env[envKey];
+    if (rawValue !== undefined && rawValue.trim() !== "") {
+      const argPattern = new RegExp(`^ARG ${envKey}=.*$`, "m");
+      if (!argPattern.test(dockerfile)) {
+        throw new Error(`Dockerfile is missing ARG ${envKey}; cannot apply value ${rawValue}`);
+      }
+      dockerfile = dockerfile.replace(argPattern, `ARG ${envKey}=${sanitizeDockerArg(rawValue)}`);
+    }
   }
-  if (Object.keys(messagingAllowedIds).length > 0) {
-    dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_MESSAGING_ALLOWED_IDS_B64=.*$/m,
-      `ARG NEMOCLAW_MESSAGING_ALLOWED_IDS_B64=${encodeSanitizedDockerJsonArg(messagingAllowedIds)}`,
+  // Keep the managed pairing opt-out distinct from an operator's choice.
+  dockerfile = remoteDashboardBindContract.patchManagedDeviceAuthOptOutContract(dockerfile);
+  const messagingPlan = MessagingSetupApplier.readPlanFromEnv();
+  if (messagingPlan) {
+    const hydratedMessagingPlan = hydrateDerivedSandboxMessagingPlanFields(
+      parseSandboxMessagingPlan(messagingPlan) ?? messagingPlan,
     );
-  }
-  if (Object.keys(discordGuilds).length > 0) {
+    const messagingPlanArgPattern = /^ARG NEMOCLAW_MESSAGING_PLAN_B64=.*$/m;
+    if (!messagingPlanArgPattern.test(dockerfile)) {
+      throw new Error(
+        "Dockerfile is missing ARG NEMOCLAW_MESSAGING_PLAN_B64; cannot apply messaging plan.",
+      );
+    }
     dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_DISCORD_GUILDS_B64=.*$/m,
-      `ARG NEMOCLAW_DISCORD_GUILDS_B64=${encodeSanitizedDockerJsonArg(discordGuilds)}`,
-    );
-  }
-  if (telegramConfig && Object.keys(telegramConfig).length > 0) {
-    dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_TELEGRAM_CONFIG_B64=.*$/m,
-      `ARG NEMOCLAW_TELEGRAM_CONFIG_B64=${encodeSanitizedDockerJsonArg(telegramConfig)}`,
-    );
-  }
-  if (wechatConfig && Object.keys(wechatConfig).length > 0) {
-    dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_WECHAT_CONFIG_B64=.*$/m,
-      `ARG NEMOCLAW_WECHAT_CONFIG_B64=${encodeSanitizedDockerJsonArg(wechatConfig)}`,
-    );
-  }
-  if (slackConfig && Object.keys(slackConfig).length > 0) {
-    dockerfile = dockerfile.replace(
-      /^ARG NEMOCLAW_SLACK_CONFIG_B64=.*$/m,
-      `ARG NEMOCLAW_SLACK_CONFIG_B64=${encodeSanitizedDockerJsonArg(slackConfig)}`,
+      messagingPlanArgPattern,
+      `ARG NEMOCLAW_MESSAGING_PLAN_B64=${sanitizeDockerArg(MessagingSetupApplier.encodePlan(hydratedMessagingPlan))}`,
     );
   }
   if (hermesToolGateways.length > 0) {
@@ -250,5 +428,57 @@ export function patchStagedDockerfile(
       `ARG NEMOCLAW_HERMES_TOOL_GATEWAY_PRESETS_B64=${encodeSanitizedDockerJsonArg(hermesToolGateways)}`,
     );
   }
-  fs.writeFileSync(dockerfilePath, dockerfile);
+
+  const baseResolutionLabels = formatSandboxBaseImageResolutionLabels(
+    options.baseImageResolutionMetadata,
+  );
+  if (baseResolutionLabels) {
+    dockerfile = `${dockerfile.trimEnd()}\n\n# NemoClaw sandbox-base warm-resolution metadata\n${baseResolutionLabels}\n`;
+  }
+  // NEMOCLAW_EXTRA_AGENTS_JSON — bake secondary OpenClaw agents into
+  // agents.list[] alongside the canonical "main" entry. Pass the raw operator
+  // payload through to the build-time validator in
+  // scripts/generate-openclaw-config.mts. The host-side encode does not
+  // parse or shape-check the JSON: that would duplicate validation logic and
+  // could silently drop a malformed payload here while the docs/contract
+  // promise an image-build failure. Encoding the raw bytes makes the build
+  // the single source of truth for validation errors.
+  const extraAgentsRaw = process.env.NEMOCLAW_EXTRA_AGENTS_JSON;
+  if (extraAgentsRaw && extraAgentsRaw.trim()) {
+    const encoded = sanitizeDockerArg(Buffer.from(extraAgentsRaw, "utf8").toString("base64"));
+    dockerfile = dockerfile.replace(
+      /^ARG NEMOCLAW_EXTRA_AGENTS_JSON_B64=.*$/m,
+      `ARG NEMOCLAW_EXTRA_AGENTS_JSON_B64=${encoded}`,
+    );
+  }
+  // Corporate proxy CA import (#6210). When the host exposes an operator
+  // corporate CA bundle — via env var or an installed host trust-store anchor —
+  // bake its base64 so the entrypoint can append it to the OpenShell trust
+  // bundle at runtime (never replacing it). The replace is a silent no-op on
+  // custom/legacy Dockerfiles that predate this ARG.
+  const corporateCa = resolveCorporateCa(process.env);
+  if (corporateCa) {
+    const corporateCaArgPattern = /^ARG NEMOCLAW_CORPORATE_CA_B64=.*$/m;
+    if (corporateCaArgPattern.test(dockerfile)) {
+      dockerfile = dockerfile.replace(
+        corporateCaArgPattern,
+        `ARG NEMOCLAW_CORPORATE_CA_B64=${sanitizeDockerArg(encodeCorporateCaArg(corporateCa.pem))}`,
+      );
+      // Surface which host source is being baked so a fallback import (from a
+      // conventional CA env var rather than the explicit opt-in) is never
+      // silent. The CA is a public certificate, so logging its source is safe.
+      console.error(
+        `[nemoclaw] baking corporate proxy CA from ${corporateCa.sourceEnv} (${corporateCa.sourcePath}) into the sandbox image trust (#6210)`,
+      );
+    } else if (corporateCa.sourceEnv === CORPORATE_CA_EXPLICIT_ENV) {
+      // Explicit opt-in must not silently no-op on a managed Dockerfile.
+      throw new Error(
+        "Dockerfile is missing ARG NEMOCLAW_CORPORATE_CA_B64; cannot bake the corporate CA from NEMOCLAW_CORPORATE_CA_BUNDLE.",
+      );
+    }
+    // Fallback source + a custom Dockerfile without the ARG: leave a no-op.
+  }
+
+  replaceDockerfilePatchSnapshot(dockerfilePath, patchSnapshot, dockerfile);
+  return { dashboardRemoteBindPrepared };
 }

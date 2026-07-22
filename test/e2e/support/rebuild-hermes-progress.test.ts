@@ -1,0 +1,95 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import { describe, expect, it, vi } from "vitest";
+import { startTestProgress, type TestProgressOptions } from "../fixtures/progress.ts";
+
+function progressHarness() {
+  const state = {
+    baselinePhases: [] as string[],
+    clearCalls: 0,
+    clockMs: 1_000,
+    lines: [] as string[],
+    timerCallback: null as (() => void) | null,
+  };
+  const options: TestProgressOptions = {
+    stallThresholdMs: 300_000,
+    stallReminderIntervalMs: 600_000,
+    now: () => state.clockMs,
+    setTimer: (callback) => {
+      state.timerCallback = callback;
+      return { unref() {} };
+    },
+    clearTimer: () => {
+      state.clearCalls += 1;
+    },
+    logLine: (line) => state.lines.push(line),
+    sampleResources: () => ({
+      freeMemoryBytes: 8 * 1024 ** 3,
+      processRssBytes: 0.5 * 1024 ** 3,
+      totalMemoryBytes: 16 * 1024 ** 3,
+      workspaceFreeBytes: 6 * 1024 ** 3,
+      loadAverage1m: 2.5,
+    }),
+    sampleResourceEvidence: (phase) => `E2E_RESOURCE_SNAPSHOT {"phase":"${phase}"}`,
+    recordResourceBaseline: (phase) => state.baselinePhases.push(phase),
+  };
+  return { options, state };
+}
+
+describe("Hermes rebuild live progress", () => {
+  it("keeps runner evidence out of normal phase transitions", () => {
+    const { options, state } = progressHarness();
+    const progress = startTestProgress(
+      "rebuild-hermes",
+      ["run authoritative Hermes rebuild", "remove rebuilt Hermes resources"],
+      options,
+    );
+
+    progress.onOutput({ stream: "stderr", atMs: 61_000 });
+    state.clockMs = 301_000;
+    state.timerCallback?.();
+    progress.phase("remove rebuilt Hermes resources");
+    progress.stop();
+    const linesAfterStop = state.lines.length;
+    progress.stop();
+    progress.phase("after stop");
+
+    expect(state.clearCalls).toBe(2);
+    expect(state.baselinePhases).toEqual([
+      "run authoritative Hermes rebuild",
+      "remove rebuilt Hermes resources",
+    ]);
+    expect(state.lines).toHaveLength(linesAfterStop);
+    expect(state.lines).toEqual([
+      "[e2e phase 1/2] run authoritative Hermes rebuild",
+      "[e2e phase 1/2] still running: run authoritative Hermes rebuild (phase 5m; child output 4m ago; no active command; rss 0.5 GiB; memory free 8.0 GiB/16.0 GiB; disk free 6.0 GiB; load 2.50)",
+      'E2E_RESOURCE_SNAPSHOT {"phase":"run authoritative Hermes rebuild"}',
+      "[e2e phase 1/2] run authoritative Hermes rebuild — passed in 5m; next 2/2: remove rebuilt Hermes resources",
+      "[e2e phase 2/2] remove rebuilt Hermes resources — passed in 0s",
+    ]);
+  });
+
+  it("keeps diagnostics best-effort when host sampling and output fail", () => {
+    const { options, state } = progressHarness();
+    options.logLine = vi.fn(() => {
+      throw new Error("closed output");
+    });
+    options.sampleResources = () => {
+      throw new Error("statfs unavailable");
+    };
+
+    expect(() => {
+      const progress = startTestProgress(
+        "rebuild-hermes",
+        ["build previous Hermes base", "remove previous Hermes base"],
+        options,
+      );
+      state.clockMs = 301_000;
+      state.timerCallback?.();
+      progress.phase("remove previous Hermes base");
+      progress.stop();
+    }).not.toThrow();
+    expect(state.clearCalls).toBe(2);
+  });
+});

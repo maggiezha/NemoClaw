@@ -2,16 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
-
+import type { CaptureOpenshellResult } from "./adapters/openshell/client";
+import { captureOpenshellCommand } from "./adapters/openshell/client";
+import { resolveOpenshell } from "./adapters/openshell/resolve";
+import { OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
+import { isObjectRecord } from "./core/json-types";
+import { GATEWAY_PORT } from "./core/ports";
 import { getNamedGatewayLifecycleState } from "./gateway-runtime-action";
 import { getLiveGatewayInference } from "./inference/live";
-import type { GatewayHealth, MessagingBridgeHealth, ShowStatusCommandDeps } from "./inventory";
-import { backfillMessagingChannels, findAllOverlaps } from "./messaging-conflict";
-import type { CaptureOpenshellResult } from "./adapters/openshell/client";
-import { captureOpenshellCommand, stripAnsi } from "./adapters/openshell/client";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
+import type {
+  GatewayHealth,
+  MessagingBridgeHealth,
+  MessagingOverlap,
+  ShowStatusCommandDeps,
+} from "./inventory";
+import { findAllOverlaps } from "./messaging/applier";
+import { createBuiltInMessagingHookRegistry } from "./messaging/hooks";
+import {
+  type MessagingStatusHookRunResult,
+  runMessagingStatusHooks,
+} from "./messaging/hooks/status-runner";
+import type { MessagingAgentId } from "./messaging/manifest";
+import { resolveGatewayName } from "./onboard/gateway-binding";
 import * as registry from "./state/registry";
-import { resolveOpenshell } from "./adapters/openshell/resolve";
 import { createSystemDeps, parseSshProcesses } from "./state/sandbox-session";
 import { getServiceStatuses, showStatus as showServiceStatus } from "./tunnel/services";
 
@@ -35,77 +48,146 @@ function checkMessagingBridgeHealth(
   rootDir: string,
   sandboxName: string,
   channels: string[],
+  agent: string | null | undefined = "openclaw",
 ): MessagingBridgeHealth[] {
-  // Only Telegram currently emits a recognizable conflict signature in the
-  // gateway log. Discord/Slack have similar single-consumer constraints but
-  // log differently; we can extend the regex when those patterns are known.
-  if (!Array.isArray(channels) || !channels.includes("telegram")) return [];
+  const channelSet = new Set(Array.isArray(channels) ? channels : []);
   const openshell = resolveOpenshell();
   if (!openshell) return [];
-  const script =
-    'tail -n 200 /tmp/gateway.log 2>/dev/null | grep -cE "getUpdates conflict|409[[:space:]:]+Conflict" || true';
+
+  return runMessagingStatusHooks({
+    agent: normalizeMessagingAgentId(agent),
+    channels: channelSet,
+    currentSandbox: sandboxName,
+    registryEntries: safeListRegistryEntries(),
+    hookRegistry: createBuiltInMessagingHookRegistry({
+      telegram: {
+        gatewayConflictStatus: {
+          executeSandboxCommand: (name, command, timeoutMs) =>
+            executeSandboxCommand(rootDir, openshell, name, command, timeoutMs),
+        },
+      },
+    }),
+  }).flatMap(readBridgeHealthOutputs);
+}
+
+function findMessagingOverlaps() {
+  // Non-critical path: status must remain usable even if overlap detection
+  // throws, so any failure yields an empty overlap list.
+  try {
+    // Report both conflict axes independently and without deduping. They are
+    // distinct, both-true facts: a shared messaging credential conflicts on any
+    // gateway, while channel-owned status hooks can report non-credential
+    // runtime exclusivity such as Slack Socket Mode on one gateway.
+    const { sandboxes } = registry.listSandboxes();
+    const credentialOverlaps = findAllOverlaps({
+      listSandboxes: () => ({ sandboxes }),
+    });
+    const statusOverlaps = runMessagingStatusHooks({
+      agents: uniqueAgentsForEntries(sandboxes),
+      registryEntries: sandboxes,
+    }).flatMap(readOverlapOutputs);
+    return [...credentialOverlaps, ...statusOverlaps];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeMessagingAgentId(agent: string | null | undefined): MessagingAgentId {
+  return agent === "hermes" ? "hermes" : "openclaw";
+}
+
+function executeSandboxCommand(
+  rootDir: string,
+  openshell: string,
+  sandboxName: string,
+  command: string,
+  timeoutMs: number,
+): {
+  readonly status?: number | null;
+  readonly stdout?: unknown;
+  readonly stderr?: unknown;
+} | null {
   try {
     const result = spawnSync(
       openshell,
-      ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-c", script],
-      { cwd: rootDir, encoding: "utf-8", timeout: 3000, stdio: ["ignore", "pipe", "pipe"] },
+      ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-c", command],
+      { cwd: rootDir, encoding: "utf-8", timeout: timeoutMs, stdio: ["ignore", "pipe", "pipe"] },
     );
-    const count = Number.parseInt((result.stdout || "").trim(), 10);
-    if (!Number.isFinite(count) || count === 0) return [];
-    return [{ channel: "telegram", conflicts: count }];
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
   } catch {
-    return [];
+    return null;
   }
 }
 
-function isMissingProviderOutput(output: string): boolean {
-  const normalized = stripAnsi(output).toLowerCase();
-  return [
-    /\bno such provider\b/,
-    /\bno provider named\b/,
-    /\bunknown provider\b/,
-    /\bprovider\b[\s\S]{0,120}\bnot found\b/,
-    /\bnot found\b[\s\S]{0,120}\bprovider\b/,
-    /\bprovider\b[\s\S]{0,120}\bdoes not exist\b/,
-  ].some((pattern) => pattern.test(normalized));
-}
-
-function makeConflictProbe(rootDir: string) {
-  // Upfront liveness check so we can distinguish "provider not attached" from
-  // "gateway unreachable". Provider probes also classify only explicit missing
-  // provider responses as absent so status remains non-destructive under
-  // transient transport, auth, or timeout failures.
-  let gatewayAlive: boolean | null = null;
-  const isGatewayAlive = (): boolean => {
-    if (gatewayAlive === null) {
-      const result = captureOpenshell(rootDir, ["sandbox", "list"], {
-        timeout: OPENSHELL_PROBE_TIMEOUT_MS,
-      });
-      gatewayAlive = result.status === 0;
-    }
-    return gatewayAlive;
-  };
-  return {
-    providerExists: (name: string) => {
-      if (!isGatewayAlive()) return "error" as const;
-      const result = captureOpenshell(rootDir, ["provider", "get", name], {
-        timeout: OPENSHELL_PROBE_TIMEOUT_MS,
-      });
-      if (result.status === 0) return "present" as const;
-      return isMissingProviderOutput(result.output) ? ("absent" as const) : ("error" as const);
-    },
-  };
-}
-
-function backfillAndFindOverlaps(rootDir: string) {
-  // Non-critical path: status must remain usable even if the gateway probe or
-  // registry write throws, so any failure yields an empty overlap list.
+function safeListRegistryEntries(): readonly registry.SandboxEntry[] {
   try {
-    backfillMessagingChannels(registry, makeConflictProbe(rootDir));
-    return findAllOverlaps(registry);
+    return registry.listSandboxes().sandboxes;
   } catch {
     return [];
   }
+}
+
+function uniqueAgentsForEntries(
+  entries: readonly registry.SandboxEntry[],
+): ReadonlySet<MessagingAgentId> {
+  const agents = new Set<MessagingAgentId>();
+  for (const entry of entries) {
+    agents.add(normalizeMessagingAgentId(entry.agent));
+  }
+  if (agents.size === 0) agents.add("openclaw");
+  return agents;
+}
+
+function readBridgeHealthOutputs(result: MessagingStatusHookRunResult): MessagingBridgeHealth[] {
+  return Object.values(result.outputs).flatMap((output) => {
+    if (output.kind !== "status" || !isObjectRecord(output.value)) return [];
+    if (output.value.type !== "messaging-bridge-health") return [];
+    const channel = stringField(output.value.channel) ?? result.channelId;
+    const conflicts = numberField(output.value.conflicts);
+    return conflicts > 0 ? [{ channel, conflicts }] : [];
+  });
+}
+
+function readOverlapOutputs(result: MessagingStatusHookRunResult): MessagingOverlap[] {
+  return Object.values(result.outputs).flatMap((output) => {
+    if (output.kind !== "status" || !isObjectRecord(output.value)) return [];
+    if (output.value.type !== "messaging-overlaps" || !Array.isArray(output.value.overlaps)) {
+      return [];
+    }
+    return output.value.overlaps.flatMap((entry) => {
+      if (!isObjectRecord(entry) || !isStringPair(entry.sandboxes)) return [];
+      return [
+        {
+          channel: stringField(entry.channel) ?? result.channelId,
+          sandboxes: entry.sandboxes,
+          ...(typeof entry.reason === "string" ? { reason: entry.reason } : {}),
+          ...(typeof entry.message === "string" ? { message: entry.message } : {}),
+          ...(typeof entry.port === "number" ? { port: entry.port } : {}),
+        },
+      ];
+    });
+  });
+}
+
+function stringField(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function numberField(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function isStringPair(value: unknown): value is [string, string] {
+  return (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    typeof value[0] === "string" &&
+    typeof value[1] === "string"
+  );
 }
 
 function readGatewayLog(rootDir: string, sandboxName: string): string | null {
@@ -135,14 +217,15 @@ function readGatewayLog(rootDir: string, sandboxName: string): string | null {
 
 function probeGatewayHealth(): GatewayHealth {
   try {
-    const lifecycle = getNamedGatewayLifecycleState();
+    const expectedGateway = resolveGatewayName(GATEWAY_PORT);
+    const lifecycle = getNamedGatewayLifecycleState(expectedGateway);
     if (lifecycle.state === "healthy_named") {
       return { healthy: true, state: lifecycle.state };
     }
     const reasonByState: Record<string, string> = {
       named_unreachable: "host port held or container not running",
       named_unhealthy: "named gateway present but not Connected",
-      connected_other: `connected to '${lifecycle.activeGateway ?? "unknown"}', not 'nemoclaw'`,
+      connected_other: `connected to '${lifecycle.activeGateway ?? "unknown"}', not '${expectedGateway}'`,
       missing_named: "named gateway not configured",
     };
     return {
@@ -199,9 +282,9 @@ export function buildStatusCommandDeps(rootDir: string): ShowStatusCommandDeps {
           }
         }
       : undefined,
-    checkMessagingBridgeHealth: (sandboxName, channels) =>
-      checkMessagingBridgeHealth(rootDir, sandboxName, channels),
-    backfillAndFindOverlaps: () => backfillAndFindOverlaps(rootDir),
+    checkMessagingBridgeHealth: (sandboxName, channels, agent) =>
+      checkMessagingBridgeHealth(rootDir, sandboxName, channels, agent),
+    findMessagingOverlaps,
     readGatewayLog: (sandboxName) => readGatewayLog(rootDir, sandboxName),
     log: console.log,
   };

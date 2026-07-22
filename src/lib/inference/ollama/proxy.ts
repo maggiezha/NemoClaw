@@ -1,4 +1,3 @@
-// @ts-nocheck
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -6,13 +5,18 @@
 // proxy start/stop, model pull and validation.
 
 import type { GpuInfo } from "../local";
+import type { PulledModelDiscoveryDeps } from "./model-discovery";
 
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
-const http = require("http");
-const { ROOT, SCRIPTS, run, runCapture, shellQuote } = require("../../runner");
+const { ROOT, SCRIPTS, redact, run, runCapture, shellQuote } = require("../../runner");
 const { OLLAMA_PORT, OLLAMA_PROXY_PORT } = require("../../core/ports");
+const { isNonInteractiveEnv }: typeof import("../../core/non-interactive") =
+  require("../../core/non-interactive");
 const { waitForPort } = require("../../core/wait");
+const { ensurePulledOllamaModel }: typeof import("./model-discovery") =
+  require("./model-discovery");
+const { ollamaModelRefsMatch }: typeof import("./model-discovery") = require("./model-discovery");
 const {
   getDefaultOllamaModel,
   getBootstrapOllamaModelOptions,
@@ -24,6 +28,7 @@ const {
   validateOllamaModel,
 } = require("../local");
 const { anyRegistryModelFits, modelFitsAvailableMemory } = require("../ollama-model-registry");
+const { isOllamaAuthProxyCommandLine }: typeof import("./process") = require("./process");
 const { buildSubprocessEnv } = require("../../subprocess-env");
 const { prompt } = require("../../credentials/store");
 const { promptManualModelId } = require("../model-prompts");
@@ -38,7 +43,6 @@ const {
   loadLocalAdapterPid,
   persistLocalAdapterPid,
   readLocalAdapterTextFile,
-  removeLocalAdapterFile,
   spawnDetachedNodeAdapter,
   writeLocalAdapterSecretFile,
 } = require("../local-adapter-lifecycle");
@@ -51,7 +55,7 @@ const PROXY_PID_PATH = path.join(PROXY_STATE_DIR, "ollama-auth-proxy.pid");
 
 let ollamaProxyToken: string | null = null;
 
-function sleep(seconds) {
+function sleep(seconds: number): void {
   spawnSync("sleep", [String(seconds)]);
 }
 
@@ -80,7 +84,10 @@ function loadPersistedProxyToken(): string | null {
 }
 
 function curlAuthHeaderConfig(token: string): string {
-  const escaped = String(token).replace(/[\r\n]/g, "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const escaped = String(token)
+    .replace(/[\r\n]/g, "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
   return `header = "Authorization: Bearer ${escaped}"\n`;
 }
 
@@ -107,7 +114,11 @@ function runCurlWithAuthConfig(args: string[], endpoint: string, token: string |
   return spawnSync("curl", curlArgs, options);
 }
 
-function runCurlCaptureWithAuthConfig(args: string[], endpoint: string, token: string | null = null): string {
+function runCurlCaptureWithAuthConfig(
+  args: string[],
+  endpoint: string,
+  token: string | null = null,
+): string {
   const result = runCurlWithAuthConfig(args, endpoint, token);
   return result.status === 0 ? String(result.stdout || "") : "";
 }
@@ -122,19 +133,15 @@ function loadPersistedProxyPid(): number | null {
   return loadLocalAdapterPid(PROXY_PID_PATH);
 }
 
-function clearPersistedProxyPid(): void {
-  removeLocalAdapterFile(PROXY_PID_PATH);
-}
-
 // ── Process management ───────────────────────────────────────────
 
 function isOllamaProxyProcess(pid: number | null | undefined): boolean {
-  return isLocalAdapterProcess(pid, "ollama-auth-proxy.js", runCapture);
+  return isLocalAdapterProcess(pid, isOllamaAuthProxyCommandLine, runCapture);
 }
 
 function spawnOllamaAuthProxy(token: string): number | null {
   const child = spawnDetachedNodeAdapter({
-    scriptPath: path.join(SCRIPTS, "ollama-auth-proxy.js"),
+    scriptPath: path.join(SCRIPTS, "ollama-auth-proxy.mts"),
     env: {
       OLLAMA_PROXY_TOKEN: token,
       OLLAMA_PROXY_PORT: String(OLLAMA_PROXY_PORT),
@@ -150,7 +157,7 @@ function killStaleProxy(): void {
   try {
     killLocalAdapterPid({
       pidPath: PROXY_PID_PATH,
-      processNeedle: "ollama-auth-proxy.js",
+      processMatcher: isOllamaAuthProxyCommandLine,
       run,
       runCapture,
     });
@@ -172,11 +179,95 @@ function killStaleProxy(): void {
   }
 }
 
+// ── Port-conflict diagnostics ────────────────────────────────────
+
+// Inspect what currently listens on the proxy port, excluding our own
+// auth-proxy processes. Returns the owning PIDs and a human-readable
+// description (command line) for each so a port conflict can be reported
+// with the exact owning process instead of telling the user to run lsof
+// themselves (issue #4820).
+//
+// `family` scopes the lookup:
+//   "4"   — IPv4 listeners only. The proxy binds IPv4 (0.0.0.0), so only an
+//           IPv4 (or IPv6 dual-stack-wildcard) listener can actually block it.
+//           An IPv6-only listener (e.g. ::1 with IPV6_V6ONLY) does NOT conflict,
+//           so the pre-start abort uses this scope to avoid a false conflict.
+//   "any" — all TCP listeners. Used only to diagnose an already-failed bind,
+//           where the proxy died from EADDRINUSE: the culprit may be an IPv6
+//           dual-stack wildcard (`:::PORT`) that blocks IPv4 yet lsof reports
+//           as IPv6, so the broad scope still names the owner.
+// Either way we restrict to TCP listeners (not outbound connections / UDP that
+// merely involve the port number).
+function inspectForeignProxyPortOwners(family: "4" | "any" = "any"): {
+  pids: number[];
+  descriptions: string[];
+} {
+  const pids: number[] = [];
+  const descriptions: string[] = [];
+  const selector = family === "4" ? `-ti4TCP:${OLLAMA_PROXY_PORT}` : `-tiTCP:${OLLAMA_PROXY_PORT}`;
+  const pidOutput = runCapture(["lsof", selector, "-sTCP:LISTEN"], {
+    ignoreError: true,
+  });
+  if (!pidOutput || !String(pidOutput).trim()) return { pids, descriptions };
+  for (const raw of String(pidOutput).trim().split(/\s+/)) {
+    const pid = Number.parseInt(raw, 10);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    // Our own auth proxy is not a conflict — killStaleProxy() reclaims it.
+    if (isOllamaProxyProcess(pid)) continue;
+    pids.push(pid);
+    // Redact the owner's command line before display: a foreign process may
+    // carry a secret in its argv (e.g. `--token=…`), and this string is printed
+    // to the console. Matches the codebase convention of redacting command
+    // output before surfacing it.
+    const args = String(
+      redact(runCapture(["ps", "-p", String(pid), "-o", "args="], { ignoreError: true }) || ""),
+    ).trim();
+    descriptions.push(args ? `PID ${pid}: ${args}` : `PID ${pid}`);
+  }
+  return { pids, descriptions };
+}
+
+function printProxyPortConflict(owners: { pids: number[]; descriptions: string[] }): void {
+  console.error(
+    `  Error: Ollama auth proxy cannot start — port ${OLLAMA_PROXY_PORT} is already in use by another process.`,
+  );
+  for (const description of owners.descriptions) {
+    console.error(`    ${description}`);
+  }
+  console.error("  Resolve the conflict, then re-run onboarding:");
+  console.error(`    • Stop the process above (e.g. kill ${owners.pids.join(" ") || "<pid>"}), or`);
+  // Export (don't inline) the override: OLLAMA_PROXY_PORT is read from the
+  // environment on every NemoClaw command, so a one-shot `VAR=… nemoclaw
+  // onboard` would drift — a later `nemoclaw connect` without it would manage
+  // the proxy on the default port while the route points at the custom one.
+  console.error("    • Choose a free proxy port and export it so every NemoClaw command");
+  console.error("      uses the same value (add it to your shell profile to persist):");
+  console.error("        export NEMOCLAW_OLLAMA_PROXY_PORT=<port>");
+  console.error("  Containers will not be able to reach Ollama without the proxy.");
+}
+
 // ── Public API ───────────────────────────────────────────────────
+
+// How long to wait for the detached proxy to bind the port. Slower hosts and
+// the window right after the systemd loopback restart can need several seconds,
+// so poll with backoff instead of the previous single 2s probe (issue #4820).
+const PROXY_START_ATTEMPTS = 12;
 
 function startOllamaAuthProxy(): boolean {
   const crypto = require("crypto");
   killStaleProxy();
+
+  // After clearing any stale NemoClaw proxy, a process still holding the port
+  // is a genuine conflict. Report the exact owner and remediation up front so
+  // the user does not have to run lsof and interpret it themselves. Scope to
+  // IPv4: an IPv6-only listener does not block our 0.0.0.0 bind, so aborting on
+  // it would be a false conflict (a dual-stack blocker is still caught below
+  // via the spawned proxy's EADDRINUSE).
+  const preOwners = inspectForeignProxyPortOwners("4");
+  if (preOwners.pids.length > 0) {
+    printProxyPortConflict(preOwners);
+    return false;
+  }
 
   const proxyToken = crypto.randomBytes(24).toString("hex");
   ollamaProxyToken = proxyToken;
@@ -184,40 +275,58 @@ function startOllamaAuthProxy(): boolean {
   // If the user backs out to a different provider, the token stays in memory
   // only and is discarded.
   const pid = spawnOllamaAuthProxy(proxyToken);
-  if (!waitForPort(OLLAMA_PROXY_PORT, 2)) {
-    console.error(
-      `  Error: Ollama auth proxy did not become ready on :${OLLAMA_PROXY_PORT} within timeout.`,
-    );
+
+  // Poll for readiness with backoff. Three terminal outcomes:
+  //   • proxy alive and listening → success
+  //   • proxy gone, a foreign process now owns the port → conflict (lost the
+  //     EADDRINUSE race after the pre-check)
+  //   • proxy gone, port free → it exited during startup (spawn failure)
+  for (let attempt = 0; attempt < PROXY_START_ATTEMPTS; attempt++) {
+    if (isOllamaProxyProcess(pid)) {
+      // waitForPort is a cheap TCP gate; proxyOwnsPortWithToken then proves the
+      // listener is our proxy (not a foreign service that grabbed the port)
+      // before we treat startup as successful.
+      if (waitForPort(OLLAMA_PROXY_PORT, 1) && proxyOwnsPortWithToken(proxyToken)) {
+        return true;
+      }
+      sleep(1); // alive but not yet bound — give a slow host more time
+      continue;
+    }
+    // The spawned proxy is gone. If it lost an EADDRINUSE race the blocker may
+    // be an IPv6 dual-stack listener, so use the broad scope to name the owner.
+    const owners = inspectForeignProxyPortOwners("any");
+    if (owners.pids.length > 0) {
+      printProxyPortConflict(owners);
+    } else {
+      console.error(`  Error: Ollama auth proxy exited during startup on :${OLLAMA_PROXY_PORT}.`);
+      console.error("  Containers will not be able to reach Ollama without the proxy.");
+      console.error(`  Check the proxy port owner: lsof -ti :${OLLAMA_PROXY_PORT}`);
+    }
     return false;
   }
-  if (!isOllamaProxyProcess(pid)) {
-    console.error(`  Error: Ollama auth proxy failed to start on :${OLLAMA_PROXY_PORT}`);
-    console.error(`  Containers will not be able to reach Ollama without the proxy.`);
-    console.error(
-      `  Check if port ${OLLAMA_PROXY_PORT} is already in use: lsof -ti :${OLLAMA_PROXY_PORT}`,
-    );
-    return false;
-  }
-  return true;
+
+  console.error(
+    `  Error: Ollama auth proxy did not become ready on :${OLLAMA_PROXY_PORT} within ${PROXY_START_ATTEMPTS}s.`,
+  );
+  console.error("  Containers will not be able to reach Ollama without the proxy.");
+  console.error(`  Check the proxy port owner: lsof -ti :${OLLAMA_PROXY_PORT}`);
+  return false;
 }
 
 /**
  * Probe the running proxy to confirm it accepts the given token.
  * The proxy validates auth before forwarding to Ollama. A backend error like
  * 502 still proves the token was accepted, while 401 means token mismatch.
+ *
+ * Targets 127.0.0.1 (not `localhost`): the proxy binds IPv4 0.0.0.0, and
+ * `localhost` can resolve to ::1 first — on a host where an unrelated IPv6-only
+ * service holds the port, that would probe the wrong listener. This matches the
+ * other proxy probes (isProxyHealthy, probeOllamaAuthProxyHealth). See #4820.
  */
 function probeProxyToken(token: string): "accepted" | "rejected" | "unreachable" {
   const result = runCurlWithAuthConfig(
-    [
-      "-sS",
-      "-o",
-      "/dev/null",
-      "-w",
-      "%{http_code}",
-      "--max-time",
-      "3",
-    ],
-    `http://localhost:${OLLAMA_PROXY_PORT}/v1/models`,
+    ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3"],
+    `http://127.0.0.1:${OLLAMA_PROXY_PORT}/v1/models`,
     token,
   );
   if (result.status !== 0) return "unreachable";
@@ -226,6 +335,22 @@ function probeProxyToken(token: string): "accepted" | "rejected" | "unreachable"
   if (status === "401") return "rejected";
   if (/^\d{3}$/.test(status)) return "accepted";
   return "unreachable";
+}
+
+// Confirm the listener on the proxy port is actually our auth proxy holding
+// THIS token — not a foreign service that merely answers on the port. Our
+// proxy is the only listener that BOTH rejects an unauthenticated request with
+// 401 AND accepts the current token (200 from Ollama, or 502 when the backend
+// is down — both non-401). A foreign HTTP service that ignores Authorization
+// (answers 200/404 to everything) fails the unauthenticated-401 half, and a
+// raw socket fails both. Requiring both halves is what makes this a
+// proxy-specific readiness proof: without it we could persist a token for a
+// process that never bound (lsof unavailable, or a dual-stack listener the
+// IPv4 precheck missed, losing the EADDRINUSE race). The probes target
+// 127.0.0.1, so they confirm our IPv4 proxy even when an unrelated IPv6-only
+// listener shares the port number. See #4820.
+function proxyOwnsPortWithToken(token: string): boolean {
+  return probeProxyToken(token) === "accepted" && probeProxyToken("") === "rejected";
 }
 
 /**
@@ -313,17 +438,7 @@ function probeOllamaAuthProxyHealth(): { ok: boolean; endpoint: string; detail: 
   }
 
   const result = runCurlWithAuthConfig(
-    [
-      "-sS",
-      "-o",
-      "/dev/null",
-      "-w",
-      "%{http_code}",
-      "--connect-timeout",
-      "3",
-      "--max-time",
-      "5",
-    ],
+    ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "3", "--max-time", "5"],
     endpoint,
     token,
   );
@@ -376,23 +491,46 @@ function probeOllamaAuthProxyHealth(): { ok: boolean; endpoint: string; detail: 
   };
 }
 
-async function promptOllamaModel(gpu: GpuInfo | null = null) {
+async function promptOllamaModel(
+  gpu: GpuInfo | null = null,
+  promptOptions: { defaultModel?: string | null; excludeModels?: ReadonlySet<string> } = {},
+) {
+  const excludeModels = promptOptions.excludeModels;
+  const isExcluded = (tag: string): boolean =>
+    excludeModels !== undefined && excludeModels.has(tag);
   const installed = getOllamaModelOptions();
   // Filter installed entries by registry-known memory fit so a host that
   // currently cannot load the only installed model still gets a usable
   // default — without the filter, pressing Enter would re-select the
   // oversized model the runner is about to crash on. Unknown tags (user-
   // pulled models the registry has never seen) pass the filter so the
-  // user's prior selection is respected.
-  const installedFitting = installed.filter((tag: string) => modelFitsAvailableMemory(tag, gpu));
+  // user's prior selection is respected. `excludeModels` additionally drops
+  // tags the caller knows the local probe has already rejected this round.
+  const installedFitting = installed.filter(
+    (tag: string) => modelFitsAvailableMemory(tag, gpu) && !isExcluded(tag),
+  );
   const usingInstalled = installedFitting.length > 0;
-  const options = usingInstalled ? installedFitting : getBootstrapOllamaModelOptions(gpu);
-  const defaultModel = getDefaultOllamaModel(gpu);
-  const defaultIndex = Math.max(0, options.indexOf(defaultModel));
+  const bootstrap = getBootstrapOllamaModelOptions(gpu).filter((tag: string) => !isExcluded(tag));
+  const options = usingInstalled ? installedFitting : bootstrap;
+  const requestedDefaultModel =
+    typeof promptOptions.defaultModel === "string" ? promptOptions.defaultModel.trim() : "";
+  const requestedDefaultOption = requestedDefaultModel
+    ? options.find((option: string) => ollamaModelRefsMatch(option, requestedDefaultModel))
+    : undefined;
+  const defaultModelCandidate = getDefaultOllamaModel(gpu);
+  const defaultModel =
+    requestedDefaultOption ??
+    (isExcluded(defaultModelCandidate)
+      ? (options[0] ?? defaultModelCandidate)
+      : defaultModelCandidate);
+  const defaultIndex = Math.max(
+    0,
+    options.findIndex((option: string) => ollamaModelRefsMatch(option, defaultModel)),
+  );
 
   console.log("");
   console.log(usingInstalled ? "  Ollama models:" : "  Ollama starter models:");
-  options.forEach((option, index) => {
+  options.forEach((option: string, index: number) => {
     console.log(`    ${index + 1}) ${option}`);
   });
   console.log(`    ${options.length + 1}) Other...`);
@@ -450,7 +588,27 @@ function pullTimeoutErrorHint(timeoutMs: number): string {
   ].join("\n");
 }
 
-function pullOllamaModelViaCli(model) {
+function normalizeOllamaPullModel(model: string): string {
+  const value = String(model || "").trim();
+  if (!value || /[\0\r\n]/.test(value)) {
+    throw new Error("Invalid Ollama model id for pull request");
+  }
+  return value;
+}
+
+function buildLocalOllamaPullUrl(): string {
+  const host = getResolvedOllamaHost();
+  const allowedHosts = new Set(["127.0.0.1", "localhost", "::1", OLLAMA_HOST_DOCKER_INTERNAL]);
+  if (!allowedHosts.has(host)) {
+    throw new Error(`Refusing to pull from unexpected Ollama host: ${host}`);
+  }
+  const url = new URL("http://127.0.0.1/api/pull");
+  url.hostname = host;
+  url.port = String(OLLAMA_PORT);
+  return url.toString();
+}
+
+function pullOllamaModelViaCli(model: string): boolean {
   const timeoutMs = getOllamaPullTimeoutMs();
   const result = spawnSync("bash", ["-c", `ollama pull ${shellQuote(model)}`], {
     cwd: ROOT,
@@ -470,15 +628,16 @@ function pullOllamaModelViaCli(model) {
 // Used only when the resolved host is the Windows host (host.docker.internal),
 // where there is no `ollama` binary in WSL to shell out to. Native Linux/macOS
 // keeps the CLI path so existing behavior is unchanged.
-function pullOllamaModelViaHttp(model) {
-  return new Promise((resolve) => {
-    const host = getResolvedOllamaHost();
-    const url = `http://${host}:${OLLAMA_PORT}/api/pull`;
-    const body = JSON.stringify({ model, stream: true });
+function pullOllamaModelViaHttp(model: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const url = buildLocalOllamaPullUrl();
+    const body = JSON.stringify({ model: normalizeOllamaPullModel(model), stream: true });
     const TIMEOUT_MS = getOllamaPullTimeoutMs();
     const isTTY = Boolean(process.stdout.isTTY);
     const BAR_WIDTH = 40;
 
+    // The endpoint is restricted to the local Ollama hosts NemoClaw probes and
+    // the model id is normalized before being serialized as JSON request data.
     const proc = spawn(
       "curl",
       [
@@ -492,6 +651,7 @@ function pullOllamaModelViaHttp(model) {
         "-H",
         "Content-Type: application/json",
         "-d",
+        // codeql[js/file-access-to-http]: local-only Ollama API with a normalized model id.
         body,
         url,
       ],
@@ -511,14 +671,14 @@ function pullOllamaModelViaHttp(model) {
     let sawSuccess = false;
     let sawError = false;
 
-    const formatSize = (bytes) => {
+    const formatSize = (bytes: number): string => {
       if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
       if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
       if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`;
       return `${bytes} B`;
     };
 
-    const renderBar = (pct) => {
+    const renderBar = (pct: number): string => {
       const filled = Math.floor((pct / 100) * BAR_WIDTH);
       return `${"█".repeat(filled)}${" ".repeat(BAR_WIDTH - filled)}`;
     };
@@ -530,7 +690,7 @@ function pullOllamaModelViaHttp(model) {
       }
     };
 
-    rl.on("line", (line) => {
+    rl.on("line", (line: string) => {
       let evt;
       try {
         evt = JSON.parse(line);
@@ -580,7 +740,7 @@ function pullOllamaModelViaHttp(model) {
       }
     });
 
-    proc.on("error", (err) => {
+    proc.on("error", (err: Error) => {
       finishLine();
       console.error(`  Pull failed to start: ${err.message}`);
       resolve(false);
@@ -589,7 +749,7 @@ function pullOllamaModelViaHttp(model) {
     // Use 'close' rather than 'exit' so the promise resolves only after the
     // child's stdio streams are fully drained, ensuring readline has emitted
     // the final 'line' event for the trailing `success` JSON.
-    proc.on("close", (code) => {
+    proc.on("close", (code: number | null) => {
       finishLine();
       if (sawError) {
         resolve(false);
@@ -612,7 +772,7 @@ function pullOllamaModelViaHttp(model) {
 }
 
 // Dispatch to HTTP pull when Ollama was resolved on the Windows host.
-async function pullOllamaModel(model) {
+async function pullOllamaModel(model: string): Promise<boolean> {
   if (getResolvedOllamaHost() === OLLAMA_HOST_DOCKER_INTERNAL) {
     return pullOllamaModelViaHttp(model);
   }
@@ -628,66 +788,43 @@ async function pullOllamaModel(model) {
 // override env var in non-interactive mode, or block. Probe failures
 // degrade to "unknown" and never block onboarding.
 
-function isProxyNonInteractive(): boolean {
-  // Lazy-require to avoid a circular import (onboard.ts requires this file
-  // at module-load time). isNonInteractive is exported from onboard.ts;
-  // fall back to the env var if onboard hasn't fully loaded yet.
-  try {
-    const onboardMod = require("./onboard");
-    if (typeof onboardMod.isNonInteractive === "function") {
-      return Boolean(onboardMod.isNonInteractive());
-    }
-  } catch {
-    /* fall through to env-var check */
-  }
-  return process.env.NEMOCLAW_NON_INTERACTIVE === "1";
-}
-
-function isProxyAutoYes(): boolean {
-  // isAutoYes is not exported from onboard.ts, so fall back to the env var.
-  // The interactive override prompt path still covers --yes-only invocations
-  // because non-interactive mode is the gate that matters here.
-  try {
-    const onboardMod = require("./onboard");
-    if (typeof onboardMod.isAutoYes === "function") {
-      return Boolean(onboardMod.isAutoYes());
-    }
-  } catch {
-    /* fall through to env-var check */
-  }
-  return process.env.NEMOCLAW_YES === "1";
-}
+export type OllamaToolCapabilityInteraction = Readonly<{
+  isNonInteractive: () => boolean;
+  isAutoYes: () => boolean;
+  confirm: (question: string, defaultIsYes: boolean) => Promise<boolean>;
+}>;
 
 async function promptProxyYesNo(question: string, defaultIsYes: boolean): Promise<boolean> {
-  // Prefer onboard's promptYesNoOrDefault so we get the same indicator
-  // formatting and non-interactive note. Lazy-require to avoid the cycle.
-  try {
-    const onboardMod = require("./onboard");
-    if (typeof onboardMod.promptYesNoOrDefault === "function") {
-      return Boolean(await onboardMod.promptYesNoOrDefault(question, null, defaultIsYes));
-    }
-  } catch {
-    /* fall through */
-  }
+  // Standalone callers use the credential-store prompt. Onboarding injects
+  // its own confirmation helper so this module does not depend on onboard.ts.
   const reply = await prompt(`${question} ${defaultIsYes ? "[Y/n]" : "[y/N]"}: `);
-  const v = String(reply ?? "").trim().toLowerCase();
+  const v = String(reply ?? "")
+    .trim()
+    .toLowerCase();
   if (v === "y" || v === "yes") return true;
   if (v === "n" || v === "no") return false;
   return defaultIsYes;
 }
 
+const defaultOllamaToolCapabilityInteraction: OllamaToolCapabilityInteraction = {
+  isNonInteractive: isNonInteractiveEnv,
+  isAutoYes: () => process.env.NEMOCLAW_YES === "1",
+  confirm: promptProxyYesNo,
+};
+
 function printToolsIncompatibleWarning(model: string): void {
   console.log("");
   console.log(`  ⚠ Ollama model '${model}' does not advertise the 'tools' capability.`);
   console.log("    NemoClaw agents need tool-calling for file operations, web search, and");
-  console.log("    running commands. This model will likely fail with \"400 ... does not");
-  console.log("    support tools\" at first prompt.");
+  console.log('    running commands. This model will likely fail with "400 ... does not');
+  console.log('    support tools" at first prompt.');
   console.log("    Inspect a model's capabilities with `ollama show <model>` and pick");
   console.log("    one whose list includes 'tools'.");
 }
 
 async function checkOllamaModelToolSupport(
   model: string,
+  interaction: OllamaToolCapabilityInteraction = defaultOllamaToolCapabilityInteraction,
 ): Promise<{ ok: boolean; message?: string; allowToolsIncompatible?: boolean }> {
   const caps = probeOllamaModelCapabilities(model);
 
@@ -711,12 +848,12 @@ async function checkOllamaModelToolSupport(
   // reject the same model on the same condition — see issue #4241.
   printToolsIncompatibleWarning(model);
 
-  if (isProxyAutoYes()) {
+  if (interaction.isAutoYes()) {
     console.log("  Continuing because --yes was passed.");
     return { ok: true, allowToolsIncompatible: true };
   }
 
-  if (isProxyNonInteractive()) {
+  if (interaction.isNonInteractive()) {
     if (process.env.NEMOCLAW_OLLAMA_REQUIRE_TOOLS === "0") {
       console.error(
         `  NEMOCLAW_OLLAMA_REQUIRE_TOOLS=0 set — proceeding with '${model}' despite missing 'tools'.`,
@@ -729,7 +866,7 @@ async function checkOllamaModelToolSupport(
     return { ok: false, message: "Tools-incompatible model in non-interactive mode." };
   }
 
-  const proceed = await promptProxyYesNo("  Use this model anyway?", false);
+  const proceed = await interaction.confirm("  Use this model anyway?", false);
   if (!proceed) {
     return { ok: false, message: "Choose a tools-capable model." };
   }
@@ -737,23 +874,24 @@ async function checkOllamaModelToolSupport(
 }
 
 async function prepareOllamaModel(
-  model,
+  model: string,
   installedModels: string[] = [],
-): Promise<{ ok: boolean; message?: string; allowToolsIncompatible?: boolean }> {
-  const alreadyInstalled = installedModels.includes(model);
-  if (!alreadyInstalled) {
-    console.log(`  Pulling Ollama model: ${model}`);
-    if (!(await pullOllamaModel(model))) {
-      return {
-        ok: false,
-        message:
-          `Failed to pull Ollama model '${model}'. ` +
-          "Check the model name and that Ollama can access the registry, then try another model.",
-      };
-    }
-  }
+  interaction: OllamaToolCapabilityInteraction = defaultOllamaToolCapabilityInteraction,
+  discoveryDeps: PulledModelDiscoveryDeps = {},
+): Promise<{
+  ok: boolean;
+  message?: string;
+  allowToolsIncompatible?: boolean;
+  daemonFailure?: boolean;
+}> {
+  const testSleep = process.env.NEMOCLAW_TEST_NO_SLEEP === "1" ? () => {} : undefined;
+  const discovery = await ensurePulledOllamaModel(model, installedModels, pullOllamaModel, {
+    ...discoveryDeps,
+    sleep: discoveryDeps.sleep ?? testSleep,
+  });
+  if (!discovery.ok) return discovery;
 
-  const capCheck = await checkOllamaModelToolSupport(model);
+  const capCheck = await checkOllamaModelToolSupport(model, interaction);
   if (!capCheck.ok) {
     return { ok: false, message: capCheck.message };
   }

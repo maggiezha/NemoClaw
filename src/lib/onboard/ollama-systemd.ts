@@ -6,6 +6,7 @@ import nodePath from "node:path";
 
 import { OLLAMA_PORT } from "../core/ports";
 import { sleepSeconds } from "../core/wait";
+import { resolveOllamaContextWindowFloor } from "../inference/ollama-runtime-context";
 import { cleanupTempDir, secureTempFile } from "./temp-files";
 
 const { runCapture, runShell, shellQuote }: typeof import("../runner") = require("../runner");
@@ -13,9 +14,7 @@ const {
   findReachableOllamaHost,
   resetOllamaHostCache,
 }: typeof import("../inference/local") = require("../inference/local");
-const {
-  detectNvidiaPlatform,
-}: typeof import("../inference/nim") = require("../inference/nim");
+const { detectNvidiaPlatform }: typeof import("../inference/nim") = require("../inference/nim");
 
 const OLLAMA_SYSTEMD_OVERRIDE_PATH = "/etc/systemd/system/ollama.service.d/override.conf";
 const NON_INTERACTIVE_SUDO_MODE_ENV = "NEMOCLAW_NON_INTERACTIVE_SUDO_MODE";
@@ -25,8 +24,33 @@ export type OllamaLoopbackSystemdOverrideState = "not-applicable" | "ready" | "f
 type OllamaLoopbackSystemdOverrideOptions = {
   isNonInteractive?: () => boolean;
   enableService?: boolean;
+  /** Minimum daemon context length to preserve or apply in the systemd override. */
+  contextWindowFloor?: number;
   detectNvidiaPlatformImpl?: () => string;
   hasOllamaCudaV13LibraryImpl?: () => boolean;
+  /**
+   * Platform override (test seam). Defaults to `process.platform`. Lets unit
+   * tests exercise the Linux-only branches from non-Linux dev hosts.
+   */
+  platformImpl?: () => NodeJS.Platform;
+  /**
+   * Override the systemd-ollama-unit detection. Defaults to a `systemctl
+   * list-unit-files` probe. Lets unit tests skip the host check so the new
+   * #5716 sudo fall-through can be reached deterministically.
+   */
+  hasOllamaSystemdUnitImpl?: () => boolean;
+  /**
+   * Optional probe for passwordless sudo. Returns true when `sudo -n true`
+   * succeeds. Defaults to running it via `runShell`. Exposed so tests can
+   * exercise the #5716 "no passwordless sudo" fall-through deterministically
+   * without needing a real sudoers config.
+   */
+  hasPasswordlessSudoImpl?: () => boolean;
+  /**
+   * Positive runtime proof that the active systemd Ollama listener is bound
+   * only to loopback. Defaults to a non-privileged `systemctl` + `ss` probe.
+   */
+  isOllamaLoopbackOnlyImpl?: () => boolean;
 };
 
 function isEnvNonInteractive(): boolean {
@@ -45,6 +69,72 @@ function getSudoPrefix(isNonInteractive: boolean): "sudo" | "sudo -n" {
   }
   if (isNonInteractive) return rawMode === "prompt" ? "sudo" : "sudo -n";
   return process.stdin.isTTY ? "sudo" : "sudo -n";
+}
+
+/**
+ * Pure decision for the #5716 sudo-skip gate. The override step requires
+ * root via `sudo -n install / daemon-reload / restart`, so a non-interactive
+ * run that picked the `sudo -n` prefix and has no passwordless sudo cannot
+ * apply it. Returns true when the override MUST be skipped.
+ *
+ * Exposed so tests can pin both branches (skip + happy path) without falling
+ * through into the real systemd code and triggering host-boundary side
+ * effects on a Linux CI runner that happens to have passwordless sudo.
+ */
+export function shouldSkipOllamaLoopbackForMissingSudo(
+  sudoPrefix: "sudo" | "sudo -n",
+  hasPasswordlessSudo: () => boolean,
+): boolean {
+  return sudoPrefix === "sudo -n" && !hasPasswordlessSudo();
+}
+
+function defaultHasPasswordlessSudo(): boolean {
+  const probe = runShell("sudo -n true", {
+    ignoreError: true,
+    suppressOutput: true,
+    timeout: 5_000,
+  });
+  return !probe.error && probe.status === 0;
+}
+
+function parseListenerEndpoint(token: string): { host: string; port: number } | null {
+  const match = token.match(/^(?:\[([^\]]+)\]|(.+)):(\d+)$/u);
+  if (!match) return null;
+  return {
+    host: String(match[1] ?? match[2])
+      .replace(/%[^%]+$/u, "")
+      .toLowerCase(),
+    port: Number(match[3]),
+  };
+}
+
+/** Return true only when at least one Ollama listener exists and all are loopback-only. */
+export function ollamaListenersAreLoopbackOnly(output: string): boolean {
+  const hosts = output.split(/\r?\n/u).flatMap((line) => {
+    const endpoint = parseListenerEndpoint(line.trim().split(/\s+/u)[3] ?? "");
+    return endpoint?.port === OLLAMA_PORT ? [endpoint.host] : [];
+  });
+  return (
+    hosts.length > 0 &&
+    hosts.every(
+      (host) =>
+        host === "::1" ||
+        /^127(?:\.\d{1,3}){3}$/u.test(host) ||
+        /^::ffff:127(?:\.\d{1,3}){3}$/u.test(host),
+    )
+  );
+}
+
+function isActiveOllamaListenerLoopbackOnly(): boolean {
+  const listeners = runCapture(
+    [
+      "sh",
+      "-c",
+      "command -v systemctl >/dev/null && command -v ss >/dev/null && systemctl is-active --quiet ollama.service && ss -H -ltn 2>/dev/null",
+    ],
+    { ignoreError: true },
+  );
+  return ollamaListenersAreLoopbackOnly(listeners);
 }
 
 function hasOllamaCudaV13Library(): boolean {
@@ -75,13 +165,16 @@ function hasOllamaCudaV13Library(): boolean {
   });
 }
 
-function resolveOllamaLibraryOverride(options: OllamaLoopbackSystemdOverrideOptions): string | null {
+function resolveOllamaLibraryOverride(
+  options: OllamaLoopbackSystemdOverrideOptions,
+): string | null {
   const platform = (options.detectNvidiaPlatformImpl ?? detectNvidiaPlatform)();
   if (platform !== "spark") return null;
   const hasCudaV13 = (options.hasOllamaCudaV13LibraryImpl ?? hasOllamaCudaV13Library)();
   return hasCudaV13 ? "cuda_v13" : null;
 }
 
+/** Ensure the Ollama systemd service is loopback-bound with the required context floor. */
 export function ensureOllamaLoopbackSystemdOverride(
   options: OllamaLoopbackSystemdOverrideOptions = {},
 ): OllamaLoopbackSystemdOverrideState {
@@ -90,17 +183,48 @@ export function ensureOllamaLoopbackSystemdOverride(
   // now handles bridge-network reachability for both native-Docker-in-WSL and
   // non-WSL Linux, so loopback binding is the right policy everywhere. See
   // issues #3342 (re-onboard repair) and #3695 (WSL native Docker).
-  if (process.platform !== "linux") return "not-applicable";
+  const platform = (options.platformImpl ?? (() => process.platform))();
+  if (platform !== "linux") return "not-applicable";
 
-  const hasOllamaSystemdUnit = !!runCapture(
-    [
-      "sh",
-      "-c",
-      "command -v systemctl >/dev/null && [ -d /run/systemd/system ] && systemctl list-unit-files ollama.service --no-legend 2>/dev/null | head -n1",
-    ],
-    { ignoreError: true },
-  ).trim();
+  const hasOllamaSystemdUnit =
+    options.hasOllamaSystemdUnitImpl?.() ??
+    !!runCapture(
+      [
+        "sh",
+        "-c",
+        "command -v systemctl >/dev/null && [ -d /run/systemd/system ] && systemctl list-unit-files ollama.service --no-legend 2>/dev/null | head -n1",
+      ],
+      { ignoreError: true },
+    ).trim();
   if (!hasOllamaSystemdUnit) return "not-applicable";
+
+  // #5716: detect missing non-interactive sudo before attempting any override
+  // command. Continuing is safe only when runtime listener evidence proves
+  // the active systemd service is already loopback-only. A loopback HTTP
+  // response is not enough because a wildcard bind responds there too.
+  const sudoPrefix = getSudoPrefix((options.isNonInteractive ?? isEnvNonInteractive)());
+  const hasPasswordlessSudo = options.hasPasswordlessSudoImpl ?? defaultHasPasswordlessSudo;
+  if (shouldSkipOllamaLoopbackForMissingSudo(sudoPrefix, hasPasswordlessSudo)) {
+    const loopbackOnly =
+      options.isOllamaLoopbackOnlyImpl?.() ?? isActiveOllamaListenerLoopbackOnly();
+    if (loopbackOnly) {
+      console.warn(
+        "  Passwordless sudo is not available; verified that the active Ollama service " +
+          "is already loopback-only, so onboarding will continue without rewriting its " +
+          `systemd drop-in. Set ${NON_INTERACTIVE_SUDO_MODE_ENV}=prompt to apply the managed override.`,
+      );
+      return "ready";
+    }
+    console.error(
+      "  Passwordless sudo is not available, and the active Ollama listener could not be " +
+        "verified as loopback-only.",
+    );
+    console.error(
+      `  Refusing to continue with a potentially exposed Ollama bind. Set ${NON_INTERACTIVE_SUDO_MODE_ENV}=prompt ` +
+        "with a terminal, or configure passwordless sudo and rerun onboarding.",
+    );
+    process.exit(1);
+  }
 
   console.log("  Configuring Ollama systemd loopback override...");
   console.log(
@@ -108,7 +232,6 @@ export function ensureOllamaLoopbackSystemdOverride(
       "The next steps use sudo to write the drop-in, reload systemd, and restart the service; " +
       "you may be prompted for your password.",
   );
-  const sudoPrefix = getSudoPrefix((options.isNonInteractive ?? isEnvNonInteractive)());
   const existingDropInResult = runShell(
     [
       `if [ -r ${shellQuote(OLLAMA_SYSTEMD_OVERRIDE_PATH)} ]; then`,
@@ -126,7 +249,9 @@ export function ensureOllamaLoopbackSystemdOverride(
         `  Non-interactive sudo could not read the existing drop-in. Set ${NON_INTERACTIVE_SUDO_MODE_ENV}=prompt to allow a sudo password prompt when a terminal is available.`,
       );
     }
-    console.error("  Refusing to continue because preserving existing Ollama settings is required.");
+    console.error(
+      "  Refusing to continue because preserving existing Ollama settings is required.",
+    );
     process.exit(1);
   }
   const existingDropIn = String(existingDropInResult.stdout || "");
@@ -135,6 +260,7 @@ export function ensureOllamaLoopbackSystemdOverride(
     console.log(`  Configuring Ollama ${libraryOverride} backend override for DGX Spark...`);
   }
   const dropInBody = mergeOllamaLoopbackSystemdOverride(existingDropIn, {
+    contextWindowFloor: options.contextWindowFloor,
     libraryOverride,
   });
   const tmpDropIn = secureTempFile("nemoclaw-ollama-override", ".conf");
@@ -159,10 +285,10 @@ export function ensureOllamaLoopbackSystemdOverride(
       "done",
       "exit 1",
     );
-    const overrideResult = runShell(
-      overrideCommands.join("\n"),
-      { ignoreError: true, timeout: 45_000 },
-    );
+    const overrideResult = runShell(overrideCommands.join("\n"), {
+      ignoreError: true,
+      timeout: 45_000,
+    });
     if (overrideResult.error || overrideResult.status !== 0) {
       overrideFailed = true;
     }
@@ -185,30 +311,93 @@ export function ensureOllamaLoopbackSystemdOverride(
   return "failed";
 }
 
+/** Ensure the managed Ollama systemd service is enabled and repaired for onboarding. */
 export function ensureManagedOllamaLoopbackSystemdOverride(
   options: Omit<OllamaLoopbackSystemdOverrideOptions, "enableService"> = {},
 ): OllamaLoopbackSystemdOverrideState {
   return ensureOllamaLoopbackSystemdOverride({ ...options, enableService: true });
 }
 
-function mergeOllamaLoopbackSystemdOverride(
+function splitSystemdEnvironmentTokens(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "\\" && i + 1 < value.length) {
+      current += ch + value[i + 1];
+      i += 1;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && (quote === null || quote === ch)) {
+      quote = quote === ch ? null : ch;
+      current += ch;
+      continue;
+    }
+    if (/\s/.test(ch) && quote === null) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function systemdEnvironmentTokenName(token: string): string | null {
+  const unquoted = token.replace(/^(["'])(.*)\1$/, "$2");
+  const match = unquoted.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+  return match ? match[1] : null;
+}
+
+function rewriteEnvironmentLineWithoutManagedAssignments(
+  line: string,
+  managedNames: ReadonlySet<string>,
+): string[] {
+  if (/^\s*[#;]/.test(line)) return [line];
+  const match = line.match(/^(\s*Environment\s*=\s*)(.*)$/);
+  if (!match) return [line];
+  const tokens = splitSystemdEnvironmentTokens(match[2]);
+  const kept = tokens.filter((token) => {
+    const name = systemdEnvironmentTokenName(token);
+    return !name || !managedNames.has(name);
+  });
+  if (kept.length === tokens.length) return [line];
+  return kept.length > 0 ? [`${match[1]}${kept.join(" ")}`] : [];
+}
+
+/**
+ * Merge NemoClaw's managed Ollama loopback and context settings into a drop-in.
+ *
+ * Existing operator context values are preserved when they already meet or
+ * exceed the selected agent floor; otherwise the managed floor is written.
+ */
+export function mergeOllamaLoopbackSystemdOverride(
   existingDropIn: string,
-  options: { libraryOverride?: string | null } = {},
+  options: { contextWindowFloor?: number; libraryOverride?: string | null } = {},
 ): string {
   const desiredLine = `Environment="OLLAMA_HOST=127.0.0.1:${OLLAMA_PORT}"`;
+  const contextWindowFloor = resolveOllamaContextWindowFloor(options.contextWindowFloor);
+  const desiredContextLine = `Environment="OLLAMA_CONTEXT_LENGTH=${contextWindowFloor}"`;
   const desiredLibraryLine = options.libraryOverride
     ? `Environment="OLLAMA_LLM_LIBRARY=${options.libraryOverride}"`
     : null;
   const lines = existingDropIn.trimEnd().length > 0 ? existingDropIn.trimEnd().split(/\r?\n/) : [];
   const serviceStart = lines.findIndex((line) => /^\s*\[Service\]\s*(?:[#;].*)?$/.test(line));
   if (serviceStart === -1) {
-    return [
-      ...lines,
-      ...(lines.length > 0 ? [""] : []),
-      "[Service]",
-      desiredLine,
-      ...(desiredLibraryLine ? [desiredLibraryLine] : []),
-    ].join("\n") + "\n";
+    return (
+      [
+        ...lines,
+        ...(lines.length > 0 ? [""] : []),
+        "[Service]",
+        desiredLine,
+        desiredContextLine,
+        ...(desiredLibraryLine ? [desiredLibraryLine] : []),
+      ].join("\n") + "\n"
+    );
   }
 
   let serviceEnd = lines.length;
@@ -219,30 +408,32 @@ function mergeOllamaLoopbackSystemdOverride(
     }
   }
 
-  // Strip any existing non-comment OLLAMA_HOST assignments inside [Service]
-  // before re-appending the loopback override. systemd's "last wins" semantics
-  // for repeated Environment= would usually pick the appended line, but legacy
-  // 0.0.0.0 drop-ins from older NemoClaw versions occasionally outlived the
-  // restart — removing the stale line makes the policy unambiguous. (#3342)
-  const ollamaHostLine = (line: string): boolean =>
-    !/^\s*[#;]/.test(line) && /\bOLLAMA_HOST=/.test(line);
-  const ollamaLibraryLine = (line: string): boolean =>
-    Boolean(desiredLibraryLine) && !/^\s*[#;]/.test(line) && /\bOLLAMA_LLM_LIBRARY=/.test(line);
+  // Strip NemoClaw-managed assignments inside [Service] before re-appending.
+  // Preserve unrelated variables that share the same systemd Environment= line
+  // so operator-supplied daemon settings such as OLLAMA_ORIGINS survive repair.
   const serviceBody = lines.slice(serviceStart + 1, serviceEnd);
-  const filteredBody = serviceBody.filter(
-    (line) => !ollamaHostLine(line) && !ollamaLibraryLine(line),
+  const managedNames = new Set(["OLLAMA_HOST", "OLLAMA_CONTEXT_LENGTH"]);
+  if (desiredLibraryLine) managedNames.add("OLLAMA_LLM_LIBRARY");
+  const parseContextValue = (line: string): number | null => {
+    const m = line.match(/\bOLLAMA_CONTEXT_LENGTH=("?)(\d+)\1/);
+    return m ? parseInt(m[2], 10) : null;
+  };
+  const existingHigherContext = serviceBody
+    .filter((line) => !/^\s*[#;]/.test(line) && /\bOLLAMA_CONTEXT_LENGTH=/.test(line))
+    .map(parseContextValue)
+    .filter((v): v is number => v !== null && v >= contextWindowFloor)
+    .sort((a, b) => b - a)[0];
+  const contextLine = existingHigherContext
+    ? `Environment="OLLAMA_CONTEXT_LENGTH=${existingHigherContext}"`
+    : desiredContextLine;
+  const filteredBody = serviceBody.flatMap((line) =>
+    rewriteEnvironmentLineWithoutManagedAssignments(line, managedNames),
   );
-  if (
-    !desiredLibraryLine &&
-    filteredBody.length === serviceBody.length &&
-    serviceBody.some((line) => line.trim() === desiredLine)
-  ) {
-    return lines.join("\n") + "\n";
-  }
   const rebuilt = [
     ...lines.slice(0, serviceStart + 1),
     ...filteredBody,
     desiredLine,
+    contextLine,
     ...(desiredLibraryLine ? [desiredLibraryLine] : []),
     ...lines.slice(serviceEnd),
   ];

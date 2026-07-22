@@ -20,10 +20,8 @@ export const BEDROCK_RUNTIME_PROVIDER_NAME = "compatible-anthropic-endpoint";
 export const BEDROCK_RUNTIME_ADAPTER_BIND_HOST = "0.0.0.0";
 export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST = "127.0.0.1";
 export const BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST = "host.openshell.internal";
-export const BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL =
-  `http://${BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
-export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_OPENAI_BASE_URL =
-  `http://${BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
+export const BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL = `http://${BEDROCK_RUNTIME_ADAPTER_SANDBOX_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
+export const BEDROCK_RUNTIME_ADAPTER_LOOPBACK_OPENAI_BASE_URL = `http://${BEDROCK_RUNTIME_ADAPTER_LOOPBACK_HOST}:${BEDROCK_RUNTIME_ADAPTER_PORT}/v1`;
 
 export type CustomAnthropicEndpointClassification =
   | {
@@ -63,6 +61,7 @@ function classifyBedrockRuntimeHostname(
 export function classifyCustomAnthropicEndpoint(
   value: string | URL | null | undefined,
 ): CustomAnthropicEndpointClassification {
+  const original = parseEndpointUrl(value);
   const normalized = normalizeProviderBaseUrl(value, "anthropic");
   const parsed = parseEndpointUrl(normalized);
   if (!parsed) {
@@ -74,7 +73,17 @@ export function classifyCustomAnthropicEndpoint(
   }
 
   const bedrock = classifyBedrockRuntimeHostname(parsed.hostname);
-  if (!bedrock) {
+  // The dedicated adapter relies on normal TLS hostname verification rather
+  // than curl --resolve pinning. Only the canonical HTTPS origin is therefore
+  // eligible: a rebound address cannot receive credentials without presenting
+  // a certificate valid for the AWS-owned hostname. Plain HTTP, custom ports,
+  // and URLs carrying userinfo stay on the generic preflighted path.
+  const isCanonicalTlsOrigin =
+    original?.protocol === "https:" &&
+    original.port === "" &&
+    original.username === "" &&
+    original.password === "";
+  if (!bedrock || !isCanonicalTlsOrigin) {
     return {
       kind: "anthropic-messages",
       endpointUrl: normalized,

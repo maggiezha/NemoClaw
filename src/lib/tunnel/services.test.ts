@@ -2,12 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import childProcess, { type SpawnSyncReturns } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Import from compiled dist/ so coverage is attributed correctly.
+// Import source directly so tests cannot pass against a stale build.
+import { registerTunnelOrigin } from "./allowed-origins";
+import { resolveDefaultSandboxName } from "./service-command";
 import {
   getServiceStatuses,
   getTunnelUrl,
@@ -15,19 +26,30 @@ import {
   showStatus,
   startAll,
   stopAll,
-} from "../../../dist/lib/tunnel/services";
+} from "./services";
 
-const ollamaProxyDistPath = resolve(
-  import.meta.dirname,
-  "..",
-  "..",
-  "..",
-  "dist",
-  "lib",
-  "inference",
-  "ollama",
-  "proxy.js",
-);
+// startAll's tunnel-origin registration performs real host→sandbox config
+// writes; stub it so these tests exercise only the wiring (tunnel-URL and
+// sandbox-name discovery plus the skip/guard branches), never openshell/docker.
+vi.mock("./allowed-origins", () => ({ registerTunnelOrigin: vi.fn() }));
+
+const INTEGRATION_ENV_SANDBOX = "nc1077-env-sandbox";
+const INTEGRATION_REGISTRY_SANDBOX = "nc1077-registry-sandbox";
+const INTEGRATION_ENV_PID_DIR = `/tmp/nemoclaw-services-${INTEGRATION_ENV_SANDBOX}`;
+const INTEGRATION_REGISTRY_PID_DIR = `/tmp/nemoclaw-services-${INTEGRATION_REGISTRY_SANDBOX}`;
+
+function resetIntegrationPidDirs(): void {
+  for (const dir of [INTEGRATION_ENV_PID_DIR, INTEGRATION_REGISTRY_PID_DIR]) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function seedAliveCloudflaredPid(pidDir: string): void {
+  mkdirSync(pidDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(pidDir, "cloudflared.pid"), String(process.pid), { mode: 0o600 });
+}
+
+const ollamaProxySourcePath = resolve(import.meta.dirname, "..", "inference", "ollama", "proxy.ts");
 
 describe("getTunnelUrl", () => {
   let pidDir: string;
@@ -45,7 +67,10 @@ describe("getTunnelUrl", () => {
   });
 
   it("parses quick tunnel URLs and strips fragments", () => {
-    writeFileSync(join(pidDir, "cloudflared.log"), "https://abc-def.trycloudflare.com/path#secret\n");
+    writeFileSync(
+      join(pidDir, "cloudflared.log"),
+      "https://abc-def.trycloudflare.com/path#secret\n",
+    );
     expect(getTunnelUrl(pidDir, 18789)).toBe("https://abc-def.trycloudflare.com/path");
   });
 
@@ -124,7 +149,85 @@ describe("sandbox name validation", () => {
   });
 
   it("accepts valid alphanumeric names", () => {
-    expect(() => getServiceStatuses({ sandboxName: "my-sandbox.1" })).not.toThrow();
+    const pidDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-valid-name-test-"));
+    try {
+      expect(() => getServiceStatuses({ pidDir, sandboxName: "my-sandbox.1" })).not.toThrow();
+    } finally {
+      rmSync(pidDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("status host service PID dir matches start/stop env (#1077)", () => {
+  const savedSandboxName = process.env.SANDBOX_NAME;
+  const savedNemoclawSandbox = process.env.NEMOCLAW_SANDBOX;
+  const savedNemoclawSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
+
+  beforeEach(() => {
+    delete process.env.SANDBOX_NAME;
+    delete process.env.NEMOCLAW_SANDBOX;
+    delete process.env.NEMOCLAW_SANDBOX_NAME;
+  });
+
+  afterEach(() => {
+    if (savedSandboxName !== undefined) process.env.SANDBOX_NAME = savedSandboxName;
+    else delete process.env.SANDBOX_NAME;
+    if (savedNemoclawSandbox !== undefined) process.env.NEMOCLAW_SANDBOX = savedNemoclawSandbox;
+    else delete process.env.NEMOCLAW_SANDBOX;
+    if (savedNemoclawSandboxName !== undefined) {
+      process.env.NEMOCLAW_SANDBOX_NAME = savedNemoclawSandboxName;
+    } else {
+      delete process.env.NEMOCLAW_SANDBOX_NAME;
+    }
+    resetIntegrationPidDirs();
+  });
+
+  it("reports running cloudflared when status passes env-resolved sandboxName", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const resolved = resolveDefaultSandboxName(() => ({
+      defaultSandbox: INTEGRATION_REGISTRY_SANDBOX,
+    }));
+    expect(resolved).toBe(INTEGRATION_ENV_SANDBOX);
+
+    const statuses = getServiceStatuses({ sandboxName: resolved });
+    const cloudflared = statuses.find((service) => service.name === "cloudflared");
+    expect(cloudflared?.running).toBe(true);
+    expect(cloudflared?.pid).toBe(process.pid);
+  });
+
+  it("reports stopped cloudflared when status passes registry sandbox but env PID dir has the process", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const statuses = getServiceStatuses({ sandboxName: INTEGRATION_REGISTRY_SANDBOX });
+    const cloudflared = statuses.find((service) => service.name === "cloudflared");
+    expect(cloudflared?.running).toBe(false);
+    expect(cloudflared?.pid).toBeNull();
+  });
+
+  it("showStatus prints running cloudflared from env-resolved production PID dir", () => {
+    resetIntegrationPidDirs();
+    process.env.SANDBOX_NAME = INTEGRATION_ENV_SANDBOX;
+    seedAliveCloudflaredPid(INTEGRATION_ENV_PID_DIR);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      showStatus({
+        sandboxName: resolveDefaultSandboxName(() => ({
+          defaultSandbox: INTEGRATION_REGISTRY_SANDBOX,
+        })),
+      });
+      const output = logSpy.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
+      // Wrong PID dir would report "(stopped)" with no PID; env-resolved dir finds our pid file.
+      expect(output).not.toContain("cloudflared  (stopped)");
+      expect(output).toContain(`cloudflared  (stale PID ${String(process.pid)})`);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
@@ -271,7 +374,7 @@ describe("startAll", () => {
         "#!/usr/bin/env sh",
         "printf 'argv:%s\\n' \"$*\"",
         "if [ \"${TUNNEL_TOKEN:-}\" = 'named-secret' ]; then echo token-env-present; fi",
-        "echo 'config=\"{\\\"ingress\\\":[{\\\"hostname\\\":\\\"agent.example.com\\\", \\\"service\\\":\\\"http://localhost:12345\\\"}]}\"'",
+        'echo \'config="{\\"ingress\\":[{\\"hostname\\":\\"agent.example.com\\", \\"service\\":\\"http://localhost:12345\\"}]}"\'',
         "sleep 20",
       ].join("\n"),
     );
@@ -363,16 +466,16 @@ describe("stopAll", () => {
       }
       return reply;
     };
-    // The dist Ollama proxy module destructures `spawnSync` at
+    // The Ollama proxy source module destructures `spawnSync` at
     // require time, so to make `stopAll` pick up the patched function we
     // bust its cache. `services.ts` requires the proxy lazily, so the
     // next call sees the freshly-loaded module.
-    delete require.cache[require.resolve(ollamaProxyDistPath)];
+    delete require.cache[require.resolve(ollamaProxySourcePath)];
   });
 
   afterEach(() => {
     childProcess.spawnSync = originalSpawnSync;
-    delete require.cache[require.resolve(ollamaProxyDistPath)];
+    delete require.cache[require.resolve(ollamaProxySourcePath)];
     rmSync(pidDir, { recursive: true, force: true });
   });
 
@@ -407,11 +510,120 @@ describe("stopAll", () => {
     logSpy.mockRestore();
 
     const psCall = spawnSyncCalls.find(
-      (c) =>
-        c.command === "curl" &&
-        c.args.some((a) => a.endsWith("/api/ps")),
+      (c) => c.command === "curl" && c.args.some((a) => a.endsWith("/api/ps")),
     );
     expect(psCall).toBeDefined();
     expect(psCall?.args).toContain("--max-time");
+  });
+});
+
+// #6212: after cloudflared yields a public URL, startAll must register that
+// origin in the sandbox gateway's allowedOrigins. These tests cover the wiring
+// in startAll (URL + sandbox-name discovery, skip/guard branches). The
+// registration module itself is mocked (see vi.mock at the top of this file),
+// so no host→sandbox config write or gateway reload runs here.
+describe("startAll tunnel-origin registration (#6212)", () => {
+  let tmpDir: string;
+  let pidDir: string;
+
+  function writeFakeCloudflared(lines: string[]): void {
+    const binDir = join(tmpDir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const fakeCloudflared = join(binDir, "cloudflared");
+    writeFileSync(fakeCloudflared, ["#!/usr/bin/env sh", ...lines].join("\n"));
+    chmodSync(fakeCloudflared, 0o700);
+    vi.stubEnv("PATH", `${binDir}:${process.env.PATH ?? ""}`);
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "nemoclaw-svc-register-test-"));
+    pidDir = join(tmpDir, "pids");
+    vi.stubEnv("CLOUDFLARE_TUNNEL_TOKEN", undefined);
+    vi.stubEnv("NEMOCLAW_SANDBOX_NAME", undefined);
+    vi.stubEnv("NEMOCLAW_SANDBOX", undefined);
+    vi.stubEnv("SANDBOX_NAME", undefined);
+    vi.mocked(registerTunnelOrigin).mockReset();
+  });
+
+  afterEach(() => {
+    const state = readCloudflaredState(pidDir);
+    const runningPid = state.kind === "running" ? state.pid : Number.NaN;
+    try {
+      process.kill(runningPid, "SIGTERM");
+    } catch {
+      // Not running (NaN pid throws) or already exited.
+    }
+    vi.unstubAllEnvs();
+    rmSync(tmpDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  // Scenario 14
+  it("calls registration with the raw discovered URL and the opts sandbox name", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" });
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).toHaveBeenCalledTimes(1);
+    // The raw URL (path intact) is passed through; origin conversion happens
+    // inside registerTunnelOrigin, not here.
+    expect(registerTunnelOrigin).toHaveBeenCalledWith(
+      "my-sandbox",
+      "https://good.trycloudflare.com/route",
+      expect.objectContaining({ info: expect.any(Function), warn: expect.any(Function) }),
+    );
+  });
+
+  // Scenario 15
+  it("skips registration and warns when no sandbox name is available", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345 });
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).not.toHaveBeenCalled();
+    expect(output).toContain("No sandbox name available — skipping tunnel-origin registration");
+  });
+
+  // Scenario 16
+  it("does not register when no tunnel URL is produced, but still prints the banner", async () => {
+    // A present-but-URL-less cloudflared would force startAll's 15s URL-wait
+    // poll and exceed the 5s test budget, so drive the same tunnelUrl==="" branch
+    // with cloudflared absent from PATH (the "cloudflared not found" path).
+    const emptyBin = join(tmpDir, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    vi.stubEnv("PATH", emptyBin);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" });
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(registerTunnelOrigin).not.toHaveBeenCalled();
+    expect(output).toContain("Services");
+    expect(output).not.toContain("Public URL");
+  });
+
+  // Scenario 17 — guard-rail for Decision 6: startAll must stay resilient even
+  // if registration escapes its own try/catch.
+  it("still resolves and prints the Public URL banner when registration throws", async () => {
+    writeFakeCloudflared(["echo 'https://good.trycloudflare.com/route'", "sleep 20"]);
+    vi.mocked(registerTunnelOrigin).mockImplementation(() => {
+      throw new Error("registration blew up");
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(
+      startAll({ pidDir, dashboardPort: 12345, sandboxName: "my-sandbox" }),
+    ).resolves.toBeUndefined();
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    logSpy.mockRestore();
+
+    expect(output).toContain("Public URL");
+    expect(output).toContain("https://good.trycloudflare.com/route");
   });
 });

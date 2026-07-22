@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { redact as debugRedact } from "../src/lib/diagnostics/debug";
-import { redactSensitiveText } from "../src/lib/state/onboard-session";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 // runner.ts uses CJS exports — import via dist
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { redact as debugRedact } from "../src/lib/diagnostics/debug";
+import { redactSensitiveText } from "../src/lib/state/onboard-session";
 
 const require = createRequire(import.meta.url);
-const { redact: runnerRedact } = require("../dist/lib/runner");
+const { redact: runnerRedact } = require("../src/lib/runner");
 
 describe("secret redaction consistency (#1736)", () => {
   // Tokens whose prefix is a literal string that must be redacted by the shared debug redactor.
@@ -23,6 +23,15 @@ describe("secret redaction consistency (#1736)", () => {
     {
       name: "GitHub PAT (fine-grained)",
       token: "github_pat_" + "d".repeat(50),
+    },
+    { name: "Tavily API key", token: "tvly-" + "e".repeat(30) },
+    {
+      name: "LangSmith personal access token",
+      token: `lsv2_pt_${"f".repeat(36)}_${"g".repeat(10)}`,
+    },
+    {
+      name: "LangSmith service key",
+      token: `lsv2_sk_${"h".repeat(36)}_${"i".repeat(10)}`,
     },
   ];
 
@@ -60,9 +69,18 @@ describe("secret redaction consistency (#1736)", () => {
 
   describe("redactor consistency (#2381)", () => {
     it("runner and debug redactors both mask shared token patterns", () => {
-      const text = "provider failed with NVIDIA_API_KEY=nvapi-" + "a".repeat(30);
+      const text = "provider failed with NVIDIA_INFERENCE_API_KEY=nvapi-" + "a".repeat(30);
       expect(runnerRedact(text)).not.toContain("nvapi-");
       expect(debugRedact(text)).not.toContain("nvapi-");
+    });
+
+    it("redacts complete multi-segment LangSmith keys without exposing their tails", () => {
+      const token = `lsv2_pt_${"a".repeat(36)}_${"tail".repeat(3)}`;
+      for (const redactor of [runnerRedact, debugRedact, redactSensitiveText]) {
+        const redacted = redactor(`provider failed with ${token}`);
+        expect(redacted).not.toContain(token);
+        expect(redacted).not.toContain("_tailtailtail");
+      }
     });
   });
 
@@ -73,22 +91,26 @@ describe("secret redaction consistency (#1736)", () => {
       mkdirSync(fakeBin);
       writeFileSync(
         join(fakeBin, "date"),
-        "#!/bin/sh\necho NVIDIA_API_KEY=nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        "#!/bin/sh\necho NVIDIA_INFERENCE_API_KEY=nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
         { mode: 0o755 },
       );
       try {
-        const result = spawnSync("bash", [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"], {
-          encoding: "utf-8",
-          env: {
-            ...process.env,
-            NEMOCLAW_NODE: process.execPath,
-            TMPDIR: tmp,
-            PATH: `${fakeBin}:${process.env.PATH || ""}`,
+        const result = spawnSync(
+          "bash",
+          [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"],
+          {
+            encoding: "utf-8",
+            env: {
+              ...process.env,
+              NEMOCLAW_NODE: process.execPath,
+              TMPDIR: tmp,
+              PATH: `${fakeBin}:${process.env.PATH || ""}`,
+            },
+            timeout: 30_000,
           },
-          timeout: 30_000,
-        });
+        );
         expect(result.status).toBe(0);
-        expect(result.stdout).toContain("NVIDIA_API_KEY=<REDACTED>");
+        expect(result.stdout).toContain("NVIDIA_INFERENCE_API_KEY=<REDACTED>");
         expect(result.stdout).not.toContain("nvapi-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
       } finally {
         rmSync(tmp, { recursive: true, force: true });
@@ -128,16 +150,20 @@ describe("secret redaction consistency (#1736)", () => {
         { mode: 0o755 },
       );
       try {
-        const result = spawnSync("/bin/bash", [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"], {
-          encoding: "utf-8",
-          env: {
-            ...process.env,
-            NEMOCLAW_NODE: process.execPath,
-            TMPDIR: tmp,
-            PATH: fakeBin,
+        const result = spawnSync(
+          "/bin/bash",
+          [join(import.meta.dirname, "..", "scripts", "debug.sh"), "--quick"],
+          {
+            encoding: "utf-8",
+            env: {
+              ...process.env,
+              NEMOCLAW_NODE: process.execPath,
+              TMPDIR: tmp,
+              PATH: fakeBin,
+            },
+            timeout: 30_000,
           },
-          timeout: 30_000,
-        });
+        );
         expect(result.status).toBe(0);
         expect(result.stdout).toContain("<REDACTED>");
         expect(result.stdout).not.toContain("nvapi-");
@@ -169,6 +195,18 @@ describe("secret redaction consistency (#1736)", () => {
       const text = redactSensitiveText("SLACK_BOT_TOKEN=xoxb-notreal SLACK_APP_TOKEN=xapp-notreal");
       expect(text).not.toContain("xoxb-notreal");
       expect(text).not.toContain("xapp-notreal");
+    });
+
+    it("redacts Deep Agents provider-key env-var assignments", () => {
+      const text = redactSensitiveText("NEMOCLAW_PROVIDER_KEY=sk-test-inference-hub-key");
+      expect(text).not.toContain("sk-test-inference-hub-key");
+      expect(text).toBe("NEMOCLAW_PROVIDER_KEY=<REDACTED>");
+    });
+
+    it("redacts TAVILY_API_KEY env-var assignments", () => {
+      const text = redactSensitiveText("TAVILY_API_KEY=tvly-redaction-regression-12345");
+      expect(text).not.toContain("tvly-redaction-regression-12345");
+      expect(text).toBe("TAVILY_API_KEY=<REDACTED>");
     });
   });
 });

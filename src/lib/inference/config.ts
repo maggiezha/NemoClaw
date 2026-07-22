@@ -6,12 +6,20 @@
  * inference output parsing. All functions are pure.
  */
 
+import { isSafeModelId, shouldSkipResponsesProbe } from "../validation";
 import { DEFAULT_OLLAMA_MODEL } from "./local";
+import { OPENROUTER_CREDENTIAL_ENV, OPENROUTER_PROVIDER_NAME } from "./openrouter";
 
 export const INFERENCE_ROUTE_URL = "https://inference.local/v1";
 export const NOUS_RECOMMENDED_MODELS_URL =
   "https://portal.nousresearch.com/api/nous/recommended-models";
 export const DEFAULT_CLOUD_MODEL = "nvidia/nemotron-3-super-120b-a12b";
+// Fallback context window used when no per-model value is known. Cloud providers
+// have no per-model context metadata today (CLOUD_MODEL_OPTIONS carries only
+// id/label), so they fall back to this; matches the onboarding build default in
+// scripts/generate-openclaw-config.mts. Per-model cloud accuracy is tracked
+// separately (cloud context-window registry).
+export const DEFAULT_CONTEXT_WINDOW = 131072;
 export const HERMES_PROVIDER_MODEL_OPTIONS = [
   "moonshotai/kimi-k2.6",
   "xiaomi/mimo-v2.5-pro",
@@ -46,13 +54,9 @@ export const HERMES_PROVIDER_MODEL_OPTIONS = [
 ] as const;
 export const DEFAULT_HERMES_PROVIDER_MODEL = HERMES_PROVIDER_MODEL_OPTIONS[0];
 export const CLOUD_MODEL_OPTIONS = [
+  { id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron 3 Ultra 550B" },
   { id: "nvidia/nemotron-3-super-120b-a12b", label: "Nemotron 3 Super 120B" },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", label: "Nemotron 3 Nano Omni 30B" },
-  { id: "z-ai/glm-5.1", label: "GLM-5" },
-  { id: "minimaxai/minimax-m2.7", label: "MiniMax M2.7" },
-  { id: "moonshotai/kimi-k2.6", label: "Kimi K2.6" },
-  { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
-  { id: "deepseek-ai/deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+  { id: "minimaxai/minimax-m3", label: "Minimax M3" },
 ];
 export const DEFAULT_ROUTE_PROFILE = "inference-local";
 export const DEFAULT_ROUTE_CREDENTIAL_ENV = "OPENAI_API_KEY";
@@ -63,6 +67,15 @@ export const OLLAMA_LOCAL_CREDENTIAL_ENV = "NEMOCLAW_OLLAMA_PROXY_TOKEN";
 export const VLLM_LOCAL_CREDENTIAL_ENV = "NEMOCLAW_VLLM_LOCAL_TOKEN";
 export const MANAGED_PROVIDER_ID = "inference";
 export { DEFAULT_OLLAMA_MODEL };
+
+/** Resolve an agent-owned NVIDIA Endpoints default without changing shared defaults. */
+export function resolveAgentDefaultCloudModel(agent: unknown): string {
+  const configured = (agent as { inference?: { default_model?: unknown } } | null | undefined)
+    ?.inference?.default_model;
+  return typeof configured === "string" && isSafeModelId(configured.trim())
+    ? configured.trim()
+    : DEFAULT_CLOUD_MODEL;
+}
 
 export interface ProviderSelectionConfig {
   endpointType: string;
@@ -86,6 +99,36 @@ export interface SandboxInferenceConfig {
   inferenceBaseUrl: string;
   inferenceApi: string;
   inferenceCompat: Record<string, unknown> | null;
+}
+
+/**
+ * Resolve provider-specific managed-proxy protocol requirements for an agent.
+ * Hermes must use the OpenAI-compatible frontend for custom Anthropic routes
+ * because the managed Anthropic SSE frontend can emit duplicate message_start
+ * events (#6289). Provider setup then verifies the endpoint's OpenAI surface
+ * and aligns the OpenShell provider type before the route is used.
+ */
+export function resolveAgentInferenceApi(
+  agentName: string | null | undefined,
+  provider: string | null | undefined,
+  preferredInferenceApi: string | null,
+): string | null {
+  return agentName === "hermes" && provider === "compatible-anthropic-endpoint"
+    ? "openai-completions"
+    : preferredInferenceApi;
+}
+
+/**
+ * Return the OpenAI-compatible base used when a custom Anthropic endpoint is
+ * routed through the managed Chat Completions frontend. Anthropic endpoint
+ * normalization intentionally strips a trailing `/v1`; OpenShell's OpenAI
+ * provider appends `/chat/completions`, so restore `/v1` exactly once here.
+ */
+export function getCompatibleAnthropicOpenAiSurfaceBaseUrl(
+  endpointUrl: string | null | undefined,
+): string {
+  const trimmed = String(endpointUrl ?? "").replace(/\/+$/, "");
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
 export function getProviderSelectionConfig(
@@ -115,6 +158,13 @@ export function getProviderSelectionConfig(
         model: model || "gpt-5.4",
         credentialEnv: "OPENAI_API_KEY",
         providerLabel: "OpenAI",
+      };
+    case OPENROUTER_PROVIDER_NAME:
+      return {
+        ...base,
+        model: model || DEFAULT_CLOUD_MODEL,
+        credentialEnv: OPENROUTER_CREDENTIAL_ENV,
+        providerLabel: "OpenRouter",
       };
     case "anthropic-prod":
       return {
@@ -185,6 +235,15 @@ export function getSandboxInferenceConfig(
   let primaryModelRef: string;
   let inferenceBaseUrl = INFERENCE_ROUTE_URL;
   let inferenceApi = preferredInferenceApi || "openai-completions";
+  // Providers without a /v1/responses endpoint must never be configured with the
+  // Responses API. On a provider switch the runtime API resolves to null and the
+  // caller falls back to the persisted (shared "inference") provider api, which
+  // can carry a prior provider's "openai-responses" over to e.g. nvidia-prod and
+  // 404 every request. Force completions here, mirroring how anthropic-prod
+  // forces anthropic-messages below.
+  if (provider && shouldSkipResponsesProbe(provider)) {
+    inferenceApi = "openai-completions";
+  }
   let inferenceCompat: Record<string, unknown> | null = null;
 
   switch (provider) {
@@ -208,6 +267,7 @@ export function getSandboxInferenceConfig(
       inferenceApi = "anthropic-messages";
       break;
     case "gemini-api":
+    case OPENROUTER_PROVIDER_NAME:
     case "hermes-provider":
       providerKey = MANAGED_PROVIDER_ID;
       primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
@@ -220,6 +280,20 @@ export function getSandboxInferenceConfig(
       primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
       inferenceCompat = {
         supportsStore: false,
+      };
+      break;
+    case "ollama-local":
+      providerKey = MANAGED_PROVIDER_ID;
+      primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
+      // Source-of-truth boundary: once local Ollama is routed through the
+      // managed "inference" provider, OpenClaw no longer sees an
+      // ollama/ollama-local provider key and cannot apply its Ollama streaming
+      // usage fallback. Seed the compat flag here, while NemoClaw still knows
+      // the original host-side provider selection. Remove this only after
+      // OpenClaw infers include_usage for inference.local Ollama routes or
+      // NemoClaw stops mapping ollama-local through the managed provider.
+      inferenceCompat = {
+        supportsUsageInStreaming: true,
       };
       break;
     case "nvidia-router":
@@ -235,6 +309,39 @@ export function getSandboxInferenceConfig(
   }
 
   return { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat };
+}
+
+/**
+ * OpenAI-only agents cannot consume an Anthropic Messages route. Select the
+ * managed OpenAI frontend for those agents; provider setup then probes the
+ * endpoint's OpenAI surface and registers the OpenShell provider as `openai`
+ * before routing traffic. Provider-specific overrides for multi-protocol
+ * agents such as Hermes are applied separately by resolveAgentInferenceApi().
+ */
+export function coerceAgentInferenceApi(
+  agent: unknown,
+  preferredInferenceApi: string | null,
+): string | null {
+  const providerType = (agent as { inference?: { provider_type?: string } } | null | undefined)
+    ?.inference?.provider_type;
+  if (providerType === "openai_compatible" && preferredInferenceApi === "anthropic-messages") {
+    return "openai-completions";
+  }
+  return preferredInferenceApi;
+}
+
+/** Resolve the runtime API after applying both agent capability and provider overrides. */
+export function resolveAgentProviderInferenceApi(
+  agentName: string | null | undefined,
+  agent: unknown,
+  provider: string | null | undefined,
+  preferredInferenceApi: string | null,
+): string | null {
+  return resolveAgentInferenceApi(
+    agentName,
+    provider,
+    coerceAgentInferenceApi(agent, preferredInferenceApi),
+  );
 }
 
 export function parseGatewayInference(output: string | null | undefined): GatewayInference | null {
@@ -262,4 +369,60 @@ export function parseGatewayInference(output: string | null | undefined): Gatewa
   }
   if (!provider && !model) return null;
   return { provider, model };
+}
+
+export interface RecordedInferenceRoute {
+  provider: string;
+  model: string;
+}
+
+export type InferenceRoutePlan =
+  | { kind: "aligned" }
+  | { kind: "repair" }
+  | { kind: "diverged"; live: GatewayInference; recorded: RecordedInferenceRoute };
+
+// Decide how `connect` reconciles the live gateway route with a sandbox's
+// recorded route. `diverged` (valid but different) must be surfaced loudly by
+// the caller — silently overriding it was #3726.
+export function planInferenceRouteReconcile(
+  live: GatewayInference | null,
+  recorded: RecordedInferenceRoute,
+): InferenceRoutePlan {
+  // No usable live route (absent or partial) → repair, not a loud override.
+  if (!live || !live.provider || !live.model) {
+    return { kind: "repair" };
+  }
+  if (live.provider !== recorded.provider || live.model !== recorded.model) {
+    return { kind: "diverged", live, recorded };
+  }
+  return { kind: "aligned" };
+}
+
+// Strip control chars so untrusted route values can't inject terminal escapes when printed.
+export function sanitizeRouteValueForDisplay(value: string | null | undefined): string {
+  return (value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+}
+
+export interface InferenceRouteDriftDisplay {
+  liveProvider: string;
+  liveModel: string;
+  recordedRoute: string;
+  warning: string;
+}
+
+export function formatInferenceRouteDriftForDisplay(
+  live: GatewayInference,
+  recorded: RecordedInferenceRoute,
+  recordedRouteOwner: string,
+): InferenceRouteDriftDisplay {
+  const liveProvider = sanitizeRouteValueForDisplay(live.provider);
+  const liveModel = sanitizeRouteValueForDisplay(live.model);
+  const recordedRoute = `${sanitizeRouteValueForDisplay(recorded.provider)}/${sanitizeRouteValueForDisplay(recorded.model)}`;
+  const owner = sanitizeRouteValueForDisplay(recordedRouteOwner);
+  return {
+    liveProvider,
+    liveModel,
+    recordedRoute,
+    warning: `gateway inference route (${liveProvider}/${liveModel}) differs from the recorded route ${owner} (${recordedRoute}).`,
+  };
 }

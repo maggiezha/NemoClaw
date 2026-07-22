@@ -1,46 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { rmSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   isConfigValue,
-  isCredentialField,
-  stripCredentials,
-  sanitizeConfigFile,
+  isSafeCredentialPlaceholder,
   isSensitiveFile,
+  sanitizeConfigFile,
   shouldScanSnapshotFileForCredentials,
+  stripCredentials,
 } from "./credential-filter.js";
 
-describe("isCredentialField", () => {
-  it("matches explicit field names", () => {
-    expect(isCredentialField("apiKey")).toBe(true);
-    expect(isCredentialField("api_key")).toBe(true);
-    expect(isCredentialField("token")).toBe(true);
-    expect(isCredentialField("secret")).toBe(true);
-    expect(isCredentialField("password")).toBe(true);
-    expect(isCredentialField("resolvedKey")).toBe(true);
+describe("isSafeCredentialPlaceholder", () => {
+  it("recognizes OpenShell resolve placeholders and the unused sentinel", () => {
+    expect(isSafeCredentialPlaceholder("openshell:resolve:env:DISCORD_BOT_TOKEN")).toBe(true);
+    expect(isSafeCredentialPlaceholder("openshell:resolve:env:BRAVE_API_KEY")).toBe(true);
+    expect(isSafeCredentialPlaceholder("xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN")).toBe(true);
+    expect(isSafeCredentialPlaceholder("xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN")).toBe(true);
+    expect(isSafeCredentialPlaceholder("unused")).toBe(true);
+    expect(isSafeCredentialPlaceholder("[STRIPPED_BY_MIGRATION]")).toBe(true);
+    expect(isSafeCredentialPlaceholder("Bearer openshell:resolve:env:REMOTE_MCP_TOKEN")).toBe(true);
+    // `Bearer <safe-literal>` proxy-auth sentinels are preserved too.
+    expect(isSafeCredentialPlaceholder("Bearer unused")).toBe(true);
+    expect(isSafeCredentialPlaceholder("Bearer [STRIPPED_BY_MIGRATION]")).toBe(true);
   });
 
-  it("matches pattern-based names", () => {
-    expect(isCredentialField("accessToken")).toBe(true);
-    expect(isCredentialField("refreshToken")).toBe(true);
-    expect(isCredentialField("clientSecret")).toBe(true);
-    expect(isCredentialField("bearerToken")).toBe(true);
-    expect(isCredentialField("privateKey")).toBe(true);
-    expect(isCredentialField("sessionToken")).toBe(true);
-  });
-
-  it("does not match safe field names", () => {
-    expect(isCredentialField("name")).toBe(false);
-    expect(isCredentialField("model")).toBe(false);
-    expect(isCredentialField("provider")).toBe(false);
-    expect(isCredentialField("endpoint")).toBe(false);
-    expect(isCredentialField("version")).toBe(false);
+  it("rejects raw secrets and malformed references", () => {
+    expect(isSafeCredentialPlaceholder("sk-1234567890")).toBe(false);
+    expect(isSafeCredentialPlaceholder("xoxb-987654321-realtoken")).toBe(false);
+    expect(isSafeCredentialPlaceholder("openshell:resolve:env:")).toBe(false);
+    expect(isSafeCredentialPlaceholder("openshell:resolve:env:BAD NAME")).toBe(false);
+    expect(isSafeCredentialPlaceholder(42)).toBe(false);
+    expect(isSafeCredentialPlaceholder(null)).toBe(false);
   });
 });
 
@@ -87,6 +82,37 @@ describe("stripCredentials", () => {
     expect(stripCredentials("hello")).toBe("hello");
     expect(stripCredentials(42)).toBe(42);
   });
+
+  it("preserves OpenShell resolve placeholders under credential fields (#5027)", () => {
+    const input = {
+      models: { providers: { nvidia: { apiKey: "unused", baseUrl: "https://x/v1" } } },
+      channels: {
+        discord: { accounts: { default: { token: "openshell:resolve:env:DISCORD_BOT_TOKEN" } } },
+        slack: {
+          accounts: { default: { botToken: "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN" } },
+        },
+      },
+    };
+    const result = stripCredentials(input);
+    expect(result.models.providers.nvidia.apiKey).toBe("unused");
+    expect(result.models.providers.nvidia.baseUrl).toBe("https://x/v1");
+    expect(result.channels.discord.accounts.default.token).toBe(
+      "openshell:resolve:env:DISCORD_BOT_TOKEN",
+    );
+    expect(result.channels.slack.accounts.default.botToken).toBe(
+      "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
+    );
+  });
+
+  it("still strips raw secrets even under preserved-style sibling fields", () => {
+    const input = {
+      good: { apiKey: "openshell:resolve:env:GOOD_KEY" },
+      bad: { apiKey: "sk-actual-secret" },
+    };
+    const result = stripCredentials(input);
+    expect(result.good.apiKey).toBe("openshell:resolve:env:GOOD_KEY");
+    expect(result.bad.apiKey).toBe("[STRIPPED_BY_MIGRATION]");
+  });
 });
 
 describe("sanitizeConfigFile", () => {
@@ -119,6 +145,41 @@ describe("sanitizeConfigFile", () => {
     expect(result.gateway).toBeUndefined();
   });
 
+  it("sanitizes a realistic openclaw.json without breaking restorable settings (#5027)", () => {
+    const configPath = join(tmpDir, "openclaw.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        models: {
+          mode: "merge",
+          providers: {
+            nvidia: { baseUrl: "https://x/v1", apiKey: "unused", models: [{ id: "kimi" }] },
+          },
+        },
+        mcpServers: { fs: { command: "npx" } },
+        channels: {
+          discord: { accounts: { default: { token: "openshell:resolve:env:DISCORD_BOT_TOKEN" } } },
+        },
+        customAgents: { researcher: { prompt: "be thorough" } },
+        leaked: { apiKey: "sk-real-secret" },
+        gateway: { port: 18789, authToken: "gw-token" },
+      }),
+    );
+
+    sanitizeConfigFile(configPath);
+
+    const result = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(result.models.providers.nvidia.apiKey).toBe("unused");
+    expect(result.models.providers.nvidia.models[0].id).toBe("kimi");
+    expect(result.mcpServers.fs.command).toBe("npx");
+    expect(result.channels.discord.accounts.default.token).toBe(
+      "openshell:resolve:env:DISCORD_BOT_TOKEN",
+    );
+    expect(result.customAgents.researcher.prompt).toBe("be thorough");
+    expect(result.leaked.apiKey).toBe("[STRIPPED_BY_MIGRATION]");
+    expect(result.gateway).toBeUndefined();
+  });
+
   it("skips non-existent files", () => {
     sanitizeConfigFile(join(tmpDir, "nonexistent.json"));
     // Should not throw
@@ -131,14 +192,33 @@ describe("sanitizeConfigFile", () => {
     // Should not throw, file unchanged
     expect(readFileSync(configPath, "utf-8")).toBe("not json at all");
   });
+
+  it("does not follow config-file symlinks while sanitizing", () => {
+    const targetPath = join(tmpDir, "target.json");
+    const linkPath = join(tmpDir, "openclaw.json");
+    writeFileSync(targetPath, JSON.stringify({ apiKey: "sk-secret" }));
+    try {
+      symlinkSync(targetPath, linkPath);
+    } catch (error) {
+      const code = error && typeof error === "object" ? (error as { code?: string }).code : "";
+      if (code === "EPERM" || code === "EACCES") return;
+      throw error;
+    }
+
+    sanitizeConfigFile(linkPath);
+
+    expect(JSON.parse(readFileSync(targetPath, "utf-8"))).toEqual({ apiKey: "sk-secret" });
+  });
 });
 
 describe("isSensitiveFile", () => {
-  it("detects auth-profiles.json", () => {
+  it("detects credential-bearing auth state basenames", () => {
     expect(isSensitiveFile("auth-profiles.json")).toBe(true);
     expect(isSensitiveFile("Auth-Profiles.json")).toBe(true);
     expect(isSensitiveFile("auth.json")).toBe(true);
     expect(isSensitiveFile("AUTH.JSON")).toBe(true);
+    expect(isSensitiveFile("chatgpt-auth.json")).toBe(true);
+    expect(isSensitiveFile("CHATGPT-AUTH.JSON")).toBe(true);
   });
 
   it("does not flag normal files", () => {

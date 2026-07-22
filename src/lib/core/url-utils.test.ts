@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-// Import from compiled dist/ so coverage is attributed correctly.
+import { describe, expect, it } from "vitest";
+// Import source directly so tests cannot pass against a stale build.
 import {
+  canonicalEndpoint,
   compactText,
-  stripEndpointSuffix,
-  normalizeProviderBaseUrl,
-  isLoopbackHostname,
   formatEnvAssignment,
+  isLoopbackHostname,
+  normalizeProviderBaseUrl,
   parsePolicyPresetEnv,
-} from "../../../dist/lib/core/url-utils";
+  stripEndpointSuffix,
+} from "./url-utils";
 
 describe("compactText", () => {
   it("collapses whitespace", () => {
@@ -37,68 +38,92 @@ describe("stripEndpointSuffix", () => {
 });
 
 describe("normalizeProviderBaseUrl", () => {
-  it("strips OpenAI suffixes", () => {
-    expect(normalizeProviderBaseUrl("https://api.openai.com/v1/chat/completions", "openai")).toBe(
+  it.each([
+    [
+      "OpenAI suffix",
+      "https://api.openai.com/v1/chat/completions",
+      "openai",
       "https://api.openai.com/v1",
-    );
-  });
-
-  it("strips Anthropic suffixes", () => {
-    expect(normalizeProviderBaseUrl("https://api.anthropic.com/v1/messages", "anthropic")).toBe(
+    ],
+    [
+      "Anthropic messages suffix",
+      "https://api.anthropic.com/v1/messages",
+      "anthropic",
       "https://api.anthropic.com",
-    );
-    expect(normalizeProviderBaseUrl("https://proxy.example.com/v1", "anthropic")).toBe(
+    ],
+    [
+      "Anthropic v1 suffix",
+      "https://proxy.example.com/v1",
+      "anthropic",
       "https://proxy.example.com",
-    );
-    expect(normalizeProviderBaseUrl("https://proxy.example.com/v1/messages", "anthropic")).toBe(
+    ],
+    [
+      "proxied Anthropic messages suffix",
+      "https://proxy.example.com/v1/messages",
+      "anthropic",
       "https://proxy.example.com",
-    );
+    ],
+    ["trailing slashes", "https://example.com/v1/", "openai", "https://example.com/v1"],
+    ["root path", "https://example.com/", "openai", "https://example.com"],
+    ["empty input", "", "openai", ""],
+    ["invalid URL", "not-a-url", "openai", "not-a-url"],
+  ] as const)("normalizes %s", (_label, input, provider, expected) => {
+    expect(normalizeProviderBaseUrl(input, provider)).toBe(expected);
+  });
+});
+
+describe("canonicalEndpoint", () => {
+  it.each([null, undefined] as const)("rejects missing endpoint %s", (input) => {
+    expect(canonicalEndpoint(input, "openai")).toBeNull();
   });
 
-  it("strips trailing slashes", () => {
-    expect(normalizeProviderBaseUrl("https://example.com/v1/", "openai")).toBe(
-      "https://example.com/v1",
-    );
+  it("rejects non-HTTP(S) protocols", () => {
+    expect(canonicalEndpoint("ftp://proxy.example.com/v1", "openai")).toBeNull();
   });
 
-  it("returns origin for root path", () => {
-    expect(normalizeProviderBaseUrl("https://example.com/", "openai")).toBe(
-      "https://example.com",
-    );
+  it.each([
+    "https://user@proxy.example.com/v1",
+    "https://user:password@proxy.example.com/v1",
+  ])("rejects URL credentials in %s", (input) => {
+    expect(canonicalEndpoint(input, "openai")).toBeNull();
   });
 
-  it("handles empty input", () => {
-    expect(normalizeProviderBaseUrl("", "openai")).toBe("");
+  it("accepts the 2048-character bound and rejects longer endpoints", () => {
+    const prefix = "https://example.com/";
+    const atLimit = `${prefix}${"a".repeat(2048 - prefix.length)}`;
+    expect(atLimit).toHaveLength(2048);
+    expect(canonicalEndpoint(atLimit, "openai")).toBe(atLimit);
+    expect(canonicalEndpoint(`${atLimit}a`, "openai")).toBeNull();
   });
 
-  it("handles invalid URL gracefully", () => {
-    expect(normalizeProviderBaseUrl("not-a-url", "openai")).toBe("not-a-url");
+  it.each([
+    [
+      "OpenAI path",
+      "https://proxy.example.com/v1/chat/completions?region=west#fragment",
+      "openai",
+      "https://proxy.example.com/v1",
+    ],
+    [
+      "Anthropic path",
+      "https://proxy.example.com/v1/messages?region=west#fragment",
+      "anthropic",
+      "https://proxy.example.com",
+    ],
+  ] as const)("normalizes %s", (_label, input, flavor, expected) => {
+    expect(canonicalEndpoint(input, flavor)).toBe(expected);
   });
 });
 
 describe("isLoopbackHostname", () => {
-  it("matches localhost", () => {
-    expect(isLoopbackHostname("localhost")).toBe(true);
-  });
-
-  it("matches 127.0.0.1", () => {
-    expect(isLoopbackHostname("127.0.0.1")).toBe(true);
-  });
-
-  it("matches ::1", () => {
-    expect(isLoopbackHostname("::1")).toBe(true);
-  });
-
-  it("matches bracketed IPv6", () => {
-    expect(isLoopbackHostname("[::1]")).toBe(true);
-  });
-
-  it("rejects external hostname", () => {
-    expect(isLoopbackHostname("example.com")).toBe(false);
-  });
-
-  it("handles empty input", () => {
-    expect(isLoopbackHostname("")).toBe(false);
+  it.each([
+    ["localhost", true],
+    ["127.0.0.1", true],
+    ["::1", true],
+    ["[::1]", true],
+    ["example.com", false],
+    ["", false],
+  ] as const)("classifies %s", (input, expected) => {
+    expect(isLoopbackHostname(input)).toBe(expected);
   });
 });
 
@@ -109,19 +134,12 @@ describe("formatEnvAssignment", () => {
 });
 
 describe("parsePolicyPresetEnv", () => {
-  it("parses comma-separated values", () => {
-    expect(parsePolicyPresetEnv("web,local-inference")).toEqual(["web", "local-inference"]);
-  });
-
-  it("trims whitespace", () => {
-    expect(parsePolicyPresetEnv(" web , local ")).toEqual(["web", "local"]);
-  });
-
-  it("filters empty segments", () => {
-    expect(parsePolicyPresetEnv("web,,local")).toEqual(["web", "local"]);
-  });
-
-  it("handles empty string", () => {
-    expect(parsePolicyPresetEnv("")).toEqual([]);
+  it.each([
+    ["comma-separated values", "web,local-inference", ["web", "local-inference"]],
+    ["whitespace", " web , local ", ["web", "local"]],
+    ["empty segments", "web,,local", ["web", "local"]],
+    ["empty string", "", []],
+  ] as const)("parses %s", (_label, input, expected) => {
+    expect(parsePolicyPresetEnv(input)).toEqual(expected);
   });
 });

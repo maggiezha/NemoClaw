@@ -17,10 +17,7 @@ export function resetStepForAgentChange(session: Session, stepName: string): voi
   stepState.error = null;
 }
 
-export function clearAgentScopedResumeState(
-  session: Session,
-  selectedAgentName: string,
-): Session {
+export function clearAgentScopedResumeState(session: Session, selectedAgentName: string): Session {
   const normalizedAgentName = normalizeAgentNameForResumeState(selectedAgentName);
   session.agent = normalizedAgentName === "openclaw" ? null : normalizedAgentName;
   session.provider = null;
@@ -33,6 +30,12 @@ export function clearAgentScopedResumeState(
   session.nimContainer = null;
   session.routerPid = null;
   session.routerCredentialHash = null;
+  session.webSearchConfig = null;
+  session.messagingPlan = null;
+  if (session.sandboxPromptProgress) {
+    session.sandboxPromptProgress.webSearch = false;
+    session.sandboxPromptProgress.messaging = false;
+  }
   session.policyPresets = null;
 
   const resetSteps = [

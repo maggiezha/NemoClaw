@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 
-type CredentialsModule = typeof import("../dist/lib/credentials/store.js");
+type CredentialsModule = typeof import("../src/lib/credentials/store.js");
 
 function isCredentialsModule(value: object | null): value is CredentialsModule {
   return (
@@ -28,7 +28,8 @@ function isCredentialsModule(value: object | null): value is CredentialsModule {
 // Pull the credential-env-key allowlist from the production module so
 // future additions only need to be made in one place. Plus a few
 // fixture-only names this suite mutates directly.
-import { KNOWN_CREDENTIAL_ENV_KEYS } from "../dist/lib/credentials/store.js";
+import { KNOWN_CREDENTIAL_ENV_KEYS } from "../src/lib/credentials/store.js";
+
 const TEST_FIXTURE_ENV_KEYS = ["TEST_API_KEY", "OTHER_KEY", "EMPTY_VALUE", "ZETA", "ALPHA"];
 const TRACKED_ENV_KEYS = [...KNOWN_CREDENTIAL_ENV_KEYS, ...TEST_FIXTURE_ENV_KEYS];
 
@@ -38,13 +39,17 @@ function clearTrackedEnv() {
   }
 }
 
-async function importCredentialsModule(home: string): Promise<CredentialsModule> {
+async function importCredentialsModule(
+  home: string,
+  gatewayPort?: number,
+): Promise<CredentialsModule> {
   vi.resetModules();
   vi.doUnmock("fs");
   vi.doUnmock("child_process");
   vi.doUnmock("readline");
   vi.stubEnv("HOME", home);
-  const module = await import("../dist/lib/credentials/store.js");
+  vi.stubEnv("NEMOCLAW_GATEWAY_PORT", gatewayPort === undefined ? "" : String(gatewayPort));
+  const module = await import("../src/lib/credentials/store.js");
   const loaded = "default" in module ? module.default : module;
   const moduleObject = typeof loaded === "object" && loaded !== null ? loaded : null;
   if (!isCredentialsModule(moduleObject)) {
@@ -54,7 +59,7 @@ async function importCredentialsModule(home: string): Promise<CredentialsModule>
 }
 
 beforeEach(() => {
-  // The user's shell may export NVIDIA_API_KEY etc.; the credentials module
+  // The user's shell may export NVIDIA_INFERENCE_API_KEY etc.; the credentials module
   // now reads exclusively from process.env, so any inherited value would
   // contaminate every test. Start each case from a clean process env.
   clearTrackedEnv();
@@ -85,6 +90,10 @@ describe("messaging legacy bridge credentials", () => {
     expect(KNOWN_CREDENTIAL_ENV_KEYS).toContain("DISCORD_BOT_TOKEN");
     expect(KNOWN_CREDENTIAL_ENV_KEYS).toContain("SLACK_BOT_TOKEN");
   });
+
+  it("registers TAVILY_API_KEY so the Tavily provider can be sanitized and rotated", () => {
+    expect(KNOWN_CREDENTIAL_ENV_KEYS).toContain("TAVILY_API_KEY");
+  });
 });
 
 describe("host-side credential staging", () => {
@@ -94,16 +103,16 @@ describe("host-side credential staging", () => {
 
     expect(credentials.loadCredentials()).toEqual({});
 
-    credentials.saveCredential("NVIDIA_API_KEY", "  nvapi-saved-key \r\n");
+    credentials.saveCredential("NVIDIA_INFERENCE_API_KEY", "  nvapi-saved-key \r\n");
 
     // No plaintext credentials.json — the gateway is the system of record.
     const legacyFile = path.join(home, ".nemoclaw", "credentials.json");
     expect(fs.existsSync(legacyFile)).toBe(false);
 
-    expect(process.env.NVIDIA_API_KEY).toBe("nvapi-saved-key");
-    expect(credentials.getCredential("NVIDIA_API_KEY")).toBe("nvapi-saved-key");
-    expect(credentials.loadCredentials()).toEqual({ NVIDIA_API_KEY: "nvapi-saved-key" });
-    expect(credentials.listCredentialKeys()).toEqual(["NVIDIA_API_KEY"]);
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-saved-key");
+    expect(credentials.getCredential("NVIDIA_INFERENCE_API_KEY")).toBe("nvapi-saved-key");
+    expect(credentials.loadCredentials()).toEqual({ NVIDIA_INFERENCE_API_KEY: "nvapi-saved-key" });
+    expect(credentials.listCredentialKeys()).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
   });
 
   it("getCredential reads only from process.env", async () => {
@@ -114,15 +123,15 @@ describe("host-side credential staging", () => {
     fs.mkdirSync(path.join(home, ".nemoclaw"), { recursive: true });
     fs.writeFileSync(
       path.join(home, ".nemoclaw", "credentials.json"),
-      JSON.stringify({ NVIDIA_API_KEY: "nvapi-from-disk" }),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-from-disk" }),
       { mode: 0o600 },
     );
 
     const credentials = await importCredentialsModule(home);
-    expect(credentials.getCredential("NVIDIA_API_KEY")).toBe(null);
+    expect(credentials.getCredential("NVIDIA_INFERENCE_API_KEY")).toBe(null);
 
-    vi.stubEnv("NVIDIA_API_KEY", "  nvapi-from-env \n");
-    expect(credentials.getCredential("NVIDIA_API_KEY")).toBe("nvapi-from-env");
+    vi.stubEnv("NVIDIA_INFERENCE_API_KEY", "  nvapi-from-env \n");
+    expect(credentials.getCredential("NVIDIA_INFERENCE_API_KEY")).toBe("nvapi-from-env");
   });
 
   it("returns null for missing or blank credential values", async () => {
@@ -131,26 +140,29 @@ describe("host-side credential staging", () => {
 
     credentials.saveCredential("EMPTY_VALUE", " \r\n ");
     expect(credentials.getCredential("EMPTY_VALUE")).toBe(null);
-    expect(credentials.getCredential("NVIDIA_API_KEY")).toBe(null);
+    expect(credentials.getCredential("NVIDIA_INFERENCE_API_KEY")).toBe(null);
   });
 
   it("deleteCredential clears the staged value without touching disk", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-creds-"));
     const credentials = await importCredentialsModule(home);
 
-    credentials.saveCredential("NVIDIA_API_KEY", "nvapi-bad-key");
+    credentials.saveCredential("NVIDIA_INFERENCE_API_KEY", "nvapi-bad-key");
     credentials.saveCredential("OPENAI_API_KEY", "sk-other");
 
-    expect(credentials.listCredentialKeys()).toEqual(["NVIDIA_API_KEY", "OPENAI_API_KEY"]);
+    expect(credentials.listCredentialKeys()).toEqual([
+      "NVIDIA_INFERENCE_API_KEY",
+      "OPENAI_API_KEY",
+    ]);
     expect(fs.existsSync(path.join(home, ".nemoclaw", "credentials.json"))).toBe(false);
 
-    expect(credentials.deleteCredential("NVIDIA_API_KEY")).toBe(true);
-    expect(credentials.getCredential("NVIDIA_API_KEY")).toBe(null);
+    expect(credentials.deleteCredential("NVIDIA_INFERENCE_API_KEY")).toBe(true);
+    expect(credentials.getCredential("NVIDIA_INFERENCE_API_KEY")).toBe(null);
     expect(credentials.listCredentialKeys()).toEqual(["OPENAI_API_KEY"]);
     expect(credentials.getCredential("OPENAI_API_KEY")).toBe("sk-other");
 
     // Idempotent.
-    expect(credentials.deleteCredential("NVIDIA_API_KEY")).toBe(false);
+    expect(credentials.deleteCredential("NVIDIA_INFERENCE_API_KEY")).toBe(false);
   });
 
   it("deleteCredential returns false when nothing is staged", async () => {
@@ -171,6 +183,29 @@ describe("host-side credential staging", () => {
 });
 
 describe("legacy credentials.json migration (two-phase: stage then remove)", () => {
+  it("stages credentials only from the selected nondefault gateway root", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-creds-port-"));
+    const defaultDir = path.join(home, ".nemoclaw");
+    const selectedDir = path.join(defaultDir, "gateways", "9123");
+    fs.mkdirSync(selectedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(defaultDir, "credentials.json"),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-default-root" }),
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(selectedDir, "credentials.json"),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-selected-port" }),
+      { mode: 0o600 },
+    );
+
+    const credentials = await importCredentialsModule(home, 9123);
+
+    expect(credentials.stageLegacyCredentialsToEnv()).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-selected-port");
+    expect(fs.existsSync(path.join(defaultDir, "credentials.json"))).toBe(true);
+  });
+
   it("stages allowlisted keys into env without touching the file", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-creds-"));
     const credsDir = path.join(home, ".nemoclaw");
@@ -179,7 +214,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     fs.writeFileSync(
       legacyFile,
       JSON.stringify({
-        NVIDIA_API_KEY: "nvapi-legacy",
+        NVIDIA_INFERENCE_API_KEY: "nvapi-legacy",
         TELEGRAM_BOT_TOKEN: "tg-legacy",
         IGNORED_NON_STRING: 42 as unknown as string,
       }),
@@ -189,8 +224,8 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     const credentials = await importCredentialsModule(home);
     const staged = credentials.stageLegacyCredentialsToEnv();
 
-    expect(staged).toEqual(["NVIDIA_API_KEY", "TELEGRAM_BOT_TOKEN"]);
-    expect(process.env.NVIDIA_API_KEY).toBe("nvapi-legacy");
+    expect(staged).toEqual(["NVIDIA_INFERENCE_API_KEY", "TELEGRAM_BOT_TOKEN"]);
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-legacy");
     expect(process.env.TELEGRAM_BOT_TOKEN).toBe("tg-legacy");
 
     // The file MUST still exist after staging — it is removed only after a
@@ -215,7 +250,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
         PATH: "/attacker/bin:/usr/bin",
         NODE_OPTIONS: "--require=/tmp/evil.js",
         OPENSHELL_GATEWAY: "evil-gw",
-        NVIDIA_API_KEY: "nvapi-legitimate",
+        NVIDIA_INFERENCE_API_KEY: "nvapi-legitimate",
       }),
       { mode: 0o600 },
     );
@@ -223,8 +258,8 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     const credentials = await importCredentialsModule(home);
     const staged = credentials.stageLegacyCredentialsToEnv();
 
-    expect(staged).toEqual(["NVIDIA_API_KEY"]);
-    expect(process.env.NVIDIA_API_KEY).toBe("nvapi-legitimate");
+    expect(staged).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-legitimate");
     expect(process.env.PATH).toBe(originalPath);
     expect(process.env.NODE_OPTIONS).toBe(originalNodeOptions);
     expect(process.env.OPENSHELL_GATEWAY).toBe(originalOpenshellGateway);
@@ -242,15 +277,15 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     fs.mkdirSync(credsDir, { recursive: true });
     fs.writeFileSync(
       path.join(credsDir, "credentials.json"),
-      JSON.stringify({ NVIDIA_API_KEY: "nvapi-from-disk" }),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-from-disk" }),
       { mode: 0o600 },
     );
 
-    vi.stubEnv("NVIDIA_API_KEY", "nvapi-from-env");
+    vi.stubEnv("NVIDIA_INFERENCE_API_KEY", "nvapi-from-env");
     const credentials = await importCredentialsModule(home);
     const staged = credentials.stageLegacyCredentialsToEnv();
 
-    expect(process.env.NVIDIA_API_KEY).toBe("nvapi-from-env");
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-from-env");
     // The legacy value was skipped, so it must NOT be reported as staged.
     // Onboard uses the staged length to decide whether to delete the file;
     // a false-positive entry here would unlink credentials we never
@@ -265,7 +300,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-creds-"));
     const credentials = await importCredentialsModule(home);
     expect(credentials.stageLegacyCredentialsToEnv()).toEqual([]);
-    expect(process.env.NVIDIA_API_KEY).toBeUndefined();
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
   });
 
   it("treats a blank/whitespace env entry as unset and stages the legacy value", async () => {
@@ -274,7 +309,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     fs.mkdirSync(credsDir, { recursive: true });
     fs.writeFileSync(
       path.join(credsDir, "credentials.json"),
-      JSON.stringify({ NVIDIA_API_KEY: "nvapi-from-disk" }),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-from-disk" }),
       { mode: 0o600 },
     );
 
@@ -282,12 +317,12 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     // an empty value — must not block staging the legacy file value, or
     // rebuild/onboard preflight will fail with a credential the user
     // demonstrably has on disk.
-    vi.stubEnv("NVIDIA_API_KEY", "   ");
+    vi.stubEnv("NVIDIA_INFERENCE_API_KEY", "   ");
     const credentials = await importCredentialsModule(home);
     const staged = credentials.stageLegacyCredentialsToEnv();
 
-    expect(staged).toEqual(["NVIDIA_API_KEY"]);
-    expect(process.env.NVIDIA_API_KEY).toBe("nvapi-from-disk");
+    expect(staged).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-from-disk");
   });
 
   it("stages nothing from a corrupt legacy file and leaves it untouched", async () => {
@@ -301,7 +336,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     expect(credentials.stageLegacyCredentialsToEnv()).toEqual([]);
     // Corrupt input must not silently disappear — leave it for inspection.
     expect(fs.existsSync(legacyFile)).toBe(true);
-    expect(process.env.NVIDIA_API_KEY).toBeUndefined();
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
   });
 
   it("refuses to migrate an oversized legacy file (DoS guard)", async () => {
@@ -311,7 +346,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     fs.mkdirSync(credsDir, { recursive: true });
     // Two megabytes of valid JSON, well above the 1 MiB sanity cap.
     const filler = "x".repeat(2 * 1024 * 1024);
-    fs.writeFileSync(legacyFile, JSON.stringify({ NVIDIA_API_KEY: `nvapi-${filler}` }), {
+    fs.writeFileSync(legacyFile, JSON.stringify({ NVIDIA_INFERENCE_API_KEY: `nvapi-${filler}` }), {
       mode: 0o600,
     });
 
@@ -320,7 +355,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
 
     try {
       expect(credentials.stageLegacyCredentialsToEnv()).toEqual([]);
-      expect(process.env.NVIDIA_API_KEY).toBeUndefined();
+      expect(process.env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
       // File is left in place so the user can inspect or delete it.
       expect(fs.existsSync(legacyFile)).toBe(true);
       // The user gets a diagnostic on stderr explaining the refusal.
@@ -340,12 +375,15 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     // A real credentials file at an unrelated path; the attacker plants a
     // symlink at credentials.json that points at it.
     const realFile = path.join(home, "real-creds.json");
-    fs.writeFileSync(realFile, JSON.stringify({ NVIDIA_API_KEY: "nvapi-attacker-controlled" }));
+    fs.writeFileSync(
+      realFile,
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-attacker-controlled" }),
+    );
     fs.symlinkSync(realFile, legacyFile);
 
     const credentials = await importCredentialsModule(home);
     expect(credentials.stageLegacyCredentialsToEnv()).toEqual([]);
-    expect(process.env.NVIDIA_API_KEY).toBeUndefined();
+    expect(process.env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
     // The pointee is intact; we never read or modified it.
     expect(fs.existsSync(realFile)).toBe(true);
   });
@@ -359,29 +397,33 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     const credsDir = path.join(home, ".nemoclaw");
     const legacyFile = path.join(credsDir, "credentials.json");
     fs.mkdirSync(credsDir, { recursive: true });
-    fs.writeFileSync(legacyFile, JSON.stringify({ NVIDIA_API_KEY: "nvapi-survives-crash" }), {
-      mode: 0o600,
-    });
+    fs.writeFileSync(
+      legacyFile,
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-survives-crash" }),
+      {
+        mode: 0o600,
+      },
+    );
 
     // --- Process A: stage, then "crash" (we just abandon the env). ---
     {
       const credentials = await importCredentialsModule(home);
       const stagedA = credentials.stageLegacyCredentialsToEnv();
-      expect(stagedA).toEqual(["NVIDIA_API_KEY"]);
-      expect(process.env.NVIDIA_API_KEY).toBe("nvapi-survives-crash");
+      expect(stagedA).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
+      expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-survives-crash");
       // Mid-onboard crash — file MUST still exist.
       expect(fs.existsSync(legacyFile)).toBe(true);
     }
 
     // Wipe env so nothing carries over from "process A" into "process B".
-    delete process.env.NVIDIA_API_KEY;
+    delete process.env.NVIDIA_INFERENCE_API_KEY;
 
     // --- Process B: fresh start, re-stage idempotently, then succeed. ---
     {
       const credentials = await importCredentialsModule(home);
       const stagedB = credentials.stageLegacyCredentialsToEnv();
-      expect(stagedB).toEqual(["NVIDIA_API_KEY"]);
-      expect(process.env.NVIDIA_API_KEY).toBe("nvapi-survives-crash");
+      expect(stagedB).toEqual(["NVIDIA_INFERENCE_API_KEY"]);
+      expect(process.env.NVIDIA_INFERENCE_API_KEY).toBe("nvapi-survives-crash");
       credentials.removeLegacyCredentialsFile();
       expect(fs.existsSync(legacyFile)).toBe(false);
     }
@@ -392,7 +434,7 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
     const credsDir = path.join(home, ".nemoclaw");
     const legacyFile = path.join(credsDir, "credentials.json");
     fs.mkdirSync(credsDir, { recursive: true });
-    const cleartext = JSON.stringify({ NVIDIA_API_KEY: "nvapi-secret-payload" });
+    const cleartext = JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "nvapi-TEST-NOT-A-REAL-PAYLOAD" });
     fs.writeFileSync(legacyFile, cleartext, { mode: 0o600 });
 
     // Capture the pre-unlink content via a wrapper that intercepts the unlink
@@ -453,8 +495,8 @@ describe("legacy credentials.json migration (two-phase: stage then remove)", () 
   });
 });
 
-describe("removeLegacyCredentialsFileIfEmpty (post-upgrade cleanup, #3105)", () => {
-  it("removes an empty {} legacy file (regression #3105)", async () => {
+describe("removeLegacyCredentialsFileIfEmpty post-upgrade cleanup (#3105)", () => {
+  it("removes an empty legacy file containing {} (#3105)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-creds-"));
     const credsDir = path.join(home, ".nemoclaw");
     const legacyFile = path.join(credsDir, "credentials.json");
@@ -471,11 +513,9 @@ describe("removeLegacyCredentialsFileIfEmpty (post-upgrade cleanup, #3105)", () 
     const credsDir = path.join(home, ".nemoclaw");
     const legacyFile = path.join(credsDir, "credentials.json");
     fs.mkdirSync(credsDir, { recursive: true });
-    fs.writeFileSync(
-      legacyFile,
-      JSON.stringify({ FOO: "bar", PATH: "/etc/passwd" }),
-      { mode: 0o600 },
-    );
+    fs.writeFileSync(legacyFile, JSON.stringify({ FOO: "bar", PATH: "/etc/passwd" }), {
+      mode: 0o600,
+    });
 
     const credentials = await importCredentialsModule(home);
     expect(credentials.removeLegacyCredentialsFileIfEmpty()).toBe(true);
@@ -489,7 +529,7 @@ describe("removeLegacyCredentialsFileIfEmpty (post-upgrade cleanup, #3105)", () 
     fs.mkdirSync(credsDir, { recursive: true });
     fs.writeFileSync(
       legacyFile,
-      JSON.stringify({ NVIDIA_API_KEY: "", OPENAI_API_KEY: "   \r\n\t  " }),
+      JSON.stringify({ NVIDIA_INFERENCE_API_KEY: "", OPENAI_API_KEY: "   \r\n\t  " }),
       { mode: 0o600 },
     );
 
@@ -503,7 +543,10 @@ describe("removeLegacyCredentialsFileIfEmpty (post-upgrade cleanup, #3105)", () 
     const credsDir = path.join(home, ".nemoclaw");
     const legacyFile = path.join(credsDir, "credentials.json");
     fs.mkdirSync(credsDir, { recursive: true });
-    const payload = JSON.stringify({ NVIDIA_API_KEY: "nvapi-real-secret", FOO: "bar" });
+    const payload = JSON.stringify({
+      NVIDIA_INFERENCE_API_KEY: "nvapi-TEST-NOT-A-REAL-SECRET",
+      FOO: "bar",
+    });
     fs.writeFileSync(legacyFile, payload, { mode: 0o600 });
 
     const credentials = await importCredentialsModule(home);
@@ -644,9 +687,10 @@ describe("prompt machinery (unchanged)", () => {
       ${JSON.stringify(process.execPath)} -e 'const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "bin", "lib", "credentials"))}); (async()=>{ await prompt("first: "); await prompt("second: "); })().catch(err=>{ console.error(err); process.exit(1); });' < "$pipe"
     `;
 
-    const result = spawnSync("bash", ["--noprofile", "--norc", "-c", script], {
+    const result = spawnSync("bash", ["--noprofile", "--norc"], {
       cwd: path.join(import.meta.dirname, ".."),
       encoding: "utf-8",
+      input: script,
       timeout: 5000,
     });
 
@@ -655,7 +699,8 @@ describe("prompt machinery (unchanged)", () => {
 
   it("settles the outer prompt promise on secret prompt errors", () => {
     const script = `
-const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
+const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+const { isAnyPromptActive } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "core", "prompt-activity.ts"))});
 process.stdin.isTTY = true;
 process.stderr.isTTY = true;
 process.stdin.ref = () => process.stdin;
@@ -664,7 +709,10 @@ process.stdin.unref = () => process.stdin;
 process.stdin.setRawMode = () => { throw new Error('raw mode unavailable'); };
 prompt('secret: ', { secret: true })
   .then(() => { console.error('unexpected resolve'); process.exit(1); })
-  .catch((err) => { console.log('REJECTED=' + err.message); });
+  .catch((err) => {
+    console.log('REJECTED=' + err.message);
+    console.log('PROMPT_ACTIVE=' + String(isAnyPromptActive()));
+  });
 `;
     const result = spawnSync(process.execPath, ["-e", script], {
       encoding: "utf-8",
@@ -672,6 +720,36 @@ prompt('secret: ', { secret: true })
     });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("REJECTED=raw mode unavailable");
+    expect(result.stdout).toContain("PROMPT_ACTIVE=false");
+  });
+
+  it("releases secret prompt activity when stdin closes before an answer (#6651)", () => {
+    const script = `
+const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+const { isAnyPromptActive } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "core", "prompt-activity.ts"))});
+process.stdin.isTTY = true;
+process.stderr.isTTY = true;
+process.stdin.ref = () => process.stdin;
+process.stdin.resume = () => process.stdin;
+process.stdin.pause = () => process.stdin;
+process.stdin.unref = () => process.stdin;
+process.stdin.setRawMode = () => process.stdin;
+const pending = prompt('secret: ', { secret: true });
+setImmediate(() => process.stdin.emit('close'));
+pending
+  .then(() => { console.error('unexpected resolve'); process.exit(1); })
+  .catch((err) => {
+    console.log('REJECTED_CODE=' + String(err.code));
+    console.log('PROMPT_ACTIVE=' + String(isAnyPromptActive()));
+  });
+`;
+    const result = spawnSync(process.execPath, ["-e", script], {
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("REJECTED_CODE=EOF");
+    expect(result.stdout).toContain("PROMPT_ACTIVE=false");
   });
 
   it("classifies secret credential prompts as navigation or credential intent", async () => {
@@ -681,25 +759,25 @@ prompt('secret: ', { secret: true })
     await expect(
       credentials.readCredentialPrompt("secret: ", async () => "  back \r\n"),
     ).resolves.toEqual({ kind: "back" });
-    await expect(
-      credentials.readCredentialPrompt("secret: ", async () => "QUIT"),
-    ).resolves.toEqual({ kind: "exit" });
-    await expect(
-      credentials.readCredentialPrompt("secret: ", async () => "?"),
-    ).resolves.toEqual({ kind: "help" });
+    await expect(credentials.readCredentialPrompt("secret: ", async () => "QUIT")).resolves.toEqual(
+      { kind: "exit" },
+    );
+    await expect(credentials.readCredentialPrompt("secret: ", async () => "?")).resolves.toEqual({
+      kind: "help",
+    });
     await expect(
       credentials.readCredentialPrompt("secret: ", async () => " help "),
     ).resolves.toEqual({ kind: "help" });
     await expect(
-      credentials.readCredentialPrompt("secret: ", async () => " sk-real-key "),
-    ).resolves.toEqual({ kind: "credential", value: "sk-real-key" });
+      credentials.readCredentialPrompt("secret: ", async () => " sk-TEST-NOT-A-REAL-KEY "),
+    ).resolves.toEqual({ kind: "credential", value: "sk-TEST-NOT-A-REAL-KEY" });
   });
 
   it("re-prompts shared credential prompts after help input", () => {
     const script = `
-const credentials = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
-const { createCredentialPromptHelpers } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "onboard", "credential-navigation.js"))});
-const answers = ["help", "sk-real-key"];
+const credentials = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+const { createCredentialPromptHelpers } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "onboard", "credential-navigation.ts"))});
+const answers = ["help", "sk-TEST-NOT-A-REAL-KEY"];
 const logs = [];
 credentials.prompt = async () => answers.shift() || "";
 const originalLog = console.log;
@@ -719,7 +797,7 @@ createCredentialPromptHelpers(() => { throw new Error("unexpected exit"); }).rea
     expect(result.status).toBe(0);
     const payload = JSON.parse(String(result.stdout).trim());
     expect(payload).toEqual({
-      value: "sk-real-key",
+      value: "sk-TEST-NOT-A-REAL-KEY",
       logs: ["  Type back to choose a different provider, or exit to quit."],
       remaining: 0,
     });
@@ -743,7 +821,7 @@ createCredentialPromptHelpers(() => { throw new Error("unexpected exit"); }).rea
     const stdinUnref = vi.spyOn(process.stdin, "unref").mockImplementation(() => process.stdin);
 
     try {
-      const credentials = await import("../dist/lib/credentials/store.js");
+      const credentials = await import("../src/lib/credentials/store.js");
       const pending = credentials.prompt("question: ");
       rl.emit("SIGINT");
       await expect(pending).rejects.toMatchObject({
@@ -761,15 +839,89 @@ createCredentialPromptHelpers(() => { throw new Error("unexpected exit"); }).rea
     }
   });
 
+  it("rejects standard readline prompts as cancellation when stdin closes before an answer (#5976)", async () => {
+    const readline = require("node:readline") as typeof import("node:readline");
+    const rl = new EventEmitter() as EventEmitter & {
+      close: ReturnType<typeof vi.fn>;
+      question: ReturnType<typeof vi.fn>;
+    };
+    rl.close = vi.fn();
+    rl.question = vi.fn();
+
+    const createInterfaceSpy = vi.spyOn(readline, "createInterface").mockReturnValue(rl as any);
+    const stdinRef = vi.spyOn(process.stdin, "ref").mockImplementation(() => process.stdin);
+    const stdinPause = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+    const stdinUnref = vi.spyOn(process.stdin, "unref").mockImplementation(() => process.stdin);
+
+    try {
+      const credentials = await import("../src/lib/credentials/store.js");
+      const pending = credentials.prompt("question: ");
+      // Simulate stdin EOF (e.g. `< /dev/null`): readline closes without ever
+      // invoking the question callback.
+      rl.emit("close");
+      await expect(pending).rejects.toMatchObject({ code: "EOF" });
+      expect(rl.close).toHaveBeenCalled();
+    } finally {
+      createInterfaceSpy.mockRestore();
+      stdinRef.mockRestore();
+      stdinPause.mockRestore();
+      stdinUnref.mockRestore();
+    }
+  });
+
+  it("registers prompt activity while a readline prompt awaits input so heartbeats hold (#6651)", async () => {
+    const readline = require("node:readline") as typeof import("node:readline");
+    const rl = new EventEmitter() as EventEmitter & {
+      close: ReturnType<typeof vi.fn>;
+      question: ReturnType<typeof vi.fn>;
+    };
+    rl.close = vi.fn();
+    const questionCallbacks: Array<(answer: string) => void> = [];
+    rl.question = vi.fn((_question: string, callback: (answer: string) => void) => {
+      questionCallbacks.push(callback);
+    });
+
+    const createInterfaceSpy = vi.spyOn(readline, "createInterface").mockReturnValue(rl as any);
+    const stdinRef = vi.spyOn(process.stdin, "ref").mockImplementation(() => process.stdin);
+    const stdinPause = vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+    const stdinUnref = vi.spyOn(process.stdin, "unref").mockImplementation(() => process.stdin);
+
+    try {
+      const credentials = await import("../src/lib/credentials/store.js");
+      const promptActivity = await import("../src/lib/core/prompt-activity.js");
+      expect(promptActivity.isAnyPromptActive()).toBe(false);
+
+      const pending = credentials.prompt("question: ");
+      expect(promptActivity.isAnyPromptActive()).toBe(true);
+
+      questionCallbacks[0]?.("answer");
+      await expect(pending).resolves.toBe("answer");
+      expect(promptActivity.isAnyPromptActive()).toBe(false);
+
+      // The cancellation path must release the registry too, or one aborted
+      // prompt would silence heartbeats for the rest of onboarding.
+      const cancelled = credentials.prompt("question: ");
+      expect(promptActivity.isAnyPromptActive()).toBe(true);
+      rl.emit("close");
+      await expect(cancelled).rejects.toMatchObject({ code: "EOF" });
+      expect(promptActivity.isAnyPromptActive()).toBe(false);
+    } finally {
+      createInterfaceSpy.mockRestore();
+      stdinRef.mockRestore();
+      stdinPause.mockRestore();
+      stdinUnref.mockRestore();
+    }
+  });
+
   it("normalizes credential values and keeps prompting on invalid NVIDIA API key prefixes", async () => {
     const credentials = await importCredentialsModule("/tmp");
     expect(credentials.normalizeCredentialValue("  nvapi-good-key\r\n")).toBe("nvapi-good-key");
 
     const script = `
-const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
-delete process.env.NVIDIA_API_KEY;
+const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+delete process.env.NVIDIA_INFERENCE_API_KEY;
 ensureApiKey()
-  .then(() => console.log('STAGED=' + process.env.NVIDIA_API_KEY))
+  .then(() => console.log('STAGED=' + process.env.NVIDIA_INFERENCE_API_KEY))
   .catch((err) => { console.error(err && err.stack ? err.stack : String(err)); process.exit(1); });
 `;
     const scriptFile = path.join(os.tmpdir(), `nemoclaw-ensure-api-key-${process.pid}.js`);
@@ -784,9 +936,10 @@ ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptFile)} < "$pipe"
 `;
     let result: ReturnType<typeof spawnSync>;
     try {
-      result = spawnSync("bash", ["--noprofile", "--norc", "-c", bash], {
+      result = spawnSync("bash", ["--noprofile", "--norc"], {
         encoding: "utf-8",
-        env: { ...process.env, NVIDIA_API_KEY: "" },
+        env: { ...process.env, NVIDIA_INFERENCE_API_KEY: "" },
+        input: bash,
         timeout: 5000,
       });
     } finally {
@@ -805,16 +958,16 @@ ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptFile)} < "$pipe"
 
   it("returns navigation from the NVIDIA API key prompt without staging it", () => {
     const script = `
-const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
-delete process.env.NVIDIA_API_KEY;
+const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+delete process.env.NVIDIA_INFERENCE_API_KEY;
 ensureApiKey()
-  .then((result) => console.log(JSON.stringify({ result, key: process.env.NVIDIA_API_KEY || null })))
+  .then((result) => console.log(JSON.stringify({ result, key: process.env.NVIDIA_INFERENCE_API_KEY || null })))
   .catch((err) => { console.error(err && err.stack ? err.stack : String(err)); process.exit(1); });
 `;
     const result = spawnSync(process.execPath, ["-e", script], {
       encoding: "utf-8",
       input: "back\n",
-      env: { ...process.env, NVIDIA_API_KEY: "" },
+      env: { ...process.env, NVIDIA_INFERENCE_API_KEY: "" },
       timeout: 5000,
     });
 
@@ -825,16 +978,16 @@ ensureApiKey()
 
   it("returns exit from the NVIDIA API key prompt without staging it", () => {
     const script = `
-const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
-delete process.env.NVIDIA_API_KEY;
+const { ensureApiKey } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
+delete process.env.NVIDIA_INFERENCE_API_KEY;
 ensureApiKey()
-  .then((result) => console.log(JSON.stringify({ result, key: process.env.NVIDIA_API_KEY || null })))
+  .then((result) => console.log(JSON.stringify({ result, key: process.env.NVIDIA_INFERENCE_API_KEY || null })))
   .catch((err) => { console.error(err && err.stack ? err.stack : String(err)); process.exit(1); });
 `;
     const result = spawnSync(process.execPath, ["-e", script], {
       encoding: "utf-8",
       input: "exit\n",
-      env: { ...process.env, NVIDIA_API_KEY: "" },
+      env: { ...process.env, NVIDIA_INFERENCE_API_KEY: "" },
       timeout: 5000,
     });
 
@@ -845,7 +998,7 @@ ensureApiKey()
 
   it("normal and secret prompts re-ref, cleanup stdin, and preserve masked input", () => {
     const script = `
-const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "dist", "lib", "credentials", "store.js"))});
+const { prompt } = require(${JSON.stringify(path.join(import.meta.dirname, "..", "src", "lib", "credentials", "store.ts"))});
 const counts = { ref: 0, resume: 0, pause: 0, unref: 0, raw: [] };
 process.stdin.ref = () => { counts.ref += 1; return process.stdin; };
 process.stdin.resume = () => { counts.resume += 1; return process.stdin; };

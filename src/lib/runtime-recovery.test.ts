@@ -3,13 +3,62 @@
 
 import { describe, expect, it } from "vitest";
 
-// Import from compiled dist/ for correct coverage attribution.
+// Import source directly so tests cannot pass against a stale build.
 import {
+  parseLiveSandboxEntries,
   parseLiveSandboxNames,
   parseReadySandboxNames,
-} from "../../dist/lib/runtime-recovery";
+} from "./runtime-recovery";
 
 describe("runtime recovery helpers", () => {
+  it("parses name + live PHASE pairs regardless of column layout (#5714)", () => {
+    // Trailing-phase (real `NAME CREATED PHASE`), header skipped, and a compact
+    // age-suffixed layout (`NAME PHASE 2m ago`) must all yield the phase.
+    expect(
+      parseLiveSandboxEntries(
+        [
+          "NAME              CREATED              PHASE",
+          "dcode-station     2026-06-25 09:40:49  Ready",
+          "beta              2026-06-25 10:01:00  Provisioning",
+          "gamma             Error                2m ago",
+          "compact           Running",
+        ].join("\n"),
+      ),
+    ).toEqual([
+      { name: "dcode-station", phase: "Ready" },
+      { name: "beta", phase: "Provisioning" },
+      { name: "gamma", phase: "Error" },
+      { name: "compact", phase: "Running" },
+    ]);
+  });
+
+  it("preserves terminal/transient phases, not just ready/running (#5714)", () => {
+    expect(
+      parseLiveSandboxEntries(
+        [
+          "alpha   2026-06-25 09:40:49  Failed",
+          "beta    2026-06-25 09:41:00  CrashLoopBackOff",
+          "gamma   2026-06-25 09:42:00  Creating",
+          "delta   2026-06-25 09:43:00  Evicted",
+        ].join("\n"),
+      ),
+    ).toEqual([
+      { name: "alpha", phase: "Failed" },
+      { name: "beta", phase: "CrashLoopBackOff" },
+      { name: "gamma", phase: "Creating" },
+      { name: "delta", phase: "Evicted" },
+    ]);
+  });
+
+  it("returns a null phase when no known phase token is present", () => {
+    expect(parseLiveSandboxEntries("solo")).toEqual([{ name: "solo", phase: null }]);
+  });
+
+  it("skips headers and error lines when parsing live entries", () => {
+    expect(parseLiveSandboxEntries("No sandboxes found.")).toEqual([]);
+    expect(parseLiveSandboxEntries("Error: boom")).toEqual([]);
+  });
+
   it("parses live sandbox names from openshell sandbox list output", () => {
     expect(
       Array.from(
@@ -59,20 +108,22 @@ describe("runtime recovery helpers", () => {
   });
 
   describe("parseReadySandboxNames", () => {
-    it("includes only sandboxes whose PHASE is Ready", () => {
+    it("includes sandboxes whose PHASE is Ready or Running", () => {
       expect(
         Array.from(
           parseReadySandboxNames(
             [
               "NAME              NAMESPACE  CREATED              PHASE",
               "alpha             openshell  2026-03-24 10:00:00  Ready",
+              "epsilon           openshell  2026-03-24 10:00:30  Running",
               "beta              openshell  2026-03-24 10:01:00  Provisioning",
               "gamma             openshell  2026-03-24 10:02:00  Error",
               "delta             openshell  2026-03-24 10:03:00  Ready",
+              "zeta              openshell  2026-03-24 10:04:00  NotReady",
             ].join("\n"),
           ),
         ),
-      ).toEqual(["alpha", "delta"]);
+      ).toEqual(["alpha", "epsilon", "delta"]);
     });
 
     it("skips sandboxes that report Error PHASE (stopped container)", () => {
@@ -82,6 +133,20 @@ describe("runtime recovery helpers", () => {
             [
               "NAME              NAMESPACE  CREATED              PHASE",
               "stopped-one       openshell  2026-03-24 10:00:00  Error",
+            ].join("\n"),
+          ),
+        ),
+      ).toEqual([]);
+    });
+
+    it("does not treat Ready or Running tokens outside the PHASE column as live", () => {
+      expect(
+        Array.from(
+          parseReadySandboxNames(
+            [
+              "NAME              NAMESPACE  CREATED              PHASE",
+              "alpha             Ready      2026-03-24 10:00:00  Provisioning",
+              "beta              Running    2026-03-24 10:01:00  Error",
             ].join("\n"),
           ),
         ),

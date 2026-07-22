@@ -7,11 +7,20 @@ import {
   createSession,
   filterSafeUpdates,
   normalizeSession,
-  sanitizeFailure,
   type Session,
   type SessionUpdates,
+  sanitizeFailure,
 } from "../../state/onboard-session";
+import type { StepMutationOptions } from "../../state/onboard-step-mutation";
 import type { OnboardMachineEvent } from "./events";
+import {
+  advanceTo,
+  branchTo,
+  completeOnboardMachine,
+  failOnboardMachine,
+  pauseOnboardMachine,
+  retryTo,
+} from "./result";
 import { OnboardRuntime, type OnboardRuntimeDeps } from "./runtime";
 import { InvalidOnboardMachineTransitionError } from "./transitions";
 
@@ -22,6 +31,7 @@ function cloneSession(session: Session): Session {
 function createHarness(initialSession: Session | null = createSession()) {
   let session = initialSession ? cloneSession(initialSession) : null;
   const events: OnboardMachineEvent[] = [];
+  const stepOptionCalls: Array<{ method: string; options: StepMutationOptions | undefined }> = [];
   let tick = 0;
   const updateSession = (mutator: (value: Session) => Session | void): Session => {
     const current = session ? cloneSession(session) : createSession();
@@ -37,16 +47,29 @@ function createHarness(initialSession: Session | null = createSession()) {
       return cloneSession(session);
     },
     updateSession,
-    markStepStarted: (stepName) =>
-      updateSession((current) => {
+    markStepStarted: (stepName, options) => {
+      stepOptionCalls.push({ method: "markStepStarted", options });
+      return updateSession((current) => {
         const step = current.steps[stepName];
         if (!step) return current;
         step.status = "in_progress";
         current.lastStepStarted = stepName;
         current.status = "in_progress";
         return current;
-      }),
-    markStepComplete: (stepName, updates: SessionUpdates = {}) =>
+      });
+    },
+    markStepComplete: (stepName, updates: SessionUpdates = {}, options) => {
+      stepOptionCalls.push({ method: "markStepComplete", options });
+      return updateSession((current) => {
+        const step = current.steps[stepName];
+        if (!step) return current;
+        step.status = "complete";
+        current.lastCompletedStep = stepName;
+        Object.assign(current, filterSafeUpdates(updates));
+        return current;
+      });
+    },
+    markStepCompleteRecordOnly: (stepName, updates: SessionUpdates = {}) =>
       updateSession((current) => {
         const step = current.steps[stepName];
         if (!step) return current;
@@ -62,13 +85,23 @@ function createHarness(initialSession: Session | null = createSession()) {
         step.status = "skipped";
         return current;
       }),
-    markStepFailed: (stepName, message) =>
-      updateSession((current) => {
+    markStepFailed: (stepName, message, options) => {
+      stepOptionCalls.push({ method: "markStepFailed", options });
+      return updateSession((current) => {
         const step = current.steps[stepName];
         if (!step) return current;
         step.status = "failed";
         current.status = "failed";
         current.failure = sanitizeFailure({ step: stepName, message, recordedAt: "now" });
+        return current;
+      });
+    },
+    markStepFailedRecordOnly: (stepName, message) =>
+      updateSession((current) => {
+        const step = current.steps[stepName];
+        if (!step) return current;
+        step.status = "failed";
+        step.error = message ?? null;
         return current;
       }),
     completeSession: (updates: SessionUpdates = {}) =>
@@ -85,6 +118,7 @@ function createHarness(initialSession: Session | null = createSession()) {
   return {
     runtime: new OnboardRuntime(deps),
     events,
+    stepOptionCalls,
     getSession: () => {
       if (!session) throw new Error("Expected runtime session");
       return cloneSession(session);
@@ -116,6 +150,43 @@ describe("OnboardRuntime", () => {
     expect(events[1]).toMatchObject({ type: "onboard.resumed", state: "init" });
   });
 
+  it("defaults step recording dependencies to record-only machine mutations", async () => {
+    const { runtime, stepOptionCalls } = createHarness();
+
+    await runtime.markStepStarted("preflight");
+    await runtime.markStepComplete("preflight", { sandboxName: "my-assistant" });
+    await runtime.markStepFailed("gateway", "boom");
+
+    expect(stepOptionCalls).toEqual([
+      { method: "markStepStarted", options: { updateMachine: false } },
+      { method: "markStepComplete", options: { updateMachine: false } },
+      { method: "markStepFailed", options: { updateMachine: false } },
+    ]);
+  });
+
+  it("forwards step mutation options to step recording dependencies", async () => {
+    const { runtime, getSession, stepOptionCalls } = createHarness();
+    const recordOnlyOptions = { updateMachine: false };
+
+    await runtime.markStepStarted("preflight", recordOnlyOptions);
+    await runtime.markStepComplete("preflight", { sandboxName: "my-assistant" }, recordOnlyOptions);
+    await runtime.markStepFailed("gateway", "boom", recordOnlyOptions);
+
+    expect(stepOptionCalls).toEqual([
+      { method: "markStepStarted", options: recordOnlyOptions },
+      { method: "markStepComplete", options: recordOnlyOptions },
+      { method: "markStepFailed", options: recordOnlyOptions },
+    ]);
+    expect(getSession()).toMatchObject({
+      sandboxName: "my-assistant",
+      status: "failed",
+      steps: {
+        preflight: { status: "complete" },
+        gateway: { status: "failed" },
+      },
+    });
+  });
+
   it("validates and persists explicit transitions", async () => {
     const { runtime, events, getSession } = createHarness();
 
@@ -143,14 +214,14 @@ describe("OnboardRuntime", () => {
     await runtime.updateContext({
       provider: "nvidia-prod",
       endpointUrl: "https://alice:secret@example.com/v1?token=super-secret&keep=yes#token=frag",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
       apiKey: "super-secret",
     } as Parameters<typeof runtime.updateContext>[0] & { apiKey: string });
 
     expect(getSession()).toMatchObject({
       provider: "nvidia-prod",
       endpointUrl: "https://example.com/v1?token=%3CREDACTED%3E&keep=yes",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     });
     expect("apiKey" in getSession()).toBe(false);
     expect(events).toHaveLength(1);
@@ -159,14 +230,122 @@ describe("OnboardRuntime", () => {
     expect(JSON.stringify(events)).not.toContain("super-secret");
   });
 
+  it("applies explicit advance results through validated runtime transitions", async () => {
+    const { runtime, events, getSession } = createHarness();
+
+    await runtime.applyResult(
+      advanceTo("preflight", {
+        updates: { sandboxName: "my-assistant" },
+        metadata: { source: "handler" },
+      }),
+    );
+
+    expect(getSession()).toMatchObject({
+      sandboxName: "my-assistant",
+      machine: { state: "preflight", revision: 1 },
+    });
+    expect(events.map((event) => event.type)).toEqual([
+      "context.updated",
+      "state.exited",
+      "state.entered",
+    ]);
+    expect(events[0].metadata).toMatchObject({ fields: ["sandboxName"], source: "handler" });
+    expect(events[1]).toMatchObject({ state: "init", metadata: { source: "handler" } });
+    expect(events[2]).toMatchObject({ state: "preflight", metadata: { source: "handler" } });
+  });
+
+  it("applies explicit retry, branch, completion, and failure results", async () => {
+    const retryHarness = createHarness(sessionInState("inference"));
+    await retryHarness.runtime.applyResult(retryTo("provider_selection"));
+    expect(retryHarness.getSession().machine).toMatchObject({ state: "provider_selection" });
+
+    const branchHarness = createHarness(sessionInState("sandbox"));
+    await branchHarness.runtime.applyResult(branchTo("agent_setup"));
+    expect(branchHarness.getSession().machine).toMatchObject({ state: "agent_setup" });
+
+    const completeHarness = createHarness(sessionInState("post_verify"));
+    await completeHarness.runtime.applyResult(
+      completeOnboardMachine({ sandboxName: "done" }, { source: "finalizer" }),
+    );
+    expect(completeHarness.getSession()).toMatchObject({
+      status: "complete",
+      sandboxName: "done",
+      machine: { state: "complete" },
+    });
+    expect(completeHarness.events.map((event) => event.type)).toEqual([
+      "context.updated",
+      "state.completed",
+      "state.entered",
+      "onboard.completed",
+    ]);
+    expect(completeHarness.events[0].metadata).toMatchObject({
+      fields: ["sandboxName"],
+      source: "finalizer",
+    });
+    expect(completeHarness.events[1]).toMatchObject({
+      state: "post_verify",
+      metadata: { source: "finalizer" },
+    });
+    expect(completeHarness.events[2]).toMatchObject({
+      state: "complete",
+      metadata: { source: "finalizer" },
+    });
+    expect(completeHarness.events[3]).toMatchObject({
+      state: "complete",
+      metadata: { source: "finalizer" },
+    });
+
+    const failedHarness = createHarness(sessionInState("gateway"));
+    await failedHarness.runtime.applyResult(failOnboardMachine("boom", { step: "gateway" }));
+    expect(failedHarness.getSession()).toMatchObject({
+      status: "failed",
+      failure: { step: "gateway", message: "boom" },
+      machine: { state: "failed" },
+    });
+  });
+
+  it("persists safe context while leaving a paused non-terminal session retryable", async () => {
+    const harness = createHarness(sessionInState("post_verify"));
+
+    await harness.runtime.applyResult(
+      pauseOnboardMachine(
+        { sandboxName: "my-assistant", provider: "compatible-endpoint" },
+        { reason: "deployment_not_ready" },
+      ),
+    );
+
+    expect(harness.getSession()).toMatchObject({
+      status: "in_progress",
+      resumable: true,
+      sandboxName: "my-assistant",
+      provider: "compatible-endpoint",
+      machine: { state: "post_verify", revision: 7 },
+    });
+    expect(harness.events).toHaveLength(1);
+    expect(harness.events[0]).toMatchObject({
+      type: "context.updated",
+      state: "post_verify",
+      metadata: { reason: "deployment_not_ready" },
+    });
+  });
+
+  it("rejects invalid explicit transition kinds before mutating context", async () => {
+    const { runtime, getSession } = createHarness(sessionInState("inference"));
+
+    await expect(
+      runtime.applyResult(advanceTo("provider_selection", { updates: { sandboxName: "mutated" } })),
+    ).rejects.toThrow("expected advance, got retry");
+    expect(getSession()).toMatchObject({ sandboxName: null, machine: { state: "inference" } });
+  });
+
   it("fails non-terminal sessions with redacted failure events", async () => {
     const { runtime, events, getSession } = createHarness(sessionInState("gateway"));
 
-    await runtime.fail("NVIDIA_API_KEY=super-secret", { step: "gateway" });
+    await runtime.fail("NVIDIA_INFERENCE_API_KEY=super-secret", { step: "gateway" });
 
     expect(getSession()).toMatchObject({
       status: "failed",
-      failure: { step: "gateway", message: "NVIDIA_API_KEY=<REDACTED>" },
+      failure: { step: "gateway", message: "NVIDIA_INFERENCE_API_KEY=<REDACTED>" },
       machine: { state: "failed", revision: 8 },
     });
     expect(events.map((event) => event.type)).toEqual(["state.failed", "onboard.failed"]);
@@ -178,6 +357,9 @@ describe("OnboardRuntime", () => {
   it("rejects terminal-state failure and invalid completion transitions", async () => {
     const completeHarness = createHarness(sessionInState("complete"));
     await expect(completeHarness.runtime.fail("boom")).rejects.toThrow("complete -> failed");
+    await expect(completeHarness.runtime.applyResult(pauseOnboardMachine())).rejects.toThrow(
+      "Cannot pause terminal onboarding state: complete",
+    );
     expect(completeHarness.getSession().machine.state).toBe("complete");
 
     const policiesHarness = createHarness(sessionInState("policies"));
@@ -207,6 +389,23 @@ describe("OnboardRuntime", () => {
     ]);
     expect(events[0]).toMatchObject({ state: "finalizing" });
     expect(events[1]).toMatchObject({ state: "post_verify" });
+  });
+
+  it("emits redacted resume conflict events without mutating durable state", async () => {
+    const { runtime, events, getSession } = createHarness(sessionInState("provider_selection"));
+
+    await runtime.emitResumeConflict({
+      field: "provider",
+      recorded: "nvidia",
+      requested: "https://alice:secret@example.com/v1?token=super-secret",
+    });
+
+    expect(getSession().machine.state).toBe("provider_selection");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "resume.conflict", state: "provider_selection" });
+    expect(events[0].metadata.field).toBe("provider");
+    expect(JSON.stringify(events)).not.toContain("super-secret");
+    expect(JSON.stringify(events)).not.toContain("alice:secret");
   });
 
   it("emits skipped and repair events without mutating durable state", async () => {

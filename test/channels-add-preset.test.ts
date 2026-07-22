@@ -1,674 +1,839 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-//
-// Regression test for #3437 — `nemoclaw <sandbox> channels add <channel>`
-// must apply the channel's matching network policy preset BEFORE triggering
-// the rebuild, so the rebuild's backup manifest captures the preset and
-// the bridge has egress to its upstream API after the new sandbox boots.
 
-import assert from "node:assert/strict";
-import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+import { addSandboxChannel, removeSandboxChannel } from "../src/lib/actions/sandbox/policy-channel";
+import { policyChannelDependencies } from "../src/lib/actions/sandbox/policy-channel-dependencies";
+import * as processRecovery from "../src/lib/actions/sandbox/process-recovery";
+import * as httpProbe from "../src/lib/adapters/http/probe";
+import * as runtime from "../src/lib/adapters/openshell/runtime";
+import * as store from "../src/lib/credentials/store";
+import * as gatewayRuntime from "../src/lib/gateway-runtime-action";
+import { MessagingWorkflowPlanner, type SandboxMessagingPlan } from "../src/lib/messaging";
+import {
+  getMessagingChannelConfigEnvKeys,
+  MESSAGING_CHANNEL_CONFIG_ENV_KEYS,
+} from "../src/lib/messaging-channel-config";
+import * as policies from "../src/lib/policy";
+import { getChannelTokenKeys, knownChannelNames, listChannels } from "../src/lib/sandbox/channels";
+import * as onboardSession from "../src/lib/state/onboard-session";
+import type { SandboxEntry } from "../src/lib/state/registry";
+import * as registry from "../src/lib/state/registry";
 
-const repoRoot = path.join(import.meta.dirname, "..");
-
-function runScript(scriptBody: string, extraEnv: Record<string, string> = {}): SpawnSyncReturns<string> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-3437-"));
-  const scriptPath = path.join(tmpDir, "script.js");
-  fs.writeFileSync(scriptPath, scriptBody);
-  const result = spawnSync(process.execPath, [scriptPath], {
-    cwd: repoRoot,
-    encoding: "utf-8",
-    env: {
-      ...process.env,
-      HOME: tmpDir,
-      NEMOCLAW_NON_INTERACTIVE: "1",
-      TELEGRAM_BOT_TOKEN: "test-telegram-token",
-      SLACK_BOT_TOKEN: "slack-bot-token-for-test",
-      SLACK_APP_TOKEN: "slack-app-token-for-test",
-      DISCORD_BOT_TOKEN: "test-discord-token",
-      ...extraEnv,
-    },
-    timeout: 15000,
-  });
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  return result;
+class ExitError extends Error {
+  constructor(public readonly code: number | undefined) {
+    super(`process.exit(${code})`);
+  }
 }
 
-// Build a preamble that:
-//   - stubs every module touched by addSandboxChannel so no real openshell,
-//     gateway, or filesystem credential write happens
-//   - records every policies.applyPreset call in `appliedCalls`
-//   - records the relative order of applyPreset vs promptAndRebuild via
-//     a console.log marker, so the test can assert the ordering invariant
-//     (apply MUST precede rebuild)
-function buildPreamble({
-  presetNamesAvailable = ["telegram", "slack", "discord", "npm", "github"],
-  applyPresetResult = true,
-  appliedPresets = [] as string[],
-  sandboxAgent = "openclaw",
-  sessionSandboxName = "test-sb",
-  sessionPolicyPresets = ["npm", "pypi", "huggingface", "brew"] as string[] | null,
-  sessionLoadThrows = false,
-  sessionUpdateThrows = false,
-  sessionMissing = false,
-}: {
-  presetNamesAvailable?: string[];
-  applyPresetResult?: boolean;
-  appliedPresets?: string[];
-  sandboxAgent?: string;
-  sessionSandboxName?: string | null;
-  sessionPolicyPresets?: string[] | null;
-  sessionLoadThrows?: boolean;
-  sessionUpdateThrows?: boolean;
-  sessionMissing?: boolean;
-} = {}): string {
-  const j = (p: string) => JSON.stringify(path.join(repoRoot, "dist", "lib", p));
-  return String.raw`
-const resolver = require(${j("adapters/openshell/resolve.js")});
-resolver.resolveOpenshell = () => "/fake/openshell";
+type ProbeResult = ReturnType<typeof httpProbe.runCurlProbe>;
 
-const openshellRuntime = require(${j("adapters/openshell/runtime.js")});
-openshellRuntime.runOpenshell = () => ({ status: 0, stdout: "", stderr: "" });
+const TEST_ENV_KEYS = new Set([
+  ...listChannels().flatMap((channel) => getChannelTokenKeys(channel)),
+  ...MESSAGING_CHANNEL_CONFIG_ENV_KEYS.flatMap((key) => getMessagingChannelConfigEnvKeys(key)),
+  "NEMOCLAW_MESSAGING_PLAN_B64",
+  "NEMOCLAW_NON_INTERACTIVE",
+  "NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION",
+  "NEMOCLAW_SKIP_TELEGRAM_REACHABILITY",
+]);
+const originalProcessEnv = { ...process.env };
 
-const processRecovery = require(${j("actions/sandbox/process-recovery.js")});
-processRecovery.executeSandboxExecCommand = () => ({ status: 0, stdout: "NEMOCLAW_CHANNEL_CLEAR_OK", stderr: "" });
-processRecovery.executeSandboxCommand = () => null;
+function makeMessagingPlan(
+  sandboxName: string,
+  channelIds: string[] = [],
+  disabledChannels: string[] = [],
+  agent = "openclaw",
+): SandboxMessagingPlan {
+  const disabled = new Set(disabledChannels);
+  return {
+    schemaVersion: 1,
+    sandboxName,
+    agent: agent as SandboxMessagingPlan["agent"],
+    workflow: "onboard",
+    channels: channelIds.map((channelId) => ({
+      channelId: channelId as SandboxMessagingPlan["channels"][number]["channelId"],
+      displayName: channelId,
+      authMode: channelId === "whatsapp" ? "in-sandbox-qr" : "token-paste",
+      active: !disabled.has(channelId),
+      selected: true,
+      configured: true,
+      disabled: disabled.has(channelId),
+      inputs: [],
+      hooks: [],
+    })),
+    disabledChannels: disabledChannels as SandboxMessagingPlan["disabledChannels"],
+    credentialBindings: [],
+    networkPolicy: { presets: [], entries: [] },
+    agentRender: [],
+    buildSteps: [],
+    stateUpdates: [],
+    healthChecks: [],
+  };
+}
 
-const runner = require(${j("runner.js")});
-runner.run = () => ({ status: 0, stdout: "", stderr: "" });
-runner.runCapture = () => "";
+function makeRegistryEntry(
+  channelIds: string[] = [],
+  disabledChannels: string[] = [],
+  agent = sandboxAgent,
+): SandboxEntry {
+  return {
+    name: "test-sb",
+    agent,
+    ...(channelIds.length > 0
+      ? {
+          messaging: {
+            schemaVersion: 1,
+            plan: makeMessagingPlan("test-sb", channelIds, disabledChannels, agent),
+          },
+        }
+      : {}),
+  } as SandboxEntry;
+}
 
-const gatewayRuntime = require(${j("gateway-runtime-action.js")});
-gatewayRuntime.recoverNamedGatewayRuntime = async () => ({ recovered: true });
+function successfulOpenshellResult(): ReturnType<typeof runtime.runOpenshell> {
+  return {
+    pid: 0,
+    output: [null, "", ""],
+    stdout: "",
+    stderr: "",
+    status: 0,
+    signal: null,
+  };
+}
 
-const credentials = require(${j("credentials/store.js")});
-credentials.getCredential = (key) => process.env[key] || null;
-credentials.saveCredential = () => true;
-credentials.deleteCredential = () => true;
-credentials.prompt = async (msg) => { throw new Error("unexpected prompt: " + msg); };
+function successfulProbe(body = '{"ok":true}'): ProbeResult {
+  return {
+    ok: true,
+    httpStatus: 200,
+    curlStatus: 0,
+    body,
+    stderr: "",
+    message: "",
+  };
+}
 
-const onboard = require(${j("onboard.js")});
-onboard.isNonInteractive = () => true;
+let logSpy: MockInstance;
+let errorSpy: MockInstance;
+let exitSpy: MockInstance;
+let promptSpy: MockInstance;
+let getCredentialSpy: MockInstance;
+let saveCredentialSpy: MockInstance;
+let deleteCredentialSpy: MockInstance;
+let updateSandboxSpy: MockInstance;
+let applyPresetSpy: MockInstance;
+let removePresetSpy: MockInstance;
+let loadPresetForSandboxSpy: MockInstance;
+let providerSpy: MockInstance;
+let rebuildSpy: MockInstance;
+let runOpenshellSpy: MockInstance;
+let curlProbeSpy: MockInstance;
+let execSpy: MockInstance;
+let buildPlanSpy: MockInstance;
 
-const onboardProviders = require(${j("onboard/providers.js")});
-const providerCalls = [];
-onboardProviders.upsertMessagingProviders = (defs) => { providerCalls.push(...defs); };
+let sandboxAgent: string;
+let registryEntry: SandboxEntry;
+let appliedPresets: string[];
+let presetContent: string | null;
+let applyPresetResult: boolean;
+let sessionState: onboardSession.Session | null;
+let sessionUpdateThrows: boolean;
+let sessionUpdates: Array<{ policyPresets: string[] | null }>;
+let callOrder: string[];
+let slackBotProbe: ProbeResult;
+let slackAppProbe: ProbeResult;
+let testConfig: Record<string, unknown>;
+let testLog: string;
+let testHome: string;
 
-const registry = require(${j("state/registry.js")});
-const registryUpdates = [];
-registry.getSandbox = () => ({
-  name: "test-sb",
-  agent: ${JSON.stringify(sandboxAgent)},
-  messagingChannels: [],
-  disabledChannels: [],
-  providerCredentialHashes: {},
+const originalBuildPlan = MessagingWorkflowPlanner.prototype.buildPlan;
+
+function printedText(): string {
+  return [...logSpy.mock.calls, ...errorSpy.mock.calls]
+    .map((call) => call.map(String).join(" "))
+    .join("\n");
+}
+
+async function expectExit(action: () => Promise<void>): Promise<void> {
+  await expect(action()).rejects.toMatchObject({ code: 1 });
+  expect(exitSpy).toHaveBeenCalledWith(1);
+}
+
+function setSession(
+  sandboxName: string | null = "test-sb",
+  policyPresets: string[] | null = ["npm", "pypi", "huggingface", "brew"],
+): void {
+  sessionState = { sandboxName, policyPresets } as onboardSession.Session;
+}
+
+beforeEach(() => {
+  for (const key of TEST_ENV_KEYS) delete process.env[key];
+  testHome = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-channels-add-preset-"));
+  process.env.HOME = testHome;
+  process.env.NEMOCLAW_NON_INTERACTIVE = "1";
+  process.env.NEMOCLAW_SKIP_TELEGRAM_REACHABILITY = "1";
+  process.env.TELEGRAM_BOT_TOKEN = "test-telegram-token";
+  process.env.SLACK_BOT_TOKEN = "xoxb-slack-bot-token-for-test";
+  process.env.SLACK_APP_TOKEN = "xapp-slack-app-token-for-test";
+  process.env.DISCORD_BOT_TOKEN = "test-discord-token";
+
+  sandboxAgent = "openclaw";
+  registryEntry = makeRegistryEntry();
+  appliedPresets = [];
+  presetContent = "network_policies:\n  stub:\n    egress:\n      - host: example.com\n";
+  applyPresetResult = true;
+  setSession();
+  sessionUpdateThrows = false;
+  sessionUpdates = [];
+  callOrder = [];
+  slackBotProbe = successfulProbe();
+  slackAppProbe = successfulProbe('{"ok":true,"url":"wss://wss-primary.slack.com/link"}');
+  testConfig = {};
+  testLog = "";
+
+  logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    const text = args.map(String).join(" ");
+    callOrder.push(
+      ...(text.includes("Effective egress that would be opened") ? ["scopeDisclosure"] : []),
+      ...(text.includes("Change queued") ? ["promptAndRebuild"] : []),
+    );
+  });
+  errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+    throw new ExitError(code);
+  }) as never);
+
+  vi.spyOn(registry, "getSandbox").mockImplementation(() => registryEntry);
+  vi.spyOn(registry, "listSandboxes").mockImplementation(() => ({
+    sandboxes: [registryEntry],
+    defaultSandbox: "test-sb",
+  }));
+  updateSandboxSpy = vi.spyOn(registry, "updateSandbox").mockImplementation(() => {
+    callOrder.push("updateSandbox");
+    return true;
+  });
+
+  loadPresetForSandboxSpy = vi
+    .spyOn(policies, "loadPresetForSandbox")
+    .mockImplementation((sandboxName, presetName) => {
+      callOrder.push(`loadPresetForSandbox:${sandboxName}:${presetName}`);
+      return presetContent;
+    });
+  vi.spyOn(policies, "getPresetContentGatewayState").mockReturnValue("absent");
+  vi.spyOn(policies, "listPresets").mockImplementation(() =>
+    ["telegram", "slack", "discord", "whatsapp", "npm", "github"].map((name) => ({
+      name,
+      file: `${name}.yaml`,
+      description: `${name} test preset`,
+    })),
+  );
+  applyPresetSpy = vi.spyOn(policies, "applyPreset").mockImplementation((name, presetName) => {
+    callOrder.push(`applyPreset:${presetName}`);
+    return applyPresetResult;
+  });
+  removePresetSpy = vi.spyOn(policies, "removePreset").mockImplementation((_name, presetName) => {
+    callOrder.push(`removePreset:${presetName}`);
+    return true;
+  });
+  vi.spyOn(policies, "getAppliedPresets").mockImplementation(() => appliedPresets);
+
+  getCredentialSpy = vi
+    .spyOn(store, "getCredential")
+    .mockImplementation((key) => process.env[key] || null);
+  saveCredentialSpy = vi.spyOn(store, "saveCredential").mockImplementation((key) => {
+    callOrder.push(`saveCredential:${key}`);
+  });
+  deleteCredentialSpy = vi.spyOn(store, "deleteCredential").mockImplementation(() => true);
+  promptSpy = vi.spyOn(store, "prompt").mockImplementation(async () => {
+    callOrder.push("credentialPrompt");
+    return "y";
+  });
+
+  vi.spyOn(onboardSession, "loadSession").mockImplementation(() => sessionState);
+  vi.spyOn(onboardSession, "updateSession").mockImplementation((mutator) => {
+    sessionUpdateThrows
+      ? (() => {
+          throw new Error("simulated save failure");
+        })()
+      : undefined;
+    sessionState ??= { sandboxName: null, policyPresets: null } as onboardSession.Session;
+    const next = mutator(sessionState as onboardSession.Session) || sessionState;
+    sessionState = next as onboardSession.Session;
+    sessionUpdates.push({
+      policyPresets: Array.isArray(sessionState.policyPresets)
+        ? [...sessionState.policyPresets]
+        : sessionState.policyPresets,
+    });
+    return sessionState;
+  });
+
+  providerSpy = vi
+    .spyOn(policyChannelDependencies, "upsertMessagingProviders")
+    .mockImplementation(() => {
+      callOrder.push("upsertMessagingProviders");
+      return [];
+    });
+  rebuildSpy = vi
+    .spyOn(policyChannelDependencies, "rebuildSandbox")
+    .mockImplementation(async () => {
+      callOrder.push("rebuildSandbox");
+    });
+
+  runOpenshellSpy = vi
+    .spyOn(runtime, "runOpenshell")
+    .mockImplementation(() => successfulOpenshellResult());
+  const healthyGatewayState = {
+    state: "healthy_named",
+    status: "",
+    gatewayInfo: "",
+    activeGateway: "nemoclaw",
+  } as const;
+  vi.spyOn(gatewayRuntime, "recoverNamedGatewayRuntime").mockResolvedValue({
+    recovered: true,
+    before: healthyGatewayState,
+    after: healthyGatewayState,
+    attempted: false,
+  });
+
+  curlProbeSpy = vi.spyOn(httpProbe, "runCurlProbe").mockImplementation((argv) => {
+    const url = argv.at(-1);
+    const isBotProbe = url?.includes("auth.test") ?? false;
+    const isAppProbe = url?.includes("apps.connections.open") ?? false;
+    callOrder.push(...(isBotProbe ? ["slackProbe:bot"] : isAppProbe ? ["slackProbe:app"] : []));
+    return isBotProbe ? slackBotProbe : isAppProbe ? slackAppProbe : successfulProbe();
+  });
+
+  execSpy = vi
+    .spyOn(processRecovery, "executeSandboxExecCommand")
+    .mockImplementation((_name, command) => {
+      return command.includes("/sandbox/.openclaw/openclaw.json")
+        ? { status: 0, stdout: JSON.stringify(testConfig), stderr: "" }
+        : command.includes("tail -n 400") && command.includes("/tmp/gateway.log")
+          ? { status: 0, stdout: testLog, stderr: "" }
+          : { status: 0, stdout: "", stderr: "" };
+    });
+  vi.spyOn(processRecovery, "executeSandboxCommand").mockReturnValue(null);
+
+  buildPlanSpy = vi
+    .spyOn(MessagingWorkflowPlanner.prototype, "buildPlan")
+    .mockImplementation(function (this: MessagingWorkflowPlanner, context) {
+      return originalBuildPlan.call(this, context);
+    });
 });
-registry.updateSandbox = (name, updates) => {
-  registryUpdates.push({ name, updates });
-  return true;
-};
 
-const policies = require(${j("policy/index.js")});
-const appliedCalls = [];
-const removedCalls = [];
-const callOrder = [];
-policies.listPresets = () => ${JSON.stringify(presetNamesAvailable.map((name) => ({ name })))};
-policies.applyPreset = (sandboxName, presetName) => {
-  appliedCalls.push({ sandboxName, presetName });
-  callOrder.push("applyPreset:" + presetName);
-  return ${JSON.stringify(applyPresetResult)};
-};
-policies.removePreset = (sandboxName, presetName) => {
-  removedCalls.push({ sandboxName, presetName });
-  callOrder.push("removePreset:" + presetName);
-  return true;
-};
-policies.getAppliedPresets = () => ${JSON.stringify(appliedPresets)};
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(testHome, { recursive: true, force: true });
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, originalProcessEnv);
+});
 
-// Stub onboardSession so the new policyPresets-sync helper has something
-// to read/write. The test asserts on sessionUpdates to verify the
-// helper kept session.policyPresets aligned with the registry.
-const onboardSession = require(${j("state/onboard-session.js")});
-const sessionUpdates = [];
-const sessionLoadConfig = ${JSON.stringify({
-      sessionSandboxName,
-      sessionPolicyPresets,
-      sessionLoadThrows,
-      sessionMissing,
-    })};
-const sessionUpdateThrows = ${JSON.stringify(sessionUpdateThrows)};
-let sessionState = sessionLoadConfig.sessionMissing
-  ? null
-  : {
-      sandboxName: sessionLoadConfig.sessionSandboxName,
-      policyPresets: Array.isArray(sessionLoadConfig.sessionPolicyPresets)
-        ? [...sessionLoadConfig.sessionPolicyPresets]
-        : sessionLoadConfig.sessionPolicyPresets,
-    };
-onboardSession.loadSession = () => {
-  if (sessionLoadConfig.sessionLoadThrows) throw new Error("simulated load failure");
-  return sessionState;
-};
-onboardSession.updateSession = (mutator) => {
-  if (sessionUpdateThrows) throw new Error("simulated save failure");
-  // Mirror the real updateSession contract: load → mutate → save.
-  if (!sessionState) sessionState = { sandboxName: null, policyPresets: null };
-  const next = mutator(sessionState) || sessionState;
-  sessionState = next;
-  sessionUpdates.push({
-    policyPresets: Array.isArray(next.policyPresets) ? [...next.policyPresets] : next.policyPresets,
+describe("channels add applies a matching policy preset (#3437)", () => {
+  it("discloses token-channel egress before credential prompts and gateway mutation (#7179)", async () => {
+    delete process.env.NEMOCLAW_NON_INTERACTIVE;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(callOrder.indexOf("scopeDisclosure")).toBeLessThan(
+      callOrder.indexOf("credentialPrompt"),
+    );
+    expect(callOrder.indexOf("scopeDisclosure")).toBeLessThan(
+      callOrder.indexOf("upsertMessagingProviders"),
+    );
+    expect(callOrder.indexOf("scopeDisclosure")).toBeLessThan(
+      callOrder.indexOf("applyPreset:telegram"),
+    );
   });
-  return next;
-};
 
-// Tag the rebuild-prompt branch via stdout so we can compare ordering.
-// In NEMOCLAW_NON_INTERACTIVE mode, promptAndRebuild logs "Change queued."
-// and returns immediately without invoking rebuildSandbox.
-const origLog = console.log;
-console.log = (...args) => {
-  const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
-  if (line.includes("Change queued")) callOrder.push("promptAndRebuild");
-  origLog.call(console, ...args);
-};
+  it("plans channel enrollment through the messaging manifest workflow", async () => {
+    await addSandboxChannel("test-sb", { channel: "slack" });
 
-const channelModule = require(${j("actions/sandbox/policy-channel.js")});
+    expect(buildPlanSpy).toHaveBeenCalledWith({
+      sandboxName: "test-sb",
+      agent: "openclaw",
+      workflow: "add-channel",
+      isInteractive: false,
+      configuredChannels: ["slack"],
+      disabledChannels: [],
+      supportedChannelIds: ["telegram", "discord", "wechat", "slack", "whatsapp", "teams"],
+      credentialAvailability: expect.any(Object),
+    });
+  });
 
-module.exports = { channelModule, appliedCalls, removedCalls, callOrder, providerCalls, registryUpdates, sessionUpdates, getSessionState: () => sessionState };
-`;
-}
-
-describe("channels add applies matching policy preset (issue #3437)", () => {
   for (const channel of ["telegram", "slack", "discord"]) {
-    it(`applies the '${channel}' preset before triggering rebuild`, () => {
-      const script = `${buildPreamble()}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: ${JSON.stringify(channel)} });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      appliedCalls: ctx.appliedCalls,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-      const result = runScript(script);
-      assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-      const marker = result.stdout.lastIndexOf("__RESULT__");
-      assert.ok(marker >= 0, `no __RESULT__ marker in stdout:\n${result.stdout}`);
-      const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-      assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+    it(`applies the '${channel}' preset before triggering rebuild`, async () => {
+      await addSandboxChannel("test-sb", { channel });
 
-      // Contract 1: applyPreset is called exactly once with the channel's name.
-      assert.deepEqual(
-        payload.appliedCalls,
-        [{ sandboxName: "test-sb", presetName: channel }],
-        `expected applyPreset("test-sb", "${channel}") exactly once; got ${JSON.stringify(payload.appliedCalls)}`,
-      );
-
-      // Contract 2: ordering invariant — preset apply must precede rebuild,
-      // otherwise the rebuild's backup manifest will not capture it and
-      // Step 5.5 of rebuild.ts has nothing to restore.
-      const applyIdx = payload.callOrder.indexOf(`applyPreset:${channel}`);
-      const rebuildIdx = payload.callOrder.indexOf("promptAndRebuild");
-      assert.ok(applyIdx >= 0, `applyPreset was never called (order: ${JSON.stringify(payload.callOrder)})`);
-      assert.ok(rebuildIdx >= 0, `promptAndRebuild was never called (order: ${JSON.stringify(payload.callOrder)})`);
-      assert.ok(
-        applyIdx < rebuildIdx,
-        `applyPreset must run before promptAndRebuild; got order: ${JSON.stringify(payload.callOrder)}`,
+      expect(applyPresetSpy).toHaveBeenCalledOnce();
+      expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", channel, {
+        disclosedPresetState: "absent",
+      });
+      expect(loadPresetForSandboxSpy).toHaveBeenCalledWith("test-sb", channel);
+      expect(callOrder.indexOf(`applyPreset:${channel}`)).toBeLessThan(
+        callOrder.indexOf("promptAndRebuild"),
       );
     });
   }
 
-  it("applies the tokenless WhatsApp preset for Hermes before triggering rebuild", () => {
-    const script = `${buildPreamble({
-      presetNamesAvailable: ["telegram", "slack", "discord", "whatsapp", "npm", "github"],
-      sandboxAgent: "hermes",
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "whatsapp" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      appliedCalls: ctx.appliedCalls,
-      callOrder: ctx.callOrder,
-      providerCalls: ctx.providerCalls,
-      registryUpdates: ctx.registryUpdates,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script, {
-      WHATSAPP_BOT_TOKEN: "must-not-be-used",
-      WHATSAPP_TOKEN: "must-not-be-used",
-      WHATSAPP_SESSION_SECRET: "must-not-be-used",
-    });
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    assert.ok(marker >= 0, `no __RESULT__ marker in stdout:\n${result.stdout}`);
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("applies the tokenless WhatsApp preset for Hermes before triggering rebuild", async () => {
+    sandboxAgent = "hermes";
+    registryEntry = makeRegistryEntry([], [], "hermes");
+    process.env.WHATSAPP_BOT_TOKEN = "must-not-be-used";
+    process.env.WHATSAPP_TOKEN = "must-not-be-used";
+    process.env.WHATSAPP_SESSION_SECRET = "must-not-be-used";
 
-    assert.deepEqual(payload.providerCalls, [], "WhatsApp must not create host-side providers");
-    assert.deepEqual(payload.registryUpdates, [
-      {
-        name: "test-sb",
-        updates: { messagingChannels: ["whatsapp"], disabledChannels: [] },
-      },
+    await addSandboxChannel("test-sb", { channel: "whatsapp" });
+
+    expect(providerSpy).not.toHaveBeenCalled();
+    const messagingUpdate = updateSandboxSpy.mock.calls.find(
+      (call) => (call[1] as { messaging?: unknown }).messaging,
+    );
+    expect(updateSandboxSpy).toHaveBeenCalledOnce();
+    expect(messagingUpdate).toBeDefined();
+    expect(messagingUpdate?.[0]).toBe("test-sb");
+    const plan = (messagingUpdate?.[1] as { messaging: { plan: SandboxMessagingPlan } }).messaging
+      .plan;
+    expect(plan.channels.map((channel) => channel.channelId)).toEqual(["whatsapp"]);
+    expect(plan.agent).toBe("hermes");
+    expect(plan.credentialBindings).toEqual([]);
+    expect(messagingUpdate?.[1]).not.toHaveProperty("messagingChannels");
+    expect(messagingUpdate?.[1]).not.toHaveProperty("disabledChannels");
+    expect(applyPresetSpy).toHaveBeenCalledOnce();
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "whatsapp", {
+      disclosedPresetState: "absent",
+    });
+    expect(callOrder.indexOf("scopeDisclosure")).toBeLessThan(callOrder.indexOf("updateSandbox"));
+    expect(callOrder.indexOf("applyPreset:whatsapp")).toBeLessThan(
+      callOrder.indexOf("promptAndRebuild"),
+    );
+  });
+
+  it("aborts tokenless WhatsApp before registry and rebuild when preset apply fails", async () => {
+    sandboxAgent = "hermes";
+    registryEntry = makeRegistryEntry([], [], "hermes");
+    applyPresetResult = false;
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "whatsapp" }));
+
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "whatsapp", {
+      disclosedPresetState: "absent",
+    });
+    expect(callOrder).not.toContain("promptAndRebuild");
+  });
+
+  it("aborts non-QR channel when policy preset YAML is missing", async () => {
+    presetContent = null;
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain(
+      "Restore the preset YAML and re-run: nemoclaw test-sb channels add telegram",
+    );
+  });
+
+  it("aborts non-QR channel when policy preset YAML has no network_policies section", async () => {
+    presetContent = 'name: telegram\ndescription: "stub preset without network_policies"\n';
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(deleteCredentialSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain("has no parseable entries under 'network_policies:'");
+    expect(printedText()).toContain(
+      "Restore the preset YAML and re-run: nemoclaw test-sb channels add telegram",
+    );
+  });
+
+  it("aborts non-QR channel when policy preset YAML body is malformed", async () => {
+    presetContent = "network_policies:\n  - [unclosed\n";
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain("has no parseable entries under 'network_policies:'");
+    expect(printedText()).toContain(
+      "Restore the preset YAML and re-run: nemoclaw test-sb channels add telegram",
+    );
+  });
+
+  it("dry-run validates the channel preset and avoids gateway, registry, and rebuild side effects", async () => {
+    await addSandboxChannel("test-sb", { channel: "telegram", dryRun: true });
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain("--dry-run: would enable channel 'telegram' for 'test-sb'");
+  });
+
+  it("dry-run fails when the matching policy preset YAML is missing", async () => {
+    presetContent = null;
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram", dryRun: true }));
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain(
+      "Restore the preset YAML and re-run: nemoclaw test-sb channels add telegram",
+    );
+  });
+
+  it("aborts QR-paired WhatsApp before registry write when its preset YAML is missing", async () => {
+    presetContent = null;
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "whatsapp" }));
+
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain(
+      "Restore the preset YAML and re-run: nemoclaw test-sb channels add whatsapp",
+    );
+  });
+
+  it("rolls back providers and credentials without writing plan state when applyPreset fails", async () => {
+    applyPresetResult = false;
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "telegram", {
+      disclosedPresetState: "absent",
+    });
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(deleteCredentialSpy).toHaveBeenCalledWith("TELEGRAM_BOT_TOKEN");
+    expect(sessionUpdates).toEqual([]);
+    expect(callOrder).not.toContain("promptAndRebuild");
+  });
+
+  it("leaves plan state untouched and reports residual gateway state when detach fails", async () => {
+    applyPresetResult = false;
+    runOpenshellSpy.mockImplementation((args: string[]) =>
+      args.slice(0, 3).join(" ") === "sandbox provider detach"
+        ? { ...successfulOpenshellResult(), status: 1, stderr: "permission denied" }
+        : successfulOpenshellResult(),
+    );
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(deleteCredentialSpy).toHaveBeenCalledWith("TELEGRAM_BOT_TOKEN");
+    expect(printedText()).toContain("Rollback could not fully clean gateway-providers");
+    expect(printedText()).toContain("'nemoclaw test-sb channels remove telegram'");
+    expect(callOrder).not.toContain("promptAndRebuild");
+  });
+
+  it("restores prior channel credentials when re-add applyPreset fails on an already-enabled channel", async () => {
+    applyPresetResult = false;
+    registryEntry = makeRegistryEntry(["telegram"]);
+    getCredentialSpy.mockImplementation((key: string) =>
+      key === "TELEGRAM_BOT_TOKEN" ? "prior-telegram-token" : null,
+    );
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).toHaveBeenCalledWith("TELEGRAM_BOT_TOKEN", "prior-telegram-token");
+    expect(providerSpy).toHaveBeenCalledTimes(2);
+    expect(
+      providerSpy.mock.calls.map(([definitions]) =>
+        definitions.map((definition: { name: string }) => definition.name),
+      ),
+    ).toEqual([["test-sb-telegram-bridge"], ["test-sb-telegram-bridge"]]);
+    expect(callOrder).not.toContain("promptAndRebuild");
+    expect(printedText()).toContain("Rollback could not fully clean gateway-providers");
+  });
+
+  it("leaves prior plan state untouched even when re-upsert during re-add rollback throws", async () => {
+    applyPresetResult = false;
+    registryEntry = makeRegistryEntry(["telegram"]);
+    getCredentialSpy.mockImplementation((key: string) =>
+      key === "TELEGRAM_BOT_TOKEN" ? "prior-telegram-token" : null,
+    );
+    providerSpy
+      .mockImplementationOnce(() => [])
+      .mockImplementationOnce(() => {
+        throw new Error("simulated gateway upsert failure during restore");
+      });
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "telegram" }));
+
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy).toHaveBeenCalledWith("TELEGRAM_BOT_TOKEN", "prior-telegram-token");
+    expect(printedText()).toContain("Failed to restore gateway providers for 'telegram'");
+    expect(printedText()).toContain("Rollback could not fully clean gateway-providers");
+  });
+
+  it("validates Slack credentials before registering providers", async () => {
+    await addSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(curlProbeSpy).toHaveBeenCalledTimes(2);
+    expect(curlProbeSpy.mock.calls[0][0]).toContain("https://slack.com/api/auth.test");
+    expect(curlProbeSpy.mock.calls[1][0]).toContain("https://slack.com/api/apps.connections.open");
+    expect(saveCredentialSpy.mock.calls.map((call) => call[0])).toEqual([
+      "SLACK_BOT_TOKEN",
+      "SLACK_APP_TOKEN",
     ]);
-    assert.deepEqual(
-      payload.appliedCalls,
-      [{ sandboxName: "test-sb", presetName: "whatsapp" }],
-      `expected applyPreset("test-sb", "whatsapp") exactly once; got ${JSON.stringify(payload.appliedCalls)}`,
+    expect(
+      providerSpy.mock.calls[0][0].map((definition: { envKey: string }) => definition.envKey),
+    ).toEqual(["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]);
+    expect(callOrder.indexOf("slackProbe:app")).toBeLessThan(
+      callOrder.indexOf("saveCredential:SLACK_BOT_TOKEN"),
     );
-    const applyIdx = payload.callOrder.indexOf("applyPreset:whatsapp");
-    const rebuildIdx = payload.callOrder.indexOf("promptAndRebuild");
-    assert.ok(applyIdx >= 0, `applyPreset was never called (order: ${JSON.stringify(payload.callOrder)})`);
-    assert.ok(rebuildIdx >= 0, `promptAndRebuild was never called (order: ${JSON.stringify(payload.callOrder)})`);
-    assert.ok(
-      applyIdx < rebuildIdx,
-      `applyPreset must run before promptAndRebuild; got order: ${JSON.stringify(payload.callOrder)}`,
+    expect(callOrder.indexOf("saveCredential:SLACK_APP_TOKEN")).toBeLessThan(
+      callOrder.indexOf("upsertMessagingProviders"),
     );
   });
 
-  it("aborts tokenless WhatsApp before registry and rebuild when preset apply fails", () => {
-    const script = `${buildPreamble({
-      presetNamesAvailable: ["telegram", "slack", "discord", "whatsapp", "npm", "github"],
-      applyPresetResult: false,
-      sandboxAgent: "hermes",
-    })}
-const ctx = module.exports;
-const exitCodes = [];
-const originalExit = process.exit;
-process.exit = (code) => {
-  exitCodes.push(code ?? 0);
-  throw new Error("__EXIT__" + (code ?? 0));
-};
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "whatsapp" });
-  } catch (err) {
-    if (!String(err && err.message).startsWith("__EXIT__")) {
-      process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-      return;
-    }
-  } finally {
-    process.exit = originalExit;
-  }
-  process.stdout.write("\\n__RESULT__" + JSON.stringify({
-    appliedCalls: ctx.appliedCalls,
-    callOrder: ctx.callOrder,
-    providerCalls: ctx.providerCalls,
-    registryUpdates: ctx.registryUpdates,
-    exitCodes,
-  }) + "\\n");
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    assert.ok(marker >= 0, `no __RESULT__ marker in stdout:\n${result.stdout}`);
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("can explicitly skip live Slack validation for offline channel add", async () => {
+    process.env.NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION = "1";
+    slackBotProbe = successfulProbe('{"ok":false,"error":"invalid_auth"}');
 
-    assert.deepEqual(payload.exitCodes, [1]);
-    assert.deepEqual(payload.providerCalls, [], "WhatsApp must not create host-side providers");
-    assert.deepEqual(
-      payload.registryUpdates,
-      [],
-      `preset failure must not register whatsapp locally; got ${JSON.stringify(payload.registryUpdates)}`,
-    );
-    assert.deepEqual(
-      payload.appliedCalls,
-      [{ sandboxName: "test-sb", presetName: "whatsapp" }],
-      `expected one failed applyPreset call; got ${JSON.stringify(payload.appliedCalls)}`,
-    );
-    assert.ok(
-      !payload.callOrder.includes("promptAndRebuild"),
-      `preset failure must not prompt for rebuild; got order: ${JSON.stringify(payload.callOrder)}`,
+    await addSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(curlProbeSpy).not.toHaveBeenCalled();
+    expect(saveCredentialSpy.mock.calls.map((call) => call[0])).toEqual([
+      "SLACK_BOT_TOKEN",
+      "SLACK_APP_TOKEN",
+    ]);
+    expect(
+      providerSpy.mock.calls[0][0].map((definition: { envKey: string }) => definition.envKey),
+    ).toEqual(["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]);
+    expect(callOrder.indexOf("saveCredential:SLACK_APP_TOKEN")).toBeLessThan(
+      callOrder.indexOf("upsertMessagingProviders"),
     );
   });
 
-  // Negative: when the channel name does not match any built-in preset,
-  // the helper short-circuits via listPresets() and applyPreset is not
-  // invoked at all. This guards against a future channel name that happens
-  // to collide with no preset (or a typo) from spamming "Cannot load preset"
-  // errors out of policies.applyPreset.
-  it("skips applyPreset when no matching built-in preset exists", () => {
-    const script = `${buildPreamble({ presetNamesAvailable: ["npm", "github"] })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "telegram" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      appliedCalls: ctx.appliedCalls,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    assert.ok(marker >= 0, `no __RESULT__ marker in stdout:\n${result.stdout}`);
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("aborts Slack channel add on rejected Slack API validation before provider registration", async () => {
+    slackBotProbe = successfulProbe('{"ok":false,"error":"invalid_auth"}');
 
-    assert.deepEqual(
-      payload.appliedCalls,
-      [],
-      `expected applyPreset NOT to be called when no built-in preset matches; got ${JSON.stringify(payload.appliedCalls)}`,
-    );
-    // Rebuild should still be triggered — channel registration succeeded,
-    // only the preset path was skipped.
-    assert.ok(
-      payload.callOrder.includes("promptAndRebuild"),
-      `expected promptAndRebuild to still run; got order: ${JSON.stringify(payload.callOrder)}`,
-    );
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "slack" }));
+
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(applyPresetSpy).not.toHaveBeenCalled();
+  });
+
+  it("aborts Slack channel add on indeterminate Slack API validation before provider registration", async () => {
+    slackBotProbe = {
+      ok: false,
+      httpStatus: 0,
+      curlStatus: 28,
+      body: "",
+      stderr: "operation timed out",
+      message: "curl failed (exit 28): operation timed out",
+    };
+
+    await expectExit(() => addSandboxChannel("test-sb", { channel: "slack" }));
+
+    expect(saveCredentialSpy).not.toHaveBeenCalled();
+    expect(providerSpy).not.toHaveBeenCalled();
+    expect(updateSandboxSpy).not.toHaveBeenCalled();
+    expect(applyPresetSpy).not.toHaveBeenCalled();
   });
 });
 
-// Regression: `channels add` was updating the registry but NOT
-// session.policyPresets. A later `rebuild` re-entered onboard in resume
-// mode, read the stale session, and the policy-selection step narrowed
-// the channel's preset back away. The new sandbox booted with the
-// channel auto-launched but no matching network policy active, so the
-// bridge's Slack/Telegram/Discord WebClient hit 403s and stayed wedged
-// even after Step 5.5 of rebuild reapplied the preset from the backup
-// manifest.
-//
-// These tests pin down the invariant: after a successful preset apply
-// via channels-add, session.policyPresets must contain the channel
-// name; after a successful preset remove via channels-remove, it must
-// not. Edge cases (no session, foreign sandbox, save failure) must not
-// abort the operation.
 describe("channels add/remove keeps session.policyPresets in sync with registry", () => {
-  it("appends the channel preset to session.policyPresets after a successful add", () => {
-    const script = `${buildPreamble({
-      sessionSandboxName: "test-sb",
-      sessionPolicyPresets: ["npm", "pypi", "huggingface", "brew"],
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      sessionUpdates: ctx.sessionUpdates,
-      finalSession: ctx.getSessionState(),
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("appends the channel preset to session.policyPresets after a successful add", async () => {
+    await addSandboxChannel("test-sb", { channel: "slack" });
 
-    // Exactly one update — the helper short-circuits when the desired
-    // membership already holds, so duplicate writes would be a bug.
-    assert.equal(
-      payload.sessionUpdates.length,
-      1,
-      `expected exactly one session update; got ${JSON.stringify(payload.sessionUpdates)}`,
-    );
-    assert.deepEqual(payload.sessionUpdates[0].policyPresets, [
-      "npm",
-      "pypi",
-      "huggingface",
-      "brew",
-      "slack",
+    expect(sessionUpdates).toEqual([
+      { policyPresets: ["npm", "pypi", "huggingface", "brew", "slack"] },
     ]);
-    assert.deepEqual(payload.finalSession.policyPresets, [
-      "npm",
-      "pypi",
-      "huggingface",
-      "brew",
-      "slack",
-    ]);
+    expect(sessionState?.policyPresets).toEqual(["npm", "pypi", "huggingface", "brew", "slack"]);
   });
 
-  it("does not touch the session when it tracks a different sandbox", () => {
-    const script = `${buildPreamble({
-      sessionSandboxName: "other-sb",
-      sessionPolicyPresets: ["npm", "github"],
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      sessionUpdates: ctx.sessionUpdates,
-      finalSession: ctx.getSessionState(),
-      appliedCalls: ctx.appliedCalls,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("does not touch the session when it tracks a different sandbox", async () => {
+    setSession("other-sb", ["npm", "github"]);
 
-    // applyPreset still runs against the registry — the preset is the
-    // channel's egress contract and lives in registry, not session.
-    assert.deepEqual(payload.appliedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    // But the foreign session's policyPresets must be left untouched —
-    // otherwise we corrupt the other sandbox's resume state.
-    assert.deepEqual(
-      payload.sessionUpdates,
-      [],
-      `session belonging to a different sandbox must not be mutated; got ${JSON.stringify(payload.sessionUpdates)}`,
-    );
-    assert.deepEqual(payload.finalSession.policyPresets, ["npm", "github"]);
+    await addSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "slack", {
+      disclosedPresetState: "absent",
+    });
+    expect(sessionUpdates).toEqual([]);
+    expect(sessionState?.policyPresets).toEqual(["npm", "github"]);
   });
 
-  it("succeeds even when no onboard session file exists", () => {
-    const script = `${buildPreamble({ sessionMissing: true })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      sessionUpdates: ctx.sessionUpdates,
-      appliedCalls: ctx.appliedCalls,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("succeeds even when no onboard session file exists", async () => {
+    sessionState = null;
 
-    // Registry mutation still happens; only the session-sync side-effect
-    // is skipped (there is no intent record to keep aligned).
-    assert.deepEqual(payload.appliedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.deepEqual(payload.sessionUpdates, []);
-    assert.ok(payload.callOrder.includes("promptAndRebuild"));
+    await addSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "slack", {
+      disclosedPresetState: "absent",
+    });
+    expect(sessionUpdates).toEqual([]);
+    expect(callOrder).toContain("promptAndRebuild");
   });
 
-  it("does not abort channels-add when session save fails", () => {
-    const script = `${buildPreamble({
-      sessionSandboxName: "test-sb",
-      sessionPolicyPresets: ["npm", "pypi", "huggingface", "brew"],
-      sessionUpdateThrows: true,
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.addSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      appliedCalls: ctx.appliedCalls,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("does not abort channels-add when session save fails", async () => {
+    sessionUpdateThrows = true;
 
-    // Even though session.updateSession threw, the channel add flow
-    // still completed: preset applied to registry, rebuild prompted.
-    // Session-sync is best-effort.
-    assert.deepEqual(payload.appliedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.ok(payload.callOrder.includes("promptAndRebuild"));
+    await addSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(applyPresetSpy).toHaveBeenCalledWith("test-sb", "slack", {
+      disclosedPresetState: "absent",
+    });
+    expect(callOrder).toContain("promptAndRebuild");
   });
 
-  it("removes the channel preset from session.policyPresets after a successful remove", () => {
-    const script = `${buildPreamble({
-      appliedPresets: ["slack"],
-      sessionSandboxName: "test-sb",
-      sessionPolicyPresets: ["npm", "slack", "github"],
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.removeSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      removedCalls: ctx.removedCalls,
-      sessionUpdates: ctx.sessionUpdates,
-      finalSession: ctx.getSessionState(),
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("removes the channel preset from session.policyPresets after a successful remove", async () => {
+    appliedPresets = ["slack"];
+    setSession("test-sb", ["npm", "slack", "github"]);
 
-    assert.deepEqual(payload.removedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.equal(
-      payload.sessionUpdates.length,
-      1,
-      `expected exactly one session update; got ${JSON.stringify(payload.sessionUpdates)}`,
-    );
-    assert.deepEqual(payload.sessionUpdates[0].policyPresets, ["npm", "github"]);
-    assert.deepEqual(payload.finalSession.policyPresets, ["npm", "github"]);
-    assert.ok(payload.callOrder.includes("promptAndRebuild"));
+    await removeSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(removePresetSpy).toHaveBeenCalledWith("test-sb", "slack");
+    expect(sessionUpdates).toEqual([{ policyPresets: ["npm", "github"] }]);
+    expect(sessionState?.policyPresets).toEqual(["npm", "github"]);
+    expect(callOrder).toContain("promptAndRebuild");
   });
 
-  it("does not touch a foreign session during channels-remove", () => {
-    const script = `${buildPreamble({
-      appliedPresets: ["slack"],
-      sessionSandboxName: "other-sb",
-      sessionPolicyPresets: ["slack", "npm"],
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.removeSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      removedCalls: ctx.removedCalls,
-      sessionUpdates: ctx.sessionUpdates,
-      finalSession: ctx.getSessionState(),
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("does not touch a foreign session during channels-remove", async () => {
+    appliedPresets = ["slack"];
+    setSession("other-sb", ["slack", "npm"]);
 
-    assert.deepEqual(payload.removedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.deepEqual(
-      payload.sessionUpdates,
-      [],
-      `session belonging to a different sandbox must not be mutated; got ${JSON.stringify(payload.sessionUpdates)}`,
-    );
-    assert.deepEqual(payload.finalSession.policyPresets, ["slack", "npm"]);
+    await removeSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(removePresetSpy).toHaveBeenCalledWith("test-sb", "slack");
+    expect(sessionUpdates).toEqual([]);
+    expect(sessionState?.policyPresets).toEqual(["slack", "npm"]);
   });
 
-  it("succeeds during channels-remove when no onboard session file exists", () => {
-    const script = `${buildPreamble({
-      appliedPresets: ["slack"],
-      sessionMissing: true,
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.removeSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      removedCalls: ctx.removedCalls,
-      sessionUpdates: ctx.sessionUpdates,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("succeeds during channels-remove when no onboard session file exists", async () => {
+    appliedPresets = ["slack"];
+    sessionState = null;
 
-    assert.deepEqual(payload.removedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.deepEqual(payload.sessionUpdates, []);
-    assert.ok(payload.callOrder.includes("promptAndRebuild"));
+    await removeSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(removePresetSpy).toHaveBeenCalledWith("test-sb", "slack");
+    expect(sessionUpdates).toEqual([]);
+    expect(callOrder).toContain("promptAndRebuild");
   });
 
-  it("does not abort channels-remove when session save fails", () => {
-    const script = `${buildPreamble({
-      appliedPresets: ["slack"],
-      sessionSandboxName: "test-sb",
-      sessionPolicyPresets: ["npm", "slack"],
-      sessionUpdateThrows: true,
-    })}
-const ctx = module.exports;
-(async () => {
-  try {
-    await ctx.channelModule.removeSandboxChannel("test-sb", { channel: "slack" });
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({
-      removedCalls: ctx.removedCalls,
-      callOrder: ctx.callOrder,
-    }) + "\\n");
-  } catch (err) {
-    process.stdout.write("\\n__RESULT__" + JSON.stringify({ error: err.message, stack: err.stack }) + "\\n");
-  }
-})();
-`;
-    const result = runScript(script);
-    assert.equal(result.status, 0, `script failed: ${result.stderr}\n${result.stdout}`);
-    const marker = result.stdout.lastIndexOf("__RESULT__");
-    const payload = JSON.parse(result.stdout.slice(marker + "__RESULT__".length).trim());
-    assert.ok(!payload.error, `unexpected error: ${payload.error}\n${payload.stack || ""}`);
+  it("does not abort channels-remove when session save fails", async () => {
+    appliedPresets = ["slack"];
+    setSession("test-sb", ["npm", "slack"]);
+    sessionUpdateThrows = true;
 
-    assert.deepEqual(payload.removedCalls, [{ sandboxName: "test-sb", presetName: "slack" }]);
-    assert.ok(payload.callOrder.includes("promptAndRebuild"));
+    await removeSandboxChannel("test-sb", { channel: "slack" });
+
+    expect(removePresetSpy).toHaveBeenCalledWith("test-sb", "slack");
+    expect(callOrder).toContain("promptAndRebuild");
+  });
+});
+
+describe("channels add verifies bridge startup after rebuild (#4314, #4390)", () => {
+  beforeEach(() => {
+    delete process.env.NEMOCLAW_NON_INTERACTIVE;
+    promptSpy.mockResolvedValue("y");
+    testConfig = { channels: { telegram: { enabled: true, accounts: { default: {} } } } };
+  });
+
+  it("confirms the startup breadcrumb when the bridge logs the starting-provider line", async () => {
+    testLog = [
+      "[telegram] [default] starting provider",
+      "[telegram] [default] provider ready (Bot API reachable; agent replies use inference.local)",
+    ].join("\n");
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(rebuildSpy).toHaveBeenCalledOnce();
+    expect(printedText()).toContain("'telegram' bridge startup detected");
+  });
+
+  it("warns when the baked config does not mark the channel enabled", async () => {
+    testConfig = { channels: { telegram: { accounts: { default: {} } } } };
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(printedText()).toContain("was not marked enabled in baked");
+  });
+
+  it("warns when the gateway log shows no bridge breadcrumb yet", async () => {
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(printedText()).toContain("did not log a startup breadcrumb");
+  });
+
+  it("does NOT claim success when only the no-start breadcrumb is present", async () => {
+    testLog =
+      "[telegram] [default] bridge did not start within 15s; check channels.telegram.enabled, plugin entries, and gateway log";
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(printedText()).not.toContain("bridge startup detected");
+    expect(printedText()).toMatch(/logged credential\/startup warnings|did not start within/);
+  });
+
+  it("forwards credential-placeholder warnings surfaced by the bridge", async () => {
+    testLog =
+      "[telegram] [default] credential placeholder mismatch: openclaw.json botToken does not match runtime TELEGRAM_BOT_TOKEN placeholder";
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(printedText()).toContain("logged credential/startup warnings");
+  });
+
+  it("skips the OpenClaw-shaped probe for Hermes sandboxes (avoids false negatives)", async () => {
+    sandboxAgent = "hermes";
+    registryEntry = makeRegistryEntry([], [], "hermes");
+    testConfig = { channels: { telegram: {} } };
+
+    await addSandboxChannel("test-sb", { channel: "telegram" });
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(printedText()).not.toContain("was not marked enabled in baked");
+    expect(printedText()).not.toContain("bridge startup detected");
+  });
+
+  it("skips the verifier for WhatsApp's QR-only runtime", async () => {
+    testConfig = { channels: {} };
+
+    await addSandboxChannel("test-sb", { channel: "whatsapp" });
+
+    expect(execSpy).not.toHaveBeenCalled();
+    expect(printedText()).not.toContain("was not marked enabled in baked openclaw.json");
+  });
+});
+
+describe("channel preset source-of-truth", () => {
+  it("every channel registered in KNOWN_CHANNELS ships a preset YAML that parsePresetPolicyKeys() accepts", () => {
+    const failures: string[] = [];
+    for (const name of knownChannelNames()) {
+      const content = policies.loadPreset(name);
+      if (content === null) {
+        failures.push(`${name}: preset YAML not found on disk`);
+        continue;
+      }
+      if (policies.parsePresetPolicyKeys(content).length === 0) {
+        failures.push(`${name}: parsePresetPolicyKeys returned no entries`);
+      }
+    }
+
+    expect(failures).toEqual([]);
   });
 });

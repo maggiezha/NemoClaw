@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { OLLAMA_HOST_DOCKER_INTERNAL } from "../inference/local";
 import { OLLAMA_PORT } from "../core/ports";
+import { OLLAMA_HOST_DOCKER_INTERNAL, validateOllamaPortConfiguration } from "../inference/local";
 import {
   getInstalledOllamaVersion,
   getRunningOllamaDaemonVersion,
@@ -36,6 +36,58 @@ function buildDaemonEndpoint(host: string): string {
 
 function isLocalOllamaHost(host: string | null | undefined): boolean {
   return Boolean(host) && host !== OLLAMA_HOST_DOCKER_INTERNAL;
+}
+
+export interface RunningOllamaMenuInput {
+  hasOllama: boolean;
+  ollamaRunning: boolean;
+  isWsl: boolean;
+  ollamaPort: number;
+  ollamaHost?: string | null;
+  windowsHostLabelSuffix?: string;
+}
+
+export function checkOllamaPortsOrWarn(input: { isNonInteractive: () => boolean }): boolean {
+  const portValidation = validateOllamaPortConfiguration();
+  if (!portValidation.ok) {
+    console.error(`  ${portValidation.message}`);
+    if (input.isNonInteractive()) {
+      process.exit(1);
+    }
+    console.log("  Choose a different local inference provider or fix the port settings.");
+    console.log("");
+    return false;
+  }
+  return true;
+}
+
+export function resolveRunningOllamaMenuEntry(
+  input: RunningOllamaMenuInput,
+): { key: "ollama"; label: string } | null {
+  if (!input.hasOllama && !input.ollamaRunning) return null;
+  let hostDisplay: string;
+  if (input.ollamaHost === OLLAMA_HOST_DOCKER_INTERNAL) {
+    hostDisplay = `Windows host:${input.ollamaPort}`;
+  } else if (input.isWsl) {
+    hostDisplay = `WSL:${input.ollamaPort}`;
+  } else {
+    hostDisplay = `localhost:${input.ollamaPort}`;
+  }
+  const windowsHostSuffix =
+    input.ollamaHost === OLLAMA_HOST_DOCKER_INTERNAL ? input.windowsHostLabelSuffix || "" : "";
+  const suggested =
+    input.ollamaRunning &&
+    (input.ollamaHost === OLLAMA_HOST_DOCKER_INTERNAL ? !windowsHostSuffix : !input.isWsl);
+  const runningSuffix = input.ollamaRunning ? " — running" : "";
+  const suggestionSuffix = suggested ? " (suggested)" : "";
+  // A stopped daemon renders as an action, not a status: selecting the entry
+  // starts Ollama, and a bare "Local Ollama (WSL:11434)" reads as a
+  // reachability claim when the daemon is down (#6750).
+  const labelPrefix = input.ollamaRunning ? "Local Ollama" : "Start local Ollama";
+  return {
+    key: "ollama",
+    label: `${labelPrefix} (${hostDisplay})${runningSuffix}${windowsHostSuffix}${suggestionSuffix}`,
+  };
 }
 
 export interface OllamaInstallMenuEntry {

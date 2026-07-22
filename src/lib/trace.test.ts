@@ -27,6 +27,10 @@ function withTraceFile<T>(fn: (traceFile: string) => T): T {
   return fn(traceFile);
 }
 
+function readTraceArtifact(traceFile: string): TraceArtifact {
+  return JSON.parse(fs.readFileSync(traceFile, "utf8")) as TraceArtifact;
+}
+
 afterEach(() => {
   delete process.env[TRACE_ENABLED_ENV];
   delete process.env[TRACE_FILE_ENV];
@@ -42,7 +46,7 @@ describe("onboard trace artifacts", () => {
       });
 
       expect(flushTrace()).toBe(traceFile);
-      const artifact = JSON.parse(fs.readFileSync(traceFile, "utf8")) as TraceArtifact;
+      const artifact = readTraceArtifact(traceFile);
       const spans = artifact.resource_spans[0].scope_spans[0].spans;
 
       expect(artifact.resource_spans[0].scope_spans[0].scope.name).toBe("nemoclaw.onboard");
@@ -60,36 +64,52 @@ describe("onboard trace artifacts", () => {
 
   it("redacts secret-like metadata before writing artifacts", () => {
     withTraceFile((traceFile) => {
+      const cloudToken = ["nv", "api", "-"].join("") + "a".repeat(16);
+      const bearerToken = `Bearer ${"b".repeat(16)}`;
+      const awsAccessKey = ["AK", "IA"].join("") + "C".repeat(16);
+      const jwt = ["eyJ" + "a".repeat(12), "b".repeat(12), "c".repeat(12)].join(".");
+
       withTraceSpan(
-        "nemoclaw.inference.validation_probe",
+        "nemoclaw.onboard.phase.inference",
         {
-          api_key: "nvapi-secret-value",
-          authorization: "Bearer sk-secret-value",
-          endpoint_url: "https://user:pass@example.test/v1?token=secret",
+          api_key: cloudToken,
+          harmless_status: `probe failed with ${bearerToken}`,
+          aws_like: awsAccessKey,
+          jwt_like: jwt,
+          credential_env: "NVIDIA_API_KEY",
         },
         () => undefined,
       );
 
-      flushTrace();
+      expect(flushTrace()).toBe(traceFile);
       const text = fs.readFileSync(traceFile, "utf8");
+      const artifact = JSON.parse(text) as TraceArtifact;
+      const attrs = artifact.resource_spans[0].scope_spans[0].spans[0].attributes;
 
-      expect(text).not.toContain("nvapi-secret-value");
-      expect(text).not.toContain("sk-secret-value");
-      expect(text).not.toContain("user:pass");
-      expect(text).not.toContain("token=secret");
-      expect(text).toContain("<REDACTED>");
+      expect(attrs.api_key).toBe("<REDACTED>");
+      expect(attrs.harmless_status).toContain("<REDACTED>");
+      expect(attrs.aws_like).toBe("<REDACTED>");
+      expect(attrs.jwt_like).toBe("<REDACTED>");
+      expect(attrs.credential_env).toBe("NVIDIA_API_KEY");
+      expect(text).not.toContain(cloudToken);
+      expect(text).not.toContain(bearerToken);
+      expect(text).not.toContain(awsAccessKey);
+      expect(text).not.toContain(jwt);
     });
   });
 
   it("sanitizes curl probe URLs and records status metadata", () => {
     withTraceFile((traceFile) => {
+      // Use a URL with a benign query parameter (`model`) that the curl-arg
+      // validator allows through but the trace sanitizer still redacts as
+      // part of its blanket query-string redaction. Inline `Authorization:
+      // Bearer ...` was removed because validateCurlProbeArgs rejects inline
+      // credential headers — credentials must go via the trusted --config
+      // tmpfile. The credential-shaped query-name rejection in
+      // CURL_SECRET_QUERY_PARAM_PATTERN now also refuses `session_token`,
+      // `api_key`, etc. See PR #5975.
       const result = runCurlProbe(
-        [
-          "-sS",
-          "-H",
-          "Authorization: Bearer should-not-appear",
-          "https://example.test/v1/chat/completions?key=secret",
-        ],
+        ["-sS", "https://example.test/v1/chat/completions?model=should-not-appear"],
         {
           spawnSyncImpl: () =>
             ({
@@ -102,7 +122,7 @@ describe("onboard trace artifacts", () => {
       );
 
       expect(result.ok).toBe(true);
-      flushTrace();
+      expect(flushTrace()).toBe(traceFile);
       const text = fs.readFileSync(traceFile, "utf8");
       const artifact = JSON.parse(text) as TraceArtifact;
       const span = artifact.resource_spans[0].scope_spans[0].spans.find(
@@ -110,11 +130,45 @@ describe("onboard trace artifacts", () => {
       );
 
       expect(text).not.toContain("should-not-appear");
-      expect(text).not.toContain("key=secret");
       expect(span?.attributes["http.url"]).toBe(
-        "https://example.test/v1/chat/completions?key=%3CREDACTED%3E",
+        "https://example.test/v1/chat/completions?model=%3CREDACTED%3E",
       );
       expect(span?.events[0].attributes).toMatchObject({ ok: true, http_status: 200 });
+    });
+  });
+
+  it("sanitizes nested sensitive span and event attributes", () => {
+    withTraceFile((traceFile) => {
+      const queryToken = ["ghp", "_"].join("") + "d".repeat(24);
+      const slackWebhook = `https://hooks.slack.com/services/${"A".repeat(12)}/${"B".repeat(
+        12,
+      )}/${"C".repeat(24)}`;
+      const eventBearer = `Bearer ${"e".repeat(16)}`;
+
+      withTraceSpan(
+        "nemoclaw.onboard.phase.gateway",
+        {
+          probe_url: `https://user:pass@example.test/path?token=${queryToken}`,
+          slack_webhook: slackWebhook,
+        },
+        () => {
+          addTraceEvent("curl_probe", {
+            headers: { authorization: eventBearer },
+          });
+        },
+      );
+
+      expect(flushTrace()).toBe(traceFile);
+      const text = fs.readFileSync(traceFile, "utf8");
+      const artifact = JSON.parse(text) as TraceArtifact;
+      const span = artifact.resource_spans[0].scope_spans[0].spans[0];
+
+      expect(String(span.attributes.probe_url)).not.toContain(queryToken);
+      expect(span.attributes.slack_webhook).toBe("<REDACTED>");
+      expect(JSON.stringify(span.events[0].attributes)).toContain("<REDACTED>");
+      expect(text).not.toContain(queryToken);
+      expect(text).not.toContain(slackWebhook);
+      expect(text).not.toContain(eventBearer);
     });
   });
 
@@ -122,11 +176,11 @@ describe("onboard trace artifacts", () => {
     expect(
       sanitizeTraceAttributes({
         nested: { token: "xoxb-secret", ok: true },
-        credential_env: "NVIDIA_API_KEY",
+        credential_env: "NVIDIA_INFERENCE_API_KEY",
       }),
     ).toMatchObject({
       nested: '{"token":"<REDACTED>","ok":true}',
-      credential_env: "NVIDIA_API_KEY",
+      credential_env: "NVIDIA_INFERENCE_API_KEY",
     });
   });
 
