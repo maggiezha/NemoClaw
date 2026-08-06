@@ -121,7 +121,7 @@ async function main() {
     loops.push(
       (async () => {
         const rampEnd = Date.now() + RAMP_SEC * 1000;
-        let limit = Math.max(2, Math.ceil(share / 4));
+        let limit;
         while (Date.now() < endAt) {
           if (Date.now() < rampEnd) {
             const progress = (Date.now() - (rampEnd - RAMP_SEC * 1000)) / (RAMP_SEC * 1000);
