@@ -96,7 +96,6 @@ export function validateNvidiaApiKeyValue(
   // a valid Anthropic key is not rejected with an NVIDIA-specific error.
   const isNvidiaBuild = credentialEnv === "NVIDIA_API_KEY";
   const isInferenceHub = credentialEnv === "NVIDIA_INFERENCE_HUB_API_KEY";
-  const isNvidia = isNvidiaBuild || isInferenceHub;
   if (!key) {
     if (isInferenceHub) {
       return "  Inference Hub API key is required (export NVIDIA_INFERENCE_HUB_API_KEY=sk-...).";
