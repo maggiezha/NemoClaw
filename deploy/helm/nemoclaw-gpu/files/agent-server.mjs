@@ -62,8 +62,9 @@ async function proxyChatCompletions(req, res) {
     res.writeHead(hubRes.status, { "content-type": "application/json" });
     res.end(text);
   } catch (err) {
+    console.error("proxyChatCompletions upstream request failed:", err);
     res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: String(err) }));
+    res.end(JSON.stringify({ error: "upstream request failed" }));
   } finally {
     recordLlmLatency(performance.now() - llmStart, llmOk);
   }
