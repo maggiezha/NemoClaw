@@ -11,10 +11,6 @@ import fs from "node:fs";
 import https from "node:https";
 import { setTimeout as sleep } from "node:timers/promises";
 
-const SERVICE_FALLBACK = (process.env.TARGET_URL || "http://nemoclaw-gpu-agent:8081").replace(
-  /\/$/,
-  "",
-);
 const DURATION_SEC = Number(process.env.DURATION_SEC || 720);
 const TARGET_PODS = Number(process.env.TARGET_PODS || 4);
 const HPA_TARGET_GPU = Number(process.env.HPA_TARGET_GPU || 40);
