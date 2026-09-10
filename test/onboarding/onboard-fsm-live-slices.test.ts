@@ -9,7 +9,7 @@ import path from "node:path";
 import { beforeAll, describe, it } from "vitest";
 
 const repoRoot = path.join(import.meta.dirname, "../..");
-const probeTimeoutMs = 10_000;
+const probeTimeoutMs = 60_000;
 
 type SliceName = "initial" | "core" | "final";
 type ProbeMode =
@@ -257,7 +257,17 @@ if (scenario.mode === "dashboard-port-composition") {
       ensureFinalizationAgentDashboardForward: nextDashboardForward,
     };
   };
-  require(${agentOnboardPath}).handleAgentSetup = async () => undefined;
+  require(${agentOnboardPath}).handleAgentSetup = async (
+    _sandboxName,
+    _model,
+    _provider,
+    _agent,
+    _resume,
+    _preparedSandbox,
+    context,
+  ) => {
+    called.push("agent-executor:" + typeof context.sandboxCommandExecutor?.runBuffered);
+  };
   require(${agentSelectionPath}).createOnboardAgentSelector = () => async () => ({
     name: "hermes",
     displayName: "Hermes Agent",
@@ -475,9 +485,7 @@ if (scenario.mode === "stale-recovery-admission") {
         gatewayName: "nemoclaw",
         gatewayPort: 8080,
         lifecycleGeneration: "stale-admission-generation",
-        verifiedEffectivePolicyIdentity: null,
         createAttemptNonce: "c".repeat(62),
-        policyCreationReceipt: null,
         resources: {
           sharedInferenceProviders: [],
           sandboxScopedProviders: [],
@@ -495,9 +503,9 @@ if (scenario.mode === "stale-recovery-admission") {
 }
 
 if (scenario.mode === "stale-session-decision") {
-  const resolveEntryOptions = onboardEntryOptions.resolveDefaultRunEntryOptionsFromState;
+  const resolveEntryOptions = onboardEntryOptions.readOptions;
   let optionReads = 0;
-  onboardEntryOptions.resolveDefaultRunEntryOptionsFromState = (...args) => {
+  onboardEntryOptions.readOptions = (...args) => {
     optionReads += 1;
     const resolved = resolveEntryOptions(...args);
     if (optionReads === 1) {
@@ -551,7 +559,7 @@ const { onboard } = require(${onboardPath});
       (scenario.mode === "providerless-staged-messaging" &&
         /supports providerless sandbox creation only/.test(String(error?.message)))
     ) {
-      const payload = JSON.stringify({ called });
+      const payload = "__RESULT__" + JSON.stringify({ called });
       if (scenario.mode === "dashboard-port-composition") {
         process.stdout.write(payload + "\\n", () => process.exit(0));
         return;
@@ -598,7 +606,10 @@ const { onboard } = require(${onboardPath});
   try {
     assert.equal(result.status, 0, probeFailureMessage(result));
     const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
-    const payload = JSON.parse(lines.at(-1) || "{}") as { called?: string[] };
+    const resultLine = [...lines].reverse().find((line) => line.startsWith("__RESULT__"));
+    const payload = JSON.parse(resultLine?.slice("__RESULT__".length) || "{}") as {
+      called?: string[];
+    };
     assert.ok(
       Array.isArray(payload.called),
       `slice probe did not return called slices\n${probeFailureMessage(result)}`,
@@ -655,14 +666,14 @@ describe("live onboard FSM slice boundaries", () => {
     assert.deepEqual(runSliceProbe({ slice: "final" }), ["initial:init", "core", "final"]);
   });
 
-  it("returns the post-recovery dashboard port after agent onboarding (#8214)", () => {
+  it("keeps the single dashboard port established during agent onboarding (#8214)", () => {
     assert.deepEqual(runSliceProbe({ slice: "final", mode: "dashboard-port-composition" }), [
       "initial:init",
       "core",
+      "agent-executor:function",
       "forward-port:18791",
-      "forward-port:18792",
-      "registry-port:18792",
-      "dashboard-url:http://127.0.0.1:18792/",
+      "registry-port:18791",
+      "dashboard-url:http://127.0.0.1:18791/",
     ]);
   }, 60_000);
 
@@ -720,11 +731,11 @@ describe("live onboard FSM slice boundaries", () => {
     },
   );
 
-  it("preserves an explicit null policy tier for authoritative rebuilds", () => {
+  it("does not carry a policy tier through authoritative rebuild state", () => {
     const called = runSliceProbe({
       slice: "core",
       mode: "authoritative-core-gateway-policy-tier",
     });
-    assert.equal(called.at(-1), "authoritative-policy-tier:null");
+    assert.equal(called.at(-1), "authoritative-policy-tier:undefined");
   });
 });

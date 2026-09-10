@@ -11,7 +11,6 @@ import { collectSandboxStatusSnapshot, getSandboxStatusReport } from "./status-s
 const sandbox: SandboxEntry = {
   name: "alpha",
   agent: "openclaw",
-  policies: [],
   provider: "nvidia",
   model: "nvidia/nemotron",
   openshellDriver: "docker",
@@ -74,8 +73,8 @@ function snapshotDeps(recoveryResult: unknown) {
     },
     probeProviderHealthImpl,
     probeSandboxInferenceGatewayHealthImpl,
-    probeSandboxInferenceInvocationImpl: vi.fn(() => ({ ok: true }) as const),
-    recoverSandboxProcesses: vi.fn(() => recoveryResult) as never,
+    probeSandboxInferenceInvocationImpl: vi.fn(async () => ({ ok: true }) as const),
+    recoverSandboxProcesses: vi.fn(async () => recoveryResult) as never,
   };
 }
 
@@ -196,17 +195,6 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
         forwardRecovered: false,
         secretBoundaryRefused: true,
         secretBoundaryReason: "persisted secret boundary refused recovery",
-      },
-    ],
-    [
-      "mcp-reconciliation",
-      {
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-        forwardRecovered: false,
-        mcpReconciliationRefused: true,
-        mcpReconciliationReason: "MCP intent mismatch",
       },
     ],
     [

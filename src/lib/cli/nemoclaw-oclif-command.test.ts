@@ -46,34 +46,9 @@ class ParsingTestCommand extends NemoClawCommand {
   }
 }
 
-class ShieldsSentinelCommand extends NemoClawCommand {
-  static id = "shields-sentinel-test";
-  static flags = {};
-
-  public async run(): Promise<void> {
-    await this.parse(ShieldsSentinelCommand);
-    throw Object.assign(new Error("Config remains unlocked — already printed"), {
-      name: "DeferredShieldsExit",
-      exitCode: 1,
-    });
-  }
-}
-
-class DriftSentinelCommand extends NemoClawCommand {
-  static id = "drift-sentinel-test";
-  static flags = {};
-
-  public async run(): Promise<void> {
-    await this.parse(DriftSentinelCommand);
-    throw Object.assign(new Error("Locked shields state has filesystem drift"), {
-      name: "DeferredShieldsExit",
-      exitCode: 2,
-    });
-  }
-}
-
 class PlainFailureCommand extends NemoClawCommand {
   static id = "plain-failure-test";
+  static enableJsonFlag = true;
   static flags = {};
 
   public async run(): Promise<void> {
@@ -194,6 +169,8 @@ describe("NemoClawCommand", () => {
 
   beforeEach(() => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-oclif-command-"));
+    vi.stubEnv("HOME", stateDir);
+    vi.stubEnv("NEMOCLAW_TEST_BASE_HOME", stateDir);
     vi.stubEnv("NEMOCLAW_TEST_STATE_DIR", stateDir);
   });
 
@@ -246,6 +223,22 @@ describe("NemoClawCommand", () => {
     );
   });
 
+  it("retains redacted error messages and exit metadata in JSON failures", async () => {
+    const secret = "nvapi-" + "a".repeat(24);
+    const output = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(PlainFailureCommand.prototype, "run").mockRejectedValue(
+      Object.assign(new Error(`Provider rejected ${secret}`), { exitCode: 7 }),
+    );
+    process.exitCode = undefined;
+
+    await PlainFailureCommand.run(["--json"], process.cwd());
+
+    expect(process.exitCode).toBe(7);
+    expect(output).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({ error: { exitCode: 7, message: "Provider rejected <REDACTED>" } }, null, 2),
+    );
+  });
+
   it("applies host logging flags from oclif parser output", async () => {
     const configure = vi.spyOn(log, "configure").mockImplementation(() => undefined);
 
@@ -267,23 +260,44 @@ describe("NemoClawCommand", () => {
     expect(log.level).toBe("debug");
   });
 
-  it("translates a shields exit sentinel into an exit code without reprinting (#7382)", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    await expect(ShieldsSentinelCommand.run([], process.cwd())).resolves.toBeUndefined();
-
-    expect(process.exitCode).toBe(1);
-    expect(error).not.toHaveBeenCalled();
-  });
-
-  it("keeps the sentinel's non-default exit code", async () => {
-    await expect(DriftSentinelCommand.run([], process.cwd())).resolves.toBeUndefined();
-
-    expect(process.exitCode).toBe(2);
-  });
-
   it("passes non-sentinel failures to the default oclif handler", async () => {
     await expect(PlainFailureCommand.run([], process.cwd())).rejects.toThrow("real failure");
+  });
+
+  it("refuses a sandbox command when removed immutability recovery may still be active", async () => {
+    fs.writeFileSync(path.join(stateDir, "shields-timer-alpha.json"), "{}\n");
+    const operation = vi.fn(async () => undefined);
+    ParsedSupportedSandboxCommand.operation = operation;
+
+    await expect(ParsedSupportedSandboxCommand.run(["alpha"], process.cwd())).rejects.toThrow(
+      /removed Shields feature.*older detached process/u,
+    );
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("announces retirement but does not interpret an inert removed-immutability state record", async () => {
+    fs.writeFileSync(path.join(stateDir, "shields-alpha.json"), "not trusted or parsed\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const operation = vi.fn(async () => undefined);
+    ParsedSupportedSandboxCommand.operation = operation;
+
+    await expect(
+      ParsedSupportedSandboxCommand.run(["alpha"], process.cwd()),
+    ).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("has been retired"));
+    expect(operation).toHaveBeenCalledOnce();
+  });
+
+  it("blocks ordinary mutations until a legacy state record is remediated", async () => {
+    fs.writeFileSync(path.join(stateDir, "shields-alpha.json"), "{}\n");
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(RawUnsupportedSandboxCommand.run(["alpha"], process.cwd())).rejects.toThrow(
+      /mutable posture cannot be proven.*no command that can restore or lower/u,
+    );
+
+    expect(RawUnsupportedSandboxCommand.ran).toBe(false);
   });
 
   it("rejects schema-5 unsupported parsed commands before the action body (#9203)", async () => {
@@ -335,7 +349,7 @@ describe("NemoClawCommand", () => {
           ),
         ).toBe(true);
         expect(isMcpLifecycleLockHeld(sandboxName)).toBe(true);
-        return { kind: "already-current", snapshot: {} as never };
+        return { kind: "already-current", snapshot: {} as never, assertCurrent: vi.fn() };
       });
     ProbeOnlyConnectCommand.operation = (sandboxName) => {
       portableAgentLifecycle.requalifyPortableAgentSandboxAuthority(sandboxName, {

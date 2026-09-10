@@ -3,6 +3,7 @@
 
 import path from "node:path";
 
+import { normalizeProcessExitCode } from "../core/process-exit";
 import type { ServingProfileProvenance } from "../inference/serving/types";
 import { NEMOCLAW_VLLM_GPU_DEVICE_ENV, parseVllmGpuDevice } from "../inference/vllm-models";
 import { PERSONAL_POLICY_TIER_NAME } from "../policy/tiers";
@@ -58,6 +59,14 @@ export {
   type OnboardResumeIntentSnapshot,
   type ResolvedOnboardResumeIntent,
 };
+
+/** Expected onboarding refusal when selected restore authority changes. */
+export class OnboardRestoreSnapshotDriftError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OnboardRestoreSnapshotDriftError";
+  }
+}
 
 export function resolveOnboardResumeIntent(options: {
   readonly explicitResume: boolean;
@@ -199,8 +208,8 @@ export function wrapOnboardDeferredExit<TOptions extends DeferredExitOptions>(
     const resolvedOptions = options ?? ({} as TOptions);
     const originalProcessExit = process.exit;
     let deferredExit: OnboardDeferredExitError | null = null;
-    process.exit = ((code?: number): never => {
-      throw new OnboardDeferredExitError(code ?? 0);
+    process.exit = ((code?: number | string | null): never => {
+      throw new OnboardDeferredExitError(normalizeProcessExitCode(code));
     }) as typeof process.exit;
     try {
       await run(resolvedOptions);

@@ -15,6 +15,7 @@ import { MCP_BRIDGE_ALLOWED_METHODS } from "../../src/lib/actions/sandbox/mcp-br
 import { startTestProgress } from "../e2e/fixtures/progress.ts";
 import {
   buildCloudflaredQuickTunnelArgs,
+  FAKE_MCP_STATUS_RESULT_TOKEN,
   HERMES_DEFERRED_TOOL_SEARCH_MISS,
   parseTryCloudflareOrigin,
   type StartedHttpServer,
@@ -150,9 +151,9 @@ describe("authenticated MCP live fixtures", () => {
       auth: `Bearer ${secret}`,
       body: "",
     });
-    expect(
-      shouldRetryMcpDiscoveryAfterRestart(server.observations.slice(observationOffset)),
-    ).toBe(false);
+    expect(shouldRetryMcpDiscoveryAfterRestart(server.observations.slice(observationOffset))).toBe(
+      false,
+    );
 
     slowRequest.end(body.slice(1));
     expect(await observedStatus).toEqual({ ok: true, status: 200 });
@@ -265,6 +266,54 @@ describe("authenticated MCP live fixtures", () => {
       priorOpenShellSecret === undefined
         ? delete process.env.OPENSHELL_OIDC_CLIENT_SECRET
         : (process.env.OPENSHELL_OIDC_CLIENT_SECRET = priorOpenShellSecret);
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("uses the proxy-aware HTTPS probe when Node fetch cannot reach the public tunnel", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cloudflared-probe-"));
+    const cloudflared = path.join(directory, "cloudflared");
+    const curl = path.join(directory, "curl");
+    const priorPath = process.env.PATH;
+    fs.writeFileSync(
+      cloudflared,
+      [
+        "#!/bin/sh",
+        "printf '%s\\n' 'https://fixture-cleanup-123.trycloudflare.com' >&2",
+        "trap 'exit 0' TERM INT",
+        "sleep 2",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(curl, "#!/bin/sh\nprintf '%s' '405'\n", { mode: 0o755 });
+    process.env.PATH = `${directory}:${priorPath ?? ""}`;
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new TypeError("fetch failed"));
+    let cleanupProcess: (() => Promise<void>) | undefined;
+
+    try {
+      const tunnel = await startPublicMcpHttpsTunnel({
+        cloudflaredBin: cloudflared,
+        cleanup: {
+          add: (_name, run) => {
+            cleanupProcess = async () => {
+              await run();
+            };
+          },
+        },
+        label: "proxy-aware fixture",
+        progress: progressProbe().progress,
+        server: { port: 43123, close: async () => {} },
+      });
+
+      expect(tunnel.origin).toBe("https://fixture-cleanup-123.trycloudflare.com");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      await cleanupProcess?.();
+      fetchMock.mockRestore();
+      priorPath === undefined ? delete process.env.PATH : (process.env.PATH = priorPath);
       fs.rmSync(directory, { force: true, recursive: true });
     }
   });
@@ -566,13 +615,8 @@ describe("authenticated MCP live fixtures", () => {
       ).status,
     ).toBe(404);
     expect(
-      (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 9, method: "tools/list" },
-          legacy.endpoint,
-        )
-      ).status,
+      (await request("POST", { jsonrpc: "2.0", id: 9, method: "tools/list" }, legacy.endpoint))
+        .status,
     ).toBe(409);
     expect(
       (
@@ -653,46 +697,30 @@ describe("authenticated MCP live fixtures", () => {
       ).status,
     ).toBe(202);
     expect(
+      (await request("POST", { jsonrpc: "2.0", id: 11, method: "tools/list" }, legacy.endpoint))
+        .status,
+    ).toBe(400);
+    expect(
       (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 11, method: "tools/list" },
-          legacy.endpoint,
-        )
+        await request("POST", { jsonrpc: "2.0", id: 11, method: "tools/list" }, legacy.endpoint, {
+          "mcp-protocol-version": "2025-03-26",
+        })
       ).status,
     ).toBe(400);
     expect(
       (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 11, method: "tools/list" },
-          legacy.endpoint,
-          { "mcp-protocol-version": "2025-03-26" },
-        )
-      ).status,
-    ).toBe(400);
-    expect(
-      (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 11, method: "tools/list" },
-          legacy.endpoint,
-          {
-            "mcp-protocol-version": "2025-06-18",
-            "mcp-session-id": "fake-session-cross-route",
-          },
-        )
+        await request("POST", { jsonrpc: "2.0", id: 11, method: "tools/list" }, legacy.endpoint, {
+          "mcp-protocol-version": "2025-06-18",
+          "mcp-session-id": "fake-session-cross-route",
+        })
       ).status,
     ).toBe(400);
     const legacyListEvent = legacy.reader.next();
     expect(
       (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 11, method: "tools/list" },
-          legacy.endpoint,
-          { "mcp-protocol-version": "2025-06-18" },
-        )
+        await request("POST", { jsonrpc: "2.0", id: 11, method: "tools/list" }, legacy.endpoint, {
+          "mcp-protocol-version": "2025-06-18",
+        })
       ).status,
     ).toBe(202);
     expect(JSON.parse((await legacyListEvent).value ?? "")).toMatchObject({
@@ -731,22 +759,18 @@ describe("authenticated MCP live fixtures", () => {
     const requestOffset = server.requests.length;
     const orderedEvents = [legacy.reader.next(), legacy.reader.next()];
     const concurrentResponses = await Promise.all([
-      request(
-        "POST",
-        { jsonrpc: "2.0", id: 30, method: "tools/list" },
-        legacy.endpoint,
-        { "mcp-protocol-version": "2025-06-18" },
-      ),
-      request(
-        "POST",
-        { jsonrpc: "2.0", id: 31, method: "tools/list" },
-        legacy.endpoint,
-        { "mcp-protocol-version": "2025-06-18" },
-      ),
+      request("POST", { jsonrpc: "2.0", id: 30, method: "tools/list" }, legacy.endpoint, {
+        "mcp-protocol-version": "2025-06-18",
+      }),
+      request("POST", { jsonrpc: "2.0", id: 31, method: "tools/list" }, legacy.endpoint, {
+        "mcp-protocol-version": "2025-06-18",
+      }),
     ]);
     expect(concurrentResponses.map((response) => response.status)).toEqual([202, 202]);
     const wireIds = await Promise.all(
-      orderedEvents.map(async (event) => (JSON.parse((await event).value ?? "") as { id: number }).id),
+      orderedEvents.map(
+        async (event) => (JSON.parse((await event).value ?? "") as { id: number }).id,
+      ),
     );
     const recordedResponses = server.requests
       .slice(requestOffset)
@@ -763,12 +787,9 @@ describe("authenticated MCP live fixtures", () => {
     await expect.poll(() => server.activeLegacySessionCount()).toBe(1);
     expect(
       (
-        await request(
-          "POST",
-          { jsonrpc: "2.0", id: 40, method: "tools/list" },
-          legacy.endpoint,
-          { "mcp-protocol-version": "2025-06-18" },
-        )
+        await request("POST", { jsonrpc: "2.0", id: 40, method: "tools/list" }, legacy.endpoint, {
+          "mcp-protocol-version": "2025-06-18",
+        })
       ).status,
     ).toBe(404);
     secondLegacy.channel.destroy();
@@ -803,6 +824,16 @@ describe("authenticated MCP live fixtures", () => {
         isError: false,
       },
     });
+    const statusCall = await request("POST", {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "fake_status", arguments: {} },
+    });
+    expect(statusCall.json()).toMatchObject({
+      result: { content: [{ type: "text", text: FAKE_MCP_STATUS_RESULT_TOKEN }], isError: false },
+    });
+    expect(server.requests.at(-1)?.rpcToolName).toBe("fake_status");
     const paramsByMethod: Partial<Record<(typeof MCP_BRIDGE_ALLOWED_METHODS)[number], unknown>> = {
       initialize: {
         protocolVersion: "2025-11-25",
@@ -973,6 +1004,96 @@ describe("authenticated MCP live fixtures", () => {
     });
   });
 
+  it("drives bridge and progressive denied-tool probes to a verified policy denial", async () => {
+    const prompt = "run denied probe";
+    const headers = {
+      authorization: "Bearer compatible-key",
+      "content-type": "application/json",
+    };
+    const post = async (
+      server: StartedHttpServer,
+      messages: Array<{ role: string; content: string; tool_call_id?: string }>,
+      tools: string[],
+    ) =>
+      (await (
+        await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            messages,
+            tools: tools.map((name) => ({ type: "function", function: { name, parameters: {} } })),
+          }),
+        })
+      ).json()) as CompatibleToolCallResponse;
+    const bridge = await startCompatibleMock({
+      apiKey: "compatible-key",
+      model: "mock/model",
+      deniedToolProbe: {
+        mode: "bridge",
+        promptMarker: prompt,
+        resultToken: "policy_denied",
+        toolName: "mcp__fake__fake_status",
+      },
+    });
+    servers.push(bridge);
+    const user = { role: "user", content: prompt };
+    const bridgeCall = await post(bridge, [user], ["tool_call"]);
+    expect(bridgeCall.choices[0].message.tool_calls[0].function.name).toBe("tool_call");
+    const bridgeResult = await post(
+      bridge,
+      [
+        user,
+        {
+          role: "tool",
+          tool_call_id: "call_denied_tool_bridge",
+          content: JSON.stringify({ error: "policy_denied", detail: "blocked by deny rule" }),
+        },
+      ],
+      ["tool_call"],
+    );
+    expect(bridgeResult.choices[0].message.content).toBe("policy_denied");
+
+    const progressive = await startCompatibleMock({
+      apiKey: "compatible-key",
+      model: "mock/model",
+      deniedToolProbe: {
+        mode: "progressive",
+        promptMarker: prompt,
+        query: "status",
+        resultToken: "policy_denied",
+        toolName: "fake_fake_status",
+      },
+    });
+    servers.push(progressive);
+    const searchCall = await post(progressive, [user], ["search_tools"]);
+    expect(searchCall.choices[0].message.tool_calls[0].function.name).toBe("search_tools");
+    const searchResult = {
+      role: "tool",
+      tool_call_id: "call_denied_tool_search",
+      content: "Found 1\n- fake_fake_status: status",
+    };
+    const deniedCall = await post(
+      progressive,
+      [user, searchResult],
+      ["search_tools", "fake_fake_status"],
+    );
+    expect(deniedCall.choices[0].message.tool_calls[0].function.name).toBe("fake_fake_status");
+    const deniedResult = await post(
+      progressive,
+      [
+        user,
+        searchResult,
+        {
+          role: "tool",
+          tool_call_id: "call_denied_progressive_tool",
+          content: "policy_denied",
+        },
+      ],
+      ["search_tools", "fake_fake_status"],
+    );
+    expect(deniedResult.choices[0].message.content).toBe("policy_denied");
+  });
+
   it("uses Hermes progressive disclosure when the MCP tool is deferred", async () => {
     const deferredToolName = "mcp__fake__fake_echo";
     const resultToken = "MCP_AUTH_REWRITE_OK::deferred-fixture";
@@ -1009,14 +1130,19 @@ describe("authenticated MCP live fixtures", () => {
       id: "call_hermes_tool_search",
       function: {
         name: "tool_search",
-        arguments: JSON.stringify({ query: deferredToolName }),
+        arguments: JSON.stringify({ queries: [deferredToolName] }),
       },
     });
     const missedSearch = await call([
       {
         role: "tool",
         tool_call_id: "call_hermes_tool_search",
-        content: '{"matches":[{"name":"some_other_tool"}]}',
+        content: JSON.stringify({
+          queries: [deferredToolName],
+          total_available: 1,
+          results: [{ query: deferredToolName, matches: ["some_other_tool"] }],
+          tools: { some_other_tool: { description: "Another tool" } },
+        }),
       },
     ]);
     expect(missedSearch).toMatchObject({
@@ -1032,7 +1158,12 @@ describe("authenticated MCP live fixtures", () => {
       {
         role: "tool",
         tool_call_id: "call_hermes_tool_search",
-        content: JSON.stringify({ query: deferredToolName, matches: [] }),
+        content: JSON.stringify({
+          queries: [deferredToolName],
+          total_available: 1,
+          results: [{ query: deferredToolName, matches: [] }],
+          tools: {},
+        }),
       },
     ]);
     expect(echoedSearchQueryWithoutMatch).toMatchObject({
@@ -1047,13 +1178,18 @@ describe("authenticated MCP live fixtures", () => {
     const searchResult = {
       role: "tool",
       tool_call_id: "call_hermes_tool_search",
-      content: JSON.stringify({ matches: [{ name: deferredToolName }] }),
+      content: JSON.stringify({
+        queries: [deferredToolName],
+        total_available: 1,
+        results: [{ query: deferredToolName, matches: [deferredToolName] }],
+        tools: { [deferredToolName]: { description: "Deferred echo" } },
+      }),
     };
     const describeBody = await call([searchResult]);
     expect(describeBody.choices[0].message.tool_calls[0]).toMatchObject({
       function: {
         name: "tool_describe",
-        arguments: JSON.stringify({ name: deferredToolName }),
+        arguments: JSON.stringify({ names: [deferredToolName] }),
       },
     });
     const wrongDescription = await call([
@@ -1061,7 +1197,7 @@ describe("authenticated MCP live fixtures", () => {
       {
         role: "tool",
         tool_call_id: "call_hermes_tool_describe",
-        content: JSON.stringify({ name: deferredToolName, parameters: {} }),
+        content: JSON.stringify({ tools: { [deferredToolName]: {} } }),
       },
     ]);
     expect(wrongDescription).toMatchObject({
@@ -1073,8 +1209,12 @@ describe("authenticated MCP live fixtures", () => {
       role: "tool",
       tool_call_id: "call_hermes_tool_describe",
       content: JSON.stringify({
-        name: deferredToolName,
-        parameters: { properties: { challenge: { type: "string" } } },
+        tools: {
+          [deferredToolName]: {
+            description: "Deferred echo",
+            parameters: { properties: { challenge: { type: "string" } } },
+          },
+        },
       }),
     };
     const callBody = await call([searchResult, descriptionResult]);
