@@ -329,6 +329,9 @@ metrics:
   # in Grafana out of the box. Default true so install/load-test/reset re-runs (plain
   # `helm upgrade`, not --reuse-values) don't silently disable this on every re-apply.
   # Clear rolling latency_avg after this idle period so latency HPA can scale down.
+  # 4× L40S keeps this 60s hard expire (verified). 8× H100 load-test overrides with
+  # idle decay via helm --set (see hpa-load-test-dgx-8xh100.sh).
+  llmLatencyIdleDecayTauMs: 0
   llmLatencyIdleExpireMs: 60000
   serviceMonitor:
     enabled: true

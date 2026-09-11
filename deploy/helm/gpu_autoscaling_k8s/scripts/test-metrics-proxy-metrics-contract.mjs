@@ -2,15 +2,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Focused contract for rolling LLM latency_avg idle-expiration used by HPA.
-// After load stops, the gauge must drop to 0 so scale-down is not blocked by stale samples.
+// Contract for rolling LLM latency_avg idle decay used by HPA.
+// After load stops, the gauge decays toward 0, then expires, so scale-down is
+// not blocked by a stale high average and does not cliff in one scrape.
 
 import assert from "node:assert/strict";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 process.env.LLM_LATENCY_WINDOW_SIZE = "8";
-process.env.LLM_LATENCY_IDLE_EXPIRE_MS = "100";
+process.env.LLM_LATENCY_IDLE_DECAY_TAU_MS = "100";
+process.env.LLM_LATENCY_IDLE_EXPIRE_MS = "500";
 
 const metricsPath = path.resolve(
   path.dirname(new URL(import.meta.url).pathname),
@@ -43,13 +45,18 @@ assert.ok(
   "p50/p95 latency gauges must not be exported",
 );
 
-// Still within the idle window — gauge retains the rolling average.
-nowMs += 99;
+// Idle decay: avg * exp(-idle / tau). tau=100ms, idle=70ms → 6000 * e^(-0.7).
+nowMs += 70;
 lines = llmMetricsLines();
-assert.equal(gaugeValue(lines, "nemoclaw_llm_latency_avg_milliseconds"), 6000);
+assert.equal(gaugeValue(lines, "nemoclaw_llm_latency_avg_milliseconds"), 2980);
+
+// Further decay, still above 0 and not yet expired (idle=140ms < 500ms).
+nowMs += 70;
+lines = llmMetricsLines();
+assert.equal(gaugeValue(lines, "nemoclaw_llm_latency_avg_milliseconds"), 1480);
 
 // Past idle expire — rolling window clears so HPA sees 0 (below target).
-nowMs += 1;
+nowMs += 360;
 lines = llmMetricsLines();
 assert.equal(gaugeValue(lines, "nemoclaw_llm_latency_avg_milliseconds"), 0);
 
@@ -62,4 +69,4 @@ assert.equal(gaugeValue(lines, "nemoclaw_llm_latency_avg_milliseconds"), 4000);
 assert.match(lines.join("\n"), /nemoclaw_llm_requests_total\{result="success"\} 3/);
 
 setLlmMetricsClockForTests(null);
-console.log("OK: rolling LLM latency_avg gauge idle-expires for HPA scale-down");
+console.log("OK: rolling LLM latency_avg gauge idle-decays then expires for HPA scale-down");
