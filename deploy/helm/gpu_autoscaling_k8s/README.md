@@ -5,7 +5,9 @@
 
 # NemoClaw Kubernetes GPU autoscaling
 
-This experimental recipe demonstrates a cost-efficient architecture that runs a single AI agent securely inside a CPU-only OpenShell sandbox while independently autoscaling GPU-backed inference. Because GPU inference is the primary compute and cost bottleneck, Kubernetes HPA dynamically adjusts inference capacity from one to multiple replicas as demand changes, maintaining responsiveness during traffic spikes while releasing idle GPU resources when demand falls.
+This experimental recipe demonstrates a cost-efficient architecture that runs a single AI agent securely inside a CPU-only OpenShell sandbox while independently autoscaling GPU-backed inference. It is **not** native NemoClaw Kubernetes support: official NemoClaw still lists operator-managed Kubernetes/OpenShift as unsupported and runs sandboxes as Docker (or explicit Podman) containers via `nemoclaw` / `nemohermes` / `nemo-deepagents`. Here the CPU agent is an OpenShell Kubernetes sandbox (Agent Sandbox CRD + OpenShell 0.0.85), and GPU inference is a separate Helm chart with HPA. Do not run `nemoclaw launch`, `nemohermes launch`, or `nemo-deepagents launch` against this cluster — those commands are the host-installer path. Use the recipe scripts in [Quick start](#quick-start) and [`AGENT-SELECTION.md`](AGENT-SELECTION.md#recipe-quick-start).
+
+Because GPU inference is the primary compute and cost bottleneck, Kubernetes HPA dynamically adjusts inference capacity from one to multiple replicas as demand changes, maintaining responsiveness during traffic spikes while releasing idle GPU resources when demand falls.
 
 The recipe provides three sandboxed agent harness options: **OpenClaw** (default), **Hermes**, or **Deep Agents Code**; see [`AGENT-SELECTION.md`](AGENT-SELECTION.md). To choose one, set `AGENT_NAME` once and reuse it for image build, create, verify, and run. Do not install two agents in one sandbox.
 
@@ -15,7 +17,7 @@ The recipe provides three sandboxed agent harness options: **OpenClaw** (default
 | Hermes | `hermes` | `./scripts/run-agent-sandbox.sh` (keep attached) |
 | Deep Agents Code | `deepagents` | `./scripts/run-agent-prompt.sh "…"` |
 
-It also provides three GPU inference runtime options: **Ollama** (default), **vLLM**, or **NVIDIA NIM**, selected with `inference.runtime` / `INFERENCE_RUNTIME`; see [Inference runtimes](#inference-runtimes). The recipe supports all nine agent × runtime combinations through the same 1 GPU → 1 pod → local OpenAI-compatible `/v1` server pattern, while metrics-proxy, HPA, and Envoy work consistently across every combination; see [Agent and runtime support](#agent-and-runtime-support) for the full matrix.
+It also provides three GPU inference runtime options: **Ollama** (default), **vLLM**, or **NVIDIA NIM**, selected with `inference.runtime` / `INFERENCE_RUNTIME`; see [Inference runtimes](#inference-runtimes). For which agent × runtime pairings official NemoClaw documents, see [Agent and runtime support](#agent-and-runtime-support). Metrics-proxy, HPA, and Envoy stay the same for the pairing you choose.
 
 Kubernetes HPA scales only those GPU inference pods (1 GPU each) using a Pods **`AverageValue`** metric (average across Ready pods). Example HPA metrics: **GPU utilization** (scale out when average per-pod util is **above 40%**) and **LLM latency** (scale out when average per-pod latency is **above 3000 ms**).
 
@@ -199,6 +201,13 @@ Do not paste kubeconfig, registry credentials, OIDC secrets, or inference API ke
 From an empty clone to a working sandbox. Run from `deploy/helm/gpu_autoscaling_k8s/`
 unless noted. Deeper options: [Install details](#install-details), [OpenShell details](#openshell-details).
 
+This path uses OpenShell's Kubernetes driver, not `nemoclaw onboard` / `nemohermes launch` /
+`nemo-deepagents launch`. After `create-agent-sandbox.sh`, OpenShell 0.0.85 leaves the
+sandbox pod idle (`sleep infinity`). OpenClaw and Hermes do not listen until
+`./scripts/run-agent-sandbox.sh` stays attached. Deep Agents Code has no gateway:
+use `./scripts/verify-agent-sandbox.sh` and `./scripts/run-agent-prompt.sh`. Per-agent
+loops: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#recipe-quick-start).
+
 ### 1. Clone and tools
 
 ```bash
@@ -278,7 +287,11 @@ Optional example test: [Example test](#example-test).
 
 ### 4. Agent Sandbox, image, OpenShell
 
-Pick your agent once here — everything below (and step 5) reuses the same `AGENT_NAME`. See [`AGENT-SELECTION.md`](AGENT-SELECTION.md#comparison) for how OpenClaw, Hermes, and Deep Agents Code differ.
+Pick your agent once here — everything below (and step 5) reuses the same `AGENT_NAME`.
+Valid values are `openclaw`, `hermes`, or `deepagents` (the recipe alias for LangChain
+Deep Agents Code — not `langchain-deepagents-code`). See [`AGENT-SELECTION.md`](AGENT-SELECTION.md#comparison)
+for how they differ, and [`AGENT-SELECTION.md`](AGENT-SELECTION.md#recipe-quick-start)
+for a complete build → create → run → verify loop per agent.
 
 ```bash
 source versions.env
@@ -318,20 +331,23 @@ Terminal 1 — keep running:
 kubectl -n nemoclaw-sandboxes port-forward service/openshell 8080:8080
 ```
 
-Terminal 2 — client TLS + gateway (OIDC flags in [OpenShell details](#openshell-details)), then create the sandbox for the `AGENT_NAME` you picked in step 4 (re-export it here if this is a fresh shell):
+Terminal 2 — client TLS + gateway (OIDC flags in [OpenShell details](#openshell-details)), then create the sandbox for the `AGENT_NAME` you picked in step 4 (re-export it here if this is a fresh shell). Creating the sandbox does **not** start Hermes or OpenClaw; the pod stays idle until the next command.
+
+Do not use `nemohermes launch` or `nemo-deepagents launch` here.
 
 ```bash
 export AGENT_SANDBOX_IMAGE=localhost:32000/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}
 export INFERENCE_MODEL=llama3.2:3b   # must match the GPU chart model
 ./scripts/create-agent-sandbox.sh
 
-# OpenClaw / Hermes — start the gateway and keep this terminal in the foreground:
+# OpenClaw / Hermes only — start /usr/local/bin/nemoclaw-start and keep this terminal
+# in the foreground. Skip this line for AGENT_NAME=deepagents.
 ./scripts/run-agent-sandbox.sh
 ```
 
 For OpenClaw or Hermes, run verification from a third terminal after the gateway starts
-(re-export the same `AGENT_NAME` and `INFERENCE_MODEL` there). For Deep Agents Code,
-which has no gateway, run it directly from Terminal 2:
+(re-export the same `AGENT_NAME` and `INFERENCE_MODEL` there). For Deep Agents Code
+(`AGENT_NAME=deepagents`), skip `run-agent-sandbox.sh` and run verify from Terminal 2:
 
 ```bash
 ./scripts/verify-agent-sandbox.sh   # sends one real synthesized prompt
@@ -487,16 +503,23 @@ These are registry/model credentials, not the chart-generated **inference API ke
 
 #### Agent and runtime support
 
-The chart and `metrics-proxy` treat all nine `AGENT_NAME` × `inference.runtime` pairings identically, and the contract suite renders every combination. Official NemoClaw guidance currently documents the following local-runtime choices:
+Please reference these docs for agent and runtime support — they are the source of
+truth for which local providers each agent offers:
 
-| Agent | Ollama | vLLM | NIM |
-|-------|--------|------|-----|
-| **OpenClaw** | Documented | Documented | Documented |
-| **Hermes** | Documented | Documented | Documented |
-| **Deep Agents Code** | Recipe experimental | Documented | Documented |
+- [Choose an Inference Provider](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/inference/learn-and-choose/choose-inference-provider) (OpenClaw)
+- [Choose an Inference Provider](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/inference/learn-and-choose/choose-inference-provider) (Hermes)
+- [Choose an Inference Provider](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/inference/learn-and-choose/choose-inference-provider) (Deep Agents)
+- In-tree: [`docs/inference/choose-inference-provider.mdx`](../../../docs/inference/choose-inference-provider.mdx)
 
-- References: [OpenClaw quickstart](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/get-started/quickstart), [Hermes quickstart](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/get-started/quickstart), and [Deep Agents Code quickstart](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/get-started/quickstart).
-- The recipe supports Deep Agents Code + Ollama through the same OpenAI-compatible route, but current NemoClaw guidance does not offer local Ollama for Deep Agents Code. `try-it.sh` allows that pairing with a warning.
+Host first-run (Docker installer, not this cluster): [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/get-started/quickstart), [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/get-started/quickstart), [Deep Agents Code](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/get-started/quickstart). On this recipe, start those same images with `run-agent-sandbox.sh` / `run-agent-prompt.sh`; see [`AGENT-SELECTION.md`](AGENT-SELECTION.md#recipe-quick-start).
+
+Popular example combinations for each agent on this recipe:
+
+- **OpenClaw** — Ollama (`AGENT_NAME=openclaw`, `INFERENCE_RUNTIME=ollama`, `INFERENCE_MODEL=llama3.2:3b`). Chart default. Cluster test: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
+- **Hermes** — vLLM (`AGENT_NAME=hermes`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). `try-it.sh` default. Cluster test: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh).
+- **Deep Agents Code** — vLLM (`AGENT_NAME=deepagents`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). Official docs do not list Local Ollama for this agent; the recipe scripts refuse that pairing. Cluster test: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
+
+Those three wrappers pin the pairing and run [`scripts/try-it.sh`](scripts/try-it.sh) (HPA load test off unless `RUN_LOAD_TEST=1`; same security opt-in). Static contract, no cluster: [`scripts/test-agent-runtime-examples-contract.sh`](scripts/test-agent-runtime-examples-contract.sh).
 
 Before creating a load Job, the test waits for a clean HPA baseline of **1 current / 1 desired** Ready replica (up to 240 seconds). This prevents a new test from inheriting replicas or the 60-second scale-down stabilization window from a prior test. It does not force a scale-down, so it cannot disrupt real traffic; wait for existing traffic to drain, then rerun. Set `HPA_BASELINE_WAIT_SEC` only if a longer wait is appropriate for your cluster.
 
@@ -779,8 +802,8 @@ openshell gateway add https://127.0.0.1:8080 \
 openshell status
 ```
 
-- `scripts/create-agent-sandbox.sh` stores the chart inference key in the OpenShell provider, strips `integrate.api.nvidia.com` from policy (where the selected agent's upstream policy grants it — see [`AGENT-SELECTION.md`](AGENT-SELECTION.md#shared-policy-notes)), and runs an example chat (`In one sentence, what is an AI agent sandbox?`).
-- OpenShell `0.0.85` leaves sandboxes idle (`sleep infinity`); `scripts/run-agent-sandbox.sh` (OpenClaw/Hermes) must stay attached and does not auto-restart — Deep Agents Code has no such gateway to keep running (see [`AGENT-SELECTION.md`](AGENT-SELECTION.md)). Combined topology may require powerful capabilities (`SYS_ADMIN`, `NET_ADMIN`, …) — check admission policy.
+- `scripts/create-agent-sandbox.sh` stores the chart inference key in the OpenShell provider, strips `integrate.api.nvidia.com` from policy (where the selected agent's upstream policy grants it — see [`AGENT-SELECTION.md`](AGENT-SELECTION.md#shared-policy-notes)), and runs a create-time smoke test (`/v1/models`, plus `hermes --version` / `dcode --version` / plugin inspect). It does **not** start the agent gateway or send the example prompt. That prompt is `scripts/verify-agent-sandbox.sh` after the gateway is up (OpenClaw/Hermes) or immediately (Deep Agents Code).
+- OpenShell `0.0.85` leaves sandboxes idle (`sleep infinity`); `scripts/run-agent-sandbox.sh` (OpenClaw/Hermes) must stay attached and does not auto-restart — Deep Agents Code has no such gateway (`run-agent-prompt.sh` instead). Do not substitute `nemohermes launch` or `nemo-deepagents launch`. Combined topology may require powerful capabilities (`SYS_ADMIN`, `NET_ADMIN`, …) — check admission policy.
 
 ## Test autoscaling and load balancing
 

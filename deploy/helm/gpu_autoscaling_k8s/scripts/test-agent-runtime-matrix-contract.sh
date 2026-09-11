@@ -5,7 +5,8 @@
 # Static compatibility contract for every AGENT_NAME × inference.runtime pairing. Agent
 # selection configures the OpenShell sandbox, while the Helm chart configures inference;
 # this test verifies each agent selection and each rendered runtime together without a
-# cluster, credentials, or GPU. It does not replace the staged live matrix in README.md.
+# cluster, credentials, or GPU. Helm can render all nine combinations; README.md documents
+# only the officially listed pairings (not Deep Agents + Ollama).
 
 set -euo pipefail
 

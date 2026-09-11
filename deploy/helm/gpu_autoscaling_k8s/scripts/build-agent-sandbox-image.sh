@@ -37,10 +37,11 @@ require_cmd sed
 
 AGENT_NAME="${AGENT_NAME:-}"
 agent_common_validate "${AGENT_NAME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 
 SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-}"
-MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
+MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME:-ollama}")}"
 PLATFORM="${NEMOCLAW_IMAGE_PLATFORM:-linux/amd64}"
 IMAGE_NAME="${SANDBOX_IMAGE##*/}"
 

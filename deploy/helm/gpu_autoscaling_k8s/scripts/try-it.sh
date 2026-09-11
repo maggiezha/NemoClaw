@@ -26,11 +26,9 @@ set -euo pipefail
 # ============================================================================
 AGENT_NAME="${AGENT_NAME:-hermes}"               # openclaw | hermes | deepagents
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-vllm}"   # ollama | vllm | nim — see
-                                                  # ../README.md#agent-and-runtime-support and
-                                                  # ../AGENT-SELECTION.md#notes for which pairings
-                                                  # are documented/tested. ollama + deepagents is
-                                                  # not currently documented upstream: this script
-                                                  # still runs it, but prints a warning below.
+                                                  # ../README.md#agent-and-runtime-support for
+                                                  # documented pairings. Deep Agents + Ollama is
+                                                  # not documented; this script refuses it.
 REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node can pull from
                                                   # (MicroK8s local registry default)
 
@@ -80,31 +78,13 @@ source versions.env
 source "${SCRIPT_DIR}/agent-common.sh"
 
 agent_common_validate "${AGENT_NAME}"
-export AGENT_NAME
-
-case "${INFERENCE_RUNTIME}" in
-  ollama)
-    INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
-    if [[ "${AGENT_NAME}" == "deepagents" ]]; then
-      echo "WARNING: AGENT_NAME=deepagents with INFERENCE_RUNTIME=ollama is not currently" \
-        "documented upstream (see ../README.md#agent-and-runtime-support and" \
-        "../AGENT-SELECTION.md#notes) — continuing, but treat this pairing as" \
-        "unsupported/untested, not a validated combination." >&2
-    fi
-    ;;
-  vllm)
-    INFERENCE_MODEL="${INFERENCE_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8}"
-    ;;
-  nim)
-    INFERENCE_MODEL="${INFERENCE_MODEL:-nvidia/nemotron-3-nano}"
-    hpa_common_require_nim_credentials "${INFERENCE_RUNTIME}" "${NAMESPACE}" || exit 1
-    ;;
-  *)
-    echo "ERROR: INFERENCE_RUNTIME must be ollama, vllm, or nim (got '${INFERENCE_RUNTIME}')." >&2
-    exit 1
-    ;;
-esac
-export INFERENCE_RUNTIME INFERENCE_MODEL
+agent_common_validate_inference_runtime "${INFERENCE_RUNTIME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
+INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
+if [[ "${INFERENCE_RUNTIME}" == "nim" ]]; then
+  hpa_common_require_nim_credentials "${INFERENCE_RUNTIME}" "${NAMESPACE}" || exit 1
+fi
+export AGENT_NAME INFERENCE_RUNTIME INFERENCE_MODEL
 
 case "${RUN_LOAD_TEST}" in
   0 | 1) ;;

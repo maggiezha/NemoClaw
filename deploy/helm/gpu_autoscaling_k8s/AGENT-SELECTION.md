@@ -13,9 +13,18 @@ Set `AGENT_NAME` to select the agent. Each uses OpenShell's
 `https://inference.local/v1` proxy and the same GPU inference, HPA, and monitoring stack;
 see [Agent and runtime support](README.md#agent-and-runtime-support).
 
-Official quickstarts: [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/get-started/quickstart),
+Official host-installer quickstarts (this branch):
+[OpenClaw](../../../docs/get-started/quickstart.mdx),
+[Hermes](../../../docs/get-started/quickstart-hermes.mdx), and
+[LangChain Deep Agents Code](../../../docs/get-started/quickstart-langchain-deepagents-code.mdx).
+Published copies: [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/get-started/quickstart),
 [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/get-started/quickstart), and
 [Deep Agents Code](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/get-started/quickstart).
+
+This recipe does **not** use `nemoclaw` / `nemohermes` / `nemo-deepagents launch`.
+Those commands are the host Docker installer path. Here the CPU agent lives in an
+OpenShell Kubernetes sandbox and talks to GPU inference through
+`https://inference.local/v1`. Confirm each agent with the [Recipe quick start](#recipe-quick-start).
 
 ## Comparison
 
@@ -31,6 +40,136 @@ Official quickstarts: [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-gu
 | Default sandbox name | `nemoclaw-onprem` | `hermes-onprem` | `deepagents-onprem` |
 | Default OpenShell provider name | `onprem-ollama` | `onprem-hermes` | `onprem-deepagents` |
 | Upstream policy grants `integrate.api.nvidia.com`? | Yes — removed by `create-agent-sandbox.sh` | Yes — removed by `create-agent-sandbox.sh` | No — nothing to remove |
+| Official installer CLI (`NEMOCLAW_AGENT`) | `nemoclaw` (`openclaw`) | `nemohermes` (`hermes`) | `nemo-deepagents` (`langchain-deepagents-code`) |
+| Official first prompt | `nemoclaw launch <sandbox>` or `openclaw tui` | `nemohermes launch <sandbox>` or `hermes` | `nemo-deepagents launch <sandbox>` or `dcode` / `dcode -n` |
+
+## Recipe quick start
+
+Run **one** of the loops below after the GPU chart and OpenShell gateway are up.
+Shared prerequisites (do these once): [README Quick start](README.md#quick-start)
+steps 1–3 (GPU inference + HPA), Agent Sandbox CRDs, `install-openshell-k8s.sh`,
+and a live OpenShell port-forward:
+
+```bash
+kubectl -n nemoclaw-sandboxes port-forward service/openshell 8080:8080
+```
+
+Keep that port-forward attached. Use a second terminal in
+`deploy/helm/gpu_autoscaling_k8s`. Source `versions.env` there. The GPU Helm
+chart is agent-neutral; only the sandbox image and `AGENT_NAME` change.
+
+Do not mix `AGENT_NAME` values in one sandbox. To try another agent, build its
+image and create a **separate** sandbox name. A pass is the `OK: sandbox …`
+line in [Example verify output](#example-verify-output).
+
+Documented example cluster tests (same security opt-in as `try-it.sh`; skips the
+HPA load test unless `RUN_LOAD_TEST=1`):
+
+- OpenClaw + Ollama: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh)
+- Hermes + vLLM: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh)
+- Deep Agents Code + vLLM: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh)
+
+### OpenClaw
+
+Matches the official [OpenClaw quickstart](../../../docs/get-started/quickstart.mdx)
+harness (`openclaw tui` / `openclaw agent --agent main -m`) on this Kubernetes path.
+
+```bash
+source versions.env
+export AGENT_NAME=openclaw
+export AGENT_SANDBOX_IMAGE=localhost:32000/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}
+export INFERENCE_MODEL=llama3.2:3b   # must match the GPU chart model
+./scripts/build-agent-sandbox-image.sh
+./scripts/create-agent-sandbox.sh
+```
+
+Terminal 2 — keep attached (starts `/usr/local/bin/nemoclaw-start`):
+
+```bash
+export AGENT_NAME=openclaw
+./scripts/run-agent-sandbox.sh
+```
+
+Terminal 3 — real headless prompt through `openclaw agent --agent main -m`:
+
+```bash
+export AGENT_NAME=openclaw
+export INFERENCE_MODEL=llama3.2:3b
+./scripts/verify-agent-sandbox.sh
+```
+
+One-script cluster test for this example: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
+
+### Hermes
+
+Matches the official [Hermes quickstart](../../../docs/get-started/quickstart-hermes.mdx)
+harness (`NEMOCLAW_AGENT=hermes`, `nemohermes`, in-sandbox `hermes` / `hermes -z`).
+This recipe's `AGENT_NAME` is the same string (`hermes`). The host CLI
+`nemohermes launch` is **not** used here: OpenShell `0.0.85` leaves the pod idle
+until `run-agent-sandbox.sh` starts the gateway. Health is `:8642/health` (not
+OpenClaw's `:18789/health`). This recipe does not port-forward the Hermes dashboard.
+
+```bash
+source versions.env
+export AGENT_NAME=hermes
+export AGENT_SANDBOX_IMAGE=localhost:32000/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}
+export INFERENCE_MODEL=llama3.2:3b
+./scripts/build-agent-sandbox-image.sh
+./scripts/create-agent-sandbox.sh
+```
+
+Terminal 2 — keep attached:
+
+```bash
+export AGENT_NAME=hermes
+./scripts/run-agent-sandbox.sh
+```
+
+Terminal 3 — real headless prompt through `hermes -z`:
+
+```bash
+export AGENT_NAME=hermes
+export INFERENCE_MODEL=llama3.2:3b
+./scripts/verify-agent-sandbox.sh
+```
+
+The loop above uses Ollama (`llama3.2:3b`), which official docs also list for Hermes.
+The popular recipe example is Hermes + vLLM: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh).
+
+### Deep Agents Code
+
+Matches the official
+[LangChain Deep Agents Code quickstart](../../../docs/get-started/quickstart-langchain-deepagents-code.mdx)
+harness (`NEMOCLAW_AGENT=langchain-deepagents-code`, `nemo-deepagents`, in-sandbox
+`dcode` / `dcode -n`). This recipe's `AGENT_NAME` is the short alias **`deepagents`**,
+not `langchain-deepagents-code`. There is no gateway and nothing to keep attached:
+`run-agent-sandbox.sh` refuses this agent. Official NemoClaw docs cover vLLM and NIM
+for Deep Agents, not Ollama. Install (or reinstall) the GPU chart with `INFERENCE_RUNTIME=vllm`
+or `nim` before this loop; do not leave the chart on the Ollama default.
+
+```bash
+source versions.env
+export AGENT_NAME=deepagents
+export INFERENCE_RUNTIME=vllm
+export INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
+export AGENT_SANDBOX_IMAGE=localhost:32000/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}
+./scripts/install-hpa.sh   # skip if the release is already on this runtime and model
+./scripts/build-agent-sandbox-image.sh
+./scripts/create-agent-sandbox.sh
+./scripts/verify-agent-sandbox.sh   # real headless prompt through dcode -n
+./scripts/run-agent-prompt.sh "Explain this repository in one sentence."
+```
+
+Interactive TUI (TTY), equivalent to `nemo-deepagents … connect` then `dcode`:
+
+```bash
+openshell sandbox exec -n deepagents-onprem -- dcode
+```
+
+One-script cluster test for this example: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
+Generic shortcut (edit `AGENT_NAME` / `INFERENCE_RUNTIME` at the top; default is
+`hermes` + `vllm`): `./scripts/try-it.sh`. For Deep Agents, keep
+`INFERENCE_RUNTIME=vllm` or `nim`.
 
 ## Env vars
 
@@ -101,15 +240,17 @@ dcode --version OK.
 [verify] Checking config.toml was generated (timeout 30s)...
 config.toml OK.
 [verify] GET https://inference.local/v1/models (timeout 120s)...
-models: llama3.2:3b
+models: nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
 [verify] dcode -n (headless) — this is the real agent binary, not a curl probe (timeout 120s)
 [verify] Example query: In one sentence, what is an AI agent sandbox?
 [verify] Answer: An AI agent sandbox is a simulated environment where an AI agent
 can interact and learn in a safe, controlled space.
-OK: sandbox deepagents-onprem reached https://inference.local for models and answered a real prompt through NemoClaw/Deep Agents Code (llama3.2:3b).
+OK: sandbox deepagents-onprem reached https://inference.local for models and answered a real prompt through NemoClaw/Deep Agents Code (nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8).
 NemoClaw/Deep Agents Code has no long-running gateway; run one-shot prompts with:
   AGENT_NAME=deepagents ./scripts/run-agent-prompt.sh "your prompt here"
 ```
+
+<a id="shared-policy-notes"></a>
 
 ## Sandbox policies
 
@@ -147,7 +288,8 @@ NemoClaw/Deep Agents Code has no long-running gateway; run one-shot prompts with
   auto-restart. Combined topology (privilege drop + agent-specific tooling) may require
   capabilities like `SYS_ADMIN` / `NET_ADMIN` in a restrictive admission policy — check your
   cluster's Pod Security admission before assuming a clean create.
-- Current NemoClaw guidance documents Deep Agents Code with vLLM and NIM, but does not
-  offer local Ollama for that agent. This recipe still permits Deep Agents Code + Ollama
-  through the common OpenAI-compatible route and prints a warning in `try-it.sh`; treat
-  that specific pairing as recipe-experimental until live-tested.
+- Official NemoClaw local providers for Deep Agents Code are vLLM and NIM, not Ollama.
+  This recipe does not document `AGENT_NAME=deepagents` with `INFERENCE_RUNTIME=ollama`.
+  `agent_common_validate_runtime_pairing` refuses that pairing in `try-it.sh`,
+  `install-hpa.sh` (when `AGENT_NAME` is set), and the sandbox build/create/verify/prompt
+  scripts.

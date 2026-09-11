@@ -32,6 +32,7 @@ command -v openshell >/dev/null 2>&1 || fail "missing command: openshell"
 
 AGENT_NAME="${AGENT_NAME:-}"
 agent_common_validate "${AGENT_NAME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 [[ "$(agent_common_run_mode "${AGENT_NAME}")" == "gateway" ]] \
   || fail "${AGENT_DISPLAY_NAME} has no long-running gateway; use AGENT_NAME=${AGENT_NAME} ./scripts/run-agent-prompt.sh \"<prompt>\" instead"

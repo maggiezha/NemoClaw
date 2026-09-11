@@ -19,6 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=hpa-common.sh
 source "${SCRIPT_DIR}/hpa-common.sh"
+# shellcheck source=agent-common.sh
+source "${SCRIPT_DIR}/agent-common.sh"
 hpa_common_load_local_env "${CHART_DIR}"
 
 NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
@@ -53,10 +55,10 @@ MIN_REPLICAS="${MIN_REPLICAS:-1}"
 # Empty → resolve to allocatable GPU count after GPU nodes are verified (MAX_REPLICAS=N).
 MAX_REPLICAS="${MAX_REPLICAS:-}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-900}"
-INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
 # ollama | vllm | nim — see README runtime comparison table. Switching runtimes usually also
 # means changing INFERENCE_MODEL to match (e.g. an HF repo id for vllm, a NIM catalog id for nim).
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
+INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 GPU_TARGET="${GPU_TARGET:-40}"
 PROM_HELM_TIMEOUT="${PROM_HELM_TIMEOUT:-25m}"
 PROM_VALUES="${PROM_VALUES:-${CHART_DIR}/monitoring/kube-prometheus-microk8s.yaml}"
@@ -93,6 +95,9 @@ case "${INFERENCE_RUNTIME}" in
     exit 1
     ;;
 esac
+if [[ -n "${AGENT_NAME:-}" ]]; then
+  agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
+fi
 hpa_common_require_nim_credentials "${INFERENCE_RUNTIME}" "${NAMESPACE}" || exit 1
 case "${ENABLE_ENVOY_LB:-1}" in
   0 | 1) ;;

@@ -16,6 +16,78 @@ agent_common_validate() {
   esac
 }
 
+# Local-runtime ids this recipe's Helm chart can render (ollama | vllm | nim).
+# Which pairings are documented for each agent is official NemoClaw guidance —
+# see ../README.md#agent-and-runtime-support and
+# ../../../docs/inference/choose-inference-provider.mdx.
+agent_common_validate_inference_runtime() {
+  case "${1:-}" in
+    ollama | vllm | nim) ;;
+    *)
+      echo "ERROR: INFERENCE_RUNTIME must be ollama, vllm, or nim (got '${1:-}')" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Refuse pairings official NemoClaw does not list. Deep Agents has no Local Ollama
+# row; empty runtime is treated as the chart default (ollama) and is also refused.
+agent_common_validate_runtime_pairing() {
+  local agent="${1:?agent}"
+  local runtime="${2:-}"
+  agent_common_validate "${agent}"
+  if [[ "${agent}" == "deepagents" && ( -z "${runtime}" || "${runtime}" == "ollama" ) ]]; then
+    echo "ERROR: AGENT_NAME=deepagents with INFERENCE_RUNTIME=${runtime:-ollama} is not an officially documented pairing." >&2
+    echo "Set INFERENCE_RUNTIME=vllm or nim. See README.md#agent-and-runtime-support and docs/inference/choose-inference-provider.mdx." >&2
+    exit 1
+  fi
+  if [[ -n "${runtime}" ]]; then
+    agent_common_validate_inference_runtime "${runtime}"
+  fi
+}
+
+# Popular documented defaults used by this recipe (OpenClaw+Ollama, Hermes/Deep Agents+vLLM).
+agent_common_default_inference_model() {
+  case "${1:-ollama}" in
+    vllm) printf '%s' "nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8" ;;
+    nim) printf '%s' "nvidia/nemotron-3-nano" ;;
+    *) printf '%s' "llama3.2:3b" ;;
+  esac
+}
+
+# README.md#agent-and-runtime-support example pairings. TAB-separated: agent runtime model
+agent_common_example_pairings() {
+  printf '%s\t%s\t%s\n' \
+    openclaw ollama llama3.2:3b \
+    hermes vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8 \
+    deepagents vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
+}
+
+agent_common_example_test_script() {
+  printf 'test-%s-%s.sh' "${1:?agent}" "${2:?runtime}"
+}
+
+agent_common_is_example_pairing() {
+  local agent="${1:?agent}" runtime="${2:?runtime}" a r
+  while IFS=$'\t' read -r a r _; do
+    if [[ "${a}" == "${agent}" && "${r}" == "${runtime}" ]]; then
+      return 0
+    fi
+  done < <(agent_common_example_pairings)
+  return 1
+}
+
+agent_common_example_model() {
+  local agent="${1:?agent}" runtime="${2:?runtime}" a r m
+  while IFS=$'\t' read -r a r m; do
+    if [[ "${a}" == "${agent}" && "${r}" == "${runtime}" ]]; then
+      printf '%s' "${m}"
+      return 0
+    fi
+  done < <(agent_common_example_pairings)
+  return 1
+}
+
 agent_common_display_name() {
   case "$1" in
     openclaw) echo "NemoClaw/OpenClaw" ;;

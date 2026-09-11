@@ -40,6 +40,7 @@ require_cmd python3
 
 AGENT_NAME="${AGENT_NAME:-}"
 agent_common_validate "${AGENT_NAME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 
 SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-}"
@@ -48,7 +49,7 @@ INFERENCE_NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 INFERENCE_RELEASE="${RELEASE:-nemoclaw-gpu}"
 INFERENCE_SERVICE="${INFERENCE_SERVICE:-${INFERENCE_RELEASE}-metrics-proxy}"
 INFERENCE_PORT="${SERVICE_PORT:-8081}"
-MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
+MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME:-ollama}")}"
 PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
 IMAGE_NAME="${SANDBOX_IMAGE##*/}"
 

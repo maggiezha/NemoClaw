@@ -41,6 +41,22 @@ if grep -R -Fq "${OLD_RECIPE_PATH}" \
   exit 1
 fi
 grep -Fq 'cd NemoClaw/deploy/helm/gpu_autoscaling_k8s' "${CHART_DIR}/README.md"
+grep -Fq 'Do not use `nemohermes launch` or `nemo-deepagents launch` here.' "${CHART_DIR}/README.md"
+grep -Fq 'not** native NemoClaw Kubernetes support' "${CHART_DIR}/README.md"
+if grep -Fq 'Recipe experimental' "${CHART_DIR}/README.md"; then
+  echo "FAIL: README must not list undocumented agent × runtime pairings as recipe-experimental" >&2
+  exit 1
+fi
+if grep -Fq '| **OpenClaw** | Documented | Documented | Documented |' "${CHART_DIR}/README.md"; then
+  echo "FAIL: README must not ship a full agent × runtime matrix; point at official provider docs" >&2
+  exit 1
+fi
+grep -Fq 'Please reference these docs for agent and runtime support' "${CHART_DIR}/README.md"
+grep -Fq 'Popular example combinations for each agent' "${CHART_DIR}/README.md"
+grep -Fq '**OpenClaw** — Ollama' "${CHART_DIR}/README.md"
+grep -Fq '**Hermes** — vLLM' "${CHART_DIR}/README.md"
+grep -Fq '**Deep Agents Code** — vLLM' "${CHART_DIR}/README.md"
+grep -Fq 'docs/inference/choose-inference-provider.mdx' "${CHART_DIR}/README.md"
 
 # --- agent-common.sh config-table contract ------------------------------------
 # Every agent must resolve to a non-empty value for every lookup function, and the
@@ -108,6 +124,10 @@ done
   || { echo "FAIL: AGENT-SELECTION.md missing at the recipe root" >&2; exit 1; }
 [[ ! -d "${CHART_DIR}/agents" ]] \
   || { echo "FAIL: agents/ folder must not exist; agent selection is the AGENT_NAME flag and agent docs live in AGENT-SELECTION.md" >&2; exit 1; }
+grep -Fq '## Recipe quick start' "${CHART_DIR}/AGENT-SELECTION.md"
+grep -Fq 'export AGENT_NAME=openclaw' "${CHART_DIR}/AGENT-SELECTION.md"
+grep -Fq 'export AGENT_NAME=hermes' "${CHART_DIR}/AGENT-SELECTION.md"
+grep -Fq 'export AGENT_NAME=deepagents' "${CHART_DIR}/AGENT-SELECTION.md"
 
 grep -Fq 'agent_common_validate' "${BUILD_SCRIPT}"
 grep -Fq 'NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION=0' "${BUILD_SCRIPT}"
@@ -203,6 +223,25 @@ START_LINE="$(grep -nF './scripts/run-agent-sandbox.sh >"${AGENT_RUNTIME_LOG}" 2
 VERIFY_LINE="$(grep -nF 'if ! ./scripts/verify-agent-sandbox.sh; then' "${TRY_IT_SCRIPT}" | cut -d: -f1)"
 [[ -n "${START_LINE}" && -n "${VERIFY_LINE}" && "${START_LINE}" -lt "${VERIFY_LINE}" ]] \
   || { echo "FAIL: try-it.sh must start gateway agents before verification" >&2; exit 1; }
+grep -Fq 'agent_common_validate_runtime_pairing' "${TRY_IT_SCRIPT}"
+grep -Fq 'agent_common_validate_runtime_pairing' "${BUILD_SCRIPT}"
+grep -Fq 'agent_common_validate_runtime_pairing' "${CREATE_SCRIPT}"
+grep -Fq 'agent_common_validate_runtime_pairing' "${VERIFY_SCRIPT}"
+grep -Fq 'agent_common_validate_runtime_pairing' "${RUN_PROMPT_SCRIPT}"
+grep -Fq 'agent_common_validate_runtime_pairing' "${SCRIPT_DIR}/install-hpa.sh"
+grep -Fq 'scripts/test-openclaw-ollama.sh' "${CHART_DIR}/README.md"
+grep -Fq 'scripts/test-hermes-vllm.sh' "${CHART_DIR}/README.md"
+grep -Fq 'scripts/test-deepagents-vllm.sh' "${CHART_DIR}/README.md"
+[[ -x "${SCRIPT_DIR}/test-openclaw-ollama.sh" ]]
+[[ -x "${SCRIPT_DIR}/test-hermes-vllm.sh" ]]
+[[ -x "${SCRIPT_DIR}/test-deepagents-vllm.sh" ]]
+if (agent_common_validate_runtime_pairing deepagents ollama) 2>/dev/null; then
+  echo "FAIL: deepagents+ollama must be refused" >&2
+  exit 1
+fi
+agent_common_validate_runtime_pairing openclaw ollama
+agent_common_validate_runtime_pairing hermes vllm
+agent_common_validate_runtime_pairing deepagents vllm
 
 grep -Fq 'agent_common_validate' "${RUN_SANDBOX_SCRIPT}"
 grep -Fq 'agent_common_run_mode' "${RUN_SANDBOX_SCRIPT}"

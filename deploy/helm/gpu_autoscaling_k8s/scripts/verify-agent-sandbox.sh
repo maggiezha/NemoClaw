@@ -37,6 +37,7 @@ command -v mktemp >/dev/null 2>&1 || fail "missing command: mktemp"
 
 AGENT_NAME="${AGENT_NAME:-}"
 agent_common_validate "${AGENT_NAME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 RUN_MODE="$(agent_common_run_mode "${AGENT_NAME}")"
 
@@ -45,7 +46,7 @@ ACTUAL_OPENSHELL_VERSION="$(openshell --version 2>/dev/null | grep -oE '[0-9]+\.
   || fail "OpenShell CLI ${OPENSHELL_VERSION} is required; found ${ACTUAL_OPENSHELL_VERSION:-unknown}"
 
 SANDBOX_NAME="${AGENT_SANDBOX_NAME:-$(agent_common_default_sandbox_name "${AGENT_NAME}")}"
-MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
+MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME:-ollama}")}"
 # Health/version/smoke commands can hang on a cold/busy gateway; keep them short.
 HEALTH_TIMEOUT_SEC="${VERIFY_HEALTH_TIMEOUT_SEC:-90}"
 SMOKE_TIMEOUT_SEC="${VERIFY_SMOKE_TIMEOUT_SEC:-30}"

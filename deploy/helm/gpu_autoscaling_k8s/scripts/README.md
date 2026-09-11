@@ -8,13 +8,16 @@
 All setup, verification, security, and teardown instructions for this recipe live in the
 main [`../README.md`](../README.md) (architecture, Quick start, TLS/security details,
 inference runtimes, HPA/Envoy testing, Grafana, uninstall) and
-[`../AGENT-SELECTION.md`](../AGENT-SELECTION.md) (per-agent comparison, env vars, and
-support matrix). This page is a quick reference for what each script in this directory
-does — it has no instructions of its own.
+[`../AGENT-SELECTION.md`](../AGENT-SELECTION.md) (per-agent comparison, recipe
+quick starts, env vars, and support notes). This page is a quick reference for
+what each script in this directory does — it has no instructions of its own.
 
 | Script | Purpose |
 |--------|---------|
 | `try-it.sh` | Runs the whole Quick start end to end (incl. `hpa-load-test.sh`), `AGENT_NAME` / `INFERENCE_RUNTIME` at the top; requires explicit opt-in for the insecure-eval shortcut |
+| `test-openclaw-ollama.sh` / `test-hermes-vllm.sh` / `test-deepagents-vllm.sh` | Cluster tests for the README example pairings; pin agent+runtime and exec `try-it.sh` (`RUN_LOAD_TEST=0` unless you set it) |
+| `test-agent-runtime-example.sh` | Shared runner those three wrappers exec; refuses pairings that are not README examples |
+| `test-agent-runtime-examples-contract.sh` | Static check that each example pairing has a test script and README / AGENT-SELECTION links |
 | `install-hpa.sh` | Monitoring + chart + HPA (+ Envoy if enabled) |
 | `hpa-load-test.sh` / `hpa-reset.sh` | Autoscaling (+ Envoy) test / restore idle |
 | `cluster-recover.sh` | Destructive release recovery for the selected release only — see script comments before use |
