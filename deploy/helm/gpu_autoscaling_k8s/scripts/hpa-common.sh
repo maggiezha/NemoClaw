@@ -1684,23 +1684,48 @@ hpa_common_wait_for_job_pods_gone() {
   kubectl wait --for=delete pod -l "job-name=${job}" -n "${ns}" --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
 }
 
-# Drop leftover Ollama generate work in this release only. Load-test Jobs are
-# deleted while hundreds of chats are still queued; Envoy probes then time out
-# (HTTP 000). 4× L40S does not call this.
-hpa_common_drop_ollama_queued_generates() {
+# Wait until leftover chat completions finish (success counters stop rising).
+# 8× H100 calls this after stopping the load Job (max replicas reached) so
+# in-flight chats drain before HPA scales toward minReplicas. 4× L40S does not.
+hpa_common_wait_for_llm_success_counters_idle() {
   local ns="${1:?namespace}"
-  local pod containers
-  hpa_common_log "Dropping leftover Ollama generate queues before Envoy check..."
-  for pod in $(kubectl get pods -n "${ns}" \
-    -l 'app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy' \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-    [[ -z "${pod}" ]] && continue
-    containers="$(kubectl get pod "${pod}" -n "${ns}" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)"
-    [[ " ${containers} " == *" ollama "* ]] || continue
-    kubectl exec -n "${ns}" "${pod}" -c ollama -- sh -c 'pkill -9 -f llama-server || true' \
-      >/dev/null 2>&1 || true
+  local stable_sec="${2:-20}"
+  local timeout_sec="${3:-1800}"
+  local port="${4:-${SERVICE_PORT:-8081}}"
+  local deadline last_sum current_sum idle_since pod line
+  deadline=$((SECONDS + timeout_sec))
+  last_sum=""
+  idle_since=""
+  hpa_common_log "Waiting for leftover chat completions to finish (success counters idle ${stable_sec}s, timeout ${timeout_sec}s)..."
+  while (( SECONDS < deadline )); do
+    current_sum=0
+    for pod in $(kubectl get pods -n "${ns}" \
+      -l 'app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy' \
+      --field-selector=status.phase=Running \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+      [[ -z "${pod}" ]] && continue
+      line="$(kubectl exec -n "${ns}" "${pod}" -c metrics-proxy -- \
+        node -e "fetch('http://127.0.0.1:${port}/metrics').then(r=>r.text()).then(t=>{const m=t.match(/nemoclaw_llm_requests_total\\{result=\\\"success\\\"\\} (\\d+)/); console.log(m?m[1]:0)}).catch(()=>console.log(0))" \
+        2>/dev/null || echo 0)"
+      current_sum=$((current_sum + 10#${line:-0}))
+    done
+    if [[ "${current_sum}" == "${last_sum}" ]]; then
+      if [[ -z "${idle_since}" ]]; then
+        idle_since="${SECONDS}"
+      fi
+      if (( SECONDS - idle_since >= stable_sec )); then
+        hpa_common_log "Leftover chat completions finished (success total=${current_sum})"
+        return 0
+      fi
+    else
+      hpa_common_log "Leftover chats still running (success total ${last_sum:-?} → ${current_sum})"
+      last_sum="${current_sum}"
+      idle_since=""
+    fi
+    sleep 5
   done
+  echo "Leftover chat completions did not finish within ${timeout_sec}s (success total=${last_sum:-unknown})" >&2
+  return 1
 }
 
 hpa_common_verify_gpu_capacity() {

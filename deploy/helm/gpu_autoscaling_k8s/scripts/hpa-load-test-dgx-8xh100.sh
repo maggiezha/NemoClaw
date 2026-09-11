@@ -6,6 +6,9 @@
 # an Envoy LeastRequest distribution check. Separate from the 4× L40S AWS script
 # (hpa-load-test-brev-4xl40s.sh).
 #
+# After HPA reaches maxReplicas (8), stop new load, let in-flight chats finish,
+# then HPA scales down toward minReplicas (1). Do not raise minReplicas.
+#
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
 #   ./scripts/hpa-load-test-dgx-8xh100.sh
@@ -61,8 +64,8 @@ HPA_LOAD_DEFAULT_DURATION_SEC=900
 HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS=90
 
 # Apply one-Pod HPA steps during every load test, then restore the configured
-# production behavior in cleanup. The 60-second hold proves all target GPUs
-# were Ready under load before the Job stops and scale-down begins.
+# production behavior in cleanup. Once replicas hit max, generators stop sending
+# and leftover chats drain before HPA scales toward minReplicas=1.
 HPA_TEST_DEFAULT_SCALE_UP_PODS=1
 HPA_TEST_DEFAULT_SCALE_UP_PERIOD_SEC=10
 HPA_TEST_DEFAULT_SCALE_DOWN_PODS=1
@@ -101,7 +104,9 @@ TARGET_POLL_SEC="${TARGET_POLL_SEC:-1}"
 SCALE_UP_POLL_SEC="${SCALE_UP_POLL_SEC:-10}"
 
 HPA_CONFIGURED_GPU_TARGET="${HPA_TARGET_GPU}"
-MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-60}"
+# 0 = stop new queries as soon as all 8 GPUs are up. Leftover in-flight chats
+# then finish on their own; HPA min stays 1, max stays 8.
+MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-0}"
 DURATION_SEC="${DURATION_SEC:-${HPA_LOAD_DEFAULT_DURATION_SEC}}"
 SCALE_UP_TARGET="${SCALE_UP_TARGET:-${TARGET_PODS}}"
 SCALE_UP_WAIT_LOOPS="${SCALE_UP_WAIT_LOOPS:-${HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS}}"
@@ -551,7 +556,7 @@ if [[ "${HPA_METRIC:-gpu_utilization}" == "latency_avg" ]]; then
 else
   HPA_TEST_METRIC_TARGET="${HPA_EFFECTIVE_GPU_TARGET}%"
 fi
-hpa_common_log "Load profile=${HPA_LOAD_PROFILE} (requested=${HPA_LOAD_PROFILE_REQUESTED}): ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} target=${HPA_TEST_METRIC_TARGET} → max ${TARGET_PODS} replicas (stop after ${MAX_REPLICAS_HOLD_SEC}s at max)"
+hpa_common_log "Load profile=${HPA_LOAD_PROFILE} (requested=${HPA_LOAD_PROFILE_REQUESTED}): ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} target=${HPA_TEST_METRIC_TARGET} → max ${TARGET_PODS} replicas, then stop new queries (hold ${MAX_REPLICAS_HOLD_SEC}s) and drain leftovers before scale-down to min 1"
 if [[ "${HPA_TEST_BEHAVIOR_APPLIED}" -eq 1 ]]; then
   hpa_common_log "Temporary test HPA behavior: up to ${HPA_TEST_SCALE_UP_PODS} pods/${HPA_TEST_SCALE_UP_PERIOD_SEC}s; down up to ${HPA_TEST_SCALE_DOWN_PODS} pods/${HPA_TEST_SCALE_DOWN_PERIOD_SEC}s after ${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC}s stabilization"
 fi
@@ -587,12 +592,6 @@ if [[ "${SCALE_UP_OK}" -ne 1 ]]; then
   echo "HPA did not scale to ${SCALE_UP_TARGET} replicas" >&2
 fi
 
-# Stop direct-to-pod load generators before the Envoy path check so success-counter
-# deltas measure Gateway LeastRequest distribution only. Wait until those pods are
-# gone — a bare delete leaves in-flight chat requests that make Envoy return 000.
-hpa_common_wait_for_job_pods_gone "${NAMESPACE}" "${JOB_NAME}" 180
-sleep "${ENVOY_LB_DRAIN_SEC:-20}"
-
 ENVOY_LB_OK=0
 RUN_ENVOY_LB_TEST=0
 if [[ "${SCALE_UP_OK}" -eq 1 && "${SCALE_UP_TARGET}" -ge 2 && "${SKIP_ENVOY_LB_TEST:-0}" != "1" ]] \
@@ -601,8 +600,22 @@ if [[ "${SCALE_UP_OK}" -eq 1 && "${SCALE_UP_TARGET}" -ge 2 && "${SKIP_ENVOY_LB_T
   RUN_ENVOY_LB_TEST=1
 fi
 
+# Hit max (8) → stop new queries → let in-flight chats finish → HPA drops toward 1.
+# minReplicas stays 1. 4× L40S does not wait for leftover generates.
+if [[ "${SCALE_UP_OK}" -eq 1 ]]; then
+  hpa_common_log "Reached ${SCALE_UP_TARGET} GPUs — stopping new queries (HPA minReplicas=1 maxReplicas=${TARGET_PODS})"
+else
+  hpa_common_log "Scale-up did not reach ${SCALE_UP_TARGET}; stopping load generators"
+fi
+hpa_common_wait_for_job_pods_gone "${NAMESPACE}" "${JOB_NAME}" 180
+if [[ "${SCALE_UP_OK}" -eq 1 ]]; then
+  hpa_common_wait_for_llm_success_counters_idle "${NAMESPACE}" \
+    "${ENVOY_QUEUE_IDLE_SEC:-20}" "${ENVOY_QUEUE_WAIT_SEC:-1800}" "${SERVICE_PORT}" \
+    || echo "Warning: leftover chats may still be running" >&2
+  hpa_common_log "In-flight chats finished — HPA can scale down toward minReplicas=1"
+fi
+
 if [[ "${RUN_ENVOY_LB_TEST}" -eq 1 ]]; then
-  # Wait until the scaled replicas are Ready before probing Envoy.
   if kubectl wait --for=condition=ready pod \
     -l 'app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy' \
     -n "${NAMESPACE}" --timeout=600s >/dev/null 2>&1; then
