@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Drive GPU utilization for HPA: chat completions directly to each metrics-proxy pod IP.
-// Each Running metrics-proxy pod gets PER_POD_PEAK × compensation concurrent requests.
-// Compensation = HPA currentReplicas / loadTargetCount so cold pods at 0% GPU
-// do not drag the average to ~42% while a new replica is starting.
+// Drive GPU utilization / latency for HPA: chat completions directly to each
+// metrics-proxy pod IP (not through Envoy). Stop opening *new* chats once HPA
+// currentReplicas reaches TARGET_PODS; already in-flight asks still finish.
 
 import fs from "node:fs";
 import https from "node:https";
@@ -596,10 +595,10 @@ async function main() {
       continue;
     }
 
-    const atMax =
-      hpaReplicas >= TARGET_PODS &&
-      hpaDesired >= TARGET_PODS &&
-      podTargets.length >= TARGET_PODS;
+    // Stop *new* chats when HPA is already at maxReplicas. Do not wait until
+    // every replica is a Ready load target — that kept sending after 8/8.
+    // In-flight asks still finish (worker awaits state.tasks).
+    const atMax = hpaReplicas >= TARGET_PODS;
     if (atMax) {
       if (atMaxSince == null) atMaxSince = Date.now();
       const heldSec = (Date.now() - atMaxSince) / 1000;
@@ -613,7 +612,8 @@ async function main() {
             targetPods: TARGET_PODS,
             heldSec: Math.round(heldSec),
             maxReplicasHoldSec: MAX_REPLICAS_HOLD_SEC,
-            message: "max replicas held — stopping new load so HPA can scale down",
+            message:
+              "max replicas reached — stopping new requests; in-flight chats will finish so HPA can scale down",
           }),
         );
         forceStopLoad = true;

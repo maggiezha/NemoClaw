@@ -6,8 +6,11 @@
 # an Envoy LeastRequest distribution check. Separate from the 4× L40S AWS script
 # (hpa-load-test-brev-4xl40s.sh).
 #
-# After HPA reaches maxReplicas (8), stop new load, let in-flight chats finish,
-# then HPA scales down toward minReplicas (1). Do not raise minReplicas.
+# After HPA reaches maxReplicas (8), generators stop *new* chats. Already
+# in-flight work finishes, then HPA scales down toward minReplicas (1).
+# Do not raise minReplicas. Envoy LeastRequest is checked at 8 Ready pods
+# after leftovers are idle, with scale-down paused so replicas do not drop
+# under the probe.
 #
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
@@ -64,8 +67,8 @@ HPA_LOAD_DEFAULT_DURATION_SEC=900
 HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS=90
 
 # Apply one-Pod HPA steps during every load test, then restore the configured
-# production behavior in cleanup. Once replicas hit max, generators stop sending
-# and leftover chats drain before HPA scales toward minReplicas=1.
+# production behavior in cleanup. Once replicas hit max, generators stop *new*
+# chats; leftover in-flight work drains, then HPA scales toward minReplicas=1.
 HPA_TEST_DEFAULT_SCALE_UP_PODS=1
 HPA_TEST_DEFAULT_SCALE_UP_PERIOD_SEC=10
 HPA_TEST_DEFAULT_SCALE_DOWN_PODS=1
@@ -176,9 +179,7 @@ HPA_HELM_ARGS=(
   --set "ingress.gateway.serviceType=${INGRESS_SERVICE_TYPE:-ClusterIP}"
   --set "ingress.gateway.className=${INGRESS_CLASS:-eg}"
 )
-if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "$(hpa_common_target_node_helm_value)")
-fi
+hpa_common_append_target_node_helm_sets HPA_HELM_ARGS
 if [[ -n "${NIM_NGC_API_KEY:-}" ]]; then
   HPA_HELM_ARGS+=(--set-string "nim.ngcApiKey.value=${NIM_NGC_API_KEY}")
 fi
@@ -237,6 +238,7 @@ if [[ "${HPA_TEST_BEHAVIOR_SET}" -eq 5 ]]; then
   HPA_TEST_BEHAVIOR_APPLIED=1
 fi
 helm "${HPA_HELM_ARGS[@]}" >/dev/null
+hpa_common_wait_for_envoy_dataplane_on_target_node "${NAMESPACE}" "${DEPLOYMENT}" 180
 
 IFS=$'\t' read -r DEPLOYED_INFERENCE_SECRET DEPLOYED_INFERENCE_SECRET_KEY < <(
   hpa_common_inference_secret_contract "${NAMESPACE}" "${RELEASE}" "${SERVICE}-inference-api"
@@ -556,7 +558,7 @@ if [[ "${HPA_METRIC:-gpu_utilization}" == "latency_avg" ]]; then
 else
   HPA_TEST_METRIC_TARGET="${HPA_EFFECTIVE_GPU_TARGET}%"
 fi
-hpa_common_log "Load profile=${HPA_LOAD_PROFILE} (requested=${HPA_LOAD_PROFILE_REQUESTED}): ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} target=${HPA_TEST_METRIC_TARGET} → max ${TARGET_PODS} replicas, then stop new queries (hold ${MAX_REPLICAS_HOLD_SEC}s) and drain leftovers before scale-down to min 1"
+hpa_common_log "Load profile=${HPA_LOAD_PROFILE} (requested=${HPA_LOAD_PROFILE_REQUESTED}): ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} target=${HPA_TEST_METRIC_TARGET} → max ${TARGET_PODS} replicas, then stop new queries (hold ${MAX_REPLICAS_HOLD_SEC}s), drain in-flight, Envoy LeastRequest at 8, then scale-down to min 1"
 if [[ "${HPA_TEST_BEHAVIOR_APPLIED}" -eq 1 ]]; then
   hpa_common_log "Temporary test HPA behavior: up to ${HPA_TEST_SCALE_UP_PODS} pods/${HPA_TEST_SCALE_UP_PERIOD_SEC}s; down up to ${HPA_TEST_SCALE_DOWN_PODS} pods/${HPA_TEST_SCALE_DOWN_PERIOD_SEC}s after ${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC}s stabilization"
 fi
@@ -577,10 +579,11 @@ fi
 
 SCALE_UP_OK=0
 SCALE_UP_POLL_SEC="${SCALE_UP_POLL_SEC:-10}"
-for _ in $(seq 1 "${SCALE_UP_WAIT_LOOPS}"); do
+for ((scale_up_i = 1; scale_up_i <= SCALE_UP_WAIT_LOOPS; scale_up_i += 1)); do
   hpa_common_log_hpa_if_changed "${NAMESPACE}" LAST_HPA_LINE
-  REPLICAS="$(kubectl get hpa -n "${NAMESPACE}" -o jsonpath='{.items[0].status.currentReplicas}' 2>/dev/null || echo 0)"
-  if [[ "${REPLICAS}" -ge "${SCALE_UP_TARGET}" ]]; then
+  REPLICAS="$(kubectl get hpa "${HPA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.currentReplicas}' 2>/dev/null || true)"
+  REPLICAS="$(hpa_common_nonneg_int "${REPLICAS}")"
+  if (( REPLICAS >= SCALE_UP_TARGET )); then
     SCALE_UP_OK=1
     hpa_common_log "Scale-up OK: ${REPLICAS}/${SCALE_UP_TARGET} replicas"
     break
@@ -588,31 +591,35 @@ for _ in $(seq 1 "${SCALE_UP_WAIT_LOOPS}"); do
   sleep "${SCALE_UP_POLL_SEC}"
 done
 
-if [[ "${SCALE_UP_OK}" -ne 1 ]]; then
-  echo "HPA did not scale to ${SCALE_UP_TARGET} replicas" >&2
-fi
-
 ENVOY_LB_OK=0
 RUN_ENVOY_LB_TEST=0
-if [[ "${SCALE_UP_OK}" -eq 1 && "${SCALE_UP_TARGET}" -ge 2 && "${SKIP_ENVOY_LB_TEST:-0}" != "1" ]] \
+if (( SCALE_UP_OK == 1 )) && (( SCALE_UP_TARGET >= 2 )) \
+  && [[ "${SKIP_ENVOY_LB_TEST:-0}" != "1" ]] \
   && hpa_common_envoy_lb_enabled \
   && kubectl get gateway "${DEPLOYMENT}" -n "${NAMESPACE}" >/dev/null 2>&1; then
   RUN_ENVOY_LB_TEST=1
 fi
 
-# Hit max (8) → stop new queries → let in-flight chats finish → HPA drops toward 1.
-# minReplicas stays 1. 4× L40S does not wait for leftover generates.
-if [[ "${SCALE_UP_OK}" -eq 1 ]]; then
-  hpa_common_log "Reached ${SCALE_UP_TARGET} GPUs — stopping new queries (HPA minReplicas=1 maxReplicas=${TARGET_PODS})"
-else
-  hpa_common_log "Scale-up did not reach ${SCALE_UP_TARGET}; stopping load generators"
-fi
-hpa_common_wait_for_job_pods_gone "${NAMESPACE}" "${JOB_NAME}" 180
-if [[ "${SCALE_UP_OK}" -eq 1 ]]; then
+# Hit max (8) → generators stop *new* chats → in-flight finish → Envoy (still 8)
+# → resume scale-down toward 1. minReplicas stays 1.
+HPA_SCALE_DOWN_PAUSED=0
+if (( SCALE_UP_OK == 1 )); then
+  hpa_common_log "Reached ${SCALE_UP_TARGET} GPUs — generators must stop new requests (HPA minReplicas=1 maxReplicas=${TARGET_PODS})"
+  hpa_common_wait_for_load_stop_at_max "${NAMESPACE}" "${JOB_NAME}" 90 \
+    || echo "Warning: proceeding without stopAtMaxReplicas log" >&2
+  if hpa_common_pause_hpa_scale_down "${NAMESPACE}" "${HPA_NAME}"; then
+    HPA_SCALE_DOWN_PAUSED=1
+    hpa_common_log "Paused HPA scale-down so 8 GPUs stay up until in-flight drain and Envoy finish"
+  fi
+  hpa_common_wait_for_load_job_drain "${NAMESPACE}" "${JOB_NAME}" "${ENVOY_QUEUE_WAIT_SEC:-1800}"
   hpa_common_wait_for_llm_success_counters_idle "${NAMESPACE}" \
     "${ENVOY_QUEUE_IDLE_SEC:-20}" "${ENVOY_QUEUE_WAIT_SEC:-1800}" "${SERVICE_PORT}" \
     || echo "Warning: leftover chats may still be running" >&2
-  hpa_common_log "In-flight chats finished — HPA can scale down toward minReplicas=1"
+  hpa_common_log "In-flight chats finished (no new generator requests)"
+else
+  echo "HPA did not scale to ${SCALE_UP_TARGET} replicas" >&2
+  hpa_common_log "Scale-up did not reach ${SCALE_UP_TARGET}; stopping load generators"
+  hpa_common_wait_for_job_pods_gone "${NAMESPACE}" "${JOB_NAME}" 180
 fi
 
 if [[ "${RUN_ENVOY_LB_TEST}" -eq 1 ]]; then
@@ -655,11 +662,18 @@ elif [[ "${SCALE_UP_OK}" -ne 1 ]]; then
   hpa_common_log "Skipping Envoy LeastRequest check because scale-up did not reach ${SCALE_UP_TARGET}"
 fi
 
+if [[ "${HPA_SCALE_DOWN_PAUSED}" -eq 1 ]]; then
+  hpa_common_resume_hpa_scale_down "${NAMESPACE}" "${HPA_NAME}"
+  HPA_SCALE_DOWN_PAUSED=0
+  hpa_common_log "Resumed HPA scale-down toward minReplicas=1"
+fi
+
 SCALE_DOWN_OK=0
-for _ in $(seq 1 "${SCALE_DOWN_WAIT_LOOPS}"); do
+for ((scale_down_i = 1; scale_down_i <= SCALE_DOWN_WAIT_LOOPS; scale_down_i += 1)); do
   hpa_common_log_hpa_if_changed "${NAMESPACE}" LAST_HPA_LINE
-  REPLICAS="$(kubectl get hpa -n "${NAMESPACE}" -o jsonpath='{.items[0].status.currentReplicas}' 2>/dev/null || echo 0)"
-  if [[ "${REPLICAS}" -le 1 ]]; then
+  REPLICAS="$(kubectl get hpa "${HPA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.currentReplicas}' 2>/dev/null || true)"
+  REPLICAS="$(hpa_common_nonneg_int "${REPLICAS}")"
+  if (( REPLICAS <= 1 )); then
     SCALE_DOWN_OK=1
     break
   fi
@@ -670,19 +684,19 @@ hpa_common_print_hpa "${NAMESPACE}"
 
 cleanup
 trap - EXIT
-if [[ "${SCALE_UP_OK}" -ne 1 ]]; then
+if (( SCALE_UP_OK != 1 )); then
   echo "HPA load test incomplete: did not reach ${SCALE_UP_TARGET} replicas" >&2
 fi
-if [[ "${SCALE_UP_OK}" -eq 1 && "${ENVOY_LB_OK}" -ne 1 && "${RUN_ENVOY_LB_TEST}" -eq 1 ]]; then
+if (( SCALE_UP_OK == 1 )) && (( ENVOY_LB_OK != 1 )) && (( RUN_ENVOY_LB_TEST == 1 )); then
   echo "HPA load test incomplete: Envoy LeastRequest distribution check failed" >&2
 fi
-if [[ "${SCALE_DOWN_OK}" -ne 1 ]]; then
+if (( SCALE_DOWN_OK != 1 )); then
   echo "HPA load test incomplete: did not scale down to 1 replica" >&2
 fi
-if [[ "${SCALE_UP_OK}" -ne 1 || "${SCALE_DOWN_OK}" -ne 1 ]]; then
+if (( SCALE_UP_OK != 1 || SCALE_DOWN_OK != 1 )); then
   exit 1
 fi
-if [[ "${RUN_ENVOY_LB_TEST}" -eq 1 && "${ENVOY_LB_OK}" -ne 1 ]]; then
+if (( RUN_ENVOY_LB_TEST == 1 && ENVOY_LB_OK != 1 )); then
   exit 1
 fi
 if [[ "${RUN_ENVOY_LB_TEST}" -eq 1 ]]; then

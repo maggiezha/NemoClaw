@@ -136,9 +136,7 @@ HPA_HELM_ARGS=(
   --set "ingress.gateway.serviceType=${INGRESS_SERVICE_TYPE:-ClusterIP}"
   --set "ingress.gateway.className=${INGRESS_CLASS:-eg}"
 )
-if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "$(hpa_common_target_node_helm_value)")
-fi
+hpa_common_append_target_node_helm_sets HPA_HELM_ARGS
 helm "${HPA_HELM_ARGS[@]}" >/dev/null
 
 IFS=$'\t' read -r DEPLOYED_INFERENCE_SECRET DEPLOYED_INFERENCE_SECRET_KEY < <(

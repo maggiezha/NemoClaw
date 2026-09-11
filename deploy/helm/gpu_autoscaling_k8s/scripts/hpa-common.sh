@@ -875,6 +875,94 @@ print(f"http://{name}.{control_plane_ns}.svc.cluster.local:{http_port}/v1")
 PY
 }
 
+# Probe Envoy by dataplane pod IP:targetPort. ClusterIP + kube-proxy iptables
+# hairpin on the same node drops a subset of concurrent SYNs (curl 000, no Envoy log).
+hpa_common_envoy_dataplane_pod_url() {
+  local control_plane_ns="${INGRESS_NS:-envoy-gateway-system}"
+  local gateway_ns="${1:-${NAMESPACE:-nemoclaw-gpu}}"
+  local gateway_name="${2:-}"
+  require_cmd kubectl
+  require_cmd python3
+  python3 - "${control_plane_ns}" "${gateway_ns}" "${gateway_name}" <<'PY'
+import json
+import subprocess
+import sys
+
+control_plane_ns, gateway_ns, gateway_name = sys.argv[1:]
+selector = "app.kubernetes.io/component=proxy,app.kubernetes.io/managed-by=envoy-gateway"
+if gateway_name:
+    selector += f",gateway.envoyproxy.io/owning-gateway-name={gateway_name}"
+    selector += f",gateway.envoyproxy.io/owning-gateway-namespace={gateway_ns}"
+
+def kube(*args):
+    return json.loads(
+        subprocess.check_output(["kubectl", *args], stderr=subprocess.PIPE, text=True)
+    )
+
+try:
+    svcs = kube("get", "services", "-n", control_plane_ns, "-l", selector, "-o", "json").get("items") or []
+    pods = kube(
+        "get", "pods", "-n", control_plane_ns, "-l", selector,
+        "--field-selector=status.phase=Running", "-o", "json",
+    ).get("items") or []
+except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as exc:
+    print(f"cannot resolve Envoy dataplane pod: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+
+if not svcs or not pods:
+    print("Envoy dataplane Service or Running pod not found", file=sys.stderr)
+    raise SystemExit(1)
+
+ports = (svcs[0].get("spec") or {}).get("ports") or []
+target = None
+for port in ports:
+    if port.get("port") == 80 or port.get("name") in {"http", "http-80"}:
+        target = port.get("targetPort") or port.get("port")
+        break
+if target is None and ports:
+    target = ports[0].get("targetPort") or ports[0].get("port")
+ip = (pods[0].get("status") or {}).get("podIP")
+if not ip or not target:
+    print("Envoy dataplane pod IP or targetPort missing", file=sys.stderr)
+    raise SystemExit(1)
+print(f"http://{ip}:{target}")
+PY
+}
+
+hpa_common_envoy_dataplane_node() {
+  local gateway_ns="${1:?namespace}"
+  local gateway_name="${2:?gatewayName}"
+  local control_plane_ns="${INGRESS_NS:-envoy-gateway-system}"
+  kubectl get pods -n "${control_plane_ns}" \
+    -l "app.kubernetes.io/component=proxy,gateway.envoyproxy.io/owning-gateway-namespace=${gateway_ns},gateway.envoyproxy.io/owning-gateway-name=${gateway_name}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true
+}
+
+# When NEMOCLAW_TARGET_NODE / HPA_LOAD_NODE_NAME is set, Envoy must sit on that
+# node with the GPU pods. Cross-node ClusterIP to Envoy is what produced curl 000.
+hpa_common_wait_for_envoy_dataplane_on_target_node() {
+  local gateway_ns="${1:?namespace}"
+  local gateway_name="${2:?gatewayName}"
+  local timeout_sec="${3:-180}"
+  local want="${NEMOCLAW_TARGET_NODE:-${HPA_LOAD_NODE_NAME:-}}"
+  local deadline node
+  [[ -n "${want}" ]] || return 0
+  deadline=$((SECONDS + timeout_sec))
+  hpa_common_log "Waiting for Envoy dataplane on ${want}..."
+  node=""
+  while (( SECONDS < deadline )); do
+    node="$(hpa_common_envoy_dataplane_node "${gateway_ns}" "${gateway_name}")"
+    if [[ "${node}" == "${want}" ]]; then
+      hpa_common_log "Envoy dataplane is on ${node}"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "Envoy dataplane is on ${node:-unknown}, expected ${want} (cross-node Envoy probes time out)" >&2
+  return 1
+}
+
 # Confirm Envoy LeastRequest is configured and concurrent OpenShell-path traffic
 # reaches every Ready inference pod. Call after HPA scale-up while replicas remain Ready.
 # Set SKIP_ENVOY_LB_TEST=1 to skip. Tunables: LB_TEST_REQUESTS, LB_TEST_CONCURRENCY,
@@ -962,8 +1050,17 @@ print(ready)
     return 1
   }
 
-  envoy_base="$(hpa_common_envoy_dataplane_base_url "${ns}" "${gateway_name}")"
-  envoy_base="${envoy_base%/v1}"
+  local envoy_host=""
+  envoy_host="$(hpa_common_envoy_dataplane_base_url "${ns}" "${gateway_name}")"
+  envoy_host="${envoy_host%/v1}"
+  envoy_host="${envoy_host#http://}"
+  envoy_host="${envoy_host%%:*}"
+  envoy_base="$(hpa_common_envoy_dataplane_pod_url "${ns}" "${gateway_name}")"
+  if ! hpa_common_wait_for_envoy_dataplane_on_target_node "${ns}" "${gateway_name}" 180; then
+    return 1
+  fi
+  local envoy_node=""
+  envoy_node="$(hpa_common_envoy_dataplane_node "${ns}" "${gateway_name}")"
   pod_ips="$(kubectl get pods -n "${ns}" \
     -l 'app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy' \
     -o json \
@@ -983,7 +1080,7 @@ print(" ".join(ips))
     return 1
   }
 
-  hpa_common_log "Envoy LeastRequest check: ${requests} requests (concurrency ${concurrency}) via ${envoy_base} across pods [${pod_ips}]"
+  hpa_common_log "Envoy LeastRequest check: ${requests} requests (concurrency ${concurrency}) via ${envoy_base} (Host ${envoy_host}) on ${envoy_node:-unknown} across pods [${pod_ips}]"
 
   kubectl delete pod "${probe_pod}" -n "${ns}" --ignore-not-found >/dev/null 2>&1 || true
   # Pin only when HPA_LOAD_NODE_NAME is set (8× H100). 4× L40S leaves it unset.
@@ -991,7 +1088,11 @@ print(" ".join(ips))
   if [[ -n "${HPA_LOAD_NODE_NAME:-}" ]]; then
     probe_node_yaml="
   nodeSelector:
-    kubernetes.io/hostname: ${HPA_LOAD_NODE_NAME}"
+    kubernetes.io/hostname: ${HPA_LOAD_NODE_NAME}
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule"
   fi
   kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -1019,11 +1120,12 @@ EOF
 set -eu
 API_KEY=\$(cat)
 ENVOY_BASE='${envoy_base}'
+ENVOY_HOST='${envoy_host}'
 POD_IPS='${pod_ips}'
 MODEL='${model}'
 N='${requests}'
 CONCUR='${concurrency}'
-rm -f /tmp/codes.txt /tmp/before.txt /tmp/after.txt
+rm -f /tmp/codes.txt /tmp/before.txt /tmp/after.txt /tmp/code.* /tmp/err.*
 snapshot() {
   out=\"\$1\"
   : > \"\$out\"
@@ -1042,20 +1144,28 @@ while [ \"\$i\" -lt \"\$N\" ]; do
   while [ \"\$active\" -lt \"\$CONCUR\" ] && [ \"\$i\" -lt \"\$N\" ]; do
     i=\$((i+1))
     active=\$((active+1))
+    idx=\$i
     (
-      code=\$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time ${LB_TEST_CURL_MAX_TIME:-180} \
+      code=\$(curl -sS -o /dev/null -w '%{http_code}' --http1.1 \
+        --connect-timeout 10 --max-time ${LB_TEST_CURL_MAX_TIME:-180} --retry 2 --retry-connrefused \
+        -H \"Host: \${ENVOY_HOST}\" \
         -H \"Authorization: Bearer \${API_KEY}\" \
         -H 'Content-Type: application/json' \
         -d \"{\\\"model\\\":\\\"\${MODEL}\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Reply with exactly one word: ping\\\"}],\\\"max_tokens\\\":8,\\\"stream\\\":false}\" \
-        \"\${ENVOY_BASE}/v1/chat/completions\" || echo 000)
-      echo \"\$code\" >> /tmp/codes.txt
+        \"\${ENVOY_BASE}/v1/chat/completions\" 2>/tmp/err.\${idx} || true)
+      [ -n \"\$code\" ] || code=000
+      printf '%s\\n' \"\$code\" > \"/tmp/code.\${idx}\"
     ) &
   done
   wait
 done
 snapshot /tmp/after.txt
 echo '---CODES---'
-cat /tmp/codes.txt
+i=1
+while [ \"\$i\" -le \"\$N\" ]; do
+  if [ -f \"/tmp/code.\$i\" ]; then cat \"/tmp/code.\$i\"; else echo 000; fi
+  i=\$((i+1))
+done
 echo '---BEFORE---'
 cat /tmp/before.txt
 echo '---AFTER---'
@@ -1356,6 +1466,19 @@ hpa_common_target_node_helm_value() {
   printf 'nodeSelector.kubernetes\\.io/hostname=%s' "${target_node}"
 }
 
+# Pin GPU pods and the Envoy dataplane to NEMOCLAW_TARGET_NODE. Envoy requests no
+# GPUs; the GPU taint toleration is only so it can schedule on that node.
+hpa_common_append_target_node_helm_sets() {
+  local -n __helm_args="${1:?helm_args array name}"
+  local target_node="${NEMOCLAW_TARGET_NODE:-}"
+  [[ -n "${target_node}" ]] || return 0
+  __helm_args+=(--set-string "$(hpa_common_target_node_helm_value)")
+  __helm_args+=(--set-string "ingress.gateway.nodeSelector.kubernetes\\.io/hostname=${target_node}")
+  __helm_args+=(--set-string "ingress.gateway.tolerations[0].key=nvidia.com/gpu")
+  __helm_args+=(--set-string "ingress.gateway.tolerations[0].operator=Exists")
+  __helm_args+=(--set-string "ingress.gateway.tolerations[0].effect=NoSchedule")
+}
+
 # Idle Kubernetes HPA baseline for GPU autoscaling (no --reuse-values — avoids Service port merge bugs).
 hpa_common_gpu_helm_upgrade() {
   local release="${1:?release}"
@@ -1423,9 +1546,7 @@ hpa_common_gpu_helm_upgrade() {
   if [[ -n "${ingress_host}" ]]; then
     helm_args+=(--set "ingress.host=${ingress_host}")
   fi
-  if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-    helm_args+=(--set-string "$(hpa_common_target_node_helm_value)")
-  fi
+  hpa_common_append_target_node_helm_sets helm_args
   hpa_common_append_servicemonitor_release_helm_set helm_args
   # Only relevant when inference_runtime=nim; harmless (ignored by the chart) otherwise.
   # NIM_NGC_API_KEY alone is enough for the common case: the chart derives both the
@@ -1525,9 +1646,7 @@ hpa_common_ensure_metrics_proxy_ready() {
   if [[ -n "${values_file}" && -f "${values_file}" ]]; then
     helm_args+=(-f "${values_file}")
   fi
-  if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-    helm_args+=(--set-string "$(hpa_common_target_node_helm_value)")
-  fi
+  hpa_common_append_target_node_helm_sets helm_args
   hpa_common_append_servicemonitor_release_helm_set helm_args
   helm "${helm_args[@]}" >/dev/null
 
@@ -1684,9 +1803,80 @@ hpa_common_wait_for_job_pods_gone() {
   kubectl wait --for=delete pod -l "job-name=${job}" -n "${ns}" --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
 }
 
+# Confirm generators logged stopAtMaxReplicas (no more *new* chats).
+hpa_common_wait_for_load_stop_at_max() {
+  local ns="${1:?namespace}"
+  local job="${2:?jobName}"
+  local timeout_sec="${3:-60}"
+  local deadline
+  deadline=$((SECONDS + timeout_sec))
+  hpa_common_log "Waiting for load generators to stop new requests at max replicas..."
+  while (( SECONDS < deadline )); do
+    if kubectl get pods -n "${ns}" -l "job-name=${job}" -o name 2>/dev/null \
+      | while read -r podref; do
+          kubectl logs -n "${ns}" "${podref}" --tail=400 2>/dev/null || true
+        done \
+      | grep -q '"event":"stopAtMaxReplicas"'; then
+      hpa_common_log "Load generators stopped opening new chats (in-flight completions may continue)"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Warning: load generators did not log stopAtMaxReplicas within ${timeout_sec}s" >&2
+  return 1
+}
+
+# Keep current replicas while leftovers drain and Envoy is probed. minReplicas stays 1.
+hpa_common_pause_hpa_scale_down() {
+  local ns="${1:?namespace}"
+  local hpa="${2:?hpaName}"
+  if kubectl patch hpa "${hpa}" -n "${ns}" --type=json \
+    -p '[{"op":"add","path":"/spec/behavior/scaleDown/selectPolicy","value":"Disabled"}]' \
+    >/dev/null 2>&1; then
+    return 0
+  fi
+  kubectl patch hpa "${hpa}" -n "${ns}" --type=json \
+    -p '[{"op":"replace","path":"/spec/behavior/scaleDown/selectPolicy","value":"Disabled"}]' \
+    >/dev/null
+}
+
+hpa_common_resume_hpa_scale_down() {
+  local ns="${1:?namespace}"
+  local hpa="${2:?hpaName}"
+  kubectl patch hpa "${hpa}" -n "${ns}" --type=json \
+    -p '[{"op":"remove","path":"/spec/behavior/scaleDown/selectPolicy"}]' \
+    >/dev/null 2>&1 || true
+}
+
+# Let generators stop sending and finish in-flight chats instead of deleting the
+# Job (which aborts client connections). Falls back to delete on timeout.
+hpa_common_wait_for_load_job_drain() {
+  local ns="${1:?namespace}"
+  local job="${2:?jobName}"
+  local timeout_sec="${3:-1800}"
+  hpa_common_log "Waiting for load-generator Job ${job} to finish in-flight chats..."
+  if kubectl wait --for=condition=complete "job/${job}" -n "${ns}" --timeout="${timeout_sec}s" >/dev/null 2>&1; then
+    hpa_common_log "Load-generator Job ${job} completed"
+    kubectl delete job "${job}" -n "${ns}" --ignore-not-found=true --wait=true --timeout=60s >/dev/null 2>&1 || true
+    return 0
+  fi
+  hpa_common_log "Load-generator Job ${job} did not complete in ${timeout_sec}s; deleting generator pods"
+  hpa_common_wait_for_job_pods_gone "${ns}" "${job}" 180
+}
+
+hpa_common_nonneg_int() {
+  local s="${1:-0}"
+  s="${s//$'\r'/}"
+  if [[ "${s}" =~ ([0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '0'
+  fi
+}
+
 # Wait until leftover chat completions finish (success counters stop rising).
-# 8× H100 calls this after stopping the load Job (max replicas reached) so
-# in-flight chats drain before HPA scales toward minReplicas. 4× L40S does not.
+# Do not wait on http_inflight: a /metrics scrape used to count as inflight=1 forever.
+# 8× H100 calls this after generators stop. 4× L40S does not.
 hpa_common_wait_for_llm_success_counters_idle() {
   local ns="${1:?namespace}"
   local stable_sec="${2:-20}"
@@ -1705,11 +1895,12 @@ hpa_common_wait_for_llm_success_counters_idle() {
       -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
       [[ -z "${pod}" ]] && continue
       line="$(kubectl exec -n "${ns}" "${pod}" -c metrics-proxy -- \
-        node -e "fetch('http://127.0.0.1:${port}/metrics').then(r=>r.text()).then(t=>{const m=t.match(/nemoclaw_llm_requests_total\\{result=\\\"success\\\"\\} (\\d+)/); console.log(m?m[1]:0)}).catch(()=>console.log(0))" \
-        2>/dev/null || echo 0)"
-      current_sum=$((current_sum + 10#${line:-0}))
+        node -e "fetch('http://127.0.0.1:${port}/metrics').then(r=>r.text()).then(t=>{const m=t.match(/nemoclaw_llm_requests_total\\{result=\\\"success\\\"\\} (\\d+)/); console.log(m?m[1]:'0')}).catch(()=>console.log('0'))" \
+        2>/dev/null || true)"
+      line="$(hpa_common_nonneg_int "${line}")"
+      current_sum=$((current_sum + line))
     done
-    if [[ "${current_sum}" == "${last_sum}" ]]; then
+    if [[ -n "${last_sum}" && "${current_sum}" -eq "${last_sum}" ]]; then
       if [[ -z "${idle_since}" ]]; then
         idle_since="${SECONDS}"
       fi

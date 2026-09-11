@@ -230,7 +230,7 @@ function metricsText() {
     "# HELP nemoclaw_http_requests_total Total HTTP requests to metrics-proxy pod",
     "# TYPE nemoclaw_http_requests_total counter",
     `nemoclaw_http_requests_total ${totalRequests}`,
-    "# HELP nemoclaw_http_inflight_requests In-flight HTTP requests",
+    "# HELP nemoclaw_http_inflight_requests In-flight HTTP requests (excludes /metrics /healthz /readyz)",
     "# TYPE nemoclaw_http_inflight_requests gauge",
     `nemoclaw_http_inflight_requests ${inflight}`,
     "# HELP nemoclaw_inference_reachable 1 if the local inference runtime's model is ready",
@@ -253,26 +253,34 @@ const server = http.createServer(
   },
   async (req, res) => {
     totalRequests += 1;
-    inflight += 1;
+    const pathOnly = (req.url || "").split("?")[0];
+    const isProbe =
+      pathOnly === "/healthz" ||
+      pathOnly === "/health" ||
+      pathOnly === "/readyz" ||
+      pathOnly === "/ready" ||
+      pathOnly === "/metrics";
+    // /metrics is snapshotted during the request. Counting it leaves inflight=1 forever
+    // and the leftover-drain wait never lets HPA scale-down proceed in the test.
+    if (!isProbe) inflight += 1;
     try {
-      if (req.url === "/healthz" || req.url === "/health") {
+      if (pathOnly === "/healthz" || pathOnly === "/health") {
         res.writeHead(200, { "content-type": "text/plain" });
         res.end("ok\n");
         return;
       }
-      if (req.url === "/readyz" || req.url === "/ready") {
+      if (pathOnly === "/readyz" || pathOnly === "/ready") {
         const ok = await checkInference();
         inferenceReachable = ok ? 1 : 0;
         res.writeHead(ok ? 200 : 503, { "content-type": "text/plain" });
         res.end(ok ? "ready\n" : `${RUNTIME} model not ready\n`);
         return;
       }
-      if (req.url === "/metrics") {
+      if (pathOnly === "/metrics") {
         res.writeHead(200, { "content-type": "text/plain; version=0.0.4" });
         res.end(metricsText());
         return;
       }
-      const pathOnly = (req.url || "").split("?")[0];
       if (pathOnly === "/v1/models" && req.method === "GET") {
         if (!requireAuthorization(req, res)) return;
         res.writeHead(200, { "content-type": "application/json" });
@@ -317,7 +325,7 @@ const server = http.createServer(
       res.writeHead(404);
       res.end("not found\n");
     } finally {
-      inflight -= 1;
+      if (!isProbe) inflight -= 1;
     }
   },
 );

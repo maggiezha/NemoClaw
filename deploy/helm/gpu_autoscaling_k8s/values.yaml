@@ -188,6 +188,10 @@ ingress:
     serviceType: ClusterIP
     connectionIdleTimeout: "60s"
     requestTimeout: "600s"
+    # Empty by default. Recipe scripts set these when NEMOCLAW_TARGET_NODE is set
+    # so the Envoy dataplane sits on the same node as the GPU pods (no GPU request).
+    nodeSelector: {}
+    tolerations: []
   # Basic auth in front of the completion proxy, which has no authentication of its own.
   # On by default. Leaving password unset (null, not an empty string — this is intentional,
   # not an accidentally-blank credential) auto-generates a random one on first install and
