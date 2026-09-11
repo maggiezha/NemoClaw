@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Cluster test for the README OpenClaw + Ollama example (chart default).
-# See ../README.md#agent-and-runtime-support
+# One-script path for OpenClaw + Ollama (chart default). Does not run the HPA
+# load test unless RUN_LOAD_TEST=1. See ../README.md#agent-and-runtime-support
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "${SCRIPT_DIR}/test-agent-runtime-example.sh" openclaw ollama
+# shellcheck source=agent-common.sh
+source "${SCRIPT_DIR}/agent-common.sh"
+agent_common_pin_example_pairing openclaw ollama
+export RUN_LOAD_TEST="${RUN_LOAD_TEST:-0}"
+# shellcheck source=e2e-common.sh
+source "${SCRIPT_DIR}/e2e-common.sh"

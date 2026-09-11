@@ -2,33 +2,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Test-drive wrapper for this recipe: install GPU inference (Ollama, vLLM, or NIM) + HPA,
-# run the synthetic HPA load test (scale-up → Envoy LeastRequest check → scale-down), then
-# build/create/start/verify one CPU sandbox agent (OpenClaw, Hermes, or Deep Agents Code).
-# This just calls the recipe's own scripts in order with AGENT_NAME / INFERENCE_RUNTIME
-# wired through — see ../README.md and ../AGENT-SELECTION.md for what each step does and
-# for the non-shortcut (TLS + OIDC) path.
+# Shared end-to-end steps for the three pairing scripts. Do not run this file.
+# Use:
+#   ./scripts/test-openclaw-ollama.sh
+#   ./scripts/test-hermes-vllm.sh
+#   ./scripts/test-deepagents-vllm.sh
 #
-# Run this against a cluster kubectl already points at, from this directory:
-#   ./scripts/try-it.sh
+# Caller must export AGENT_NAME, INFERENCE_RUNTIME, and INFERENCE_MODEL first.
+# RUN_LOAD_TEST defaults to 0 (install inference, skip HPA scale-up/down).
+# Set RUN_LOAD_TEST=1 later to also run hpa-load-test.sh.
 #
-# Everything you'd want to change lives in the block below (or override any of these as
-# env vars before running, e.g. `AGENT_NAME=openclaw ./scripts/try-it.sh`).
-#
-# SECURITY: this script does NOT default to an insecure configuration. See the
-# ALLOW_INSECURE_HTTP / ALLOW_UNAUTHENTICATED_OPENSHELL block below — you must explicitly
-# opt in before it will run at all.
+# SECURITY: this path does NOT default to an insecure configuration. See the
+# ALLOW_INSECURE_HTTP / ALLOW_UNAUTHENTICATED_OPENSHELL block below — you must
+# explicitly opt in before it will run at all.
 
-set -euo pipefail
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  echo "ERROR: do not run e2e-common.sh. Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-vllm.sh, or ./scripts/test-deepagents-vllm.sh." >&2
+  exit 1
+fi
 
 # ============================================================================
-# EDIT THESE
+# Optional overrides (pairing scripts already pinned agent/runtime/model)
 # ============================================================================
-AGENT_NAME="${AGENT_NAME:-hermes}"               # openclaw | hermes | deepagents
-INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-vllm}"   # ollama | vllm | nim — see
-                                                  # ../README.md#agent-and-runtime-support for
-                                                  # documented pairings. Deep Agents + Ollama is
-                                                  # not documented; this script refuses it.
 REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node can pull from
                                                   # (MicroK8s local registry default)
 
@@ -40,11 +35,8 @@ REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node c
 # Optional: pin everything to one GPU node (recommended on a shared cluster).
 # export NEMOCLAW_TARGET_NODE=dgx02
 
-# Runs ./scripts/hpa-load-test.sh after installing GPU inference, so this script actually
-# demonstrates GPU scale-up, Envoy LeastRequest load balancing, and scale-down — not just
-# an idle install. Takes roughly 10-20 minutes depending on hardware and TARGET_PODS. Set
-# to 0 to skip straight to the agent sandbox steps.
-RUN_LOAD_TEST="${RUN_LOAD_TEST:-1}"
+# 0 = install GPU inference only (no synthetic scale-up). 1 = also run hpa-load-test.sh.
+RUN_LOAD_TEST="${RUN_LOAD_TEST:-0}"
 
 # SECURITY (required — no default): this shortcut does not silently enable an insecure
 # configuration for you. It has exactly two supported modes:
@@ -77,6 +69,9 @@ source versions.env
 # shellcheck source=agent-common.sh
 source "${SCRIPT_DIR}/agent-common.sh"
 
+: "${AGENT_NAME:?pairing script must export AGENT_NAME}"
+: "${INFERENCE_RUNTIME:?pairing script must export INFERENCE_RUNTIME}"
+
 agent_common_validate "${AGENT_NAME}"
 agent_common_validate_inference_runtime "${INFERENCE_RUNTIME}"
 agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
@@ -100,7 +95,7 @@ esac
 if [[ "${ALLOW_INSECURE_HTTP:-0}" == "1" || "${ALLOW_UNAUTHENTICATED_OPENSHELL:-0}" == "1" ]]; then
   echo "Security mode: ISOLATED-EVAL SHORTCUT (cleartext HTTP and/or unauthenticated OpenShell requested via env vars)." >&2
 else
-  echo "Security mode: SECURE (default) — TLS + OIDC required; the install steps below will fail fast with setup instructions if ingress.tls / OPENSHELL_OIDC_ISSUER aren't configured. See ../README.md#tls-values, or opt into the isolated-eval shortcut (see the SECURITY comment at the top of this script)." >&2
+  echo "Security mode: SECURE (default) — TLS + OIDC required; the install steps below will fail fast with setup instructions if ingress.tls / OPENSHELL_OIDC_ISSUER aren't configured. See ../README.md#tls-values, or opt into the isolated-eval shortcut (see the SECURITY comment at the top of this file)." >&2
 fi
 
 echo "=== 1/7: GPU + DCGM sanity check ==="
@@ -108,7 +103,7 @@ kubectl get nodes \
   -o jsonpath='{range .items[*]}{.metadata.name}{" GPUs="}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
 kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter
 
-echo "=== 2/7: Install GPU inference (${INFERENCE_RUNTIME}) + HPA ==="
+echo "=== 2/7: Install GPU inference (${INFERENCE_RUNTIME}) ==="
 ./scripts/install-hpa.sh
 kubectl get pods,service,hpa -n nemoclaw-gpu
 ./scripts/get-hpa.sh -n nemoclaw-gpu
@@ -117,14 +112,14 @@ if [[ "${RUN_LOAD_TEST}" == "1" ]]; then
   echo "=== 3/7: Synthetic HPA load test (scale-up -> Envoy LeastRequest check -> scale-down) ==="
   ./scripts/hpa-load-test.sh
 else
-  echo "=== 3/7: Synthetic HPA load test skipped (RUN_LOAD_TEST=0) ==="
+  echo "=== 3/7: Synthetic HPA load test skipped (RUN_LOAD_TEST=0; pairing check only) ==="
 fi
 
 echo "=== 4/7: Agent Sandbox CRDs + build ${AGENT_NAME} sandbox image ==="
 kubectl apply -f \
   "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
 microk8s enable registry 2>/dev/null || true   # no-op if already on / not MicroK8s
-AGENT_SANDBOX_IMAGE="${REGISTRY}/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}"
+AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-${REGISTRY}/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}}"
 export AGENT_SANDBOX_IMAGE
 ./scripts/build-agent-sandbox-image.sh
 

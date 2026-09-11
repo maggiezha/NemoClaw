@@ -62,8 +62,7 @@ Do not mix `AGENT_NAME` values in one sandbox. To try another agent, build its
 image and create a **separate** sandbox name. A pass is the `OK: sandbox …`
 line in [Example verify output](#example-verify-output).
 
-Documented example cluster tests (same security opt-in as `try-it.sh`; skips the
-HPA load test unless `RUN_LOAD_TEST=1`):
+Documented example one-script paths (skip the HPA load test unless `RUN_LOAD_TEST=1`):
 
 - OpenClaw + Ollama: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh)
 - Hermes + vLLM: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh)
@@ -98,7 +97,7 @@ export INFERENCE_MODEL=llama3.2:3b
 ./scripts/verify-agent-sandbox.sh
 ```
 
-One-script cluster test for this example: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
+One-script path for this example: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
 
 ### Hermes
 
@@ -166,10 +165,7 @@ Interactive TUI (TTY), equivalent to `nemo-deepagents … connect` then `dcode`:
 openshell sandbox exec -n deepagents-onprem -- dcode
 ```
 
-One-script cluster test for this example: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
-Generic shortcut (edit `AGENT_NAME` / `INFERENCE_RUNTIME` at the top; default is
-`hermes` + `vllm`): `./scripts/try-it.sh`. For Deep Agents, keep
-`INFERENCE_RUNTIME=vllm` or `nim`.
+One-script path for this example: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
 
 ## Env vars
 
@@ -290,6 +286,6 @@ NemoClaw/Deep Agents Code has no long-running gateway; run one-shot prompts with
   cluster's Pod Security admission before assuming a clean create.
 - Official NemoClaw local providers for Deep Agents Code are vLLM and NIM, not Ollama.
   This recipe does not document `AGENT_NAME=deepagents` with `INFERENCE_RUNTIME=ollama`.
-  `agent_common_validate_runtime_pairing` refuses that pairing in `try-it.sh`,
-  `install-hpa.sh` (when `AGENT_NAME` is set), and the sandbox build/create/verify/prompt
-  scripts.
+  `agent_common_validate_runtime_pairing` refuses that pairing in the three pairing
+  scripts, `install-hpa.sh` (when `AGENT_NAME` is set), and the sandbox
+  build/create/verify/prompt scripts.

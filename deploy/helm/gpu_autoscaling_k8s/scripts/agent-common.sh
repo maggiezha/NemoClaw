@@ -63,7 +63,8 @@ agent_common_example_pairings() {
     deepagents vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
 }
 
-agent_common_example_test_script() {
+# User-facing one-script path for that agent's documented example pairing.
+agent_common_example_script() {
   printf 'test-%s-%s.sh' "${1:?agent}" "${2:?runtime}"
 }
 
@@ -86,6 +87,28 @@ agent_common_example_model() {
     fi
   done < <(agent_common_example_pairings)
   return 1
+}
+
+# Pin AGENT_NAME / INFERENCE_RUNTIME / INFERENCE_MODEL to one README example.
+# Used by test-openclaw-ollama.sh / test-hermes-vllm.sh / test-deepagents-vllm.sh.
+agent_common_pin_example_pairing() {
+  local agent="${1:?agent}" runtime="${2:?runtime}" model
+  model="$(agent_common_example_model "${agent}" "${runtime}")" || {
+    echo "ERROR: ${agent}+${runtime} is not a README example pairing." >&2
+    exit 1
+  }
+  if [[ -n "${AGENT_NAME:-}" && "${AGENT_NAME}" != "${agent}" ]]; then
+    echo "ERROR: AGENT_NAME=${AGENT_NAME} does not match this script (${agent}). Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-vllm.sh, or ./scripts/test-deepagents-vllm.sh." >&2
+    exit 1
+  fi
+  if [[ -n "${INFERENCE_RUNTIME:-}" && "${INFERENCE_RUNTIME}" != "${runtime}" ]]; then
+    echo "ERROR: INFERENCE_RUNTIME=${INFERENCE_RUNTIME} does not match this script (${runtime}). This script only runs ${agent}+${runtime}." >&2
+    exit 1
+  fi
+  export AGENT_NAME="${agent}"
+  export INFERENCE_RUNTIME="${runtime}"
+  export INFERENCE_MODEL="${INFERENCE_MODEL:-${model}}"
+  agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
 }
 
 agent_common_display_name() {

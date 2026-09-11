@@ -217,13 +217,15 @@ if agent_common_output_has_embedded_fallback 'normal agent response'; then
 fi
 grep -Fq 'agent_common_output_has_embedded_fallback "${ANSWER}"' "${VERIFY_SCRIPT}"
 
-# The end-to-end shortcut must launch a gateway agent before verification.
-TRY_IT_SCRIPT="${SCRIPT_DIR}/try-it.sh"
-START_LINE="$(grep -nF './scripts/run-agent-sandbox.sh >"${AGENT_RUNTIME_LOG}" 2>&1 &' "${TRY_IT_SCRIPT}" | cut -d: -f1)"
-VERIFY_LINE="$(grep -nF 'if ! ./scripts/verify-agent-sandbox.sh; then' "${TRY_IT_SCRIPT}" | cut -d: -f1)"
+# The end-to-end pairing scripts must launch a gateway agent before verification.
+E2E_COMMON="${SCRIPT_DIR}/e2e-common.sh"
+START_LINE="$(grep -nF './scripts/run-agent-sandbox.sh >"${AGENT_RUNTIME_LOG}" 2>&1 &' "${E2E_COMMON}" | cut -d: -f1)"
+VERIFY_LINE="$(grep -nF 'if ! ./scripts/verify-agent-sandbox.sh; then' "${E2E_COMMON}" | cut -d: -f1)"
 [[ -n "${START_LINE}" && -n "${VERIFY_LINE}" && "${START_LINE}" -lt "${VERIFY_LINE}" ]] \
-  || { echo "FAIL: try-it.sh must start gateway agents before verification" >&2; exit 1; }
-grep -Fq 'agent_common_validate_runtime_pairing' "${TRY_IT_SCRIPT}"
+  || { echo "FAIL: e2e-common.sh must start gateway agents before verification" >&2; exit 1; }
+[[ ! -e "${SCRIPT_DIR}/try-it.sh" ]] \
+  || { echo "FAIL: try-it.sh must not exist; use test-openclaw-ollama.sh / test-hermes-vllm.sh / test-deepagents-vllm.sh" >&2; exit 1; }
+grep -Fq 'agent_common_validate_runtime_pairing' "${E2E_COMMON}"
 grep -Fq 'agent_common_validate_runtime_pairing' "${BUILD_SCRIPT}"
 grep -Fq 'agent_common_validate_runtime_pairing' "${CREATE_SCRIPT}"
 grep -Fq 'agent_common_validate_runtime_pairing' "${VERIFY_SCRIPT}"

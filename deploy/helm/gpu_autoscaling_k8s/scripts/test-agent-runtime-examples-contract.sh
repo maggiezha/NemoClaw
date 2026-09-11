@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Static contract for the README documented example pairings (no cluster).
-# Cluster tests: test-openclaw-ollama.sh, test-hermes-vllm.sh, test-deepagents-vllm.sh.
+# One-script paths: test-openclaw-ollama.sh, test-hermes-vllm.sh, test-deepagents-vllm.sh.
 
 set -euo pipefail
 
@@ -25,6 +25,11 @@ expect_fail() {
   fi
 }
 
+[[ ! -e "${SCRIPT_DIR}/try-it.sh" ]] \
+  || fail "try-it.sh must not exist; use the three named pairing scripts"
+[[ ! -e "${SCRIPT_DIR}/test-agent-runtime-example.sh" ]] \
+  || fail "test-agent-runtime-example.sh must not exist; pairing scripts source e2e-common.sh"
+
 agent_common_validate_runtime_pairing openclaw ollama
 agent_common_validate_runtime_pairing hermes vllm
 agent_common_validate_runtime_pairing deepagents vllm
@@ -43,11 +48,15 @@ while IFS=$'\t' read -r agent runtime model; do
     || fail "${agent}+${runtime} example model is not ${model}"
   [[ "$(agent_common_default_inference_model "${runtime}")" == "${model}" ]] \
     || fail "${runtime} default model drifted from the ${agent}+${runtime} example"
-  script="$(agent_common_example_test_script "${agent}" "${runtime}")"
+  script="$(agent_common_example_script "${agent}" "${runtime}")"
   [[ -x "${SCRIPT_DIR}/${script}" ]] \
     || fail "${script} missing or not executable"
-  grep -Fq "test-agent-runtime-example.sh\" ${agent} ${runtime}" "${SCRIPT_DIR}/${script}" \
-    || fail "${script} must exec test-agent-runtime-example.sh ${agent} ${runtime}"
+  grep -Fq "agent_common_pin_example_pairing ${agent} ${runtime}" "${SCRIPT_DIR}/${script}" \
+    || fail "${script} must pin ${agent}+${runtime}"
+  grep -Fq 'source "${SCRIPT_DIR}/e2e-common.sh"' "${SCRIPT_DIR}/${script}" \
+    || fail "${script} must source e2e-common.sh"
+  grep -Fq 'RUN_LOAD_TEST:-0' "${SCRIPT_DIR}/${script}" \
+    || fail "${script} must default RUN_LOAD_TEST=0"
   grep -Fq "${script}" "${CHART_DIR}/README.md" \
     || fail "README.md must link ${script} next to the ${agent}+${runtime} example"
   grep -Fq "${script}" "${CHART_DIR}/AGENT-SELECTION.md" \
@@ -64,27 +73,31 @@ grep -Fq '**Hermes** — vLLM' "${CHART_DIR}/README.md" \
   || fail "README Hermes example bullet missing"
 grep -Fq '**Deep Agents Code** — vLLM' "${CHART_DIR}/README.md" \
   || fail "README Deep Agents example bullet missing"
+if grep -Fq './scripts/try-it.sh' "${CHART_DIR}/README.md" "${CHART_DIR}/AGENT-SELECTION.md" "${SCRIPT_DIR}/README.md"; then
+  fail "docs must not point users at try-it.sh"
+fi
 
-GENERIC="${SCRIPT_DIR}/test-agent-runtime-example.sh"
-[[ -x "${GENERIC}" ]] || fail "test-agent-runtime-example.sh missing or not executable"
-grep -Fq 'exec "${SCRIPT_DIR}/try-it.sh"' "${GENERIC}" \
-  || fail "example cluster test must exec try-it.sh"
-grep -Fq 'RUN_LOAD_TEST:-0' "${GENERIC}" \
-  || fail "example cluster tests should default RUN_LOAD_TEST=0"
+E2E_COMMON="${SCRIPT_DIR}/e2e-common.sh"
+[[ -f "${E2E_COMMON}" ]] || fail "e2e-common.sh missing"
+grep -Fq 'agent_common_validate_runtime_pairing' "${E2E_COMMON}" \
+  || fail "e2e-common.sh must call agent_common_validate_runtime_pairing"
+grep -Fq 'RUN_LOAD_TEST:-0' "${E2E_COMMON}" \
+  || fail "e2e-common.sh must default RUN_LOAD_TEST=0"
+if [[ -x "${E2E_COMMON}" ]]; then
+  if "${E2E_COMMON}" >/dev/null 2>&1; then
+    fail "e2e-common.sh must refuse being run directly"
+  fi
+fi
 
 for script in \
   "${SCRIPT_DIR}/create-agent-sandbox.sh" \
   "${SCRIPT_DIR}/build-agent-sandbox-image.sh" \
   "${SCRIPT_DIR}/verify-agent-sandbox.sh" \
   "${SCRIPT_DIR}/run-agent-prompt.sh" \
-  "${SCRIPT_DIR}/try-it.sh" \
-  "${SCRIPT_DIR}/install-hpa.sh"; do
+  "${SCRIPT_DIR}/install-hpa.sh" \
+  "${E2E_COMMON}"; do
   grep -Fq 'agent_common_validate_runtime_pairing' "${script}" \
     || fail "$(basename "${script}") must call agent_common_validate_runtime_pairing"
 done
 
-if grep -Fq 'if [[ "${AGENT_NAME}" == "deepagents" ]]; then' "${SCRIPT_DIR}/try-it.sh"; then
-  fail "try-it.sh must use agent_common_validate_runtime_pairing, not an inline Deep Agents+Ollama check"
-fi
-
-echo "OK: README example pairings (openclaw+ollama, hermes+vllm, deepagents+vllm) have tests and docs links"
+echo "OK: README example pairings (openclaw+ollama, hermes+vllm, deepagents+vllm) have named scripts and docs links"

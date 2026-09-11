@@ -11,11 +11,11 @@ Because GPU inference is the primary compute and cost bottleneck, Kubernetes HPA
 
 The recipe provides three sandboxed agent harness options: **OpenClaw** (default), **Hermes**, or **Deep Agents Code**; see [`AGENT-SELECTION.md`](AGENT-SELECTION.md). To choose one, set `AGENT_NAME` once and reuse it for image build, create, verify, and run. Do not install two agents in one sandbox.
 
-| Agent | `AGENT_NAME` | After create |
-|-------|--------------|--------------|
-| OpenClaw (default, most exercised) | `openclaw` | `./scripts/run-agent-sandbox.sh` (keep attached) |
-| Hermes | `hermes` | `./scripts/run-agent-sandbox.sh` (keep attached) |
-| Deep Agents Code | `deepagents` | `./scripts/run-agent-prompt.sh "…"` |
+| Agent | `AGENT_NAME` | One-script path | After create |
+|-------|--------------|-----------------|--------------|
+| OpenClaw (default, most exercised) | `openclaw` | [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh) | `./scripts/run-agent-sandbox.sh` (keep attached) |
+| Hermes | `hermes` | [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh) | `./scripts/run-agent-sandbox.sh` (keep attached) |
+| Deep Agents Code | `deepagents` | [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh) | `./scripts/run-agent-prompt.sh "…"` |
 
 It also provides three GPU inference runtime options: **Ollama** (default), **vLLM**, or **NVIDIA NIM**, selected with `inference.runtime` / `INFERENCE_RUNTIME`; see [Inference runtimes](#inference-runtimes). For which agent × runtime pairings official NemoClaw documents, see [Agent and runtime support](#agent-and-runtime-support). Metrics-proxy, HPA, and Envoy stay the same for the pairing you choose.
 
@@ -28,7 +28,7 @@ Kubernetes HPA scales only those GPU inference pods (1 GPU each) using a Pods **
 | With Envoy LeastRequest (default) | Create a TLS Secret in `nemoclaw-gpu` and configure `ingress.tls`; see [TLS values](#tls-values). | `./scripts/install-hpa.sh` |
 | Without Envoy (metrics-proxy Service only) | No Gateway or TLS Secret. Protect the in-cluster Service with a NetworkPolicy and the inference API key. | `ENABLE_ENVOY_LB=0 ./scripts/install-hpa.sh` |
 
-**New here?** Start with [Quick start](#quick-start). Optional one-script path: `./scripts/try-it.sh` (edit `AGENT_NAME` / `INFERENCE_RUNTIME` at the top). Teardown: [Uninstall](#uninstall).
+**New here?** Start with [Quick start](#quick-start). Optional one-script path — pick the pairing: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh), [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh), or [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh). Teardown: [Uninstall](#uninstall).
 
 Keep the versions in `versions.env` align with NemoClaw blueprint: NemoClaw `v0.0.104`, OpenShell `0.0.85`, Agent Sandbox `v0.5.0`. NemoClaw blueprint only accepts a specific OpenShell range, and OpenShell’s K8s path pins Agent Sandbox. When upstream NemoClaw moves on: bump all three together in `versions.env`, rebuild/push a new sandbox image tag, re-apply Agent Sandbox if needed, reinstall/restart OpenShell, recreate the sandbox, then re-run verify + HPA checks to `MAX_REPLICAS` (allocatable GPUs).
 
@@ -515,11 +515,11 @@ Host first-run (Docker installer, not this cluster): [OpenClaw](https://docs.nvi
 
 Popular example combinations for each agent on this recipe:
 
-- **OpenClaw** — Ollama (`AGENT_NAME=openclaw`, `INFERENCE_RUNTIME=ollama`, `INFERENCE_MODEL=llama3.2:3b`). Chart default. Cluster test: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
-- **Hermes** — vLLM (`AGENT_NAME=hermes`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). `try-it.sh` default. Cluster test: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh).
-- **Deep Agents Code** — vLLM (`AGENT_NAME=deepagents`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). Official docs do not list Local Ollama for this agent; the recipe scripts refuse that pairing. Cluster test: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
+- **OpenClaw** — Ollama (`AGENT_NAME=openclaw`, `INFERENCE_RUNTIME=ollama`, `INFERENCE_MODEL=llama3.2:3b`). Chart default. One-script path: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
+- **Hermes** — vLLM (`AGENT_NAME=hermes`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). One-script path: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh).
+- **Deep Agents Code** — vLLM (`AGENT_NAME=deepagents`, `INFERENCE_RUNTIME=vllm`, `INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`). Official docs do not list Local Ollama for this agent; the recipe scripts refuse that pairing. One-script path: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
 
-Those three wrappers pin the pairing and run [`scripts/try-it.sh`](scripts/try-it.sh) (HPA load test off unless `RUN_LOAD_TEST=1`; same security opt-in). Static contract, no cluster: [`scripts/test-agent-runtime-examples-contract.sh`](scripts/test-agent-runtime-examples-contract.sh).
+Each of those scripts installs GPU inference and verifies the sandbox. They skip the HPA load test unless you set `RUN_LOAD_TEST=1`. Same security opt-in as [Quick start](#quick-start) (TLS + OIDC, or the isolated-eval env vars). Static pairing/docs contract, no cluster: [`scripts/test-agent-runtime-examples-contract.sh`](scripts/test-agent-runtime-examples-contract.sh).
 
 Before creating a load Job, the test waits for a clean HPA baseline of **1 current / 1 desired** Ready replica (up to 240 seconds). This prevents a new test from inheriting replicas or the 60-second scale-down stabilization window from a prior test. It does not force a scale-down, so it cannot disrupt real traffic; wait for existing traffic to drain, then rerun. Set `HPA_BASELINE_WAIT_SEC` only if a longer wait is appropriate for your cluster.
 
