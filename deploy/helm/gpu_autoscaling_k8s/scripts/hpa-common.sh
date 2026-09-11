@@ -1317,6 +1317,7 @@ hpa_common_gpu_helm_upgrade() {
     --namespace "${ns}"
     --create-namespace
     --set namespace.create=false
+    --set "namespace.name=${ns}"
     -f "${hpa_values}"
     --set inference.model="${inference_model}"
     --set inference.runtime="${inference_runtime}"
@@ -1426,6 +1427,7 @@ hpa_common_ensure_metrics_proxy_ready() {
   local helm_args=(
     upgrade --install "${release}" "${chart_dir}" -n "${ns}"
     --set "namespace.create=false"
+    --set "namespace.name=${ns}"
     --set "autoscaling.enabled=false"
     --set "gpuScaling.count=1"
     --set "ingress.allowInsecureHttp=${allow_insecure_http}"
