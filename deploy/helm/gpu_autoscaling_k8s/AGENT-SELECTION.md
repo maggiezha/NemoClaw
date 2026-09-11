@@ -62,11 +62,12 @@ Do not mix `AGENT_NAME` values in one sandbox. To try another agent, build its
 image and create a **separate** sandbox name. A pass is the `OK: sandbox …`
 line in [Example verify output](#example-verify-output).
 
-Documented example one-script paths (skip the HPA load test unless `RUN_LOAD_TEST=1`):
-
-- OpenClaw + Ollama: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh)
-- Hermes + NIM: [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh)
-- Deep Agents Code + vLLM: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh)
+The loops below are the recipe path. Optional developer pairing tests (one GPU
+replica, no Kubernetes autoscaling, no load test; not required for HPA) live in
+[README Optional pairing tests](README.md#optional-pairing-tests):
+[`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh),
+[`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh),
+[`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
 
 ### OpenClaw
 
@@ -97,7 +98,7 @@ export INFERENCE_MODEL=llama3.2:3b
 ./scripts/verify-agent-sandbox.sh
 ```
 
-One-script path for this example: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
+Optional pairing test (not required for autoscaling): [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
 
 ### Hermes
 
@@ -134,8 +135,8 @@ export INFERENCE_MODEL=nvidia/nemotron-3-nano
 ./scripts/verify-agent-sandbox.sh
 ```
 
-The popular recipe example is Hermes + NIM: [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
-Official docs also list vLLM and Ollama for Hermes; this recipe's one-script path uses NIM so one example shows the NGC Secret flow.
+Optional pairing test for Hermes + NIM (not required for autoscaling): [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
+Official docs also list vLLM and Ollama for Hermes; the optional NIM test exists so one example shows the NGC Secret flow.
 
 ### Deep Agents Code
 
@@ -167,7 +168,7 @@ Interactive TUI (TTY), equivalent to `nemo-deepagents … connect` then `dcode`:
 openshell sandbox exec -n deepagents-onprem -- dcode
 ```
 
-One-script path for this example: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
+Optional pairing test (not required for autoscaling): [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
 
 ## Env vars
 
@@ -288,6 +289,6 @@ NemoClaw/Deep Agents Code has no long-running gateway; run one-shot prompts with
   cluster's Pod Security admission before assuming a clean create.
 - Official NemoClaw local providers for Deep Agents Code are vLLM and NIM, not Ollama.
   This recipe does not document `AGENT_NAME=deepagents` with `INFERENCE_RUNTIME=ollama`.
-  `agent_common_validate_runtime_pairing` refuses that pairing in the three pairing
-  scripts, `install-hpa.sh` (when `AGENT_NAME` is set), and the sandbox
+  `agent_common_validate_runtime_pairing` refuses that pairing in the optional
+  pairing tests, `install-hpa.sh` (when `AGENT_NAME` is set), and the sandbox
   build/create/verify/prompt scripts.

@@ -1322,13 +1322,6 @@ hpa_common_gpu_helm_upgrade() {
     --set inference.model="${inference_model}"
     --set inference.runtime="${inference_runtime}"
     --set probes.readinessChecksInference=true
-    --set autoscaling.enabled=true
-    --set autoscaling.minReplicas="${min}"
-    --set autoscaling.maxReplicas="${max}"
-    --set autoscaling.maxGpus="${max}"
-    --set "autoscaling.metric=${HPA_METRIC:-gpu_utilization}"
-    --set "autoscaling.targetGPUUtilizationPercentage=${gpu_target}"
-    --set "autoscaling.targetLatencyMilliseconds=${HPA_TARGET_LATENCY_MS:-5000}"
     --set "ingress.allowInsecureHttp=${allow_insecure_http}"
     --set "ingress.gateway.enabled=$(hpa_common_envoy_lb_helm_value)"
     --set "ingress.gateway.serviceType=${INGRESS_SERVICE_TYPE:-ClusterIP}"
@@ -1336,6 +1329,30 @@ hpa_common_gpu_helm_upgrade() {
     --set "ingress.auth.password=${auth_password}"
     --set-string "ingress.auth.htpasswd=${auth_htpasswd}"
   )
+  case "${ENABLE_AUTOSCALING:-1}" in
+    1)
+      helm_args+=(
+        --set autoscaling.enabled=true
+        --set autoscaling.minReplicas="${min}"
+        --set autoscaling.maxReplicas="${max}"
+        --set autoscaling.maxGpus="${max}"
+        --set "autoscaling.metric=${HPA_METRIC:-gpu_utilization}"
+        --set "autoscaling.targetGPUUtilizationPercentage=${gpu_target}"
+        --set "autoscaling.targetLatencyMilliseconds=${HPA_TARGET_LATENCY_MS:-5000}"
+      )
+      ;;
+    0)
+      helm_args+=(
+        --set autoscaling.enabled=false
+        --set replicaCount=1
+        --set gpuScaling.count=1
+      )
+      ;;
+    *)
+      echo "ENABLE_AUTOSCALING must be 0 or 1" >&2
+      return 1
+      ;;
+  esac
   if [[ -n "${ingress_host}" ]]; then
     helm_args+=(--set "ingress.host=${ingress_host}")
   fi

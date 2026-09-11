@@ -130,6 +130,9 @@ nim:
     registry: nvcr.io
   # Extra env vars (list of {name, value}) for NIM-specific tuning, e.g. NIM_MODEL_PROFILE.
   extraEnv: []
+  # First NGC model-profile download for nvcr.io/nim/nvidia/nemotron-3-nano can take
+  # well past the default 10-minute metrics-proxy startup window.
+  startupProbeSeconds: 1800
   persistence:
     enabled: true
     size: 40Gi

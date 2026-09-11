@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Shared end-to-end steps for the three pairing scripts. Do not run this file.
+# Shared steps for the optional agent/runtime pairing tests. Do not run this file.
 # Use:
 #   ./scripts/test-openclaw-ollama.sh
 #   ./scripts/test-hermes-nim.sh
 #   ./scripts/test-deepagents-vllm.sh
 #
-# Caller must export AGENT_NAME, INFERENCE_RUNTIME, and INFERENCE_MODEL first.
-# RUN_LOAD_TEST defaults to 0 (install inference, skip HPA scale-up/down).
-# Set RUN_LOAD_TEST=1 later to also run hpa-load-test.sh.
+# These tests are not part of GPU autoscaling. They never install HPA and never
+# run hpa-load-test.sh. Caller must export AGENT_NAME, INFERENCE_RUNTIME, and
+# INFERENCE_MODEL first.
 #
 # SECURITY: this path does NOT default to an insecure configuration. See the
 # ALLOW_INSECURE_HTTP / ALLOW_UNAUTHENTICATED_OPENSHELL block below — you must
@@ -36,9 +36,6 @@ REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node c
 # This host uses dgx01 via gitignored local.env; override only if you mean it.
 # export NEMOCLAW_TARGET_NODE=dgx01
 
-# 0 = install GPU inference only (no synthetic scale-up). 1 = also run hpa-load-test.sh.
-RUN_LOAD_TEST="${RUN_LOAD_TEST:-0}"
-
 # SECURITY (required — no default): this shortcut does not silently enable an insecure
 # configuration for you. It has exactly two supported modes:
 #
@@ -63,13 +60,20 @@ cd "${CHART_DIR}"
 # shellcheck source=hpa-common.sh
 source "${SCRIPT_DIR}/hpa-common.sh"
 hpa_common_load_local_env "${CHART_DIR}"
+# Pairing tests always run one replica with no HorizontalPodAutoscaler, even if
+# local.env is written for the autoscaling recipe.
+ENABLE_AUTOSCALING=0
+if [[ "${RUN_LOAD_TEST:-0}" != "0" ]]; then
+  echo "WARNING: ignoring RUN_LOAD_TEST — pairing tests never run a load test. Use ./scripts/hpa-load-test.sh after ./scripts/install-hpa.sh." >&2
+fi
+unset RUN_LOAD_TEST
 if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
   echo "GPU node pin: NEMOCLAW_TARGET_NODE=${NEMOCLAW_TARGET_NODE} (inference and sandboxes stay on this node)"
 else
   echo "WARNING: NEMOCLAW_TARGET_NODE is unset; GPU pods may schedule on any GPU node." >&2
 fi
 NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
-DCGM_NAMESPACE="${DCGM_NAMESPACE:-gpu-operator-resources}"
+RELEASE="${RELEASE:-nemoclaw-gpu}"
 # shellcheck source=versions.env
 source versions.env
 # shellcheck source=agent-common.sh
@@ -85,15 +89,7 @@ INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${IN
 if [[ "${INFERENCE_RUNTIME}" == "nim" ]]; then
   hpa_common_require_nim_credentials "${INFERENCE_RUNTIME}" "${NAMESPACE}" || exit 1
 fi
-export AGENT_NAME INFERENCE_RUNTIME INFERENCE_MODEL
-
-case "${RUN_LOAD_TEST}" in
-  0 | 1) ;;
-  *)
-    echo "ERROR: RUN_LOAD_TEST must be 0 or 1 (got '${RUN_LOAD_TEST}')." >&2
-    exit 1
-    ;;
-esac
+export AGENT_NAME INFERENCE_RUNTIME INFERENCE_MODEL ENABLE_AUTOSCALING
 
 # Transparency, not enforcement: install-hpa.sh / install-openshell-k8s.sh below are the
 # ones that actually validate and enforce these — this just states the mode up front so
@@ -104,28 +100,19 @@ else
   echo "Security mode: SECURE (default) — TLS + OIDC required; the install steps below will fail fast with setup instructions if ingress.tls / OPENSHELL_OIDC_ISSUER aren't configured. See ../README.md#tls-values, or opt into the isolated-eval shortcut (see the SECURITY comment at the top of this file)." >&2
 fi
 
-echo "=== 1/7: GPU + DCGM sanity check ==="
+echo "=== 1/6: GPU sanity check (pairing test, no Kubernetes autoscaling) ==="
 kubectl get nodes \
   -o jsonpath='{range .items[*]}{.metadata.name}{" GPUs="}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter
 
-echo "=== 2/7: Install GPU inference (${INFERENCE_RUNTIME}) ==="
+echo "=== 2/6: Install GPU inference (${INFERENCE_RUNTIME}, one replica, no HPA) ==="
 if [[ "${SKIP_INSTALL_HPA:-0}" == "1" ]]; then
   echo "SKIP_INSTALL_HPA=1: leaving existing ${RELEASE} in ${NAMESPACE} unchanged."
 else
   ./scripts/install-hpa.sh
 fi
-kubectl get pods,service,hpa -n "${NAMESPACE}"
-./scripts/get-hpa.sh -n "${NAMESPACE}"
+kubectl get pods,service -n "${NAMESPACE}"
 
-if [[ "${RUN_LOAD_TEST}" == "1" ]]; then
-  echo "=== 3/7: Synthetic HPA load test (scale-up -> Envoy LeastRequest check -> scale-down) ==="
-  ./scripts/hpa-load-test.sh
-else
-  echo "=== 3/7: Synthetic HPA load test skipped (RUN_LOAD_TEST=0; pairing check only) ==="
-fi
-
-echo "=== 4/7: Agent Sandbox CRDs + build ${AGENT_NAME} sandbox image ==="
+echo "=== 3/6: Agent Sandbox CRDs + build ${AGENT_NAME} sandbox image ==="
 kubectl apply -f \
   "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
 microk8s enable registry 2>/dev/null || true   # no-op if already on / not MicroK8s
@@ -133,10 +120,10 @@ AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-${REGISTRY}/nemoclaw-${AGENT_NAME}-k
 export AGENT_SANDBOX_IMAGE
 ./scripts/build-agent-sandbox-image.sh
 
-echo "=== 5/7: Install OpenShell gateway ==="
+echo "=== 4/6: Install OpenShell gateway ==="
 ./scripts/install-openshell-k8s.sh
 
-echo "=== 6/7: Port-forward + connect OpenShell CLI (no second terminal needed) ==="
+echo "=== 5/6: Port-forward + connect OpenShell CLI (no second terminal needed) ==="
 PF_LOG="$(mktemp)"
 AGENT_RUNTIME_LOG=""
 AGENT_RUNTIME_PID=""
@@ -174,7 +161,7 @@ else
 fi
 openshell status
 
-echo "=== 7/7: Create, start, and verify ${AGENT_NAME} sandbox ==="
+echo "=== 6/6: Create, start, and verify ${AGENT_NAME} sandbox ==="
 ./scripts/create-agent-sandbox.sh
 
 if [[ "$(agent_common_run_mode "${AGENT_NAME}")" == "terminal" ]]; then

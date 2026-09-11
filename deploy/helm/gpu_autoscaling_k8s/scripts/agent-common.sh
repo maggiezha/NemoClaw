@@ -63,7 +63,7 @@ agent_common_example_pairings() {
     deepagents vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
 }
 
-# User-facing one-script path for that agent's documented example pairing.
+# Optional pairing-test script for that agent's documented example pairing.
 agent_common_example_script() {
   printf 'test-%s-%s.sh' "${1:?agent}" "${2:?runtime}"
 }
@@ -98,7 +98,7 @@ agent_common_pin_example_pairing() {
     exit 1
   }
   if [[ -n "${AGENT_NAME:-}" && "${AGENT_NAME}" != "${agent}" ]]; then
-    echo "ERROR: AGENT_NAME=${AGENT_NAME} does not match this script (${agent}). Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-nim.sh, or ./scripts/test-deepagents-vllm.sh." >&2
+    echo "ERROR: AGENT_NAME=${AGENT_NAME} does not match this pairing test (${agent}). Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-nim.sh, or ./scripts/test-deepagents-vllm.sh." >&2
     exit 1
   fi
   if [[ -n "${INFERENCE_RUNTIME:-}" && "${INFERENCE_RUNTIME}" != "${runtime}" ]]; then

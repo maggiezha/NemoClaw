@@ -68,6 +68,15 @@ require_cmd kubectl
 require_cmd helm
 hpa_common_verify_target_node 0 || exit 1
 
+case "${ENABLE_AUTOSCALING:-1}" in
+  0 | 1) ;;
+  *)
+    echo "ENABLE_AUTOSCALING must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+ENABLE_AUTOSCALING="${ENABLE_AUTOSCALING:-1}"
+
 if [[ ${#DCGM_NAMESPACE} -gt 63 || ! "${DCGM_NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "DCGM_NAMESPACE must be a valid Kubernetes namespace name" >&2
   exit 1
@@ -371,17 +380,24 @@ helm_install() {
 
 if command -v microk8s >/dev/null 2>&1; then
   microk8s enable gpu 2>/dev/null || true
-  microk8s enable metrics-server 2>/dev/null || true
+  if [[ "${ENABLE_AUTOSCALING}" == "1" ]]; then
+    microk8s enable metrics-server 2>/dev/null || true
+  fi
 fi
-for _ in $(seq 1 36); do
-  metrics_server_ready && break
-  sleep 5
-done
-metrics_server_ready || {
-  echo "metrics-server is not consistently reachable — CPU/memory HPA APIs unavailable. Check kubectl get apiservice v1beta1.metrics.k8s.io and kubectl get --raw /apis/metrics.k8s.io/v1beta1." >&2
-  exit 1
-}
+if [[ "${ENABLE_AUTOSCALING}" == "1" ]]; then
+  for _ in $(seq 1 36); do
+    metrics_server_ready && break
+    sleep 5
+  done
+  metrics_server_ready || {
+    echo "metrics-server is not consistently reachable — CPU/memory HPA APIs unavailable. Check kubectl get apiservice v1beta1.metrics.k8s.io and kubectl get --raw /apis/metrics.k8s.io/v1beta1." >&2
+    exit 1
+  }
+fi
 hpa_common_verify_gpu_nodes || exit 1
+if [[ "${ENABLE_AUTOSCALING}" == "0" ]]; then
+  MAX_REPLICAS="${MAX_REPLICAS:-1}"
+fi
 if [[ -z "${MAX_REPLICAS}" ]]; then
   MAX_REPLICAS="$(hpa_common_allocatable_gpus)"
 fi
@@ -390,11 +406,15 @@ if [[ ! "${MAX_REPLICAS}" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 hpa_common_verify_gpu_capacity "${MAX_REPLICAS}" || exit 1
-echo "HPA maxReplicas=${MAX_REPLICAS} (allocatable GPUs / MAX_REPLICAS)"
-kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter 2>/dev/null | grep -q Running || {
-  echo "nvidia-dcgm-exporter not running in namespace ${DCGM_NAMESPACE} — GPU HPA metric unavailable" >&2
-  exit 1
-}
+if [[ "${ENABLE_AUTOSCALING}" == "1" ]]; then
+  echo "HPA maxReplicas=${MAX_REPLICAS} (allocatable GPUs / MAX_REPLICAS)"
+  kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter 2>/dev/null | grep -q Running || {
+    echo "nvidia-dcgm-exporter not running in namespace ${DCGM_NAMESPACE} — GPU HPA metric unavailable" >&2
+    exit 1
+  }
+else
+  echo "ENABLE_AUTOSCALING=0: one GPU replica, no HorizontalPodAutoscaler."
+fi
 
 case "${SKIP_MONITORING:-0}" in
   0 | 1) ;;
@@ -427,5 +447,9 @@ if ! hpa_common_wait_rollout "${DEPLOYMENT}" "${NAMESPACE}" "${ROLLOUT_TIMEOUT}"
   exit 1
 fi
 
-hpa_common_verify_hpa_bounds "${NAMESPACE}" "${DEPLOYMENT}" "${HPA_NAME}" "${MIN_REPLICAS}" "${MAX_REPLICAS}" || true
-hpa_common_print_hpa "${NAMESPACE}"
+if [[ "${ENABLE_AUTOSCALING}" == "1" ]]; then
+  hpa_common_verify_hpa_bounds "${NAMESPACE}" "${DEPLOYMENT}" "${HPA_NAME}" "${MIN_REPLICAS}" "${MAX_REPLICAS}" || true
+  hpa_common_print_hpa "${NAMESPACE}"
+else
+  kubectl get deploy,pods,service -n "${NAMESPACE}"
+fi
