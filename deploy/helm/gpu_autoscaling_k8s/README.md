@@ -15,7 +15,7 @@ HPA scales GPU inference from 1 to **N** replicas (1 GPU each) so spikes stay re
 | Hermes | `hermes` | `./scripts/run-agent-sandbox.sh` (keep attached) |
 | Deep Agents Code | `deepagents` | `./scripts/run-agent-prompt.sh "…"` |
 
-Set `AGENT_NAME` once and reuse it. Do not install two agents in one sandbox. Optional pairing checks (no HPA): [Optional pairing tests](#optional-pairing-tests).
+Set `AGENT_NAME` once and reuse it. Do not install two agents in one sandbox. Optional pairing checks (no HPA): [recipe examples](#agent-and-runtime-support).
 
 GPU runtime is **Ollama** (default), **vLLM**, or **NVIDIA NIM** (`INFERENCE_RUNTIME`). Metrics-proxy, HPA, and Envoy stay the same. Official pairings: [Agent and runtime support](#agent-and-runtime-support).
 
@@ -65,21 +65,6 @@ The wrappers pin `TARGET_PODS` and `HPA_LOAD_PROFILE`. Do not pass a different `
 Both paths cover chart deploy, optional Envoy LeastRequest, authenticated inference, HPA scale-up/down, Envoy distribution, and OpenShell → `https://inference.local/v1`. Default models fit either GPU. Pin a node with `NEMOCLAW_TARGET_NODE` when other GPU nodes exist.
 
 <img width="647" height="463" alt="Reference 4× L40S MicroK8s node used for validation" src="https://github.com/user-attachments/assets/80cb397b-d2e3-4b0d-933e-3b8dd1dfdb80" />
-
-### Reuse existing Prometheus / one GPU node
-
-Do not install a second Prometheus stack. `MAX_REPLICAS` does **not** follow a Deployment nodeSelector — in a multi-node cluster you must set it to that node's GPU count.
-
-```bash
-export MONITORING_NS=prometheus PROM_RELEASE=kube-prometheus-stack ADAPTER_RELEASE=prometheus-adapter
-export DCGM_NAMESPACE=gpu-operator          # GPU Operator; MicroK8s default is gpu-operator-resources
-export NEMOCLAW_TARGET_NODE=dgx01          # example: pin inference to one 8-GPU node
-export MAX_REPLICAS=8
-./scripts/install-hpa.sh
-./scripts/hpa-load-test-dgx-8xh100.sh
-```
-
-`ALLOW_INSECURE_HTTP=1` is isolated-eval cleartext only. For HTTPS, configure `ingress.tls` and omit it. Do not paste kubeconfig, registry credentials, OIDC secrets, or API keys into issues or PRs.
 
 ## Prerequisites
 
@@ -302,27 +287,15 @@ These are registry/model credentials, not the chart inference API key. Put **Sec
 
 #### Agent and runtime support
 
-- [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/inference/learn-and-choose/choose-inference-provider) / [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/inference/learn-and-choose/choose-inference-provider) / [Deep Agents](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/inference/learn-and-choose/choose-inference-provider) inference providers
-- In-tree: [`docs/inference/choose-inference-provider.mdx`](../../../docs/inference/choose-inference-provider.mdx)
-- Host Docker installers (not this cluster): [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/get-started/quickstart), [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/get-started/quickstart), [Deep Agents Code](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/get-started/quickstart)
+- Inference providers: [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/inference/learn-and-choose/choose-inference-provider) / [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/inference/learn-and-choose/choose-inference-provider) / [Deep Agents](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/inference/learn-and-choose/choose-inference-provider)
 
-Recipe examples:
 
-- **OpenClaw** + Ollama (`llama3.2:3b`) — chart default
-- **Hermes** + NIM (`nvidia/nemotron-3-nano`) — NGC Secrets first
-- **Deep Agents Code** + vLLM (`nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`) — scripts refuse Local Ollama for this agent
+Recipe examples (optional test scripts, no HPA):
 
-#### Optional pairing tests
+- **OpenClaw** + Ollama (`llama3.2:3b`) — chart default — [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh)
+- **Hermes** + NIM (`nvidia/nemotron-3-nano`) — [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh)
+- **Deep Agents Code** + vLLM (`nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`) — [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh)
 
-Optional developer checks. **Not** part of autoscaling. One GPU replica, no HPA, never run a load test.
-
-| Script | Pairing |
-|--------|---------|
-| [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh) | OpenClaw + Ollama |
-| [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh) | Hermes + NIM (NGC Secrets) |
-| [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh) | Deep Agents Code + vLLM |
-
-For HPA, use `./scripts/install-hpa.sh` then the [hardware load-test wrapper](#validation).
 
 #### Switching runtimes
 
@@ -339,18 +312,10 @@ export NIM_NGC_API_KEY_SECRET=nim-ngc-key NIM_IMAGE_PULL_SECRET=ngc-registry
 ./scripts/verify-agent-sandbox.sh
 ```
 
-Notes:
-
-- Prefer `NIM_NGC_API_KEY_SECRET` over plaintext `NIM_NGC_API_KEY` (`helm get values` / history). See [NVIDIA NIM registry access](#nvidia-nim-registry-access).
-- vLLM needs no NIM `NGC_API_KEY` for weights. Default HF model is public. Reuse `ngc-registry` for the vLLM **image** if nvcr.io requires auth. Gated HF: Opaque Secret key `HF_TOKEN` → `VLLM_HF_TOKEN_SECRET`.
-- vLLM `extraArgs` defaults are for Nemotron-3-Nano-4B-FP8 — replace them for other models.
-- Per-runtime security contexts: `ollamaSecurityContext` / `vllmSecurityContext` / `nimSecurityContext`.
-
 #### NVIDIA NIM registry access
 
-NIM needs the same NGC key in **two** places: kubelet `imagePullSecret` (`nvcr.io/nim/...`) and in-container `NGC_API_KEY` (model profile). `create-nim-ngc-secrets.sh` creates both. Do not commit the key.
+NIM needs the same NGC key in **two** places: kubelet `imagePullSecret` (`nvcr.io/nim/...`) and in-container `NGC_API_KEY` (model profile). `create-nim-ngc-secrets.sh` creates both. 
 
-If you already have an Opaque `NGC_API_KEY` Secret, also create the dockerconfigjson Secret — Helm cannot derive it from the Opaque Secret at template time:
 
 ```bash
 kubectl create secret docker-registry ngc-registry \

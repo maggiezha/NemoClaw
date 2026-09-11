@@ -64,7 +64,7 @@ line in [Example verify output](#example-verify-output).
 
 The loops below are the recipe path. Optional developer pairing tests (one GPU
 replica, no Kubernetes autoscaling, no load test; not required for HPA) live in
-[README Optional pairing tests](README.md#optional-pairing-tests):
+[README recipe examples](README.md#agent-and-runtime-support):
 [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh),
 [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh),
 [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
