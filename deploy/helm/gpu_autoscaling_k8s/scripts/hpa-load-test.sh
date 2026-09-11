@@ -8,24 +8,11 @@
 # verify concurrent Envoy traffic spreads across those pods, then scale back to 1.
 #
 # Usage:
-#   cd deploy/helm/gpu_autoscaling_k8s
+#   cd examples/recipes/nvidia/kubernetes-gpu-autoscaling
 #   ./scripts/hpa-load-test.sh
 # Optional: SKIP_ENVOY_LB_TEST=1 to skip the Envoy distribution check.
 # ENABLE_ENVOY_LB=0 also skips that check (no Envoy Gateway to probe).
 set -euo pipefail
-
-# Local DGX01 H100 test defaults. Callers can still override every value.
-# Keep ALLOW_INSECURE_HTTP explicit: it is a security acknowledgement, not a
-# portable chart default.
-: "${MAX_REPLICAS:=8}"
-: "${TARGET_PODS:=8}"
-: "${HPA_LOAD_PROFILE:=dgx-8xh100}"
-: "${JOB_PARALLELISM:=4}"
-: "${MAX_TOKENS:=128}"
-: "${LOAD_MULTIPLIER:=2}"
-: "${LOAD_COMPENSATION_SAFETY:=2}"
-: "${RAMP_SEC:=45}"
-: "${HPA_LOAD_NODE_NAME:=dgx01}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -35,79 +22,11 @@ hpa_common_load_local_env "${CHART_DIR}"
 NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 RELEASE="${RELEASE:-nemoclaw-gpu}"
 JOB_NAME="${JOB_NAME:-nemoclaw-gpu-hpa-load-test}"
-INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
-INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
-# `auto` selects the named hardware profile when the requested pod count and GPU product
-# match. Explicit names make the terminal and Job logs unambiguous: dgx-8xh100 uses a
-# higher per-GPU synthetic load; brev-4xl40s preserves the previously validated defaults.
-HPA_LOAD_PROFILE_REQUESTED="${HPA_LOAD_PROFILE:-auto}"
 require_cmd kubectl
 require_cmd helm
-hpa_common_require_nim_credentials "${INFERENCE_RUNTIME}" "${NAMESPACE}" || exit 1
 hpa_common_verify_gpu_nodes || exit 1
 ALLOC_GPUS="$(hpa_common_allocatable_gpus)"
 TARGET_PODS="${TARGET_PODS:-${ALLOC_GPUS}}"
-
-hpa_load_detect_auto_profile() {
-  local products
-  if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-    products="$(kubectl get node "${NEMOCLAW_TARGET_NODE}" \
-      -o jsonpath='{.metadata.labels.nvidia\.com/gpu\.product}' 2>/dev/null || true)"
-  else
-    products="$(kubectl get nodes -l nvidia.com/gpu.present=true \
-      -o jsonpath='{range .items[*]}{.metadata.labels.nvidia\.com/gpu\.product}{"\\n"}{end}' 2>/dev/null || true)"
-  fi
-  if [[ "${TARGET_PODS}" == "8" && "${products}" == *H100* ]]; then
-    printf 'dgx-8xh100'
-  elif [[ "${TARGET_PODS}" == "4" && "${products}" == *L40S* ]]; then
-    printf 'brev-4xl40s'
-  else
-    printf 'portable'
-  fi
-}
-
-case "${HPA_LOAD_PROFILE_REQUESTED}" in
-  auto) HPA_LOAD_PROFILE="$(hpa_load_detect_auto_profile)" ;;
-  dgx-8xh100 | brev-4xl40s | portable) HPA_LOAD_PROFILE="${HPA_LOAD_PROFILE_REQUESTED}" ;;
-  # Legacy aliases retained for users of the initial profile implementation.
-  h100) HPA_LOAD_PROFILE="dgx-8xh100" ;;
-  *)
-    echo "HPA_LOAD_PROFILE must be auto, dgx-8xh100, brev-4xl40s, or portable" >&2
-    exit 1
-    ;;
-esac
-case "${HPA_LOAD_PROFILE}" in
-  dgx-8xh100)
-    # 8×H100 needs more than the portable profile once load is split across
-    # several fast GPUs. The load generator does not leave bootstrap mode until
-    # a chat request completes, so bootstrap must also reach the known
-    # 640-request/pod ceiling that avoided the 502s seen at 768.
-    HPA_LOAD_DEFAULT_INFLIGHT_PER_GPU=320
-    HPA_LOAD_DEFAULT_MAX_INFLIGHT_PER_POD=640
-    HPA_LOAD_DEFAULT_BOOTSTRAP_INFLIGHT=160
-    # Leave enough time for a cold H100 inference pod to load before the
-    # controller gives up and deletes the load Job.
-    HPA_LOAD_DEFAULT_DURATION_SEC=900
-    HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS=90
-    ;;
-  brev-4xl40s | portable)
-    HPA_LOAD_DEFAULT_INFLIGHT_PER_GPU=64
-    HPA_LOAD_DEFAULT_MAX_INFLIGHT_PER_POD=512
-    HPA_LOAD_DEFAULT_BOOTSTRAP_INFLIGHT=8
-    HPA_LOAD_DEFAULT_DURATION_SEC=720
-    HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS=60
-    ;;
-esac
-
-# Apply one-Pod HPA steps during every load test, then restore the configured
-# production behavior in cleanup. The 60-second hold proves all target GPUs
-# were Ready under load before the Job stops and scale-down begins.
-HPA_TEST_DEFAULT_SCALE_UP_PODS=1
-HPA_TEST_DEFAULT_SCALE_UP_PERIOD_SEC=10
-HPA_TEST_DEFAULT_SCALE_DOWN_PODS=1
-HPA_TEST_DEFAULT_SCALE_DOWN_PERIOD_SEC=30
-HPA_TEST_DEFAULT_SCALE_DOWN_STABILIZATION_SEC=60
-HPA_TEST_DEFAULT_GPU_TARGET=40
 
 # Backoff / floor — never drive all GPUs to 0% when HPA has 2+ replicas (circuit breaker keeps probe load).
 ERROR_BACKOFF_FACTOR="${ERROR_BACKOFF_FACTOR:-0.92}"
@@ -126,14 +45,14 @@ if [[ "${TARGET_PODS}" -ge 4 ]]; then
   JOB_PARALLELISM="${JOB_PARALLELISM:-4}"
   MAX_TOKENS="${MAX_TOKENS:-128}"
   HPA_TARGET_GPU="${HPA_TARGET_GPU:-40}"
-  INFLIGHT_PER_GPU="${INFLIGHT_PER_GPU:-${HPA_LOAD_DEFAULT_INFLIGHT_PER_GPU}}"
+  INFLIGHT_PER_GPU="${INFLIGHT_PER_GPU:-64}"
   LOAD_MULTIPLIER="${LOAD_MULTIPLIER:-2}"
   LOAD_COMPENSATION_SAFETY="${LOAD_COMPENSATION_SAFETY:-2}"
   MAX_COMPENSATION="${MAX_COMPENSATION:-4}"
-  MAX_INFLIGHT_PER_POD="${MAX_INFLIGHT_PER_POD:-${HPA_LOAD_DEFAULT_MAX_INFLIGHT_PER_POD}}"
+  MAX_INFLIGHT_PER_POD="${MAX_INFLIGHT_PER_POD:-512}"
   WARMUP_SEC="${WARMUP_SEC:-90}"
   NEW_POD_RAMP_SEC="${NEW_POD_RAMP_SEC:-0}"
-  BOOTSTRAP_INFLIGHT="${BOOTSTRAP_INFLIGHT:-${HPA_LOAD_DEFAULT_BOOTSTRAP_INFLIGHT}}"
+  BOOTSTRAP_INFLIGHT="${BOOTSTRAP_INFLIGHT:-8}"
   NEW_POD_WARMUP_PARALLEL="${NEW_POD_WARMUP_PARALLEL:-8}"
   RAMP_SEC="${RAMP_SEC:-45}"
   ESCALATE_INTERVAL_SEC="${ESCALATE_INTERVAL_SEC:-15}"
@@ -146,13 +65,13 @@ else
   LOAD_MULTIPLIER="${LOAD_MULTIPLIER:-2}"
   MAX_TOKENS="${MAX_TOKENS:-128}"
   HPA_TARGET_GPU="${HPA_TARGET_GPU:-40}"
-  INFLIGHT_PER_GPU="${INFLIGHT_PER_GPU:-${HPA_LOAD_DEFAULT_INFLIGHT_PER_GPU}}"
+  INFLIGHT_PER_GPU="${INFLIGHT_PER_GPU:-64}"
   LOAD_COMPENSATION_SAFETY="${LOAD_COMPENSATION_SAFETY:-3}"
   MAX_COMPENSATION="${MAX_COMPENSATION:-8}"
-  MAX_INFLIGHT_PER_POD="${MAX_INFLIGHT_PER_POD:-${HPA_LOAD_DEFAULT_MAX_INFLIGHT_PER_POD}}"
+  MAX_INFLIGHT_PER_POD="${MAX_INFLIGHT_PER_POD:-512}"
   WARMUP_SEC="${WARMUP_SEC:-90}"
   NEW_POD_RAMP_SEC="${NEW_POD_RAMP_SEC:-0}"
-  BOOTSTRAP_INFLIGHT="${BOOTSTRAP_INFLIGHT:-${HPA_LOAD_DEFAULT_BOOTSTRAP_INFLIGHT}}"
+  BOOTSTRAP_INFLIGHT="${BOOTSTRAP_INFLIGHT:-8}"
   NEW_POD_WARMUP_PARALLEL="${NEW_POD_WARMUP_PARALLEL:-8}"
   RAMP_SEC="${RAMP_SEC:-20}"
   ESCALATE_INTERVAL_SEC="${ESCALATE_INTERVAL_SEC:-15}"
@@ -161,33 +80,16 @@ else
   SCALE_UP_POLL_SEC="${SCALE_UP_POLL_SEC:-10}"
 fi
 
-HPA_CONFIGURED_GPU_TARGET="${HPA_TARGET_GPU}"
-MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-60}"
-DURATION_SEC="${DURATION_SEC:-${HPA_LOAD_DEFAULT_DURATION_SEC}}"
+MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-15}"
+DURATION_SEC="${DURATION_SEC:-720}"
 SCALE_UP_TARGET="${SCALE_UP_TARGET:-${TARGET_PODS}}"
-SCALE_UP_WAIT_LOOPS="${SCALE_UP_WAIT_LOOPS:-${HPA_LOAD_DEFAULT_SCALE_UP_WAIT_LOOPS}}"
+SCALE_UP_WAIT_LOOPS="${SCALE_UP_WAIT_LOOPS:-60}"
 HPA_VALUES="${HPA_VALUES:-${CHART_DIR}/values.yaml}"
 SCALE_DOWN_WAIT_LOOPS="${SCALE_DOWN_WAIT_LOOPS:-40}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-900}"
 DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
-HPA_NAME="${HPA_NAME:-${DEPLOYMENT}}"
 SERVICE="${SERVICE:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)}"
 SERVICE_PORT="${SERVICE_PORT:-8081}"
-# A test must begin from the HPA floor so its scale-up result is meaningful. This
-# is intentionally a wait, not an automatic scale-down: forcing replicas down
-# could interrupt real traffic that happens to share the deployment.
-HPA_BASELINE_WAIT_SEC="${HPA_BASELINE_WAIT_SEC:-240}"
-# The test applies one-Pod HPA steps only while it runs and restores the
-# configured behavior from HPA_VALUES in cleanup.
-HPA_TEST_SCALE_UP_PODS="${HPA_TEST_SCALE_UP_PODS:-${HPA_TEST_DEFAULT_SCALE_UP_PODS}}"
-HPA_TEST_SCALE_UP_PERIOD_SEC="${HPA_TEST_SCALE_UP_PERIOD_SEC:-${HPA_TEST_DEFAULT_SCALE_UP_PERIOD_SEC}}"
-HPA_TEST_SCALE_DOWN_PODS="${HPA_TEST_SCALE_DOWN_PODS:-${HPA_TEST_DEFAULT_SCALE_DOWN_PODS}}"
-HPA_TEST_SCALE_DOWN_PERIOD_SEC="${HPA_TEST_SCALE_DOWN_PERIOD_SEC:-${HPA_TEST_DEFAULT_SCALE_DOWN_PERIOD_SEC}}"
-HPA_TEST_SCALE_DOWN_STABILIZATION_SEC="${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC:-${HPA_TEST_DEFAULT_SCALE_DOWN_STABILIZATION_SEC}}"
-HPA_TEST_GPU_TARGET="${HPA_TEST_GPU_TARGET:-${HPA_TEST_DEFAULT_GPU_TARGET}}"
-HPA_EFFECTIVE_GPU_TARGET="${HPA_CONFIGURED_GPU_TARGET}"
-HPA_TEST_BEHAVIOR_APPLIED=0
-HPA_RESTORE_HELM_ARGS=()
 # shellcheck disable=SC2034 # passed by name to hpa_common_log_hpa_if_changed
 LAST_HPA_LINE=""
 
@@ -198,9 +100,7 @@ kubectl get apiservice v1beta1.metrics.k8s.io 2>/dev/null | grep -q True || {
   exit 1
 }
 hpa_common_verify_gpu_capacity "${TARGET_PODS}" || exit 1
-if [[ "${HPA_METRIC:-gpu_utilization}" != "latency_avg" ]]; then
-  hpa_common_verify_gpu_hpa_metric "${NAMESPACE}" || exit 1
-fi
+hpa_common_verify_gpu_hpa_metric "${NAMESPACE}" || exit 1
 
 # Free GPUs held by historical *-agent leftovers before any Helm upgrade / rollout wait.
 hpa_common_migrate_pre_metrics_proxy_resources "${NAMESPACE}" "${RELEASE}"
@@ -211,6 +111,7 @@ if ! hpa_common_ensure_metrics_proxy_ready "${NAMESPACE}" "${RELEASE}" "${CHART_
   exit 1
 fi
 
+INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
 HPA_HELM_ARGS=(
   upgrade --install "${RELEASE}" "${CHART_DIR}"
   --namespace "${NAMESPACE}"
@@ -218,14 +119,13 @@ HPA_HELM_ARGS=(
   --set namespace.create=false
   -f "${HPA_VALUES}"
   --set inference.model="${INFERENCE_MODEL}"
-  --set inference.runtime="${INFERENCE_RUNTIME}"
   --set probes.readinessChecksInference=true
   --set autoscaling.enabled=true
   --set autoscaling.minReplicas=1
   --set autoscaling.maxReplicas="${TARGET_PODS}"
   --set autoscaling.maxGpus="${TARGET_PODS}"
   --set "autoscaling.metric=${HPA_METRIC:-gpu_utilization}"
-  --set "autoscaling.targetGPUUtilizationPercentage=${HPA_CONFIGURED_GPU_TARGET}"
+  --set "autoscaling.targetGPUUtilizationPercentage=${HPA_TARGET_GPU}"
   --set "autoscaling.targetLatencyMilliseconds=${HPA_TARGET_LATENCY_MS:-5000}"
   --set "ingress.allowInsecureHttp=${ALLOW_INSECURE_VALUE}"
   --set "ingress.gateway.enabled=$(hpa_common_envoy_lb_helm_value)"
@@ -234,62 +134,6 @@ HPA_HELM_ARGS=(
 )
 if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
   HPA_HELM_ARGS+=(--set-string "$(hpa_common_target_node_helm_value)")
-fi
-if [[ -n "${NIM_NGC_API_KEY:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "nim.ngcApiKey.value=${NIM_NGC_API_KEY}")
-fi
-if [[ -n "${NIM_NGC_API_KEY_SECRET:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "nim.ngcApiKey.existingSecret=${NIM_NGC_API_KEY_SECRET}")
-fi
-if [[ -n "${NIM_IMAGE_PULL_SECRET:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "nim.imagePullSecret.existingSecret=${NIM_IMAGE_PULL_SECRET}")
-fi
-if [[ -n "${VLLM_IMAGE_PULL_SECRET:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "vllm.imagePullSecret.existingSecret=${VLLM_IMAGE_PULL_SECRET}")
-fi
-if [[ -n "${VLLM_HF_TOKEN_SECRET:-}" ]]; then
-  HPA_HELM_ARGS+=(--set-string "vllm.huggingFaceToken.existingSecret=${VLLM_HF_TOKEN_SECRET}")
-fi
-
-# The test restores the configured policy in cleanup. Require all five knobs
-# together so a half-configured override cannot leave an invalid HPA policy behind.
-HPA_TEST_BEHAVIOR_VALUES=(
-  "${HPA_TEST_SCALE_UP_PODS}"
-  "${HPA_TEST_SCALE_UP_PERIOD_SEC}"
-  "${HPA_TEST_SCALE_DOWN_PODS}"
-  "${HPA_TEST_SCALE_DOWN_PERIOD_SEC}"
-  "${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC}"
-)
-HPA_TEST_BEHAVIOR_SET=0
-for value in "${HPA_TEST_BEHAVIOR_VALUES[@]}"; do
-  [[ -n "${value}" ]] && HPA_TEST_BEHAVIOR_SET=$((HPA_TEST_BEHAVIOR_SET + 1))
-done
-if [[ "${HPA_TEST_BEHAVIOR_SET}" -ne 0 && "${HPA_TEST_BEHAVIOR_SET}" -ne 5 ]]; then
-  echo "Set all HPA_TEST_SCALE_{UP,DOWN}_* values together, or leave all unset" >&2
-  exit 1
-fi
-if [[ "${HPA_TEST_BEHAVIOR_SET}" -eq 5 ]]; then
-  for value in "${HPA_TEST_BEHAVIOR_VALUES[@]}"; do
-    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
-      echo "HPA_TEST_SCALE_* values must be positive integers" >&2
-      exit 1
-    fi
-  done
-  if [[ ! "${HPA_TEST_GPU_TARGET}" =~ ^([1-9]|[1-9][0-9]|100)$ ]]; then
-    echo "HPA_TEST_GPU_TARGET must be an integer from 1 to 100" >&2
-    exit 1
-  fi
-  HPA_EFFECTIVE_GPU_TARGET="${HPA_TEST_GPU_TARGET}"
-  HPA_RESTORE_HELM_ARGS=("${HPA_HELM_ARGS[@]}")
-  HPA_HELM_ARGS+=(
-    --set "autoscaling.targetGPUUtilizationPercentage=${HPA_EFFECTIVE_GPU_TARGET}"
-    --set "autoscaling.behavior.scaleUp.policies[0].value=${HPA_TEST_SCALE_UP_PODS}"
-    --set "autoscaling.behavior.scaleUp.policies[0].periodSeconds=${HPA_TEST_SCALE_UP_PERIOD_SEC}"
-    --set "autoscaling.behavior.scaleDown.stabilizationWindowSeconds=${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC}"
-    --set "autoscaling.behavior.scaleDown.policies[0].value=${HPA_TEST_SCALE_DOWN_PODS}"
-    --set "autoscaling.behavior.scaleDown.policies[0].periodSeconds=${HPA_TEST_SCALE_DOWN_PERIOD_SEC}"
-  )
-  HPA_TEST_BEHAVIOR_APPLIED=1
 fi
 helm "${HPA_HELM_ARGS[@]}" >/dev/null
 
@@ -307,42 +151,18 @@ if [[ ! "${INFERENCE_API_SECRET_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 1
 fi
 
-hpa_common_verify_hpa_bounds "${NAMESPACE}" "${DEPLOYMENT}" "${HPA_NAME}" 1 "${TARGET_PODS}" || true
+hpa_common_verify_hpa_bounds "${NAMESPACE}" "${DEPLOYMENT}" "${DEPLOYMENT}" 1 "${TARGET_PODS}" || true
 hpa_common_wait_rollout "${DEPLOYMENT}" "${NAMESPACE}" "${ROLLOUT_TIMEOUT}"
 hpa_common_print_hpa "${NAMESPACE}"
 
-hpa_wait_for_one_replica_baseline() {
-  local deadline hpa_status current desired available
-  deadline=$((SECONDS + HPA_BASELINE_WAIT_SEC))
-  hpa_common_log "Waiting for HPA baseline: 1 current / 1 desired replica before synthetic load..."
-
-  while (( SECONDS < deadline )); do
-    hpa_status="$(kubectl get hpa "${HPA_NAME}" -n "${NAMESPACE}" \
-      -o jsonpath='{.status.currentReplicas}{" "}{.status.desiredReplicas}' 2>/dev/null || true)"
-    read -r current desired <<<"${hpa_status}"
-    available="$(kubectl get deployment "${DEPLOYMENT}" -n "${NAMESPACE}" \
-      -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true)"
-    if [[ "${current:-0}" == "1" && "${desired:-0}" == "1" && "${available:-0}" == "1" ]]; then
-      hpa_common_log "HPA baseline ready: 1 current / 1 desired replica"
-      return 0
-    fi
-    sleep 5
-  done
-
-  echo "HPA did not settle to 1 current / 1 desired replica within ${HPA_BASELINE_WAIT_SEC}s." >&2
-  echo "Wait for existing traffic or scale-down stabilization to finish, then retry. The test does not force a scale-down to avoid interrupting real traffic." >&2
-  hpa_common_print_hpa "${NAMESPACE}" || true
-  return 1
-}
-
-# Ensure metrics-proxy pods are Ready (inference model loaded) before load starts.
+# Ensure metrics-proxy pods are Ready (Ollama loaded) before load starts.
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy \
   -n "${NAMESPACE}" --timeout=600s >/dev/null 2>&1 || {
   echo "metrics-proxy pods not Ready — run ./scripts/hpa-reset.sh then retry" >&2
   exit 1
 }
 
-# Wait for inference ready (runtime model loaded) before starting load Job.
+# Wait for inference ready (Ollama model loaded) before starting load Job.
 hpa_common_log "Waiting for metrics-proxy /readyz (model loaded)..."
 READY_OK=0
 for _ in $(seq 1 60); do
@@ -357,11 +177,9 @@ for _ in $(seq 1 60); do
   sleep 3
 done
 if [[ "${READY_OK}" -ne 1 ]]; then
-  echo "metrics-proxy /readyz not stable — the inference runtime may still be pulling the model. Run ./scripts/hpa-reset.sh then retry" >&2
+  echo "metrics-proxy /readyz not stable — Ollama may still be pulling the model. Run ./scripts/hpa-reset.sh then retry" >&2
   exit 1
 fi
-
-hpa_wait_for_one_replica_baseline || exit 1
 
 # Smoke-test one chat completion before load Job starts.
 hpa_common_log "Smoke test: chat completion on metrics-proxy pod..."
@@ -381,28 +199,6 @@ if [[ "${SMOKE_OK}" -ne 1 ]]; then
   echo "Chat smoke test failed — inference not serving yet" >&2
   exit 1
 fi
-
-# The metrics-proxy creates its latency series only after a request completes.
-# Prime it with the smoke request above, then wait for Prometheus and the adapter
-# before starting the latency-driven load Job.
-if [[ "${HPA_METRIC:-gpu_utilization}" == "latency_avg" ]]; then
-  LATENCY_METRIC_WAIT_SEC="${LATENCY_METRIC_WAIT_SEC:-180}"
-  hpa_common_log "Waiting for latency metric after the smoke request..."
-  LATENCY_METRIC_READY=0
-  LATENCY_METRIC_DEADLINE=$((SECONDS + LATENCY_METRIC_WAIT_SEC))
-  while (( SECONDS < LATENCY_METRIC_DEADLINE )); do
-    if hpa_common_verify_gpu_hpa_metric "${NAMESPACE}" >/dev/null 2>&1; then
-      LATENCY_METRIC_READY=1
-      break
-    fi
-    sleep 5
-  done
-  if [[ "${LATENCY_METRIC_READY}" -ne 1 ]]; then
-    hpa_common_verify_gpu_hpa_metric "${NAMESPACE}" || true
-    echo "Latency metric did not appear within ${LATENCY_METRIC_WAIT_SEC}s after the smoke request" >&2
-    exit 1
-  fi
-fi
 hpa_common_log "Smoke test OK — starting load generators"
 
 LOAD_SA="${JOB_NAME}-sa"
@@ -412,11 +208,6 @@ cleanup() {
   hpa_common_cleanup_load_test_resources "${NAMESPACE}" "${JOB_NAME}"
   kubectl delete pod "${LB_TEST_PROBE_POD:-nemoclaw-gpu-envoy-lb-probe}" \
     -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
-  if [[ "${HPA_TEST_BEHAVIOR_APPLIED}" -eq 1 ]]; then
-    hpa_common_log "Restoring the configured HPA scale behavior..."
-    helm "${HPA_RESTORE_HELM_ARGS[@]}" >/dev/null \
-      || echo "Warning: could not restore configured HPA behavior; rerun ./scripts/install-hpa.sh" >&2
-  fi
 }
 trap cleanup EXIT
 
@@ -501,8 +292,6 @@ spec:
       serviceAccountName: ${LOAD_SA}
       restartPolicy: Never
 ${LOAD_TEST_NODE_SELECTOR}
-      nodeSelector:
-        kubernetes.io/hostname: ${HPA_LOAD_NODE_NAME}
       containers:
         - name: load-generator
           image: node:22-bookworm-slim@sha256:8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27
@@ -511,11 +300,7 @@ ${LOAD_TEST_NODE_SELECTOR}
             - name: TARGET_PODS
               value: "${TARGET_PODS}"
             - name: HPA_TARGET_GPU
-              value: "${HPA_EFFECTIVE_GPU_TARGET}"
-            - name: HPA_LOAD_PROFILE
-              value: "${HPA_LOAD_PROFILE}"
-            - name: HPA_LOAD_PROFILE_REQUESTED
-              value: "${HPA_LOAD_PROFILE_REQUESTED}"
+              value: "${HPA_TARGET_GPU}"
             - name: JOB_PARALLELISM
               value: "${JOB_PARALLELISM}"
             - name: INFLIGHT_PER_GPU
@@ -606,15 +391,7 @@ ${LOAD_TEST_NODE_SELECTOR}
 EOF
 
 PER_POD_PEAK=$((INFLIGHT_PER_GPU * LOAD_MULTIPLIER))
-if [[ "${HPA_METRIC:-gpu_utilization}" == "latency_avg" ]]; then
-  HPA_TEST_METRIC_TARGET="${HPA_TARGET_LATENCY_MS:-5000}ms"
-else
-  HPA_TEST_METRIC_TARGET="${HPA_EFFECTIVE_GPU_TARGET}%"
-fi
-hpa_common_log "Load profile=${HPA_LOAD_PROFILE} (requested=${HPA_LOAD_PROFILE_REQUESTED}): ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} target=${HPA_TEST_METRIC_TARGET} → max ${TARGET_PODS} replicas (stop after ${MAX_REPLICAS_HOLD_SEC}s at max)"
-if [[ "${HPA_TEST_BEHAVIOR_APPLIED}" -eq 1 ]]; then
-  hpa_common_log "Temporary test HPA behavior: up to ${HPA_TEST_SCALE_UP_PODS} pods/${HPA_TEST_SCALE_UP_PERIOD_SEC}s; down up to ${HPA_TEST_SCALE_DOWN_PODS} pods/${HPA_TEST_SCALE_DOWN_PERIOD_SEC}s after ${HPA_TEST_SCALE_DOWN_STABILIZATION_SEC}s stabilization"
-fi
+hpa_common_log "Load: ${JOB_PARALLELISM} generators × ${MAX_TOKENS} tokens → each Ready metrics-proxy pod; base ~${PER_POD_PEAK} in-flight/pod (${LOAD_MULTIPLIER}×), cap ${MAX_INFLIGHT_PER_POD}/pod, warmup ${WARMUP_SEC}s, bootstrap ${BOOTSTRAP_INFLIGHT}; metric=${HPA_METRIC:-gpu_utilization} → max ${TARGET_PODS} replicas (stop after ${MAX_REPLICAS_HOLD_SEC}s at max)"
 
 kubectl wait --for=condition=ready pod -l "job-name=${JOB_NAME}" -n "${NAMESPACE}" --timeout=120s >/dev/null 2>&1 || {
   echo "Load-generator pods not ready — check: kubectl get pods -n ${NAMESPACE} -l job-name=${JOB_NAME}" >&2

@@ -32,7 +32,7 @@ Keep `versions.env` aligned: NemoClaw `v0.0.104`, OpenShell `0.0.85`, Agent Sand
 
 ## Deployment Architecture
 
-HPA scales to **N** inference pods (1 GPU each). Envoy LeastRequest when enabled; otherwise the metrics-proxy Service. Set install `MAX_REPLICAS` to the GPUs you intend to use (**N**). Load-test **N** with the hardware wrappers in [Validation](#validation).
+HPA scales to **N** inference pods (1 GPU each). Envoy LeastRequest when enabled; otherwise the metrics-proxy Service. Set install `MAX_REPLICAS` to the GPUs you intend to use (**N**). Load-test with the matching script in [Validation](#validation).
 
 Each GPU pod is **2/2 Ready** when healthy: inference (`ollama` / `vllm` / `nim`) + `metrics-proxy` (auth, `/v1`, health, `/metrics`). The sandboxed agent is CPU-only OpenShell, not this pod.
 
@@ -59,8 +59,6 @@ The chart generates a local inference API key (Bearer on `/v1`). OpenShell injec
 |----------|-----------------|-----------|
 | On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` |
 | [Brev AWS](https://brev.nvidia.com) **4× L40S** (48 GB), MicroK8s | `MAX_REPLICAS=4` | `./scripts/hpa-load-test-brev-4xl40s.sh` |
-
-The wrappers pin `TARGET_PODS` and `HPA_LOAD_PROFILE`. Do not pass a different `TARGET_PODS` into them. For any other replica count, use `./scripts/hpa-load-test.sh`.
 
 Both paths cover chart deploy, optional Envoy LeastRequest, authenticated inference, HPA scale-up/down, Envoy distribution, and OpenShell → `https://inference.local/v1`. Default models fit either GPU. Pin a node with `NEMOCLAW_TARGET_NODE` when other GPU nodes exist.
 
@@ -194,13 +192,11 @@ Create does **not** start Hermes/OpenClaw. Do not use `nemohermes launch` / `nem
 
 ### 6. HPA load test
 
-Use the wrapper that matches the GPUs you installed for:
-
 ```bash
-# 8× H100 — TARGET_PODS=8, profile dgx-8xh100
+# 8× H100 on-prem
 ./scripts/hpa-load-test-dgx-8xh100.sh
 
-# 4× L40S (Brev) — TARGET_PODS=4, profile brev-4xl40s
+# 4× L40S on AWS (Brev)
 ./scripts/hpa-load-test-brev-4xl40s.sh
 ```
 
@@ -252,7 +248,7 @@ ingress:
 
 `local.env` resolves paths from **its own directory**. Manual export from the recipe directory: `export HPA_VALUES="$PWD/hpa-tls-values.yaml"`. Explicit env wins over `local.env`. The chart never creates or rotates the TLS Secret.
 
-Without Envoy, skip TLS and keep `ENABLE_ENVOY_LB=0` on `install-hpa.sh`, `hpa-reset.sh`, and the load-test wrapper you use.
+Without Envoy, skip TLS and keep `ENABLE_ENVOY_LB=0` on `install-hpa.sh`, `hpa-reset.sh`, and the load-test script you use.
 
 ### Scheduling
 
@@ -286,9 +282,6 @@ When Envoy is off: metrics-proxy Service only; protect with NetworkPolicy + the 
 These are registry/model credentials, not the chart inference API key. Put **Secret names** in `local.env`, never key values.
 
 #### Agent and runtime support
-
-- Inference providers: [OpenClaw](https://docs.nvidia.com/nemoclaw/latest/user-guide/openclaw/inference/learn-and-choose/choose-inference-provider) / [Hermes](https://docs.nvidia.com/nemoclaw/latest/user-guide/hermes/inference/learn-and-choose/choose-inference-provider) / [Deep Agents](https://docs.nvidia.com/nemoclaw/latest/user-guide/deepagents/inference/learn-and-choose/choose-inference-provider)
-
 
 Recipe examples (optional test scripts, no HPA):
 
@@ -459,11 +452,10 @@ openshell status
 
 | Hardware | Command |
 |----------|---------|
-| **8× H100** | `./scripts/hpa-load-test-dgx-8xh100.sh` |
-| **4× L40S** | `./scripts/hpa-load-test-brev-4xl40s.sh` |
-| Other **N** | `./scripts/hpa-load-test.sh` |
+| **8× H100** on-prem | `./scripts/hpa-load-test-dgx-8xh100.sh` |
+| **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` |
 
-Wrappers lock `TARGET_PODS` (8 vs 4) and the in-flight profile. Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a new test does not inherit a prior scale-down window — it will not force a scale-down under real traffic. While running, the HPA uses one-pod 40% steps, then restores `HPA_VALUES`. Load stops after a short hold at max so replicas return to 1.
+Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a new test does not inherit a prior scale-down window — it will not force a scale-down under real traffic. While running, the HPA uses one-pod 40% steps, then restores `HPA_VALUES`. Load stops after a short hold at max so replicas return to 1.
 
 ```bash
 # Same TLS overlay / local.env as install
@@ -472,16 +464,24 @@ Wrappers lock `TARGET_PODS` (8 vs 4) and the in-flight profile. Each run waits f
 ./scripts/hpa-load-test-brev-4xl40s.sh
 
 HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-dgx-8xh100.sh
+HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-brev-4xl40s.sh
 ./scripts/hpa-reset.sh
 ```
 
+On 8× H100, `hpa-load-test-dgx-8xh100.sh` sets the metrics-proxy ServiceMonitor `release` label to `PROM_RELEASE` (default `kube-prometheus-stack`) so Prometheus scrapes `nemoclaw_llm_*` and latency HPA can read a current value instead of `?/3000`. GPU-util HPA uses DCGM and does not need that label.
+
 With Envoy on, the script prints `Envoy LeastRequest OK: <pod>:+<delta>, …`. Skip that phase with `SKIP_ENVOY_LB_TEST=1`. Keep `ENABLE_ENVOY_LB` consistent with install.
+
+HPA still adds **one** pod per step. After each step a new GPU sits at 0% until the model is loaded, which can drop the **average** under 40% and delay the next replica (~2 min/pod when busy GPUs are only ~50%). Raise in-flight on the already-busy pods so the average stays above 40% without waiting for the new GPU (do not add two pods per step — that dip is worse). If you see many HTTP 502s on 8× H100, stay at or below the 640 in-flight cap.
 
 | Knob | Default | Purpose |
 |------|---------|---------|
 | `SKIP_ENVOY_LB_TEST` | `0` | Skip Envoy distribution check |
 | `LB_TEST_REQUESTS` / `LB_TEST_CONCURRENCY` | `48` / `12` | Envoy check load |
-| `DURATION_SEC` / `HPA_TARGET_GPU` | profile / `40` | Load duration / util target |
+| `DURATION_SEC` / `HPA_TARGET_GPU` | script / `40` | Load duration / util target |
+| `INFLIGHT_PER_GPU` | `320` on 8× H100; `64` on 4× L40S | Concurrent chats aimed at each GPU |
+| `LOAD_MULTIPLIER` | `2` | Extra in-flight vs `INFLIGHT_PER_GPU` |
+| `MAX_INFLIGHT_PER_POD` | `640` on 8× H100; `512` on 4× L40S | Hard cap per pod |
 
 Validated 4× L40S — GPU util > 40%:
 
@@ -493,7 +493,7 @@ Validated 4× L40S — latency > 3000 ms:
 
 ## Grafana: watch workload balancing
 
-Optional, while a load-test wrapper is running.
+Optional, while a load-test script is running.
 
 ```bash
 kubectl port-forward -n monitoring service/kube-prometheus-grafana 3000:80

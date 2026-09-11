@@ -18,6 +18,52 @@ hpa_common_load_local_env() {
   source "${env_file}"
 }
 
+# Optional ServiceMonitor release= label. Recipe Prometheus scrapes every monitor;
+# a shared kube-prometheus-stack only scrapes ServiceMonitors with
+# release=<PROM_RELEASE>. hpa-load-test-dgx-8xh100.sh sets
+# HPA_SERVICEMONITOR_RELEASE so latency series are scraped. install-hpa.sh /
+# hpa-reset.sh also stamp when USE_EXISTING_PROMETHEUS=1.
+hpa_common_servicemonitor_release_helm_set() {
+  local release_label="${HPA_SERVICEMONITOR_RELEASE:-}"
+  if [[ -z "${release_label}" && "${USE_EXISTING_PROMETHEUS:-0}" == "1" ]]; then
+    release_label="${PROM_RELEASE:-kube-prometheus-stack}"
+  fi
+  [[ -n "${release_label}" ]] || return 0
+  printf '%s' "--set-string metrics.serviceMonitor.labels.release=${release_label}"
+}
+
+hpa_common_append_servicemonitor_release_helm_set() {
+  local -n __helm_args="${1:?helm_args array name}"
+  local sm
+  sm="$(hpa_common_servicemonitor_release_helm_set)" || true
+  [[ -n "${sm}" ]] && __helm_args+=("${sm}")
+}
+
+# Shared kube-prometheus-stack matches ServiceMonitors by metadata.labels.release.
+# Without that label, DCGM GPU util still works (DCGM's monitor is already labeled)
+# but metrics-proxy latency is never scraped and HPA shows ?/target.
+hpa_common_verify_metrics_proxy_servicemonitor_release() {
+  local ns="${1:?namespace}"
+  local expected="${HPA_SERVICEMONITOR_RELEASE:-}"
+  [[ -n "${expected}" ]] || return 0
+
+  local sm got
+  sm="$(kubectl get servicemonitor -n "${ns}" \
+    -l 'app.kubernetes.io/name=nemoclaw-gpu' \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "${sm}" ]]; then
+    echo "metrics-proxy ServiceMonitor not found in ${ns}; Prometheus cannot scrape latency metrics." >&2
+    return 1
+  fi
+  got="$(kubectl get servicemonitor "${sm}" -n "${ns}" \
+    -o jsonpath='{.metadata.labels.release}' 2>/dev/null || true)"
+  if [[ "${got}" != "${expected}" ]]; then
+    echo "ServiceMonitor ${sm} has release=${got:-<none>}; Prometheus scrapes release=${expected}. Latency HPA needs that label on the metrics-proxy ServiceMonitor." >&2
+    return 1
+  fi
+  hpa_common_log "Prometheus scrape: ServiceMonitor ${sm} release=${expected}"
+}
+
 # NIM needs a credential for two separate operations: kubelet's nvcr.io image pull and
 # the NIM container's model-profile download. Keep the credential out of Helm values by
 # preferring the pre-created Secret pair made by create-nim-ngc-secrets.sh.
@@ -976,7 +1022,7 @@ while [ \"\$i\" -lt \"\$N\" ]; do
     i=\$((i+1))
     active=\$((active+1))
     (
-      code=\$(curl -s -o /dev/null -w '%{http_code}' --max-time 180 \
+      code=\$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 180 \
         -H \"Authorization: Bearer \${API_KEY}\" \
         -H 'Content-Type: application/json' \
         -d \"{\\\"model\\\":\\\"\${MODEL}\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Reply with exactly one word: ping\\\"}],\\\"max_tokens\\\":8,\\\"stream\\\":false}\" \
@@ -1359,6 +1405,7 @@ hpa_common_gpu_helm_upgrade() {
   if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
     helm_args+=(--set-string "$(hpa_common_target_node_helm_value)")
   fi
+  hpa_common_append_servicemonitor_release_helm_set helm_args
   # Only relevant when inference_runtime=nim; harmless (ignored by the chart) otherwise.
   # NIM_NGC_API_KEY alone is enough for the common case: the chart derives both the
   # in-container NGC_API_KEY Secret and the nvcr.io imagePullSecret from this one value.
@@ -1460,6 +1507,7 @@ hpa_common_ensure_metrics_proxy_ready() {
   if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
     helm_args+=(--set-string "$(hpa_common_target_node_helm_value)")
   fi
+  hpa_common_append_servicemonitor_release_helm_set helm_args
   helm "${helm_args[@]}" >/dev/null
 
   hpa_common_kick_deployment "${ns}" "${deploy}" || helm "${helm_args[@]}" >/dev/null
@@ -1565,6 +1613,56 @@ hpa_common_allocatable_gpus() {
   awk -F '\t' '$2 == "True" && $3 ~ /^[0-9]+$/ && $4 == "true" {s += $3} END {print s+0}' <<<"${inventory}"
 }
 
+# GPUs already bound on the target node (or all inventoried GPU nodes) that this
+# release cannot reuse — e.g. a NIM pod in another namespace.
+hpa_common_gpus_held_outside_release() {
+  local ns="${1:-${NAMESPACE:-nemoclaw-gpu}}"
+  local release="${2:-${RELEASE:-nemoclaw-gpu}}"
+  local target_node="${NEMOCLAW_TARGET_NODE:-}"
+  require_cmd kubectl
+  require_cmd python3
+  python3 - "${ns}" "${release}" "${target_node}" <<'PY'
+import json, subprocess, sys
+
+ns, release, target = sys.argv[1], sys.argv[2], sys.argv[3]
+cmd = ["kubectl", "get", "pods", "-A", "-o", "json"]
+if target:
+    cmd.append(f"--field-selector=spec.nodeName={target}")
+try:
+    docs = json.loads(subprocess.check_output(cmd, text=True))
+except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
+    print(0)
+    raise SystemExit(0)
+
+held = 0
+for pod in docs.get("items") or []:
+    meta = pod.get("metadata") or {}
+    spec = pod.get("spec") or {}
+    labels = meta.get("labels") or {}
+    if meta.get("namespace") == ns and labels.get("app.kubernetes.io/instance") == release:
+        continue
+    gpu = 0
+    for container in spec.get("containers") or []:
+        resources = container.get("resources") or {}
+        req = (resources.get("requests") or {}).get("nvidia.com/gpu")
+        lim = (resources.get("limits") or {}).get("nvidia.com/gpu")
+        raw = req or lim
+        if raw:
+            gpu += int(float(raw))
+    held += gpu
+print(held)
+PY
+}
+
+hpa_common_wait_for_job_pods_gone() {
+  local ns="${1:?namespace}"
+  local job="${2:?jobName}"
+  local timeout_sec="${3:-180}"
+  hpa_common_log "Waiting for load-generator Job ${job} pods to terminate..."
+  kubectl delete job "${job}" -n "${ns}" --ignore-not-found=true --wait=true --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
+  kubectl wait --for=delete pod -l "job-name=${job}" -n "${ns}" --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
+}
+
 hpa_common_verify_gpu_capacity() {
   local requested="${1:?requested GPU replicas}"
   if [[ ! "${requested}" =~ ^[1-9][0-9]*$ ]]; then
@@ -1572,13 +1670,19 @@ hpa_common_verify_gpu_capacity() {
     return 1
   fi
 
-  local allocatable
+  local allocatable held available
   allocatable="$(hpa_common_allocatable_gpus)"
-  if ((10#${requested} > 10#${allocatable})); then
+  held="$(hpa_common_gpus_held_outside_release "${NAMESPACE:-nemoclaw-gpu}" "${RELEASE:-nemoclaw-gpu}" 2>/dev/null || echo 0)"
+  held="${held:-0}"
+  available=$((10#${allocatable} - 10#${held}))
+  if ((available < 0)); then
+    available=0
+  fi
+  if ((10#${requested} > available)); then
     if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
-      echo "Requested ${requested} GPU replicas, but NEMOCLAW_TARGET_NODE ${NEMOCLAW_TARGET_NODE} reports ${allocatable} allocatable GPUs" >&2
+      echo "Requested ${requested} GPU replicas, but NEMOCLAW_TARGET_NODE ${NEMOCLAW_TARGET_NODE} has ${allocatable} allocatable GPUs with ${held} held by other workloads (${available} left for this release)." >&2
     else
-      echo "Requested ${requested} GPU replicas, but Ready nodes report ${allocatable} allocatable GPUs" >&2
+      echo "Requested ${requested} GPU replicas, but Ready nodes report ${allocatable} allocatable GPUs with ${held} held by other workloads (${available} left for this release)." >&2
     fi
     return 1
   fi

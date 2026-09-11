@@ -9,7 +9,7 @@
 #   ./scripts/test-deepagents-vllm.sh
 #
 # These tests are not part of GPU autoscaling. They never install HPA and never
-# run hpa-load-test.sh. Caller must export AGENT_NAME, INFERENCE_RUNTIME, and
+# run a load test. Caller must export AGENT_NAME, INFERENCE_RUNTIME, and
 # INFERENCE_MODEL first.
 #
 # SECURITY: this path does NOT default to an insecure configuration. See the
@@ -64,7 +64,7 @@ hpa_common_load_local_env "${CHART_DIR}"
 # local.env is written for the autoscaling recipe.
 ENABLE_AUTOSCALING=0
 if [[ "${RUN_LOAD_TEST:-0}" != "0" ]]; then
-  echo "WARNING: ignoring RUN_LOAD_TEST — pairing tests never run a load test. Use ./scripts/hpa-load-test.sh after ./scripts/install-hpa.sh." >&2
+  echo "WARNING: ignoring RUN_LOAD_TEST — pairing tests never run a load test. Use ./scripts/hpa-load-test-dgx-8xh100.sh or ./scripts/hpa-load-test-brev-4xl40s.sh after ./scripts/install-hpa.sh." >&2
 fi
 unset RUN_LOAD_TEST
 if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then

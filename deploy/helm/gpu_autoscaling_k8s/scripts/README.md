@@ -15,9 +15,9 @@ what each script in this directory does — it has no instructions of its own.
 | Script | Purpose |
 |--------|---------|
 | `install-hpa.sh` | Monitoring + chart + HPA (+ Envoy if enabled). This is the autoscaling install path. |
-| `hpa-load-test-dgx-8xh100.sh` | HPA load test for **8× H100** (`TARGET_PODS=8`, profile `dgx-8xh100`) |
-| `hpa-load-test-brev-4xl40s.sh` | HPA load test for **4× L40S** (`TARGET_PODS=4`, profile `brev-4xl40s`) |
-| `hpa-load-test.sh` / `hpa-reset.sh` | Generic autoscaling test (other replica counts) / restore idle |
+| `hpa-load-test-dgx-8xh100.sh` | HPA load test for **8× H100** on-prem |
+| `hpa-load-test-brev-4xl40s.sh` | HPA load test for **4× L40S** on AWS (Brev) |
+| `hpa-reset.sh` | Restore idle HPA / inference |
 | `cluster-recover.sh` | Destructive release recovery for the selected release only — see script comments before use |
 | `get-metrics-proxy-pods.sh` / `get-hpa.sh` / `hpa-watch.sh` | Inspect / watch |
 | `install-openshell-k8s.sh` | OpenShell gateway |
