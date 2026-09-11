@@ -23,20 +23,22 @@ hpa_common_load_local_env() {
 # release=<PROM_RELEASE>. hpa-load-test-dgx-8xh100.sh sets
 # HPA_SERVICEMONITOR_RELEASE so latency series are scraped. install-hpa.sh /
 # hpa-reset.sh also stamp when USE_EXISTING_PROMETHEUS=1.
-hpa_common_servicemonitor_release_helm_set() {
+hpa_common_servicemonitor_release_label() {
   local release_label="${HPA_SERVICEMONITOR_RELEASE:-}"
   if [[ -z "${release_label}" && "${USE_EXISTING_PROMETHEUS:-0}" == "1" ]]; then
     release_label="${PROM_RELEASE:-kube-prometheus-stack}"
   fi
   [[ -n "${release_label}" ]] || return 0
-  printf '%s' "--set-string metrics.serviceMonitor.labels.release=${release_label}"
+  printf '%s' "${release_label}"
 }
 
 hpa_common_append_servicemonitor_release_helm_set() {
   local -n __helm_args="${1:?helm_args array name}"
-  local sm
-  sm="$(hpa_common_servicemonitor_release_helm_set)" || true
-  [[ -n "${sm}" ]] && __helm_args+=("${sm}")
+  local release_label
+  release_label="$(hpa_common_servicemonitor_release_label)" || true
+  [[ -n "${release_label}" ]] || return 0
+  # Two argv entries: a single "--set-string key=val" string is parsed as one unknown flag.
+  __helm_args+=(--set-string "metrics.serviceMonitor.labels.release=${release_label}")
 }
 
 # Shared kube-prometheus-stack matches ServiceMonitors by metadata.labels.release.
@@ -984,8 +986,27 @@ print(" ".join(ips))
   hpa_common_log "Envoy LeastRequest check: ${requests} requests (concurrency ${concurrency}) via ${envoy_base} across pods [${pod_ips}]"
 
   kubectl delete pod "${probe_pod}" -n "${ns}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl run "${probe_pod}" -n "${ns}" --restart=Never --image=curlimages/curl:8.5.0 \
-    --command -- sleep 900 >/dev/null
+  # Pin only when HPA_LOAD_NODE_NAME is set (8× H100). 4× L40S leaves it unset.
+  local probe_node_yaml=""
+  if [[ -n "${HPA_LOAD_NODE_NAME:-}" ]]; then
+    probe_node_yaml="
+  nodeSelector:
+    kubernetes.io/hostname: ${HPA_LOAD_NODE_NAME}"
+  fi
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${probe_pod}
+  namespace: ${ns}
+spec:
+  restartPolicy: Never
+${probe_node_yaml}
+  containers:
+    - name: curl
+      image: curlimages/curl:8.5.0
+      command: ["sleep", "900"]
+EOF
   if ! kubectl wait --for=condition=Ready "pod/${probe_pod}" -n "${ns}" --timeout=120s >/dev/null 2>&1; then
     echo "Envoy LB probe pod not Ready" >&2
     kubectl delete pod "${probe_pod}" -n "${ns}" --ignore-not-found >/dev/null 2>&1 || true
@@ -1022,7 +1043,7 @@ while [ \"\$i\" -lt \"\$N\" ]; do
     i=\$((i+1))
     active=\$((active+1))
     (
-      code=\$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 180 \
+      code=\$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time ${LB_TEST_CURL_MAX_TIME:-180} \
         -H \"Authorization: Bearer \${API_KEY}\" \
         -H 'Content-Type: application/json' \
         -d \"{\\\"model\\\":\\\"\${MODEL}\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Reply with exactly one word: ping\\\"}],\\\"max_tokens\\\":8,\\\"stream\\\":false}\" \
@@ -1661,6 +1682,25 @@ hpa_common_wait_for_job_pods_gone() {
   hpa_common_log "Waiting for load-generator Job ${job} pods to terminate..."
   kubectl delete job "${job}" -n "${ns}" --ignore-not-found=true --wait=true --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
   kubectl wait --for=delete pod -l "job-name=${job}" -n "${ns}" --timeout="${timeout_sec}s" >/dev/null 2>&1 || true
+}
+
+# Drop leftover Ollama generate work in this release only. Load-test Jobs are
+# deleted while hundreds of chats are still queued; Envoy probes then time out
+# (HTTP 000). 4× L40S does not call this.
+hpa_common_drop_ollama_queued_generates() {
+  local ns="${1:?namespace}"
+  local pod containers
+  hpa_common_log "Dropping leftover Ollama generate queues before Envoy check..."
+  for pod in $(kubectl get pods -n "${ns}" \
+    -l 'app.kubernetes.io/name=nemoclaw-gpu,component=gpu-metrics-proxy' \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    [[ -z "${pod}" ]] && continue
+    containers="$(kubectl get pod "${pod}" -n "${ns}" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)"
+    [[ " ${containers} " == *" ollama "* ]] || continue
+    kubectl exec -n "${ns}" "${pod}" -c ollama -- sh -c 'pkill -9 -f llama-server || true' \
+      >/dev/null 2>&1 || true
+  done
 }
 
 hpa_common_verify_gpu_capacity() {
