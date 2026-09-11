@@ -46,7 +46,7 @@ agent_common_validate_runtime_pairing() {
   fi
 }
 
-# Popular documented defaults used by this recipe (OpenClaw+Ollama, Hermes/Deep Agents+vLLM).
+# Popular documented defaults used by this recipe (OpenClaw+Ollama, Hermes+NIM, Deep Agents+vLLM).
 agent_common_default_inference_model() {
   case "${1:-ollama}" in
     vllm) printf '%s' "nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8" ;;
@@ -59,7 +59,7 @@ agent_common_default_inference_model() {
 agent_common_example_pairings() {
   printf '%s\t%s\t%s\n' \
     openclaw ollama llama3.2:3b \
-    hermes vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8 \
+    hermes nim nvidia/nemotron-3-nano \
     deepagents vllm nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
 }
 
@@ -90,7 +90,7 @@ agent_common_example_model() {
 }
 
 # Pin AGENT_NAME / INFERENCE_RUNTIME / INFERENCE_MODEL to one README example.
-# Used by test-openclaw-ollama.sh / test-hermes-vllm.sh / test-deepagents-vllm.sh.
+# Used by test-openclaw-ollama.sh / test-hermes-nim.sh / test-deepagents-vllm.sh.
 agent_common_pin_example_pairing() {
   local agent="${1:?agent}" runtime="${2:?runtime}" model
   model="$(agent_common_example_model "${agent}" "${runtime}")" || {
@@ -98,7 +98,7 @@ agent_common_pin_example_pairing() {
     exit 1
   }
   if [[ -n "${AGENT_NAME:-}" && "${AGENT_NAME}" != "${agent}" ]]; then
-    echo "ERROR: AGENT_NAME=${AGENT_NAME} does not match this script (${agent}). Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-vllm.sh, or ./scripts/test-deepagents-vllm.sh." >&2
+    echo "ERROR: AGENT_NAME=${AGENT_NAME} does not match this script (${agent}). Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-nim.sh, or ./scripts/test-deepagents-vllm.sh." >&2
     exit 1
   fi
   if [[ -n "${INFERENCE_RUNTIME:-}" && "${INFERENCE_RUNTIME}" != "${runtime}" ]]; then

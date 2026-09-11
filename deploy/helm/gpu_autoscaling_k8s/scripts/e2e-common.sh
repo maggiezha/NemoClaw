@@ -5,7 +5,7 @@
 # Shared end-to-end steps for the three pairing scripts. Do not run this file.
 # Use:
 #   ./scripts/test-openclaw-ollama.sh
-#   ./scripts/test-hermes-vllm.sh
+#   ./scripts/test-hermes-nim.sh
 #   ./scripts/test-deepagents-vllm.sh
 #
 # Caller must export AGENT_NAME, INFERENCE_RUNTIME, and INFERENCE_MODEL first.
@@ -17,7 +17,7 @@
 # explicitly opt in before it will run at all.
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  echo "ERROR: do not run e2e-common.sh. Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-vllm.sh, or ./scripts/test-deepagents-vllm.sh." >&2
+  echo "ERROR: do not run e2e-common.sh. Use ./scripts/test-openclaw-ollama.sh, ./scripts/test-hermes-nim.sh, or ./scripts/test-deepagents-vllm.sh." >&2
   exit 1
 fi
 
@@ -32,8 +32,9 @@ REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node c
 # in-container model profile download (NGC_API_KEY) — see ../README.md#nvidia-nim-registry-access.
 # export NIM_NGC_API_KEY=nvapi-...
 
-# Optional: pin everything to one GPU node (recommended on a shared cluster).
-# export NEMOCLAW_TARGET_NODE=dgx02
+# Optional: pin everything to one GPU node (required on a shared cluster).
+# This host uses dgx01 via gitignored local.env; override only if you mean it.
+# export NEMOCLAW_TARGET_NODE=dgx01
 
 # 0 = install GPU inference only (no synthetic scale-up). 1 = also run hpa-load-test.sh.
 RUN_LOAD_TEST="${RUN_LOAD_TEST:-0}"
@@ -62,6 +63,11 @@ cd "${CHART_DIR}"
 # shellcheck source=hpa-common.sh
 source "${SCRIPT_DIR}/hpa-common.sh"
 hpa_common_load_local_env "${CHART_DIR}"
+if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
+  echo "GPU node pin: NEMOCLAW_TARGET_NODE=${NEMOCLAW_TARGET_NODE} (inference and sandboxes stay on this node)"
+else
+  echo "WARNING: NEMOCLAW_TARGET_NODE is unset; GPU pods may schedule on any GPU node." >&2
+fi
 NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 DCGM_NAMESPACE="${DCGM_NAMESPACE:-gpu-operator-resources}"
 # shellcheck source=versions.env
@@ -104,9 +110,13 @@ kubectl get nodes \
 kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter
 
 echo "=== 2/7: Install GPU inference (${INFERENCE_RUNTIME}) ==="
-./scripts/install-hpa.sh
-kubectl get pods,service,hpa -n nemoclaw-gpu
-./scripts/get-hpa.sh -n nemoclaw-gpu
+if [[ "${SKIP_INSTALL_HPA:-0}" == "1" ]]; then
+  echo "SKIP_INSTALL_HPA=1: leaving existing ${RELEASE} in ${NAMESPACE} unchanged."
+else
+  ./scripts/install-hpa.sh
+fi
+kubectl get pods,service,hpa -n "${NAMESPACE}"
+./scripts/get-hpa.sh -n "${NAMESPACE}"
 
 if [[ "${RUN_LOAD_TEST}" == "1" ]]; then
   echo "=== 3/7: Synthetic HPA load test (scale-up -> Envoy LeastRequest check -> scale-down) ==="

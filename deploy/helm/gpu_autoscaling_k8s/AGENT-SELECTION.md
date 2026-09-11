@@ -65,7 +65,7 @@ line in [Example verify output](#example-verify-output).
 Documented example one-script paths (skip the HPA load test unless `RUN_LOAD_TEST=1`):
 
 - OpenClaw + Ollama: [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh)
-- Hermes + vLLM: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh)
+- Hermes + NIM: [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh)
 - Deep Agents Code + vLLM: [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh)
 
 ### OpenClaw
@@ -112,7 +112,8 @@ OpenClaw's `:18789/health`). This recipe does not port-forward the Hermes dashbo
 source versions.env
 export AGENT_NAME=hermes
 export AGENT_SANDBOX_IMAGE=localhost:32000/nemoclaw-${AGENT_NAME}-k8s:${NEMOCLAW_VERSION}
-export INFERENCE_MODEL=llama3.2:3b
+export INFERENCE_RUNTIME=nim
+export INFERENCE_MODEL=nvidia/nemotron-3-nano
 ./scripts/build-agent-sandbox-image.sh
 ./scripts/create-agent-sandbox.sh
 ```
@@ -128,12 +129,13 @@ Terminal 3 — real headless prompt through `hermes -z`:
 
 ```bash
 export AGENT_NAME=hermes
-export INFERENCE_MODEL=llama3.2:3b
+export INFERENCE_RUNTIME=nim
+export INFERENCE_MODEL=nvidia/nemotron-3-nano
 ./scripts/verify-agent-sandbox.sh
 ```
 
-The loop above uses Ollama (`llama3.2:3b`), which official docs also list for Hermes.
-The popular recipe example is Hermes + vLLM: [`scripts/test-hermes-vllm.sh`](scripts/test-hermes-vllm.sh).
+The popular recipe example is Hermes + NIM: [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
+Official docs also list vLLM and Ollama for Hermes; this recipe's one-script path uses NIM so one example shows the NGC Secret flow.
 
 ### Deep Agents Code
 
@@ -219,12 +221,12 @@ config.yaml OK.
 [verify] Waiting for NemoClaw/Hermes gateway at http://localhost:8642/health (timeout 90s)...
 [verify] Gateway health OK (HTTP 200).
 [verify] GET https://inference.local/v1/models (timeout 120s)...
-models: llama3.2:3b
+models: nvidia/nemotron-3-nano
 [verify] hermes -z (headless) — this is the real agent binary, not a curl probe (timeout 120s)
 [verify] Example query: In one sentence, what is an AI agent sandbox?
 [verify] Answer: An AI agent sandbox is a simulated environment where an AI agent
 can interact and learn in a safe, controlled space.
-OK: sandbox hermes-onprem reached https://inference.local for models and answered a real prompt through NemoClaw/Hermes (llama3.2:3b).
+OK: sandbox hermes-onprem reached https://inference.local for models and answered a real prompt through NemoClaw/Hermes (nvidia/nemotron-3-nano).
 Runtime: NemoClaw/Hermes gateway is healthy; keep run-agent-sandbox.sh attached.
 ```
 

@@ -396,11 +396,22 @@ kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter 2>/dev/null 
   exit 1
 }
 
-ensure_prometheus_stack
-if hpa_common_envoy_lb_enabled; then
-  ensure_envoy_gateway
+case "${SKIP_MONITORING:-0}" in
+  0 | 1) ;;
+  *)
+    echo "SKIP_MONITORING must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [[ "${SKIP_MONITORING}" == "1" ]]; then
+  echo "SKIP_MONITORING=1: installing the GPU chart only (no Prometheus/Envoy changes)." >&2
 else
-  echo "ENABLE_ENVOY_LB=0: skipping Envoy Gateway install; inference uses the metrics-proxy Service only." >&2
+  ensure_prometheus_stack
+  if hpa_common_envoy_lb_enabled; then
+    ensure_envoy_gateway
+  else
+    echo "ENABLE_ENVOY_LB=0: skipping Envoy Gateway install; inference uses the metrics-proxy Service only." >&2
+  fi
 fi
 
 hpa_common_migrate_pre_metrics_proxy_resources "${NAMESPACE}" "${RELEASE}"
