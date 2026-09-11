@@ -196,12 +196,6 @@ if [[ -n "${VLLM_HF_TOKEN_SECRET:-}" ]]; then
   HPA_HELM_ARGS+=(--set-string "vllm.huggingFaceToken.existingSecret=${VLLM_HF_TOKEN_SECRET}")
 fi
 hpa_common_append_servicemonitor_release_helm_set HPA_HELM_ARGS
-# Smooth latency_avg after load stops (42444 → ~20k → ~8k → ~3k → 0). Do not set
-# this on 4× L40S — that path keeps the 60s hard expire.
-HPA_HELM_ARGS+=(
-  --set "metrics.llmLatencyIdleDecayTauMs=${LLM_LATENCY_IDLE_DECAY_TAU_MS:-40000}"
-  --set "metrics.llmLatencyIdleExpireMs=${LLM_LATENCY_IDLE_EXPIRE_MS:-180000}"
-)
 
 # The test restores the configured policy in cleanup. Require all five knobs
 # together so a half-configured override cannot leave an invalid HPA policy behind.

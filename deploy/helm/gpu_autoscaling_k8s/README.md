@@ -51,7 +51,7 @@ HPA (GPU util >40% or latency >3000 ms)
 
 The chart generates a local inference API key (Bearer on `/v1`). OpenShell injects it for the sandbox. It is not an Ollama pull key, OpenAI key, or `NVIDIA_API_KEY`.
 
-`latency_avg` is metrics-proxy **chat/completions duration** on that pod (in-pod fetch until the full response, including streams). It excludes client→Envoy time. After 60s with no samples the gauge resets to 0 so HPA can scale down. On 8× H100, `hpa-load-test-dgx-8xh100.sh` instead decays the gauge toward 0 (then expires) so the HPA reading falls smoothly. `get-hpa.sh` prints milliseconds (`46514/3000` = 46514 ms / 3000 ms).
+`latency_avg` is metrics-proxy **chat/completions duration** on that pod (in-pod fetch until the full response, including streams). It excludes client→Envoy time. After 60s with no samples the gauge resets to 0 so HPA can scale down. `get-hpa.sh` prints milliseconds (`46514/3000` = 46514 ms / 3000 ms).
 
 ## Validation
 
