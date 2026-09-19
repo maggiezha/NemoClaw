@@ -17,10 +17,10 @@ what each script in this directory does — it has no instructions of its own.
 | `install-hpa.sh` | Monitoring + chart + HPA (+ Envoy if enabled). This is the autoscaling install path. |
 | `hpa-load-test-dgx-8xh100.sh` | HPA load test for **8× H100** on-prem (metrics-proxy pod-IP Job) |
 | `hpa-load-test-brev-4xl40s.sh` | HPA load test for **4× L40S** on AWS (Brev) |
-| `test-openclaw-e2e-hpa.sh` | N OpenClaw sandboxes (default `E2E_USERS=10`) as the 8×H100 saturator (`inference.local` → Envoy → GPU HPA) |
-| `setup-openclaw-e2e-sandboxes.sh` | Create / start / stop / cleanup `openclaw-e2e-*` sandboxes for that e2e |
-| `e2e-openclaw-load-test.py` | Per-user driver used by `test-openclaw-e2e-hpa.sh` (`openclaw agent`) |
-| `test-hermes-e2e-hpa.sh` | Same N-user e2e for Hermes (`hermes -z`); do not run while OpenClaw e2e owns the GPUs |
+| `test-openclaw-ollama-e2e-hpa.sh` | OpenClaw + Ollama e2e: N sandboxes (default `E2E_USERS=10`) saturate 8×H100 Ollama HPA through Envoy |
+| `setup-openclaw-ollama-e2e-sandboxes.sh` | Create / start / stop / cleanup `openclaw-ollama-e2e-*` |
+| `e2e-openclaw-ollama-load-test.py` | Per-user driver (`openclaw agent` into each sandbox) |
+| `test-hermes-e2e-hpa.sh` | Hermes + vLLM e2e next (`hermes -z`); do not run while OpenClaw e2e owns the GPUs |
 | `setup-hermes-e2e-sandboxes.sh` | Create / start / stop / cleanup `hermes-e2e-*` only |
 | `e2e-hermes-load-test.py` | Per-user driver used by `test-hermes-e2e-hpa.sh` |
 | `hpa-reset.sh` | Restore idle HPA / inference |

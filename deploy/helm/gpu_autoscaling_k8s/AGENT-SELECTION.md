@@ -100,7 +100,7 @@ export INFERENCE_MODEL=llama3.2:3b
 
 Optional pairing test (not required for autoscaling): [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
 
-Multi-user HPA e2e: N sandboxes (one per end user) on the same 8×H100 GPU backend through Envoy. `E2E_USERS=10` is an example for testing OpenClaw now, and for Hermes and Deep Agents next. OpenClaw: [`scripts/test-openclaw-e2e-hpa.sh`](scripts/test-openclaw-e2e-hpa.sh). Hermes: [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh) (do not run while OpenClaw e2e owns the GPUs).
+Multi-user HPA e2e: N sandboxes (one per end user). `E2E_USERS=10` is an example. **OpenClaw + Ollama now:** [`scripts/test-openclaw-ollama-e2e-hpa.sh`](scripts/test-openclaw-ollama-e2e-hpa.sh) (`nemoclaw-gpu`). **Hermes + vLLM next:** [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh) — do not run it while OpenClaw e2e owns the GPUs.
 
 ### Hermes
 
@@ -165,7 +165,7 @@ above still proves inference.
 Optional pairing test for Hermes + NIM (not required for autoscaling): [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
 Official docs also list vLLM and Ollama for Hermes; the optional NIM test exists so one example shows the NGC Secret flow.
 
-Multi-user HPA e2e for Hermes: same N-user / N-sandbox example as OpenClaw (`E2E_USERS=10` is only an example; `hermes -z` into each sandbox): [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh). Do not run it while the OpenClaw e2e owns the GPUs.
+Multi-user HPA e2e for Hermes + vLLM is the next step after OpenClaw + Ollama (`E2E_USERS=10` is only an example; `hermes -z` into each sandbox): [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh). Do not run it while the OpenClaw e2e owns the GPUs.
 
 ### Deep Agents Code
 

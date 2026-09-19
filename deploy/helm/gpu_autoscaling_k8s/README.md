@@ -5,7 +5,7 @@
 
 # NemoClaw Kubernetes GPU autoscaling
 
-This experimental recipe demonstrates a cost-efficient architecture that runs AI agents securely inside CPU-only OpenShell sandboxes while independently autoscaling GPU-backed inference. Pairing and quick start use **one** sandbox. The multi-user e2e uses **one sandbox per end user** sharing `inference.local` → Envoy → GPU HPA. `E2E_USERS=10` is only an example for testing OpenClaw now, and the same example for Hermes and Deep Agents next — change it to match CPU. The CPU agent is an OpenShell Kubernetes sandbox (Agent Sandbox CRD + OpenShell 0.0.85); GPU inference is a separate Helm chart with HPA. 
+This experimental recipe demonstrates a cost-efficient architecture that runs AI agents securely inside CPU-only OpenShell sandboxes while independently autoscaling GPU-backed inference. Pairing and quick start use **one** sandbox. The OpenClaw + Ollama e2e uses **one sandbox per end user** sharing `inference.local` → Envoy → Ollama GPU HPA in `nemoclaw-gpu`. `E2E_USERS=10` is only an example — change it to match CPU. Hermes + vLLM is the next e2e and is not run during the OpenClaw test. The CPU agent is an OpenShell Kubernetes sandbox (Agent Sandbox CRD + OpenShell 0.0.85); GPU inference is a separate Helm chart with HPA. 
 
 HPA scales GPU inference from 1 to **N** replicas (1 GPU each) so spikes stay responsive and idle GPUs are released.
 
@@ -53,7 +53,7 @@ Authenticated inference endpoints
 HPA (GPU util >40% or latency >3000 ms)
 ```
 
-Sandboxes never request GPUs. Several users share one inference route and one HPA. The OpenClaw e2e (`./scripts/test-openclaw-e2e-hpa.sh`) saturates the 8×H100 backend from those sandboxes instead of the metrics-proxy pod-IP Job. `E2E_USERS=10` is an example for that OpenClaw run (and later Hermes / Deep Agents), not a fixed user count.
+Sandboxes never request GPUs. Several users share one inference route and one HPA. The OpenClaw + Ollama e2e (`./scripts/test-openclaw-ollama-e2e-hpa.sh`) saturates the 8×H100 Ollama backend from those sandboxes instead of the metrics-proxy pod-IP Job. `E2E_USERS=10` is an example, not a fixed user count. Hermes + vLLM is next and is not this script.
 
 The chart generates a local inference API key (Bearer on `/v1`). OpenShell injects it for the sandbox. It is not an Ollama pull key, OpenAI key, or `NVIDIA_API_KEY`.
 
@@ -63,7 +63,7 @@ The chart generates a local inference API key (Bearer on `/v1`). OpenShell injec
 
 | Hardware | Install ceiling | Load test |
 |----------|-----------------|-----------|
-| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` (pod-IP Job) or `./scripts/test-openclaw-e2e-hpa.sh` (`E2E_USERS` sandboxes → Envoy; example 10) |
+| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` (pod-IP Job) or `./scripts/test-openclaw-ollama-e2e-hpa.sh` (OpenClaw + Ollama; `E2E_USERS` example 10) |
 | [Brev AWS](https://brev.nvidia.com) **4× L40S** (48 GB), MicroK8s | `MAX_REPLICAS=4` | `./scripts/hpa-load-test-brev-4xl40s.sh` |
 
 Both paths cover chart deploy, optional Envoy LeastRequest, authenticated inference, HPA scale-up/down, Envoy distribution, and OpenShell → `https://inference.local/v1`. Default models fit either GPU. Pin a node with `NEMOCLAW_TARGET_NODE` when other GPU nodes exist.
@@ -394,7 +394,7 @@ Ask **In one sentence, what is an AI agent sandbox?** through authenticated infe
 
 A non-empty answer plus the final `OK:` line is a pass. Wording varies; small models may not know product names. Sample output: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#example-verify-output).
 
-N users / N OpenClaw sandboxes saturating GPU HPA through Envoy (`E2E_USERS`; example 10): [OpenClaw N-user end-to-end](#openclaw-n-user-end-to-end-sandboxes-saturate-hpa).
+N users / N OpenClaw + Ollama sandboxes saturating GPU HPA through Envoy (`E2E_USERS`; example 10): [OpenClaw + Ollama N-user end-to-end](#openclaw-ollama-n-user-end-to-end-sandboxes-saturate-hpa).
 
 ### Hermes simple test
 
@@ -482,27 +482,26 @@ openshell status
 On 8× H100 there are two saturators. Both keep `minReplicas=1` and `maxReplicas=8`:
 
 - `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy.
-- `./scripts/test-openclaw-e2e-hpa.sh` — OpenClaw: N end users, each with one sandbox. Those sandboxes send load through `https://inference.local` → Envoy → GPU HPA.
-- `./scripts/test-hermes-e2e-hpa.sh` — same architecture with Hermes (`hermes -z`). Do not run it while the OpenClaw e2e owns the GPUs.
-- Deep Agents uses the same N-user layout next (`dcode -n`); there is no Deep Agents e2e script in this recipe yet.
+- `./scripts/test-openclaw-ollama-e2e-hpa.sh` — OpenClaw + Ollama e2e: N end users, each with one OpenClaw sandbox. Those sandboxes send load through `https://inference.local` → Envoy → **Ollama** HPA in `nemoclaw-gpu`.
+- `./scripts/test-hermes-e2e-hpa.sh` — Hermes + vLLM, next step. Do not run it while the OpenClaw + Ollama e2e owns the GPUs.
 
-`E2E_USERS=10` (10 end users → 10 sandboxes) is **only an example** for testing OpenClaw, and for the Hermes / Deep Agents steps after that. Set `E2E_USERS` to whatever the node’s CPU can hold. Size from CPU, not GPU count: each sandbox requests `AGENT_SANDBOX_CPU` (default **2**) and `AGENT_SANDBOX_MEMORY` (default **4Gi**). This recipe does not publish a DGX user cap.
+`E2E_USERS=10` (10 end users → 10 sandboxes) is **only an example** for the OpenClaw + Ollama test, and for the Hermes + vLLM step after that. Set `E2E_USERS` to whatever the node’s CPU can hold. Size from CPU, not GPU count: each sandbox requests `AGENT_SANDBOX_CPU` (default **2**) and `AGENT_SANDBOX_MEMORY` (default **4Gi**). This recipe does not publish a DGX user cap.
 
-### OpenClaw N-user end-to-end (sandboxes saturate HPA)
+### OpenClaw + Ollama N-user end-to-end (sandboxes saturate HPA)
 
-This is the multi-user architecture test, currently exercised with OpenClaw. Pairing (`test-openclaw-ollama.sh`) stays one sandbox and does **not** enable HPA.
+This is the multi-user architecture test for **OpenClaw + Ollama**. Pairing (`test-openclaw-ollama.sh`) stays one sandbox and does **not** enable HPA. Do not point this e2e at `nemoclaw-deepagents-vllm` / vLLM.
 
 ```text
-N end users  (example E2E_USERS=10 for this OpenClaw test; same example later for Hermes / Deep Agents)
+N end users  (example E2E_USERS=10)
         ↓  openclaw agent --agent main -m  (one sandbox per user)
-N CPU OpenClaw agent sandboxes (openclaw-e2e-0000 …)
+N CPU OpenClaw sandboxes (openclaw-ollama-e2e-0000 …)
         ↓  https://inference.local
 Envoy LeastRequest
         ↓
-GPU inference HPA (minReplicas=1, maxReplicas=8)
+Ollama GPU HPA in nemoclaw-gpu (minReplicas=1, maxReplicas=8)
 ```
 
-Queries are generated by the N users and sent **into the sandboxes**. They are not POSTed at Envoy or metrics-proxy pod IPs (that is `hpa-load-test-dgx-8xh100.sh` / `files/load-generator.ts`). The OpenClaw agent in each sandbox is what calls GPU inference.
+Queries are generated by the N users and sent **into the sandboxes**. They are not POSTed at Envoy or metrics-proxy pod IPs (that is `hpa-load-test-dgx-8xh100.sh` / `files/load-generator.ts`). The OpenClaw agent in each sandbox is what calls Ollama.
 
 OpenShell must already be connected (`openshell status`). `ENABLE_ENVOY_LB=1`. Do not source `e2e-common.sh` (it forces `ENABLE_AUTOSCALING=0`). Do not set `minReplicas=8`. The 4× L40S load profile is unchanged.
 
@@ -512,42 +511,32 @@ export PATH="${HOME}/.local/bin:${PATH}"
 # Official complete OpenClaw image (not *-sandbox-base). Override if you already built locally.
 export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba}"
 
-# Default: Ollama in nemoclaw-gpu (same backend as hpa-load-test-dgx-8xh100.sh).
-./scripts/test-openclaw-e2e-hpa.sh
-
-# Already-running vLLM release instead of installing a second GPU stack:
-# NAMESPACE=nemoclaw-deepagents-vllm RELEASE=deepagents-vllm \
-#   INFERENCE_RUNTIME=vllm \
-#   INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8 \
-#   ./scripts/test-openclaw-e2e-hpa.sh
+# OpenClaw + Ollama in nemoclaw-gpu (same GPU backend as hpa-load-test-dgx-8xh100.sh).
+./scripts/test-openclaw-ollama-e2e-hpa.sh
 ```
 
-Pass: HPA scales **1→8** under sandbox load, then back to **1** after the saturators stop. Results land in `e2e-results/` (gitignored). Watch with `./scripts/hpa-watch.sh`.
+Pass: HPA scales **1→8** under sandbox load, then back to **1** after the saturators stop. Results land in `e2e-results/openclaw-ollama/` (gitignored). Watch with `./scripts/get-hpa.sh -n nemoclaw-gpu -w`.
 
 ```bash
-E2E_USERS=10 ./scripts/setup-openclaw-e2e-sandboxes.sh   # example for this OpenClaw test
-python3 ./scripts/e2e-openclaw-load-test.py
-./scripts/setup-openclaw-e2e-sandboxes.sh cleanup
+E2E_USERS=10 ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh   # example for this OpenClaw + Ollama test
+python3 ./scripts/e2e-openclaw-ollama-load-test.py
+./scripts/setup-openclaw-ollama-e2e-sandboxes.sh cleanup
 ```
 
-### Hermes N-user end-to-end (same architecture)
+### Hermes + vLLM N-user end-to-end (next step, do not run now)
 
-Next agent on the same path: load generator → N Hermes sandboxes (`hermes -z`) → `inference.local` → Envoy → GPU HPA. Use the same `E2E_USERS` example (10) or a larger count from CPU. Cleanup only destroys `hermes-e2e-*` (not `hermes-onprem`, not `openclaw-e2e-*`). Do not run this while OpenClaw e2e owns the GPUs.
-
-Deep Agents follows the same N-user / N-sandbox example after Hermes (`dcode -n`).
+Same user → sandbox path after OpenClaw + Ollama is done: load generator → N Hermes sandboxes (`hermes -z`) → `inference.local` → Envoy → **vLLM** HPA. Use the same `E2E_USERS` example (10). Cleanup only destroys `hermes-e2e-*` (not `hermes-onprem`, not `openclaw-ollama-e2e-*`). Do not run this while OpenClaw e2e owns the GPUs.
 
 ```bash
-# After OpenClaw e2e is done, against the same vLLM HPA:
-# NAMESPACE=nemoclaw-deepagents-vllm RELEASE=deepagents-vllm \
-#   INFERENCE_RUNTIME=vllm SKIP_INSTALL_HPA=1 \
-#   ./scripts/test-hermes-e2e-hpa.sh
+# After OpenClaw + Ollama e2e is done:
+# ./scripts/test-hermes-e2e-hpa.sh
 ```
 
 | Hardware | Command |
 |----------|---------|
 | **8× H100** on-prem (pod-IP saturator Job) | `./scripts/hpa-load-test-dgx-8xh100.sh` |
-| **8× H100** on-prem (**N OpenClaw sandboxes** → Envoy; example `E2E_USERS=10`) | `./scripts/test-openclaw-e2e-hpa.sh` |
-| **8× H100** on-prem (**N Hermes sandboxes** → Envoy; example `E2E_USERS=10`) | `./scripts/test-hermes-e2e-hpa.sh` |
+| **8× H100** on-prem (**OpenClaw + Ollama** e2e; example `E2E_USERS=10`) | `./scripts/test-openclaw-ollama-e2e-hpa.sh` |
+| **8× H100** on-prem (**Hermes + vLLM** e2e, next; example `E2E_USERS=10`) | `./scripts/test-hermes-e2e-hpa.sh` |
 | **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` |
 
 Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a new test does not inherit a prior scale-down window — it will not force a scale-down under real traffic. While running, the HPA uses one-pod 40% steps, then restores `HPA_VALUES`. Load stops after a short hold at max so replicas return to 1.
@@ -555,8 +544,8 @@ Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a 
 ```bash
 # Same TLS overlay / local.env as install
 ./scripts/hpa-load-test-dgx-8xh100.sh
-# or N OpenClaw sandboxes as the 8-GPU saturator (through Envoy; example E2E_USERS=10):
-./scripts/test-openclaw-e2e-hpa.sh
+# or OpenClaw + Ollama e2e as the 8-GPU saturator (through Envoy; example E2E_USERS=10):
+./scripts/test-openclaw-ollama-e2e-hpa.sh
 # or
 ./scripts/hpa-load-test-brev-4xl40s.sh
 
