@@ -47,7 +47,12 @@ SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-}"
 SANDBOX_NAME="${AGENT_SANDBOX_NAME:-$(agent_common_default_sandbox_name "${AGENT_NAME}")}"
 INFERENCE_NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 INFERENCE_RELEASE="${RELEASE:-nemoclaw-gpu}"
-INFERENCE_SERVICE="${INFERENCE_SERVICE:-${INFERENCE_RELEASE}-metrics-proxy}"
+# Helm fullname: release "nemoclaw-gpu" → nemoclaw-gpu-metrics-proxy; release
+# "deepagents-vllm" → deepagents-vllm-nemoclaw-gpu-metrics-proxy.
+INFERENCE_GATEWAY="${INFERENCE_GATEWAY:-$(
+  RELEASE="${INFERENCE_RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment
+)}"
+INFERENCE_SERVICE="${INFERENCE_SERVICE:-${INFERENCE_GATEWAY}}"
 INFERENCE_PORT="${SERVICE_PORT:-8081}"
 MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME:-ollama}")}"
 PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
@@ -65,6 +70,8 @@ else
 fi
 [[ "${INFERENCE_NAMESPACE}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
   || fail "NAMESPACE must be a valid lowercase Kubernetes namespace"
+[[ "${INFERENCE_GATEWAY}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+  || fail "INFERENCE_GATEWAY must be a valid lowercase Kubernetes Gateway name"
 [[ "${INFERENCE_SERVICE}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
   || fail "INFERENCE_SERVICE must be a valid lowercase Kubernetes Service name"
 if [[ ! "${INFERENCE_PORT}" =~ ^[0-9]+$ ]] \
@@ -124,7 +131,7 @@ API_KEY="$(
 BASE_URL="$(
   hpa_common_openshell_inference_base_url \
     "${INFERENCE_NAMESPACE}" \
-    "${INFERENCE_RELEASE}-metrics-proxy" \
+    "${INFERENCE_GATEWAY}" \
     "${INFERENCE_SERVICE}" \
     "${INFERENCE_PORT}"
 )"
@@ -211,7 +218,7 @@ case "${SKIP_CREATE_SMOKE:-0}" in
 esac
 
 echo "${AGENT_DISPLAY_NAME} sandbox ${SANDBOX_NAME} is ready without a GPU."
-if kubectl get gateway "${INFERENCE_RELEASE}-metrics-proxy" -n "${INFERENCE_NAMESPACE}" >/dev/null 2>&1; then
+if kubectl get gateway "${INFERENCE_GATEWAY}" -n "${INFERENCE_NAMESPACE}" >/dev/null 2>&1; then
   echo "Inference routes through OpenShell → Envoy Gateway (LeastRequest) → ${BASE_URL}; only the GPU HPA pods request GPUs."
 else
   echo "Inference routes through OpenShell → metrics-proxy Service → ${BASE_URL} (Envoy LB disabled); only the GPU HPA pods request GPUs."

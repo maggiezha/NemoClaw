@@ -394,6 +394,8 @@ Ask **In one sentence, what is an AI agent sandbox?** through authenticated infe
 
 A non-empty answer plus the final `OK:` line is a pass. Wording varies; small models may not know product names. Sample output: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#example-verify-output).
 
+20 users / 20 OpenClaw sandboxes saturating GPU HPA through Envoy: [OpenClaw 20-user end-to-end](#openclaw-20-user-end-to-end-sandboxes-saturate-hpa).
+
 ### Hermes simple test
 
 This is the pairing check for Hermes. It is a oneshot through the in-sandbox
@@ -477,10 +479,47 @@ openshell status
 
 `install-hpa.sh` does not generate load. Pairing tests are not this path. The 4× L40S script is unchanged.
 
-On 8× H100 there are two saturators. Both keep `minReplicas=1` and `maxReplicas=8` on the same Ollama GPU chart:
+On 8× H100 there are two saturators. Both keep `minReplicas=1` and `maxReplicas=8`:
 
 - `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy.
-- `./scripts/test-openclaw-e2e-hpa.sh` — **20 end users**, each with one OpenClaw sandbox. Those sandboxes send the same chat-completions load through `https://inference.local` → Envoy → GPU HPA (in-flight 32→256 per sandbox so 20 users can fill the 640/pod cap). This is the multi-user architecture demo.
+- `./scripts/test-openclaw-e2e-hpa.sh` — **20 end users**, each with one OpenClaw sandbox. Those sandboxes send the chat-completions load through `https://inference.local` → Envoy → GPU HPA (in-flight 32→256 per sandbox so 20 users can fill the 640/pod cap).
+
+### OpenClaw 20-user end-to-end (sandboxes saturate HPA)
+
+This is the multi-user architecture test. Pairing (`test-openclaw-ollama.sh`) stays one sandbox and does **not** enable HPA. Hermes e2e is not this script.
+
+```text
+20 users  →  20 CPU OpenClaw sandboxes (openclaw-e2e-0000 … 0019)
+          →  https://inference.local
+          →  Envoy LeastRequest
+          →  GPU inference HPA (minReplicas=1, maxReplicas=8)
+```
+
+OpenShell must already be connected (`openshell status`). `ENABLE_ENVOY_LB=1`. Do not source `e2e-common.sh` (it forces `ENABLE_AUTOSCALING=0`). Do not set `minReplicas=8`. The 4× L40S load profile is unchanged.
+
+```bash
+cd deploy/helm/gpu_autoscaling_k8s
+export PATH="${HOME}/.local/bin:${PATH}"
+# Official complete OpenClaw image (not *-sandbox-base). Override if you already built locally.
+export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba}"
+
+# Default: Ollama in nemoclaw-gpu (same backend as hpa-load-test-dgx-8xh100.sh).
+./scripts/test-openclaw-e2e-hpa.sh
+
+# Already-running vLLM release instead of installing a second GPU stack:
+# NAMESPACE=nemoclaw-deepagents-vllm RELEASE=deepagents-vllm \
+#   INFERENCE_RUNTIME=vllm \
+#   INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8 \
+#   ./scripts/test-openclaw-e2e-hpa.sh
+```
+
+Pass: HPA scales **1→8** under sandbox load, then back to **1** after the saturators stop. Results land in `e2e-results/` (gitignored). Watch with `./scripts/hpa-watch.sh`.
+
+```bash
+./scripts/setup-openclaw-e2e-sandboxes.sh 20   # create only
+python3 ./scripts/e2e-openclaw-load-test.py --users 20
+./scripts/setup-openclaw-e2e-sandboxes.sh cleanup
+```
 
 | Hardware | Command |
 |----------|---------|
