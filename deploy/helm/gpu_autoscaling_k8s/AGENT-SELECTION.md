@@ -126,13 +126,24 @@ export AGENT_NAME=hermes
 ./scripts/run-agent-sandbox.sh
 ```
 
-Terminal 3 — real headless prompt through `hermes -z`:
+Terminal 3 — real headless prompt through `hermes -z` (same check as
+[`docs/get-started/quickstart-hermes.mdx`](../../../docs/get-started/quickstart-hermes.mdx)
+health + first prompt, without `nemohermes launch`):
 
 ```bash
 export AGENT_NAME=hermes
 export INFERENCE_RUNTIME=nim
 export INFERENCE_MODEL=nvidia/nemotron-3-nano
 ./scripts/verify-agent-sandbox.sh
+```
+
+Against an already-running vLLM release, keep `run-agent-sandbox.sh` attached and use
+the same verify with `INFERENCE_RUNTIME=vllm` and
+`INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`. Manual one-shot:
+
+```bash
+openshell sandbox exec -n hermes-onprem --no-tty -- \
+  hermes -z "In one sentence, what is an AI agent sandbox?"
 ```
 
 Optional pairing test for Hermes + NIM (not required for autoscaling): [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).

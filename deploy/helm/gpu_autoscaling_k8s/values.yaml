@@ -71,7 +71,9 @@ vllm:
     existingSecret: ""
     existingSecretKey: HF_TOKEN
   port: 8000
-  maxModelLen: 32768
+  # Hermes oneshot defaults to max_tokens=65536; vLLM rejects that unless
+  # max-model-len is strictly larger (official Nano-4B recipe uses 262144).
+  maxModelLen: 131072
   gpuMemoryUtilization: 0.85
   # One GPU per pod (see gpuScaling.perPodGpu) — keep at 1 unless you also change perPodGpu.
   tensorParallelSize: 1
@@ -82,6 +84,14 @@ vllm:
     - --trust-remote-code
     - --async-scheduling
     - --kv-cache-dtype=fp8
+    # Hermes (and other agents) send tool_choice=auto. vLLM returns HTTP 400 unless
+    # auto tool-choice and a parser are enabled. Pin the Nano-4B-FP8 flags from the
+    # official NemoClaw managed vLLM recipe (#6314, #6915).
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - qwen3_coder
+    - --reasoning-parser
+    - nemotron_v3
   # Same persistence rationale as ollama.persistence above; caches Hugging Face weights instead
   # of Ollama's model store.
   persistence:

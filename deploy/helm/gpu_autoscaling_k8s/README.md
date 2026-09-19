@@ -386,7 +386,37 @@ Ask **In one sentence, what is an AI agent sandbox?** through authenticated infe
 ./scripts/verify-agent-sandbox.sh
 ```
 
-A non-empty answer plus the final `OK:` line is a pass. Wording varies; small models may not know product names. Sample OpenClaw output: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#example-verify-output).
+A non-empty answer plus the final `OK:` line is a pass. Wording varies; small models may not know product names. Sample output: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#example-verify-output).
+
+#### Hermes + vLLM (manual)
+
+This is the Kubernetes-recipe equivalent of the official Hermes checks in
+[`docs/get-started/quickstart-hermes.mdx`](../../../docs/get-started/quickstart-hermes.mdx)
+(`nemohermes … status`, `curl -sf http://127.0.0.1:8642/health`, then a first prompt).
+Do **not** use `nemohermes launch` here. Keep `./scripts/run-agent-sandbox.sh` attached
+so the in-sandbox Hermes gateway is up, then:
+
+```bash
+export AGENT_NAME=hermes
+export INFERENCE_RUNTIME=vllm
+export INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
+# AGENT_SANDBOX_NAME defaults to hermes-onprem
+./scripts/verify-agent-sandbox.sh
+```
+
+That script is the pass/fail test: `hermes --version`, `config.yaml`,
+`http://localhost:8642/health`, `GET https://inference.local/v1/models`, then the same
+headless prompt the official harness uses via `hermes -z`. To run only that prompt:
+
+```bash
+openshell sandbox exec -n hermes-onprem --no-tty -- \
+  curl -sf http://127.0.0.1:8642/health
+openshell sandbox exec -n hermes-onprem --no-tty -- \
+  hermes -z "In one sentence, what is an AI agent sandbox?"
+```
+
+Do not pass `-m` to `hermes -z` (Hermes treats `-m` as the oneshot text). A non-empty
+answer plus verify's `OK:` line is a pass.
 
 Direct curl (loopback only; Bearer still required; **8081** not 8080):
 

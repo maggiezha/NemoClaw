@@ -94,15 +94,25 @@ INFERENCE_SECRET_KEY="${INFERENCE_API_SECRET_KEY:-${DEPLOYED_INFERENCE_SECRET_KE
 [[ "${INFERENCE_SECRET_KEY}" =~ ^[A-Za-z0-9._-]+$ ]] \
   || fail "INFERENCE_API_SECRET_KEY is invalid"
 
-SOURCE_ROOT="$(mktemp -d)"
-trap 'rm -rf -- "${SOURCE_ROOT}"' EXIT
-git clone --quiet --depth 1 --branch "${NEMOCLAW_VERSION}" \
-  https://github.com/NVIDIA/NemoClaw.git "${SOURCE_ROOT}/nemoclaw"
-ACTUAL_NEMOCLAW_COMMIT="$(git -C "${SOURCE_ROOT}/nemoclaw" rev-parse HEAD)"
-[[ "${ACTUAL_NEMOCLAW_COMMIT}" == "${NEMOCLAW_COMMIT}" ]] \
-  || fail "NemoClaw ${NEMOCLAW_VERSION} resolved to unexpected commit ${ACTUAL_NEMOCLAW_COMMIT}"
-POLICY_FILE="${SOURCE_ROOT}/nemoclaw/$(agent_common_policy_rel_path "${AGENT_NAME}")"
-[[ -f "${POLICY_FILE}" ]] || fail "NemoClaw release ${AGENT_DISPLAY_NAME} policy is missing"
+POLICY_FILE="${AGENT_SANDBOX_POLICY_FILE:-}"
+if [[ -z "${POLICY_FILE}" ]]; then
+  LOCAL_POLICY="$(cd "${CHART_DIR}/../../.." && pwd)/$(agent_common_policy_rel_path "${AGENT_NAME}")"
+  if [[ -f "${LOCAL_POLICY}" ]]; then
+    POLICY_FILE="${LOCAL_POLICY}"
+  fi
+fi
+SOURCE_ROOT=""
+if [[ -z "${POLICY_FILE}" ]]; then
+  SOURCE_ROOT="$(mktemp -d)"
+  trap 'rm -rf -- "${SOURCE_ROOT}"' EXIT
+  git clone --quiet --depth 1 --branch "${NEMOCLAW_VERSION}" \
+    https://github.com/NVIDIA/NemoClaw.git "${SOURCE_ROOT}/nemoclaw"
+  ACTUAL_NEMOCLAW_COMMIT="$(git -C "${SOURCE_ROOT}/nemoclaw" rev-parse HEAD)"
+  [[ "${ACTUAL_NEMOCLAW_COMMIT}" == "${NEMOCLAW_COMMIT}" ]] \
+    || fail "NemoClaw ${NEMOCLAW_VERSION} resolved to unexpected commit ${ACTUAL_NEMOCLAW_COMMIT}"
+  POLICY_FILE="${SOURCE_ROOT}/nemoclaw/$(agent_common_policy_rel_path "${AGENT_NAME}")"
+fi
+[[ -f "${POLICY_FILE}" ]] || fail "${AGENT_DISPLAY_NAME} policy is missing: ${POLICY_FILE}"
 
 API_KEY="$(
   kubectl get secret "${INFERENCE_SECRET}" -n "${INFERENCE_NAMESPACE}" -o json \
