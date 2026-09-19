@@ -4,3 +4,6 @@ hpa-tls-values.yaml
 
 # Local OpenShell CLI prefix (pip --prefix); not part of the recipe.
 .tools-openshell/
+
+# Multi-user sandbox e2e output (HPA CSV, per-sandbox saturator logs).
+e2e-results/

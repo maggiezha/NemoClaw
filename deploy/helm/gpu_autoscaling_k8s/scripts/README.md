@@ -15,8 +15,11 @@ what each script in this directory does — it has no instructions of its own.
 | Script | Purpose |
 |--------|---------|
 | `install-hpa.sh` | Monitoring + chart + HPA (+ Envoy if enabled). This is the autoscaling install path. |
-| `hpa-load-test-dgx-8xh100.sh` | HPA load test for **8× H100** on-prem |
+| `hpa-load-test-dgx-8xh100.sh` | HPA load test for **8× H100** on-prem (metrics-proxy pod-IP Job) |
 | `hpa-load-test-brev-4xl40s.sh` | HPA load test for **4× L40S** on AWS (Brev) |
+| `test-openclaw-e2e-hpa.sh` | **20 OpenClaw sandboxes** as the 8×H100 saturator (`inference.local` → Envoy → GPU HPA) |
+| `setup-openclaw-e2e-sandboxes.sh` | Create / start / stop / cleanup `openclaw-e2e-*` sandboxes for that e2e |
+| `e2e-openclaw-load-test.py` | Per-user saturator driver used by `test-openclaw-e2e-hpa.sh` |
 | `hpa-reset.sh` | Restore idle HPA / inference |
 | `cluster-recover.sh` | Destructive release recovery for the selected release only — see script comments before use |
 | `get-metrics-proxy-pods.sh` / `get-hpa.sh` / `hpa-watch.sh` | Inspect / watch |

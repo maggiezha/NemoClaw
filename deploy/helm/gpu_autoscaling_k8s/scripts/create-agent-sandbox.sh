@@ -198,7 +198,17 @@ if grep -Fq 'integrate.api.nvidia.com' <<<"${EFFECTIVE_POLICY}"; then
 fi
 unset EFFECTIVE_POLICY
 
-agent_common_create_smoke_test "${AGENT_NAME}" "${SANDBOX_NAME}"
+case "${SKIP_CREATE_SMOKE:-0}" in
+  0)
+    agent_common_create_smoke_test "${AGENT_NAME}" "${SANDBOX_NAME}"
+    ;;
+  1)
+    echo "SKIP_CREATE_SMOKE=1: not running create-time smoke tests for ${SANDBOX_NAME}."
+    ;;
+  *)
+    fail "SKIP_CREATE_SMOKE must be 0 or 1"
+    ;;
+esac
 
 echo "${AGENT_DISPLAY_NAME} sandbox ${SANDBOX_NAME} is ready without a GPU."
 if kubectl get gateway "${INFERENCE_RELEASE}-metrics-proxy" -n "${INFERENCE_NAMESPACE}" >/dev/null 2>&1; then

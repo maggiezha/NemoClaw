@@ -5,7 +5,7 @@
 
 # NemoClaw Kubernetes GPU autoscaling
 
-This experimental recipe demonstrates a cost-efficient architecture that runs a single AI agent securely inside a CPU-only OpenShell sandbox while independently autoscaling GPU-backed inference. Here the CPU agent is an OpenShell Kubernetes sandbox (Agent Sandbox CRD + OpenShell 0.0.85), and GPU inference is a separate Helm chart with HPA. 
+This experimental recipe demonstrates a cost-efficient architecture that runs AI agents securely inside CPU-only OpenShell sandboxes while independently autoscaling GPU-backed inference. Pairing and quick start use **one** sandbox. The multi-user e2e uses **one sandbox per end user** (default 20) sharing the same `inference.local` → Envoy → GPU HPA backend. The CPU agent is an OpenShell Kubernetes sandbox (Agent Sandbox CRD + OpenShell 0.0.85); GPU inference is a separate Helm chart with HPA. 
 
 HPA scales GPU inference from 1 to **N** replicas (1 GPU each) so spikes stay responsive and idle GPUs are released.
 
@@ -37,7 +37,11 @@ HPA scales to **N** inference pods (1 GPU each). Envoy LeastRequest when enabled
 Each GPU pod is **2/2 Ready** when healthy: inference (`ollama` / `vllm` / `nim`) + `metrics-proxy` (auth, `/v1`, health, `/metrics`). The sandboxed agent is CPU-only OpenShell, not this pod.
 
 ```text
-CPU-only OpenShell sandbox (AGENT_NAME=openclaw | hermes | deepagents)
+End users (1 pairing sandbox, or M e2e sandboxes — one per user)
+        ↓
+CPU-only OpenShell sandboxes (AGENT_NAME=openclaw | hermes | deepagents)
+        ↓
+OpenShell https://inference.local
         ↓
 Envoy Gateway — LeastRequest  (or metrics-proxy Service when ENABLE_ENVOY_LB=0)
         ↓
@@ -49,6 +53,8 @@ Authenticated inference endpoints
 HPA (GPU util >40% or latency >3000 ms)
 ```
 
+Sandboxes never request GPUs. Several users share one inference route and one HPA. The 20-user OpenClaw e2e (`./scripts/test-openclaw-e2e-hpa.sh`) saturates the 8×H100 backend from those sandboxes instead of the metrics-proxy pod-IP Job.
+
 The chart generates a local inference API key (Bearer on `/v1`). OpenShell injects it for the sandbox. It is not an Ollama pull key, OpenAI key, or `NVIDIA_API_KEY`.
 
 `latency_avg` is metrics-proxy **chat/completions duration** on that pod (in-pod fetch until the full response, including streams). It excludes client→Envoy time. After 60s with no samples the gauge resets to 0 so HPA can scale down. `get-hpa.sh` prints milliseconds (`46514/3000` = 46514 ms / 3000 ms).
@@ -57,7 +63,7 @@ The chart generates a local inference API key (Bearer on `/v1`). OpenShell injec
 
 | Hardware | Install ceiling | Load test |
 |----------|-----------------|-----------|
-| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` |
+| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` (pod-IP Job) or `./scripts/test-openclaw-e2e-hpa.sh` (20 sandboxes → Envoy) |
 | [Brev AWS](https://brev.nvidia.com) **4× L40S** (48 GB), MicroK8s | `MAX_REPLICAS=4` | `./scripts/hpa-load-test-brev-4xl40s.sh` |
 
 Both paths cover chart deploy, optional Envoy LeastRequest, authenticated inference, HPA scale-up/down, Envoy distribution, and OpenShell → `https://inference.local/v1`. Default models fit either GPU. Pin a node with `NEMOCLAW_TARGET_NODE` when other GPU nodes exist.
@@ -388,35 +394,26 @@ Ask **In one sentence, what is an AI agent sandbox?** through authenticated infe
 
 A non-empty answer plus the final `OK:` line is a pass. Wording varies; small models may not know product names. Sample output: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#example-verify-output).
 
-#### Hermes + vLLM (manual)
+### Hermes simple test
 
-This is the Kubernetes-recipe equivalent of the official Hermes checks in
-[`docs/get-started/quickstart-hermes.mdx`](../../../docs/get-started/quickstart-hermes.mdx)
-(`nemohermes … status`, `curl -sf http://127.0.0.1:8642/health`, then a first prompt).
-Do **not** use `nemohermes launch` here. Keep `./scripts/run-agent-sandbox.sh` attached
-so the in-sandbox Hermes gateway is up, then:
-
-```bash
-export AGENT_NAME=hermes
-export INFERENCE_RUNTIME=vllm
-export INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
-# AGENT_SANDBOX_NAME defaults to hermes-onprem
-./scripts/verify-agent-sandbox.sh
-```
-
-That script is the pass/fail test: `hermes --version`, `config.yaml`,
-`http://localhost:8642/health`, `GET https://inference.local/v1/models`, then the same
-headless prompt the official harness uses via `hermes -z`. To run only that prompt:
+This is the pairing check for Hermes. It is a oneshot through the in-sandbox
+`hermes` binary and on-prem `https://inference.local`. It does **not** open a
+browser, does **not** use `nemohermes launch`, and does **not** need the Hermes
+gateway on `:8642`.
 
 ```bash
-openshell sandbox exec -n hermes-onprem --no-tty -- \
-  curl -sf http://127.0.0.1:8642/health
+export PATH="${HOME}/.local/bin:${PATH}"
 openshell sandbox exec -n hermes-onprem --no-tty -- \
   hermes -z "In one sentence, what is an AI agent sandbox?"
 ```
 
-Do not pass `-m` to `hermes -z` (Hermes treats `-m` as the oneshot text). A non-empty
-answer plus verify's `OK:` line is a pass.
+Pass: a non-empty sentence (wording varies). Do not pass `-m` (`hermes -z`
+treats `-m` as the prompt). OpenShell must already be connected (`openshell status`).
+
+`./scripts/verify-agent-sandbox.sh` also waits for in-sandbox
+`http://localhost:8642/health`. That URL is inside the sandbox, not on the host
+and not in a browser. Skip that script unless `./scripts/run-agent-sandbox.sh`
+is already attached and healthy. Per-agent loops: [`AGENT-SELECTION.md`](AGENT-SELECTION.md#hermes).
 
 Direct curl (loopback only; Bearer still required; **8081** not 8080):
 
@@ -478,11 +475,17 @@ openshell status
 
 ## Test autoscaling and load balancing
 
-`install-hpa.sh` does not generate load. Pairing tests are not this path.
+`install-hpa.sh` does not generate load. Pairing tests are not this path. The 4× L40S script is unchanged.
+
+On 8× H100 there are two saturators. Both keep `minReplicas=1` and `maxReplicas=8` on the same Ollama GPU chart:
+
+- `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy.
+- `./scripts/test-openclaw-e2e-hpa.sh` — **20 end users**, each with one OpenClaw sandbox. Those sandboxes send the same chat-completions load through `https://inference.local` → Envoy → GPU HPA (in-flight 32→256 per sandbox so 20 users can fill the 640/pod cap). This is the multi-user architecture demo.
 
 | Hardware | Command |
 |----------|---------|
-| **8× H100** on-prem | `./scripts/hpa-load-test-dgx-8xh100.sh` |
+| **8× H100** on-prem (pod-IP saturator Job) | `./scripts/hpa-load-test-dgx-8xh100.sh` |
+| **8× H100** on-prem (**20 users / 20 OpenClaw sandboxes** → Envoy) | `./scripts/test-openclaw-e2e-hpa.sh` |
 | **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` |
 
 Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a new test does not inherit a prior scale-down window — it will not force a scale-down under real traffic. While running, the HPA uses one-pod 40% steps, then restores `HPA_VALUES`. Load stops after a short hold at max so replicas return to 1.
@@ -490,6 +493,8 @@ Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a 
 ```bash
 # Same TLS overlay / local.env as install
 ./scripts/hpa-load-test-dgx-8xh100.sh
+# or 20 OpenClaw sandboxes as the 8-GPU saturator (through Envoy):
+./scripts/test-openclaw-e2e-hpa.sh
 # or
 ./scripts/hpa-load-test-brev-4xl40s.sh
 

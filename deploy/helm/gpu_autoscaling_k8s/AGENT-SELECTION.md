@@ -5,7 +5,7 @@
 
 # Agent selection
 
-Choose one CPU-only agent for the OpenShell sandbox:
+Choose one CPU-only agent type per OpenShell sandbox (`AGENT_NAME`). Pairing uses one sandbox; the OpenClaw e2e uses many sandboxes (one per end user) on the same GPU HPA:
 [OpenClaw](https://openclaw.ai) (default and most exercised),
 [Hermes](https://github.com/NousResearch/hermes-agent), or
 [Deep Agents Code](https://docs.langchain.com/oss/python/deepagents/code/overview).
@@ -100,6 +100,8 @@ export INFERENCE_MODEL=llama3.2:3b
 
 Optional pairing test (not required for autoscaling): [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
 
+Multi-user HPA e2e (20 sandboxes saturate the same 8×H100 GPU backend through Envoy; not the pairing script): [`scripts/test-openclaw-e2e-hpa.sh`](scripts/test-openclaw-e2e-hpa.sh).
+
 ### Hermes
 
 Matches the official [Hermes quickstart](../../../docs/get-started/quickstart-hermes.mdx)
@@ -126,9 +128,27 @@ export AGENT_NAME=hermes
 ./scripts/run-agent-sandbox.sh
 ```
 
-Terminal 3 — real headless prompt through `hermes -z` (same check as
-[`docs/get-started/quickstart-hermes.mdx`](../../../docs/get-started/quickstart-hermes.mdx)
-health + first prompt, without `nemohermes launch`):
+#### Simple test (no gateway, no browser)
+
+This is the Hermes pairing check. It does not use `:8642`, a browser, or
+`./scripts/verify-agent-sandbox.sh`.
+
+```bash
+export PATH="${HOME}/.local/bin:${PATH}"
+openshell sandbox exec -n hermes-onprem --no-tty -- \
+  hermes -z "In one sentence, what is an AI agent sandbox?"
+```
+
+Pass: a non-empty sentence. Do not pass `-m`. Same oneshot as
+[`docs/get-started/quickstart-hermes.mdx`](../../../docs/get-started/quickstart-hermes.mdx),
+without `nemohermes launch`. Works against NIM or vLLM once `openshell inference set`
+points `inference.local` at that runtime (vLLM model
+`nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`).
+
+#### Optional full verify (needs the gateway)
+
+`verify-agent-sandbox.sh` also waits for in-sandbox `http://localhost:8642/health`
+(not a host/browser URL). Keep Terminal 2 attached first, then:
 
 ```bash
 export AGENT_NAME=hermes
@@ -137,14 +157,10 @@ export INFERENCE_MODEL=nvidia/nemotron-3-nano
 ./scripts/verify-agent-sandbox.sh
 ```
 
-Against an already-running vLLM release, keep `run-agent-sandbox.sh` attached and use
-the same verify with `INFERENCE_RUNTIME=vllm` and
-`INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`. Manual one-shot:
-
-```bash
-openshell sandbox exec -n hermes-onprem --no-tty -- \
-  hermes -z "In one sentence, what is an AI agent sandbox?"
-```
+For an already-running vLLM release, use `INFERENCE_RUNTIME=vllm` and
+`INFERENCE_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8`. If start fails with
+`HERMES_MCP_CONFIG_DRIFT`, rebuild the sandbox; the simple `hermes -z` test
+above still proves inference.
 
 Optional pairing test for Hermes + NIM (not required for autoscaling): [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
 Official docs also list vLLM and Ollama for Hermes; the optional NIM test exists so one example shows the NGC Secret flow.
