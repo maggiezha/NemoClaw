@@ -493,7 +493,7 @@ This is the multi-user architecture test for **OpenClaw + Ollama**. Pairing (`te
 
 ```text
 N end users  (example E2E_USERS=10)
-        ↓  openclaw agent --agent main -m  (one sandbox per user)
+        ↓  prompt to the already-running OpenClaw agent (one sandbox / one agent per user)
 N CPU OpenClaw sandboxes (openclaw-ollama-e2e-0000 …)
         ↓  https://inference.local
 Envoy LeastRequest

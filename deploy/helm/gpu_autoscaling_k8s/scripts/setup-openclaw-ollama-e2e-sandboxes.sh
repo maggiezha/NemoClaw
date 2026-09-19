@@ -65,7 +65,11 @@ if [[ -n "${INFERENCE_RUNTIME:-}" && "${INFERENCE_RUNTIME}" != "ollama" ]]; then
   fail "this e2e is OpenClaw + Ollama (got INFERENCE_RUNTIME=${INFERENCE_RUNTIME}). Hermes + vLLM is later and is not started here."
 fi
 agent_common_pin_example_pairing openclaw ollama
+if [[ "${INFERENCE_MODEL}" != "llama3.2:3b" ]]; then
+  fail "this e2e is OpenClaw + Ollama llama3.2:3b (got INFERENCE_MODEL=${INFERENCE_MODEL}). Do not point it at Hermes/vLLM/NIM models."
+fi
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
+PIN_OPENCLAW_MODEL_PY="${CHART_DIR}/files/pin-openclaw-ollama-model.py"
 SANDBOX_PREFIX="${SANDBOX_PREFIX:-openclaw-ollama-e2e-}"
 [[ "${SANDBOX_PREFIX}" =~ ^[a-z][a-z0-9-]{0,40}$ ]] \
   || fail "SANDBOX_PREFIX must be a lowercase Kubernetes-style prefix"
@@ -136,12 +140,26 @@ agent_health_ok() {
     >/dev/null 2>&1
 }
 
+pin_openclaw_ollama_model() {
+  local name="${1:?sandbox}"
+  local helper_b64
+  [[ -f "${PIN_OPENCLAW_MODEL_PY}" ]] || fail "missing ${PIN_OPENCLAW_MODEL_PY}"
+  helper_b64="$(base64 -w0 "${PIN_OPENCLAW_MODEL_PY}")"
+  # Drop leftover extra OpenClaw CLIs from the old load path; keep openclaw-gateway.
+  timeout --foreground 45 openshell sandbox exec -n "${name}" --no-tty -- bash -c '
+    set -euo pipefail
+    pkill -f "openclaw agent --agent main -m" >/dev/null 2>&1 || true
+    echo "$1" | base64 -d | python3 - "$2"
+  ' bash "${helper_b64}" "${INFERENCE_MODEL}"
+}
+
 start_one_agent() {
   local name="${1:?sandbox}"
   local log="${STATE_DIR}/${name}.log"
   local pidfile="${STATE_DIR}/${name}.pid"
   if agent_health_ok "${name}"; then
     echo "  ${name}: OpenClaw agent already healthy"
+    pin_openclaw_ollama_model "${name}" || true
     return 0
   fi
   if [[ -f "${pidfile}" ]]; then
@@ -155,7 +173,8 @@ start_one_agent() {
   fi
   if [[ ! -f "${pidfile}" ]]; then
     echo "  ${name}: starting /usr/local/bin/nemoclaw-start"
-    openshell sandbox exec -n "${name}" --no-tty -- \
+    openshell sandbox exec -n "${name}" --no-tty \
+      --env "NEMOCLAW_MODEL_OVERRIDE=${INFERENCE_MODEL}" -- \
       /usr/local/bin/nemoclaw-start >"${log}" 2>&1 &
     echo $! >"${pidfile}"
   fi
@@ -163,6 +182,7 @@ start_one_agent() {
   for ((i = 1; i <= 90; i += 1)); do
     if agent_health_ok "${name}"; then
       echo "  ${name}: OpenClaw agent healthy"
+      pin_openclaw_ollama_model "${name}" || true
       return 0
     fi
     if [[ "${i}" -eq 1 ]]; then

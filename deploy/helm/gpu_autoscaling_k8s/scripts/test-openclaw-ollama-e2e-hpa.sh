@@ -45,6 +45,9 @@ if [[ -n "${AGENT_NAME:-}" && "${AGENT_NAME}" != "openclaw" ]]; then
   fail "this e2e is OpenClaw + Ollama (got AGENT_NAME=${AGENT_NAME})"
 fi
 agent_common_pin_example_pairing openclaw ollama
+if [[ "${INFERENCE_MODEL}" != "llama3.2:3b" ]]; then
+  fail "this e2e is OpenClaw + Ollama llama3.2:3b (got INFERENCE_MODEL=${INFERENCE_MODEL}). Do not point it at Hermes/vLLM/NIM models."
+fi
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 
 export NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
@@ -74,9 +77,10 @@ export DURATION_SEC="${DURATION_SEC:-900}"
 export MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-0}"
 export SCALE_DOWN_WAIT_LOOPS="${SCALE_DOWN_WAIT_LOOPS:-40}"
 HPA_BASELINE_WAIT_SEC="${HPA_BASELINE_WAIT_SEC:-240}"
-# User→sandbox path uses E2E_INFLIGHT_PER_USER. Do not reuse the Job's BOOTSTRAP_INFLIGHT=160.
+# One in-flight prompt per user keeps the sandbox light (one agent, no extra Node CLI).
+# Do not reuse the Job's BOOTSTRAP_INFLIGHT=160.
 E2E_BOOTSTRAP_INFLIGHT="${E2E_BOOTSTRAP_INFLIGHT:-32}"
-E2E_INFLIGHT_PER_USER="${E2E_INFLIGHT_PER_USER:-4}"
+E2E_INFLIGHT_PER_USER="${E2E_INFLIGHT_PER_USER:-1}"
 E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-${CHART_DIR}/e2e-results/openclaw-ollama}"
 # Start one OpenClaw agent per sandbox (not extra OpenShell/Envoy gateways).
 # START_GATEWAYS is a deprecated alias for START_AGENTS.
@@ -151,7 +155,7 @@ if [[ "${START_AGENTS}" == "1" ]]; then
   E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" start
 fi
 
-echo "OpenClaw + Ollama e2e: ${E2E_USERS} users sending openclaw agent prompts into ${E2E_USERS} CPU sandboxes (not Envoy-direct, not load-generator.ts)"
+echo "OpenClaw + Ollama e2e: ${E2E_USERS} users sending prompts to ${E2E_USERS} already-running OpenClaw agents (not a second Node CLI, not Envoy-direct)"
 set +e
 python3 "${SCRIPT_DIR}/e2e-openclaw-ollama-load-test.py" \
   --users "${E2E_USERS}" \

@@ -19,7 +19,7 @@ what each script in this directory does — it has no instructions of its own.
 | `hpa-load-test-brev-4xl40s.sh` | HPA load test for **4× L40S** on AWS (Brev) |
 | `test-openclaw-ollama-e2e-hpa.sh` | Longer OpenClaw + Ollama e2e (additional): N sandboxes (default `E2E_USERS=10`) saturate Ollama HPA through Envoy. Not a replacement for `hpa-load-test-dgx-8xh100.sh`. |
 | `setup-openclaw-ollama-e2e-sandboxes.sh` | Create / start / stop / cleanup `openclaw-ollama-e2e-*` |
-| `e2e-openclaw-ollama-load-test.py` | Per-user driver (`openclaw agent` into each sandbox) |
+| `e2e-openclaw-ollama-load-test.py` | Per-user driver (prompt the already-running OpenClaw agent; no second Node CLI) |
 | `test-hermes-e2e-hpa.sh` | Hermes + vLLM e2e next (`hermes -z`); do not run while OpenClaw e2e owns the GPUs |
 | `setup-hermes-e2e-sandboxes.sh` | Create / start / stop / cleanup `hermes-e2e-*` only |
 | `e2e-hermes-load-test.py` | Per-user driver used by `test-hermes-e2e-hpa.sh` |

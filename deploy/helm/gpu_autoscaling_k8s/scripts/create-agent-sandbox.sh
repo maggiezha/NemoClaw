@@ -178,6 +178,11 @@ SANDBOX_CREATE_ARGS=(
   --cpu "${AGENT_SANDBOX_CPU:-2}"
   --memory "${AGENT_SANDBOX_MEMORY:-4Gi}"
 )
+# Official OpenClaw GHCR images bake NVIDIA Nemotron as the agent model.
+# This recipe's OpenClaw + Ollama path must use INFERENCE_MODEL (llama3.2:3b).
+if [[ "${AGENT_NAME}" == "openclaw" ]]; then
+  SANDBOX_CREATE_ARGS+=(--env "NEMOCLAW_MODEL_OVERRIDE=${MODEL}")
+fi
 if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
   DRIVER_CONFIG_JSON="$(python3 - "${NEMOCLAW_TARGET_NODE}" <<'PYEOF'
 import json

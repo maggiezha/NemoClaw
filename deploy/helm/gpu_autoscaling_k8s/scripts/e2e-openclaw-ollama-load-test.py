@@ -5,11 +5,12 @@
 OpenClaw + Ollama e2e: N end users send prompts into N CPU OpenClaw sandboxes.
 Default N is E2E_USERS=10 (one sandbox per user). GPU inference is Ollama.
 
-Each user talks only to its sandbox:
+Each user talks only to its sandbox's already-running OpenClaw agent (:18789).
+Do not spawn `openclaw agent -m` (that starts a second Node CLI).
 
-    openshell sandbox exec -n openclaw-ollama-e2e-NNNN -- openclaw agent --agent main -m "..."
+    openshell sandbox exec → chat.send on ws://127.0.0.1:18789/ws
 
-The agent inside the sandbox then calls https://inference.local (Envoy → Ollama HPA).
+The agent then calls https://inference.local (Envoy → Ollama HPA).
 This is not files/load-generator.ts (that Job POSTs chat/completions at pod IPs).
 This is not in-sandbox curl to inference.local.
 Hermes + vLLM is a later e2e and is not this script.
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import csv
 import json
 import os
@@ -49,8 +51,19 @@ PROMPTS = [
 ]
 
 
+HELPER_PATH = Path(__file__).resolve().parent.parent / "files" / "openclaw-e2e-ws-prompt.py"
+_HELPER_B64 = ""
+
+
 def sandbox_name(prefix: str, user_id: int) -> str:
     return f"{prefix}{user_id:04d}"
+
+
+def helper_b64() -> str:
+    global _HELPER_B64
+    if not _HELPER_B64:
+        _HELPER_B64 = base64.b64encode(HELPER_PATH.read_bytes()).decode("ascii")
+    return _HELPER_B64
 
 
 def read_hpa(namespace: str, name: str) -> tuple[int, int]:
@@ -89,10 +102,12 @@ async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
 
 
 async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[bool, str]:
-    """One end-user turn: prompt goes to the sandbox agent, not to Envoy."""
+    """Send one prompt to the already-running OpenClaw agent. No extra Node CLI."""
     openshell = shutil.which("openshell")
     if not openshell:
         return False, "openshell is not on PATH"
+    if not HELPER_PATH.is_file():
+        return False, f"missing {HELPER_PATH}"
     proc = await asyncio.create_subprocess_exec(
         openshell,
         "sandbox",
@@ -101,17 +116,24 @@ async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[
         sandbox,
         "--no-tty",
         "--",
-        "openclaw",
-        "agent",
-        "--agent",
-        "main",
-        "-m",
+        "bash",
+        "-c",
+        (
+            "set -euo pipefail; "
+            ". /tmp/nemoclaw-proxy-env.sh; "
+            "export E2E_PROMPT_TIMEOUT_SEC=\"$3\" E2E_SESSION_KEY=\"$4\"; "
+            "echo \"$1\" | base64 -d | python3 - \"$2\""
+        ),
+        "bash",
+        helper_b64(),
         prompt,
+        str(timeout_sec),
+        f"agent:main:{sandbox}",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec + 30)
     except asyncio.TimeoutError:
         await terminate_proc(proc)
         return False, f"timed out after {timeout_sec}s"
@@ -124,6 +146,8 @@ async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[
         return False, "OpenClaw used embedded fallback instead of the managed gateway"
     if not stdout:
         return False, "empty OpenClaw response"
+    if "LLM request failed" in combined or "network connection error" in combined:
+        return False, stdout or stderr
     return True, stdout
 
 
@@ -198,8 +222,8 @@ async def run_test(args: argparse.Namespace) -> int:
     print("=" * 70)
     print(f"  OpenClaw + Ollama e2e: {args.users} users → {args.users} sandboxes → Envoy → Ollama HPA")
     print(f"  Users: {args.users}  sandbox prefix={args.prefix}")
-    print("  Query: openshell sandbox exec -- openclaw agent --agent main -m")
-    print("  Not: load-generator.ts pod-IP Job, not in-sandbox curl to Envoy")
+    print("  Query: chat.send to the already-running OpenClaw agent on :18789")
+    print("  Not: second Node CLI (openclaw agent -m), not load-generator.ts, not curl to Envoy")
     print(f"  Concurrent prompts per user: {args.inflight_per_user}")
     print(f"  GPU inference model={args.model}  HPA {args.hpa_namespace}/{args.hpa_name}")
     print(f"  duration≤{args.duration}s  target replicas={args.target_pods}")
@@ -343,8 +367,8 @@ def main() -> int:
     parser.add_argument(
         "--inflight-per-user",
         type=int,
-        default=int(os.environ.get("E2E_INFLIGHT_PER_USER", "4")),
-        help="Concurrent openclaw agent prompts each user sends into their sandbox",
+        default=int(os.environ.get("E2E_INFLIGHT_PER_USER", "1")),
+        help="Concurrent prompts each user sends to their already-running agent (keep 1 to stay light)",
     )
     parser.add_argument("--target-pods", type=int, default=int(os.environ.get("TARGET_PODS", "8")))
     parser.add_argument("--hold-sec", type=float, default=float(os.environ.get("MAX_REPLICAS_HOLD_SEC", "0")))
