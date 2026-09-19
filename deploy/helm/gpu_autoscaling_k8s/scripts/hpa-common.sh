@@ -784,8 +784,12 @@ hpa_common_metrics_proxy_service_base_url() {
   printf 'http://%s.%s.svc.cluster.local:%s/v1' "${service}" "${ns}" "${port}"
 }
 
-# OpenShell / in-cluster inference base URL: Envoy dataplane when LB is on, else metrics-proxy Service.
-# When ENABLE_ENVOY_LB is unset at runtime, auto-detect from an existing Gateway object.
+# OpenShell inference.local backend. Same reason as files/load-generator.ts:
+# ClusterIP + kube-proxy iptables hairpin on dgx01 drops SYNs from sandbox
+# supervisors (curl 35 / OpenClaw "network connection error"). The Job talks
+# HTTP to metrics-proxy pod IPs. With Envoy LeastRequest, use the Envoy
+# dataplane pod IP:targetPort so traffic still goes Envoy → Ollama HPA.
+# When ENABLE_ENVOY_LB is unset at runtime, auto-detect from an existing Gateway.
 hpa_common_openshell_inference_base_url() {
   local gateway_ns="${1:-${NAMESPACE:-nemoclaw-gpu}}"
   local gateway_name="${2:-}"
@@ -800,7 +804,7 @@ hpa_common_openshell_inference_base_url() {
 
   case "${ENABLE_ENVOY_LB:-}" in
     1)
-      hpa_common_envoy_dataplane_base_url "${gateway_ns}" "${gateway_name}"
+      hpa_common_envoy_dataplane_pod_v1_url "${gateway_ns}" "${gateway_name}"
       return
       ;;
     0)
@@ -809,7 +813,7 @@ hpa_common_openshell_inference_base_url() {
       ;;
     "")
       if kubectl get gateway "${gateway_name}" -n "${gateway_ns}" >/dev/null 2>&1; then
-        hpa_common_envoy_dataplane_base_url "${gateway_ns}" "${gateway_name}"
+        hpa_common_envoy_dataplane_pod_v1_url "${gateway_ns}" "${gateway_name}"
       else
         hpa_common_metrics_proxy_service_base_url "${gateway_ns}" "${service}" "${port}"
       fi
@@ -820,6 +824,12 @@ hpa_common_openshell_inference_base_url() {
       return 1
       ;;
   esac
+}
+
+hpa_common_envoy_dataplane_pod_v1_url() {
+  local base
+  base="$(hpa_common_envoy_dataplane_pod_url "${1:-}" "${2:-}")" || return 1
+  printf '%s/v1\n' "${base%/}"
 }
 
 hpa_common_envoy_dataplane_base_url() {

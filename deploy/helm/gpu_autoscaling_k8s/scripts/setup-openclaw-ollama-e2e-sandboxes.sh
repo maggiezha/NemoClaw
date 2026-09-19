@@ -140,6 +140,12 @@ agent_health_ok() {
     >/dev/null 2>&1
 }
 
+inference_local_ok() {
+  local name="${1:?sandbox}"
+  timeout --foreground 25 openshell sandbox exec -n "${name}" --no-tty -- \
+    curl -fsS --http1.1 --max-time 10 https://inference.local/v1/models >/dev/null 2>&1
+}
+
 pin_openclaw_ollama_model() {
   local name="${1:?sandbox}"
   local helper_b64
@@ -160,6 +166,10 @@ start_one_agent() {
   if agent_health_ok "${name}"; then
     echo "  ${name}: OpenClaw agent already healthy"
     pin_openclaw_ollama_model "${name}" || true
+    if ! inference_local_ok "${name}"; then
+      echo "ERROR: ${name}: agent is up but https://inference.local is not (OpenShell MITM). The HPA Job uses metrics-proxy pod IPs and does not catch this." >&2
+      return 1
+    fi
     return 0
   fi
   if [[ -f "${pidfile}" ]]; then
@@ -183,6 +193,10 @@ start_one_agent() {
     if agent_health_ok "${name}"; then
       echo "  ${name}: OpenClaw agent healthy"
       pin_openclaw_ollama_model "${name}" || true
+      if ! inference_local_ok "${name}"; then
+        echo "ERROR: ${name}: https://inference.local not reachable after agent start" >&2
+        return 1
+      fi
       return 0
     fi
     if [[ "${i}" -eq 1 ]]; then

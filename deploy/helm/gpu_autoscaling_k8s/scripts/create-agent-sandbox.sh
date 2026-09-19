@@ -6,6 +6,8 @@
 # (LeastRequest) when ENABLE_ENVOY_LB=1 / a Gateway exists, otherwise through the
 # metrics-proxy Service, then create a sandbox for the agent selected by AGENT_NAME
 # (openclaw | hermes | deepagents) without assigning it a GPU.
+# Envoy LeastRequest uses the dataplane pod IP (not ClusterIP): same-node kube-proxy
+# hairpin is why the HPA Job (files/load-generator.ts) also targets pod IPs.
 #
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
@@ -253,15 +255,18 @@ wait_inference_local() {
   local name="${1:?sandbox}"
   local i
   echo "  ${name}: waiting for https://inference.local"
-  for ((i = 1; i <= 20; i += 1)); do
+  for ((i = 1; i <= 40; i += 1)); do
     if timeout --foreground 25 openshell sandbox exec -n "${name}" --no-tty -- \
-      curl -fsS --max-time 10 https://inference.local/v1/models >>"${OPENSHELL_LOG}" 2>&1; then
+      curl -fsS --http1.1 --max-time 10 https://inference.local/v1/models >>"${OPENSHELL_LOG}" 2>&1; then
       echo "  ${name}: inference.local reachable"
       return 0
     fi
+    if [[ $((i % 10)) -eq 0 ]]; then
+      echo "  ${name}: still waiting for inference.local (${i}/40)"
+    fi
     sleep 3
   done
-  echo "  ${name}: still waiting for inference.local (continuing; see ${OPENSHELL_LOG})"
+  echo "ERROR: ${name}: https://inference.local not reachable (OpenShell MITM). The HPA Job uses metrics-proxy pod IPs and does not catch this." >&2
   return 1
 }
 
@@ -308,7 +313,8 @@ if grep -Fq 'integrate.api.nvidia.com' <<<"${EFFECTIVE_POLICY}"; then
   echo "WARNING: effective sandbox policy still lists integrate.api.nvidia.com" >&2
 fi
 unset EFFECTIVE_POLICY
-wait_inference_local "${SANDBOX_NAME}" || true
+wait_inference_local "${SANDBOX_NAME}" \
+  || fail "${SANDBOX_NAME}: https://inference.local not reachable. OpenShell MITM must work before the agent starts; the HPA Job's pod-IP path does not cover this."
 
 case "${SKIP_CREATE_SMOKE:-0}" in
   0)
