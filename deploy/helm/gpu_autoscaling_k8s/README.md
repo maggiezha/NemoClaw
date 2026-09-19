@@ -53,7 +53,7 @@ Authenticated inference endpoints
 HPA (GPU util >40% or latency >3000 ms)
 ```
 
-Sandboxes never request GPUs. Several users share one inference route and one HPA. The OpenClaw + Ollama e2e (`./scripts/test-openclaw-ollama-e2e-hpa.sh`) saturates the 8×H100 Ollama backend from those sandboxes instead of the metrics-proxy pod-IP Job. `E2E_USERS=10` is an example, not a fixed user count. Hermes + vLLM is next and is not this script.
+Sandboxes never request GPUs. Several users share one inference route and one HPA. The **fast HPA-only test stays** `./scripts/hpa-load-test-dgx-8xh100.sh` (`files/load-generator.ts` Job against metrics-proxy pod IPs; GPU util or `HPA_METRIC=latency_avg`). Do not drop that Job — sandbox e2e takes much longer (create + OpenClaw agents). The OpenClaw + Ollama e2e (`./scripts/test-openclaw-ollama-e2e-hpa.sh`) is **additional** architecture coverage: N users → N sandboxes → `inference.local` → Envoy → Ollama HPA. `E2E_USERS=10` is an example, not a fixed user count. Hermes + vLLM is next and is not this script.
 
 The chart generates a local inference API key (Bearer on `/v1`). OpenShell injects it for the sandbox. It is not an Ollama pull key, OpenAI key, or `NVIDIA_API_KEY`.
 
@@ -61,10 +61,10 @@ The chart generates a local inference API key (Bearer on `/v1`). OpenShell injec
 
 ## Validation
 
-| Hardware | Install ceiling | Load test |
-|----------|-----------------|-----------|
-| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` (pod-IP Job) or `./scripts/test-openclaw-ollama-e2e-hpa.sh` (OpenClaw + Ollama; `E2E_USERS` example 10) |
-| [Brev AWS](https://brev.nvidia.com) **4× L40S** (48 GB), MicroK8s | `MAX_REPLICAS=4` | `./scripts/hpa-load-test-brev-4xl40s.sh` |
+| Hardware | Install ceiling | Fast HPA-only (keep) | Longer sandbox e2e (additional) |
+|----------|-----------------|----------------------|----------------------------------|
+| On-prem DGX **8× H100** (80 GB) | `MAX_REPLICAS=8` | `./scripts/hpa-load-test-dgx-8xh100.sh` (pod-IP Job; GPU util or `latency_avg`) | `./scripts/test-openclaw-ollama-e2e-hpa.sh` (OpenClaw + Ollama; `E2E_USERS` example 10) |
+| [Brev AWS](https://brev.nvidia.com) **4× L40S** (48 GB), MicroK8s | `MAX_REPLICAS=4` | `./scripts/hpa-load-test-brev-4xl40s.sh` | — |
 
 Both paths cover chart deploy, optional Envoy LeastRequest, authenticated inference, HPA scale-up/down, Envoy distribution, and OpenShell → `https://inference.local/v1`. Default models fit either GPU. Pin a node with `NEMOCLAW_TARGET_NODE` when other GPU nodes exist.
 
@@ -473,16 +473,16 @@ openshell gateway add https://127.0.0.1:8080 \
 openshell status
 ```
 
-`create-agent-sandbox.sh` stores the inference key, strips `integrate.api.nvidia.com` where the agent policy grants it, and smokes `/v1/models` plus a version check. It does not start the gateway or send the example prompt — that is `verify-agent-sandbox.sh`. OpenClaw/Hermes need `run-agent-sandbox.sh` attached; Deep Agents Code uses `run-agent-prompt.sh`. Combined topology may need `SYS_ADMIN` / `NET_ADMIN` — check admission policy.
+`create-agent-sandbox.sh` stores the inference key, strips `integrate.api.nvidia.com` where the agent policy grants it, and smokes `/v1/models` plus a version check. It does not start the OpenClaw agent or send the example prompt — that is `verify-agent-sandbox.sh`. OpenClaw/Hermes need `run-agent-sandbox.sh` attached; Deep Agents Code uses `run-agent-prompt.sh`. Combined topology may need `SYS_ADMIN` / `NET_ADMIN` — check admission policy.
 
 ## Test autoscaling and load balancing
 
 `install-hpa.sh` does not generate load. Pairing tests are not this path. The 4× L40S script is unchanged.
 
-On 8× H100 there are two saturators. Both keep `minReplicas=1` and `maxReplicas=8`:
+On 8× H100 both of these keep `minReplicas=1` and `maxReplicas=8`. **Keep the Job.** The sandbox e2e does not replace it.
 
-- `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy.
-- `./scripts/test-openclaw-ollama-e2e-hpa.sh` — OpenClaw + Ollama e2e: N end users, each with one OpenClaw sandbox. Those sandboxes send load through `https://inference.local` → Envoy → **Ollama** HPA in `nemoclaw-gpu`.
+- **Fast HPA-only (keep):** `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy. Use this for GPU-util HPA and for `HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000`.
+- **Longer architecture e2e (additional):** `./scripts/test-openclaw-ollama-e2e-hpa.sh` — OpenClaw + Ollama: N end users, each with one OpenClaw sandbox and one OpenClaw **agent**. Those sandboxes send load through `https://inference.local` → Envoy → **Ollama** HPA in `nemoclaw-gpu`. Sandbox create + agent start make this much slower than the Job. Still **one** OpenShell gateway and **one** Envoy Gateway.
 - `./scripts/test-hermes-e2e-hpa.sh` — Hermes + vLLM, next step. Do not run it while the OpenClaw + Ollama e2e owns the GPUs.
 
 `E2E_USERS=10` (10 end users → 10 sandboxes) is **only an example** for the OpenClaw + Ollama test, and for the Hermes + vLLM step after that. Set `E2E_USERS` to whatever the node’s CPU can hold. Size from CPU, not GPU count: each sandbox requests `AGENT_SANDBOX_CPU` (default **2**) and `AGENT_SANDBOX_MEMORY` (default **4Gi**). This recipe does not publish a DGX user cap.
@@ -501,7 +501,7 @@ Envoy LeastRequest
 Ollama GPU HPA in nemoclaw-gpu (minReplicas=1, maxReplicas=8)
 ```
 
-Queries are generated by the N users and sent **into the sandboxes**. They are not POSTed at Envoy or metrics-proxy pod IPs (that is `hpa-load-test-dgx-8xh100.sh` / `files/load-generator.ts`). The OpenClaw agent in each sandbox is what calls Ollama.
+Queries are generated by the N users and sent **into the sandboxes**. They are not POSTed at Envoy or metrics-proxy pod IPs. The OpenClaw agent in each sandbox is what calls Ollama. The original Job (`hpa-load-test-dgx-8xh100.sh` / `files/load-generator.ts`) remains the fast HPA-only test; this e2e is extra coverage of the user → sandbox path.
 
 OpenShell must already be connected (`openshell status`). `ENABLE_ENVOY_LB=1`. Do not source `e2e-common.sh` (it forces `ENABLE_AUTOSCALING=0`). Do not set `minReplicas=8`. The 4× L40S load profile is unchanged.
 
@@ -532,24 +532,25 @@ Same user → sandbox path after OpenClaw + Ollama is done: load generator → N
 # ./scripts/test-hermes-e2e-hpa.sh
 ```
 
-| Hardware | Command |
-|----------|---------|
-| **8× H100** on-prem (pod-IP saturator Job) | `./scripts/hpa-load-test-dgx-8xh100.sh` |
-| **8× H100** on-prem (**OpenClaw + Ollama** e2e; example `E2E_USERS=10`) | `./scripts/test-openclaw-ollama-e2e-hpa.sh` |
-| **8× H100** on-prem (**Hermes + vLLM** e2e, next; example `E2E_USERS=10`) | `./scripts/test-hermes-e2e-hpa.sh` |
-| **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` |
+| Hardware | Command | Kind |
+|----------|---------|------|
+| **8× H100** on-prem | `./scripts/hpa-load-test-dgx-8xh100.sh` | Fast HPA-only Job (keep) |
+| **8× H100** on-prem | `./scripts/test-openclaw-ollama-e2e-hpa.sh` | Longer OpenClaw + Ollama e2e (additional; example `E2E_USERS=10`) |
+| **8× H100** on-prem | `./scripts/test-hermes-e2e-hpa.sh` | Longer Hermes + vLLM e2e (next; example `E2E_USERS=10`) |
+| **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` | Fast HPA-only Job |
 
 Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a new test does not inherit a prior scale-down window — it will not force a scale-down under real traffic. While running, the HPA uses one-pod 40% steps, then restores `HPA_VALUES`. Load stops after a short hold at max so replicas return to 1.
 
 ```bash
 # Same TLS overlay / local.env as install
+# Fast HPA-only (keep; GPU util):
 ./scripts/hpa-load-test-dgx-8xh100.sh
-# or OpenClaw + Ollama e2e as the 8-GPU saturator (through Envoy; example E2E_USERS=10):
-./scripts/test-openclaw-ollama-e2e-hpa.sh
-# or
-./scripts/hpa-load-test-brev-4xl40s.sh
-
+# Fast HPA-only (keep; latency):
 HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-dgx-8xh100.sh
+# Longer OpenClaw + Ollama e2e (additional; not a replacement for the Job):
+./scripts/test-openclaw-ollama-e2e-hpa.sh
+# 4× L40S:
+./scripts/hpa-load-test-brev-4xl40s.sh
 HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-brev-4xl40s.sh
 ./scripts/hpa-reset.sh
 ```

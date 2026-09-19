@@ -6,10 +6,15 @@
 # user) for the OpenClaw + Ollama HPA e2e. The model stays on Ollama GPU pods
 # in nemoclaw-gpu. Traffic: sandbox → inference.local → Envoy → Ollama HPA.
 #
+# "start" launches one OpenClaw agent (nemoclaw-start) per sandbox. Those are
+# agents, not extra OpenShell or Envoy gateways: there is still one OpenShell
+# gateway and one Envoy Gateway for the cluster.
+#
 # Does not run openshell gateway start, nemoclaw launch, or the metrics-proxy
-# chat-completions Job (hpa-load-test-*.sh). Does not destroy sandboxes outside
-# SANDBOX_PREFIX (default openclaw-ollama-e2e-). Does not touch hermes-onprem
-# or hermes-e2e-*. Hermes + vLLM is a later e2e.
+# chat-completions Job (hpa-load-test-*.sh). Keep that Job as the fast HPA-only
+# test. Does not destroy sandboxes outside SANDBOX_PREFIX (default
+# openclaw-ollama-e2e-). Does not touch hermes-onprem or hermes-e2e-*.
+# Hermes + vLLM is a later e2e.
 #
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
@@ -89,7 +94,7 @@ export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-2}"
 export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-4Gi}"
 export OPENSHELL_PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
 
-STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/openclaw-ollama-gateways}"
+STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/openclaw-ollama-agents}"
 mkdir -p "${STATE_DIR}"
 
 sandbox_name() {
@@ -124,19 +129,19 @@ for name in sorted(names):
 PY
 }
 
-gateway_health_ok() {
+agent_health_ok() {
   local name="${1:?sandbox}"
   timeout --foreground 20 openshell sandbox exec -n "${name}" --no-tty -- \
     bash -c 'code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:18789/health 2>/dev/null || true)"; case "${code}" in 200|401) exit 0 ;; esac; exit 1' \
     >/dev/null 2>&1
 }
 
-start_one_gateway() {
+start_one_agent() {
   local name="${1:?sandbox}"
   local log="${STATE_DIR}/${name}.log"
   local pidfile="${STATE_DIR}/${name}.pid"
-  if gateway_health_ok "${name}"; then
-    echo "  ${name}: OpenClaw gateway already healthy"
+  if agent_health_ok "${name}"; then
+    echo "  ${name}: OpenClaw agent already healthy"
     return 0
   fi
   if [[ -f "${pidfile}" ]]; then
@@ -156,22 +161,22 @@ start_one_gateway() {
   fi
   local i
   for ((i = 1; i <= 90; i += 1)); do
-    if gateway_health_ok "${name}"; then
-      echo "  ${name}: gateway healthy"
+    if agent_health_ok "${name}"; then
+      echo "  ${name}: OpenClaw agent healthy"
       return 0
     fi
     if [[ "${i}" -eq 1 ]]; then
-      echo "  ${name}: waiting for OpenClaw gateway on :18789"
+      echo "  ${name}: waiting for OpenClaw agent on :18789"
     elif [[ $((i % 10)) -eq 0 ]]; then
-      echo "  ${name}: still waiting for gateway (${i}/90)"
+      echo "  ${name}: still waiting for agent (${i}/90)"
     fi
     sleep 2
   done
-  echo "ERROR: ${name} OpenClaw gateway did not become healthy; see ${log}" >&2
+  echo "ERROR: ${name} OpenClaw agent did not become healthy; see ${log}" >&2
   return 1
 }
 
-stop_one_gateway() {
+stop_one_agent() {
   local name="${1:?sandbox}"
   local pidfile="${STATE_DIR}/${name}.pid"
   if [[ -f "${pidfile}" ]]; then
@@ -183,7 +188,7 @@ stop_one_gateway() {
     fi
     rm -f "${pidfile}"
   fi
-  echo "  ${name}: gateway start process stopped"
+  echo "  ${name}: OpenClaw agent start process stopped"
 }
 
 count_from_existing() {
@@ -201,31 +206,31 @@ count_from_existing() {
   printf '%s' "${max}"
 }
 
-start_gateways() {
+start_agents() {
   local count="${1:?count}"
   local i name
-  echo "Starting OpenClaw + Ollama e2e gateways in ${count} sandboxes (${SANDBOX_PREFIX}0000…)"
+  echo "Starting ${count} OpenClaw agents in ${count} sandboxes (${SANDBOX_PREFIX}0000…). Cluster still has one OpenShell gateway and one Envoy Gateway."
   for ((i = 0; i < count; i += 1)); do
     name="$(sandbox_name "${i}")"
     echo "  sandbox $((i + 1))/${count}: ${name}"
     openshell sandbox get "${name}" >/dev/null 2>&1 \
       || fail "sandbox ${name} does not exist"
-    start_one_gateway "${name}"
+    start_one_agent "${name}"
   done
 }
 
-stop_gateways() {
+stop_agents() {
   local name
-  echo "Stopping OpenClaw gateway start processes for ${SANDBOX_PREFIX}*"
+  echo "Stopping OpenClaw agent start processes for ${SANDBOX_PREFIX}*"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
-    stop_one_gateway "${name}"
+    stop_one_agent "${name}"
   done < <(list_prefix_sandboxes)
 }
 
 cleanup_sandboxes() {
   local name
-  stop_gateways || true
+  stop_agents || true
   echo "Destroying sandboxes named ${SANDBOX_PREFIX}*"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
@@ -275,7 +280,7 @@ create_sandboxes() {
     [[ "${created_ok}" -eq 1 ]] || fail "failed to create ${name}"
     created=$((created + 1))
   done
-  echo "Ready: ${created}/${count} sandboxes. Start gateways with:"
+  echo "Ready: ${created}/${count} sandboxes. Start OpenClaw agents with:"
   echo "  ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh start"
 }
 
@@ -284,10 +289,10 @@ case "${ACTION}" in
     cleanup_sandboxes
     ;;
   start)
-    start_gateways "${E2E_USERS:-$(count_from_existing)}"
+    start_agents "${E2E_USERS:-$(count_from_existing)}"
     ;;
   stop)
-    stop_gateways
+    stop_agents
     ;;
   '' | *[!0-9]*)
     fail "usage: $0 <count>|start|stop|cleanup"

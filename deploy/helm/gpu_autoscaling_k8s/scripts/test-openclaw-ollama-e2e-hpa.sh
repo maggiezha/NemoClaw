@@ -3,14 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # OpenClaw + Ollama e2e 8×H100 saturator: N end users, each with one CPU
-# OpenClaw sandbox. Users send prompts into those sandboxes; OpenClaw calls
-# inference.local → Envoy → Ollama GPU HPA in namespace/release nemoclaw-gpu.
+# OpenClaw sandbox and one OpenClaw agent. Users send prompts into those
+# sandboxes; OpenClaw calls inference.local → Envoy → Ollama GPU HPA in
+# namespace/release nemoclaw-gpu.
 # Same minReplicas=1 / maxReplicas=8 as hpa-load-test-dgx-8xh100.sh.
-# It does not start files/load-generator.ts (that Job talks to metrics-proxy
-# pod IPs). Does not source e2e-common.sh (pairing tests force
-# ENABLE_AUTOSCALING=0). Does not reinstall Prometheus, Envoy Gateway, or
-# OpenShell. Does not change the 4× L40S profile. Does not use the
-# Deep Agents + vLLM stack (nemoclaw-deepagents-vllm). Hermes + vLLM e2e is
+# This does not replace that Job (files/load-generator.ts); keep the Job as
+# the fast HPA-only test. It does not start load-generator.ts. Does not
+# source e2e-common.sh (pairing tests force ENABLE_AUTOSCALING=0). Does not
+# reinstall Prometheus, Envoy Gateway, or OpenShell. Does not add extra
+# OpenShell/Envoy gateways — START_AGENTS starts N OpenClaw agents.
+# Does not change the 4× L40S profile. Does not use the Deep Agents + vLLM
+# stack (nemoclaw-deepagents-vllm). Hermes + vLLM e2e is
 # test-hermes-e2e-hpa.sh and is not run from this script.
 #
 # Usage:
@@ -75,7 +78,9 @@ HPA_BASELINE_WAIT_SEC="${HPA_BASELINE_WAIT_SEC:-240}"
 E2E_BOOTSTRAP_INFLIGHT="${E2E_BOOTSTRAP_INFLIGHT:-32}"
 E2E_INFLIGHT_PER_USER="${E2E_INFLIGHT_PER_USER:-4}"
 E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-${CHART_DIR}/e2e-results/openclaw-ollama}"
-START_GATEWAYS="${START_GATEWAYS:-1}"
+# Start one OpenClaw agent per sandbox (not extra OpenShell/Envoy gateways).
+# START_GATEWAYS is a deprecated alias for START_AGENTS.
+START_AGENTS="${START_AGENTS:-${START_GATEWAYS:-1}}"
 SKIP_INSTALL_HPA="${SKIP_INSTALL_HPA:-0}"
 SKIP_CREATE_SANDBOXES="${SKIP_CREATE_SANDBOXES:-0}"
 
@@ -142,7 +147,7 @@ done
 if [[ "${SKIP_CREATE_SANDBOXES}" != "1" ]]; then
   "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" "${E2E_USERS}"
 fi
-if [[ "${START_GATEWAYS}" == "1" ]]; then
+if [[ "${START_AGENTS}" == "1" ]]; then
   E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" start
 fi
 

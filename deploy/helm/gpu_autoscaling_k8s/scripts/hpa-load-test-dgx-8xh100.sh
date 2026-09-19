@@ -4,7 +4,9 @@
 #
 # Independent 8× H100 on-prem HPA scale-up / scale-down test (DCGM → HPA), then
 # an Envoy LeastRequest distribution check. Separate from the 4× L40S AWS script
-# (hpa-load-test-brev-4xl40s.sh).
+# (hpa-load-test-brev-4xl40s.sh). This Job (files/load-generator.ts) is the fast
+# HPA-only path. Keep it. The OpenClaw/Hermes sandbox e2e scripts are additional
+# architecture coverage and do not replace this test.
 #
 # After HPA reaches maxReplicas (8), generators stop *new* chats. Already
 # in-flight work finishes, then HPA scales down toward minReplicas (1).
