@@ -219,7 +219,7 @@ PY
       echo "  ${name}: Ready"
       return 0
     fi
-    if ((i == 1 || i % 5 == 0)); then
+    if [[ "${i}" -eq 1 ]]; then
       echo "  ${name}: waiting (${phase:-starting})"
     fi
     sleep 2

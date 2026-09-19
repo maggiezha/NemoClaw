@@ -100,7 +100,7 @@ export INFERENCE_MODEL=llama3.2:3b
 
 Optional pairing test (not required for autoscaling): [`scripts/test-openclaw-ollama.sh`](scripts/test-openclaw-ollama.sh).
 
-Multi-user HPA e2e (20 sandboxes saturate the same 8×H100 GPU backend through Envoy; not the pairing script): [`scripts/test-openclaw-e2e-hpa.sh`](scripts/test-openclaw-e2e-hpa.sh).
+Multi-user HPA e2e: N sandboxes (one per end user) on the same 8×H100 GPU backend through Envoy. `E2E_USERS=10` is an example for testing OpenClaw now, and for Hermes and Deep Agents next. OpenClaw: [`scripts/test-openclaw-e2e-hpa.sh`](scripts/test-openclaw-e2e-hpa.sh). Hermes: [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh) (do not run while OpenClaw e2e owns the GPUs).
 
 ### Hermes
 
@@ -165,6 +165,8 @@ above still proves inference.
 Optional pairing test for Hermes + NIM (not required for autoscaling): [`scripts/test-hermes-nim.sh`](scripts/test-hermes-nim.sh).
 Official docs also list vLLM and Ollama for Hermes; the optional NIM test exists so one example shows the NGC Secret flow.
 
+Multi-user HPA e2e for Hermes: same N-user / N-sandbox example as OpenClaw (`E2E_USERS=10` is only an example; `hermes -z` into each sandbox): [`scripts/test-hermes-e2e-hpa.sh`](scripts/test-hermes-e2e-hpa.sh). Do not run it while the OpenClaw e2e owns the GPUs.
+
 ### Deep Agents Code
 
 Matches the official
@@ -196,6 +198,8 @@ openshell sandbox exec -n deepagents-onprem -- dcode
 ```
 
 Optional pairing test (not required for autoscaling): [`scripts/test-deepagents-vllm.sh`](scripts/test-deepagents-vllm.sh).
+
+Multi-user HPA e2e for Deep Agents is the same N-user / N-sandbox example as OpenClaw and Hermes (`E2E_USERS=10` is only an example). That script is the next step after Hermes; it is not in this recipe yet.
 
 ## Env vars
 

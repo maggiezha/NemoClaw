@@ -2,23 +2,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Create, start, stop, or destroy N CPU-only agent sandboxes (one per end user)
-# for the multi-user HPA test. Each sandbox runs the selected AGENT_NAME
-# (openclaw now; hermes / deepagents later). The model stays on GPU inference
-# pods. Traffic: sandbox → inference.local → Envoy → GPU HPA.
+# Create, start, stop, or destroy N CPU-only Hermes agent sandboxes (one per
+# end user) for the multi-user HPA test. Same layout as
+# setup-openclaw-e2e-sandboxes.sh. The model stays on GPU inference pods.
+# Traffic: sandbox → inference.local → Envoy → GPU HPA.
 #
-# Does not run openshell gateway start, nemoclaw launch, or the metrics-proxy
-# chat-completions Job (hpa-load-test-*.sh). Does not destroy sandboxes outside
-# SANDBOX_PREFIX (default openclaw-e2e-).
+# Does not run openshell gateway start, nemohermes launch, or the
+# metrics-proxy chat-completions Job. Does not destroy sandboxes outside
+# SANDBOX_PREFIX (default hermes-e2e-). Does not touch openclaw-e2e-* or
+# hermes-onprem.
 #
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
-#   ./scripts/setup-openclaw-e2e-sandboxes.sh          # default E2E_USERS=10
-#   E2E_USERS=10 ./scripts/setup-openclaw-e2e-sandboxes.sh
-#   ./scripts/setup-openclaw-e2e-sandboxes.sh 10        # same; any positive count
-#   ./scripts/setup-openclaw-e2e-sandboxes.sh start
-#   ./scripts/setup-openclaw-e2e-sandboxes.sh stop
-#   ./scripts/setup-openclaw-e2e-sandboxes.sh cleanup
+#   ./scripts/setup-hermes-e2e-sandboxes.sh             # default E2E_USERS=10
+#   E2E_USERS=10 ./scripts/setup-hermes-e2e-sandboxes.sh
+#   ./scripts/setup-hermes-e2e-sandboxes.sh 10           # same; any positive count
+#   ./scripts/setup-hermes-e2e-sandboxes.sh start
+#   ./scripts/setup-hermes-e2e-sandboxes.sh stop
+#   ./scripts/setup-hermes-e2e-sandboxes.sh cleanup
+#
+# Do not run this while the OpenClaw e2e owns the GPUs.
 
 set -euo pipefail
 
@@ -52,36 +55,31 @@ ACTION="${1:-}"
 if [[ -z "${ACTION}" ]]; then
   ACTION="${E2E_USERS}"
 fi
-export AGENT_NAME="${AGENT_NAME:-openclaw}"
+export AGENT_NAME="${AGENT_NAME:-hermes}"
+[[ "${AGENT_NAME}" == "hermes" ]] \
+  || fail "setup-hermes-e2e-sandboxes.sh is Hermes-only (got AGENT_NAME=${AGENT_NAME})"
 agent_common_validate "${AGENT_NAME}"
-agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-ollama}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-vllm}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
-SANDBOX_PREFIX="${SANDBOX_PREFIX:-${AGENT_NAME}-e2e-}"
+SANDBOX_PREFIX="${SANDBOX_PREFIX:-hermes-e2e-}"
 [[ "${SANDBOX_PREFIX}" =~ ^[a-z][a-z0-9-]{0,40}$ ]] \
   || fail "SANDBOX_PREFIX must be a lowercase Kubernetes-style prefix"
+[[ "${SANDBOX_PREFIX}" == hermes-e2e-* || "${SANDBOX_PREFIX}" == "hermes-e2e-" ]] \
+  || fail "SANDBOX_PREFIX must stay under hermes-e2e- so OpenClaw e2e / hermes-onprem are not destroyed"
 
-export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
+export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-vllm}"
 export INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 export NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 export RELEASE="${RELEASE:-nemoclaw-gpu}"
 export ENABLE_ENVOY_LB="${ENABLE_ENVOY_LB:-1}"
 export INFERENCE_SERVICE="${INFERENCE_SERVICE:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)}"
-if [[ -z "${AGENT_SANDBOX_IMAGE:-}" ]]; then
-  case "${AGENT_NAME}" in
-    openclaw)
-      AGENT_SANDBOX_IMAGE="ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba"
-      ;;
-    *)
-      fail "set AGENT_SANDBOX_IMAGE for AGENT_NAME=${AGENT_NAME} (Hermes / Deep Agents e2e reuse this layout later)"
-      ;;
-  esac
-fi
-export AGENT_SANDBOX_IMAGE
+# Official complete Hermes image (not *-sandbox-base).
+export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/hermes-sandbox@sha256:28b9578ab9676ef046de37fa6feb9b7b61824b87d77fd08978758bd01c03cb54}"
 export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-2}"
 export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-4Gi}"
 export OPENSHELL_PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
 
-STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/openclaw-gateways}"
+STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/hermes-gateways}"
 mkdir -p "${STATE_DIR}"
 
 sandbox_name() {
@@ -119,7 +117,7 @@ PY
 gateway_health_ok() {
   local name="${1:?sandbox}"
   timeout --foreground 20 openshell sandbox exec -n "${name}" --no-tty -- \
-    bash -c 'code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:18789/health 2>/dev/null || true)"; case "${code}" in 200|401) exit 0 ;; esac; exit 1' \
+    bash -c 'code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:8642/health 2>/dev/null || true)"; case "${code}" in 200|401) exit 0 ;; esac; exit 1' \
     >/dev/null 2>&1
 }
 
@@ -128,7 +126,7 @@ start_one_gateway() {
   local log="${STATE_DIR}/${name}.log"
   local pidfile="${STATE_DIR}/${name}.pid"
   if gateway_health_ok "${name}"; then
-    echo "  ${name}: OpenClaw gateway already healthy"
+    echo "  ${name}: Hermes gateway already healthy"
     return 0
   fi
   if [[ -f "${pidfile}" ]]; then
@@ -154,7 +152,7 @@ start_one_gateway() {
     fi
     sleep 2
   done
-  echo "ERROR: ${name} OpenClaw gateway did not become healthy; see ${log}" >&2
+  echo "ERROR: ${name} Hermes gateway did not become healthy; see ${log}" >&2
   return 1
 }
 
@@ -176,7 +174,7 @@ stop_one_gateway() {
 count_from_existing() {
   local names max=0 n
   names="$(list_prefix_sandboxes)"
-  [[ -n "${names}" ]] || fail "no ${SANDBOX_PREFIX}* sandboxes; run ./scripts/setup-openclaw-e2e-sandboxes.sh ${E2E_USERS} first"
+  [[ -n "${names}" ]] || fail "no ${SANDBOX_PREFIX}* sandboxes; run ./scripts/setup-hermes-e2e-sandboxes.sh ${E2E_USERS} first"
   while IFS= read -r n; do
     [[ -z "${n}" ]] && continue
     n="${n#"${SANDBOX_PREFIX}"}"
@@ -191,7 +189,8 @@ count_from_existing() {
 start_gateways() {
   local count="${1:?count}"
   local i name
-  echo "Starting OpenClaw gateways in ${count} sandboxes (${SANDBOX_PREFIX}0000…)"
+  echo "Starting Hermes gateways in ${count} sandboxes (${SANDBOX_PREFIX}0000…)"
+  echo "  Optional for e2e load: hermes -z does not need :8642."
   for ((i = 0; i < count; i += 1)); do
     name="$(sandbox_name "${i}")"
     openshell sandbox get "${name}" >/dev/null 2>&1 \
@@ -202,7 +201,7 @@ start_gateways() {
 
 stop_gateways() {
   local name
-  echo "Stopping OpenClaw gateway start processes for ${SANDBOX_PREFIX}*"
+  echo "Stopping Hermes gateway start processes for ${SANDBOX_PREFIX}*"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
     stop_one_gateway "${name}"
@@ -212,7 +211,7 @@ stop_gateways() {
 cleanup_sandboxes() {
   local name
   stop_gateways || true
-  echo "Destroying sandboxes named ${SANDBOX_PREFIX}*"
+  echo "Destroying sandboxes named ${SANDBOX_PREFIX}* (not hermes-onprem, not openclaw-e2e-*)"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
     echo "  destroying ${name}"
@@ -244,7 +243,7 @@ create_sandboxes() {
     echo "  creating ${name} (user ${i}, agent ${AGENT_NAME})"
     created_ok=0
     for attempt in 1 2 3 4 5; do
-      if AGENT_SANDBOX_NAME="${name}" \
+      if AGENT_NAME=hermes AGENT_SANDBOX_NAME="${name}" \
         SKIP_CREATE_SMOKE="$([[ "${i}" -eq 0 && "${attempt}" -eq 1 ]] && echo 0 || echo 1)" \
         "${SCRIPT_DIR}/create-agent-sandbox.sh"; then
         created_ok=1
@@ -261,8 +260,9 @@ create_sandboxes() {
     [[ "${created_ok}" -eq 1 ]] || fail "failed to create ${name}"
     created=$((created + 1))
   done
-  echo "Ready: ${created}/${count} sandboxes. Start gateways with:"
-  echo "  ./scripts/setup-openclaw-e2e-sandboxes.sh start"
+  echo "Ready: ${created}/${count} sandboxes. Optional gateway start:"
+  echo "  ./scripts/setup-hermes-e2e-sandboxes.sh start"
+  echo "Load path is hermes -z into each sandbox (no Envoy-direct Job)."
 }
 
 case "${ACTION}" in

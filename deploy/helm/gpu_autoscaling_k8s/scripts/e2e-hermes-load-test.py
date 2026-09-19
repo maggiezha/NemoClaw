@@ -2,20 +2,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-N end users send prompts into N CPU agent sandboxes (OpenClaw).
+N end users send prompts into N CPU agent sandboxes (Hermes).
 Default N is E2E_USERS=10 (one sandbox per user).
 
 Each user talks only to its sandbox:
 
-    openshell sandbox exec -n openclaw-e2e-NNNN -- openclaw agent --agent main -m "..."
+    openshell sandbox exec -n hermes-e2e-NNNN -- hermes -z "..."
 
 The agent inside the sandbox then calls https://inference.local (Envoy → GPU HPA).
 This is not files/load-generator.ts (that Job POSTs chat/completions at pod IPs).
 This is not in-sandbox curl to inference.local.
+This is not the OpenClaw e2e (openclaw agent --agent main -m).
 
 Usage:
-    E2E_USERS=10 python3 scripts/e2e-openclaw-load-test.py
-    python3 scripts/e2e-openclaw-load-test.py --users 10
+    E2E_USERS=10 python3 scripts/e2e-hermes-load-test.py
+    python3 scripts/e2e-hermes-load-test.py --users 10
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ import asyncio
 import csv
 import json
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -88,7 +88,7 @@ async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
 
 
 async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[bool, str]:
-    """One end-user turn: prompt goes to the sandbox agent, not to Envoy."""
+    """One end-user turn: prompt goes to the sandbox Hermes agent, not to Envoy."""
     openshell = shutil.which("openshell")
     if not openshell:
         return False, "openshell is not on PATH"
@@ -100,11 +100,8 @@ async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[
         sandbox,
         "--no-tty",
         "--",
-        "openclaw",
-        "agent",
-        "--agent",
-        "main",
-        "-m",
+        "hermes",
+        "-z",
         prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -120,9 +117,9 @@ async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[
     if proc.returncode != 0:
         return False, stderr or stdout or f"exit {proc.returncode}"
     if FALLBACK_RE.search(combined):
-        return False, "OpenClaw used embedded fallback instead of the managed gateway"
+        return False, "Hermes used embedded fallback instead of the managed gateway"
     if not stdout:
-        return False, "empty OpenClaw response"
+        return False, "empty Hermes response"
     return True, stdout
 
 
@@ -195,9 +192,9 @@ async def run_test(args: argparse.Namespace) -> int:
     hold_started: float | None = None
 
     print("=" * 70)
-    print(f"  {args.users} end users → {args.users} OpenClaw agent sandboxes → Envoy → GPU HPA")
+    print(f"  {args.users} end users → {args.users} Hermes agent sandboxes → Envoy → GPU HPA")
     print(f"  Users: {args.users}  sandbox prefix={args.prefix}")
-    print("  Query: openshell sandbox exec -- openclaw agent --agent main -m")
+    print("  Query: openshell sandbox exec -- hermes -z")
     print("  Not: load-generator.ts pod-IP Job, not in-sandbox curl to Envoy")
     print(f"  Concurrent prompts per user: {args.inflight_per_user}")
     print(f"  GPU inference model={args.model}  HPA {args.hpa_namespace}/{args.hpa_name}")
@@ -294,7 +291,7 @@ async def run_test(args: argparse.Namespace) -> int:
     failed = sum(int(r.get("err") or 0) for r in results)
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "path": "user -> sandbox openclaw agent -> inference.local -> Envoy -> GPU HPA",
+        "path": "user -> sandbox hermes -z -> inference.local -> Envoy -> GPU HPA",
         "users": args.users,
         "target_pods": args.target_pods,
         "hpa_max_replicas": max_replicas,
@@ -315,7 +312,7 @@ async def run_test(args: argparse.Namespace) -> int:
         f"user→sandbox queries ok={successful} err={failed}"
     )
     if successful < 1:
-        print("No successful user→sandbox OpenClaw queries.", file=sys.stderr)
+        print("No successful user→sandbox Hermes queries.", file=sys.stderr)
         return 1
     if not summary["reached_target"]:
         print(
@@ -331,19 +328,22 @@ async def run_test(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="N end users send OpenClaw prompts into N sandboxes (not Envoy-direct); default E2E_USERS=10"
+        description="N end users send Hermes -z prompts into N sandboxes (not Envoy-direct); default E2E_USERS=10"
     )
     parser.add_argument("--users", type=int, default=int(os.environ.get("E2E_USERS", "10")))
-    parser.add_argument("--prefix", default=os.environ.get("SANDBOX_PREFIX", "openclaw-e2e-"))
-    parser.add_argument("--output", default=os.environ.get("E2E_OUTPUT_DIR", "./e2e-results"))
-    parser.add_argument("--model", default=os.environ.get("INFERENCE_MODEL", "llama3.2:3b"))
+    parser.add_argument("--prefix", default=os.environ.get("SANDBOX_PREFIX", "hermes-e2e-"))
+    parser.add_argument("--output", default=os.environ.get("E2E_OUTPUT_DIR", "./e2e-results/hermes"))
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("INFERENCE_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8"),
+    )
     parser.add_argument("--duration", type=int, default=int(os.environ.get("DURATION_SEC", "900")))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("E2E_PROMPT_TIMEOUT_SEC", "180")))
     parser.add_argument(
         "--inflight-per-user",
         type=int,
         default=int(os.environ.get("E2E_INFLIGHT_PER_USER", "4")),
-        help="Concurrent openclaw agent prompts each user sends into their sandbox",
+        help="Concurrent hermes -z prompts each user sends into their sandbox",
     )
     parser.add_argument("--target-pods", type=int, default=int(os.environ.get("TARGET_PODS", "8")))
     parser.add_argument("--hold-sec", type=float, default=float(os.environ.get("MAX_REPLICAS_HOLD_SEC", "0")))

@@ -2,19 +2,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end 8×H100 saturator: N end users, each with one CPU agent sandbox
-# (AGENT_NAME=openclaw today; hermes / deepagents later). Those sandboxes send
-# load through inference.local → Envoy → GPU HPA (the model runs on GPU pods,
-# not in the sandbox). Same inflight / token / minReplicas=1 / maxReplicas=8
-# knobs as hpa-load-test-dgx-8xh100.sh.
-# It does not start files/load-generator.ts (that Job talks to metrics-proxy
-# pod IPs). Does not source e2e-common.sh (pairing tests force
-# ENABLE_AUTOSCALING=0). Does not reinstall Prometheus, Envoy Gateway, or
-# OpenShell. Does not change the 4× L40S profile.
+# End-to-end 8×H100 saturator for Hermes: N end users, each with one CPU Hermes
+# sandbox. The load generator sends hermes -z prompts into those sandboxes;
+# Hermes calls inference.local → Envoy → GPU HPA (the model runs on GPU pods,
+# not in the sandbox). Same minReplicas=1 / maxReplicas=8 as the OpenClaw e2e.
+#
+# It does not start files/load-generator.ts. Does not source e2e-common.sh
+# (pairing tests force ENABLE_AUTOSCALING=0). Does not reinstall Prometheus,
+# Envoy Gateway, or OpenShell. Does not change the 4× L40S profile. Does not
+# create or destroy openclaw-e2e-* or hermes-onprem.
+#
+# Do not run this while the OpenClaw e2e owns the GPUs.
 #
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
-#   ./scripts/test-openclaw-e2e-hpa.sh
+#   ./scripts/test-hermes-e2e-hpa.sh
 
 set -euo pipefail
 
@@ -34,9 +36,11 @@ fail() {
 }
 
 export PATH="${HOME}/.local/bin:${PATH}"
-export AGENT_NAME="${AGENT_NAME:-openclaw}"
+export AGENT_NAME="${AGENT_NAME:-hermes}"
+[[ "${AGENT_NAME}" == "hermes" ]] \
+  || fail "test-hermes-e2e-hpa.sh is Hermes-only (got AGENT_NAME=${AGENT_NAME})"
 agent_common_validate "${AGENT_NAME}"
-export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
+export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-vllm}"
 agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
 export INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
@@ -53,23 +57,18 @@ export SKIP_MONITORING="${SKIP_MONITORING:-1}"
 export USE_EXISTING_PROMETHEUS="${USE_EXISTING_PROMETHEUS:-1}"
 export INGRESS_SERVICE_TYPE="${INGRESS_SERVICE_TYPE:-ClusterIP}"
 export E2E_USERS="${E2E_USERS:-10}"
-export SANDBOX_PREFIX="${SANDBOX_PREFIX:-openclaw-e2e-}"
-export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba}"
+export SANDBOX_PREFIX="${SANDBOX_PREFIX:-hermes-e2e-}"
+export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/hermes-sandbox@sha256:28b9578ab9676ef046de37fa6feb9b7b61824b87d77fd08978758bd01c03cb54}"
 export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-2}"
 export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-4Gi}"
-export INFLIGHT_PER_GPU="${INFLIGHT_PER_GPU:-320}"
-export LOAD_MULTIPLIER="${LOAD_MULTIPLIER:-2}"
-export MAX_INFLIGHT_PER_POD="${MAX_INFLIGHT_PER_POD:-640}"
-export MAX_TOKENS="${MAX_TOKENS:-128}"
 export DURATION_SEC="${DURATION_SEC:-900}"
 export MAX_REPLICAS_HOLD_SEC="${MAX_REPLICAS_HOLD_SEC:-0}"
 export SCALE_DOWN_WAIT_LOOPS="${SCALE_DOWN_WAIT_LOOPS:-40}"
 HPA_BASELINE_WAIT_SEC="${HPA_BASELINE_WAIT_SEC:-240}"
-# User→sandbox path uses E2E_INFLIGHT_PER_USER. Do not reuse the Job's BOOTSTRAP_INFLIGHT=160.
-E2E_BOOTSTRAP_INFLIGHT="${E2E_BOOTSTRAP_INFLIGHT:-32}"
 E2E_INFLIGHT_PER_USER="${E2E_INFLIGHT_PER_USER:-4}"
-E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-${CHART_DIR}/e2e-results}"
-START_GATEWAYS="${START_GATEWAYS:-1}"
+E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-${CHART_DIR}/e2e-results/hermes}"
+# hermes -z is the user→sandbox query and does not need :8642.
+START_GATEWAYS="${START_GATEWAYS:-0}"
 SKIP_INSTALL_HPA="${SKIP_INSTALL_HPA:-0}"
 SKIP_CREATE_SANDBOXES="${SKIP_CREATE_SANDBOXES:-0}"
 
@@ -83,7 +82,7 @@ if [[ "${ENABLE_ENVOY_LB}" != "1" ]]; then
   fail "this e2e requires ENABLE_ENVOY_LB=1 so sandboxes reach GPUs through Envoy"
 fi
 if [[ "${ENABLE_AUTOSCALING}" != "1" ]]; then
-  fail "this e2e requires ENABLE_AUTOSCALING=1 (pairing tests are test-openclaw-ollama.sh)"
+  fail "this e2e requires ENABLE_AUTOSCALING=1 (pairing tests are test-hermes-nim.sh)"
 fi
 
 DEPLOYMENT="$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)"
@@ -134,15 +133,15 @@ while ((SECONDS < deadline)); do
 done
 
 if [[ "${SKIP_CREATE_SANDBOXES}" != "1" ]]; then
-  "${SCRIPT_DIR}/setup-openclaw-e2e-sandboxes.sh" "${E2E_USERS}"
+  "${SCRIPT_DIR}/setup-hermes-e2e-sandboxes.sh" "${E2E_USERS}"
 fi
 if [[ "${START_GATEWAYS}" == "1" ]]; then
-  E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-e2e-sandboxes.sh" start
+  E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-hermes-e2e-sandboxes.sh" start
 fi
 
-echo "${E2E_USERS} users sending openclaw agent prompts into ${E2E_USERS} CPU ${AGENT_DISPLAY_NAME} sandboxes (not Envoy-direct, not load-generator.ts)"
+echo "${E2E_USERS} users sending hermes -z prompts into ${E2E_USERS} CPU ${AGENT_DISPLAY_NAME} sandboxes (not Envoy-direct, not load-generator.ts)"
 set +e
-python3 "${SCRIPT_DIR}/e2e-openclaw-load-test.py" \
+python3 "${SCRIPT_DIR}/e2e-hermes-load-test.py" \
   --users "${E2E_USERS}" \
   --prefix "${SANDBOX_PREFIX}" \
   --output "${E2E_OUTPUT_DIR}" \
@@ -159,7 +158,7 @@ set -e
 
 hpa_common_print_hpa "${NAMESPACE}" || true
 if [[ "${LOAD_RC}" -ne 0 ]]; then
-  fail "sandbox saturator failed (exit ${LOAD_RC}); results in ${E2E_OUTPUT_DIR}"
+  fail "Hermes user→sandbox load failed (exit ${LOAD_RC}); results in ${E2E_OUTPUT_DIR}"
 fi
 echo "OK: ${E2E_USERS} CPU ${AGENT_DISPLAY_NAME} agent sandboxes drove GPU HPA ${NAMESPACE}/${RELEASE} through Envoy (1→8→1)."
-echo "Tear down only these sandboxes with: ./scripts/setup-openclaw-e2e-sandboxes.sh cleanup"
+echo "Tear down only these sandboxes with: ./scripts/setup-hermes-e2e-sandboxes.sh cleanup"
