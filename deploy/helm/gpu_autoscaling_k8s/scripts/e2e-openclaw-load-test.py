@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-20-user OpenClaw sandbox saturator for the same 8×H100 GPU HPA backend.
+20 end users send prompts into 20 CPU agent sandboxes (OpenClaw).
 
-Each simulated end user owns one CPU-only sandbox. That sandbox sends concurrent
-chat completions to https://inference.local (Envoy → GPU replicas). Combined
-in-flight matches the 8×H100 knobs (320×2 per GPU, cap 640/pod) split across
-the users — this replaces files/load-generator.ts for the multi-sandbox e2e.
+Each user talks only to its sandbox:
+
+    openshell sandbox exec -n openclaw-e2e-NNNN -- openclaw agent --agent main -m "..."
+
+The agent inside the sandbox then calls https://inference.local (Envoy → GPU HPA).
+This is not files/load-generator.ts (that Job POSTs chat/completions at pod IPs).
+This is not in-sandbox curl to inference.local.
 
 Usage:
     python3 scripts/e2e-openclaw-load-test.py --users 20
@@ -17,16 +20,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import csv
 import json
 import os
+import random
+import re
 import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+FALLBACK_RE = re.compile(
+    r"EMBEDDED FALLBACK|\[agent/embedded\]|fallbackFrom[\": ]+gateway|transport[\": ]+embedded",
+    re.IGNORECASE,
+)
 
 PROMPTS = [
     "In one sentence, what is an AI agent sandbox?",
@@ -65,31 +74,6 @@ def read_hpa(namespace: str, name: str) -> tuple[int, int]:
     return current, desired
 
 
-def load_saturate_script(script_path: Path) -> str:
-    text = script_path.read_text()
-    if "sandbox-saturate" not in text:
-        raise RuntimeError(f"{script_path} does not look like the sandbox saturator")
-    return text
-
-
-def parse_ok_err(log_path: Path) -> tuple[int, int]:
-    ok = err = 0
-    try:
-        tail = log_path.read_text(errors="replace").strip().splitlines()
-    except OSError:
-        return 0, 0
-    for line in reversed(tail):
-        if "ok=" not in line or "err=" not in line:
-            continue
-        for part in line.split():
-            if part.startswith("ok="):
-                ok = int(part.split("=", 1)[1])
-            if part.startswith("err="):
-                err = int(part.split("=", 1)[1])
-        break
-    return ok, err
-
-
 async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is not None:
         return
@@ -101,91 +85,122 @@ async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-async def run_user_sandbox(
-    user_id: int,
-    prefix: str,
-    script_b64: str,
-    inflight: int,
-    max_inflight: int,
-    duration_sec: int,
-    max_tokens: int,
-    model: str,
-    log_path: Path,
-    procs: list[asyncio.subprocess.Process],
-) -> dict[str, object]:
+async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[bool, str]:
+    """One end-user turn: prompt goes to the sandbox agent, not to Envoy."""
     openshell = shutil.which("openshell")
     if not openshell:
-        raise RuntimeError("openshell is not on PATH")
-    name = sandbox_name(prefix, user_id)
-    prompt = PROMPTS[user_id % len(PROMPTS)].replace("'", "")
-    remote = (
-        f"echo {script_b64} | base64 -d | "
-        f"INFLIGHT={inflight} MAX_INFLIGHT={max_inflight} "
-        f"DURATION_SEC={duration_sec} MAX_TOKENS={max_tokens} "
-        f"INFERENCE_MODEL={model} PROMPT='{prompt}' bash"
-    )
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = log_path.open("w")
-    started = time.monotonic()
+        return False, "openshell is not on PATH"
     proc = await asyncio.create_subprocess_exec(
         openshell,
         "sandbox",
         "exec",
         "-n",
-        name,
+        sandbox,
         "--no-tty",
         "--",
-        "bash",
-        "-c",
-        remote,
-        stdout=log_handle,
-        stderr=asyncio.subprocess.STDOUT,
+        "openclaw",
+        "agent",
+        "--agent",
+        "main",
+        "-m",
+        prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    procs.append(proc)
     try:
-        rc = await proc.wait()
-    except asyncio.CancelledError:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
         await terminate_proc(proc)
-        rc = proc.returncode if proc.returncode is not None else -15
+        return False, f"timed out after {timeout_sec}s"
+    stdout = stdout_b.decode("utf-8", errors="replace").strip()
+    stderr = stderr_b.decode("utf-8", errors="replace").strip()
+    combined = f"{stdout}\n{stderr}"
+    if proc.returncode != 0:
+        return False, stderr or stdout or f"exit {proc.returncode}"
+    if FALLBACK_RE.search(combined):
+        return False, "OpenClaw used embedded fallback instead of the managed gateway"
+    if not stdout:
+        return False, "empty OpenClaw response"
+    return True, stdout
+
+
+async def simulate_user(
+    user_id: int,
+    prefix: str,
+    inflight: int,
+    duration_sec: int,
+    timeout_sec: int,
+    stop_event: asyncio.Event,
+    log_path: Path,
+) -> dict[str, object]:
+    sandbox = sandbox_name(prefix, user_id)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = 0
+    err = 0
+    started = time.monotonic()
+    end = started + duration_sec
+    turn = 0
+    log_handle = log_path.open("w")
+
+    async def one_turn(turn_id: int) -> None:
+        nonlocal ok, err
+        prompt = PROMPTS[(user_id + turn_id) % len(PROMPTS)]
+        success, detail = await send_user_query(sandbox, prompt, timeout_sec)
+        if success:
+            ok += 1
+            log_handle.write(f"ok turn={turn_id}\n")
+        else:
+            err += 1
+            log_handle.write(f"err turn={turn_id} {detail}\n")
+            print(f"[user {user_id} {sandbox}] turn {turn_id} error: {detail}", file=sys.stderr)
+        log_handle.flush()
+
+    pending: set[asyncio.Task[None]] = set()
+    try:
+        while time.monotonic() < end and not stop_event.is_set():
+            while len(pending) < inflight and time.monotonic() < end and not stop_event.is_set():
+                pending.add(asyncio.create_task(one_turn(turn)))
+                turn += 1
+            if not pending:
+                break
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
     finally:
+        log_handle.write(f"ok={ok} err={err}\n")
         log_handle.close()
-    elapsed = time.monotonic() - started
-    ok, err = parse_ok_err(log_path)
     return {
         "user_id": user_id,
-        "sandbox": name,
-        "returncode": rc,
-        "duration": elapsed,
+        "sandbox": sandbox,
         "ok": ok,
         "err": err,
+        "turns": turn,
+        "duration": time.monotonic() - started,
         "log": str(log_path),
     }
 
 
 async def run_test(args: argparse.Namespace) -> int:
-    script_path = Path(args.saturate_script)
-    script_b64 = base64.b64encode(load_saturate_script(script_path).encode()).decode("ascii")
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = output_dir / "sandbox-logs"
-
-    per_pod_peak = min(args.inflight_per_gpu * args.load_multiplier, args.max_inflight_per_pod)
-    max_inflight = max(1, (per_pod_peak * args.target_pods + args.users - 1) // args.users)
-    inflight = max(1, min(args.bootstrap_inflight, max_inflight))
-
-    print("=" * 70)
-    print("  OpenClaw 20-user sandbox saturator (8×H100 GPU HPA backend)")
-    print(f"  Users/sandboxes: {args.users}  prefix={args.prefix}")
-    print(f"  Per sandbox inflight {inflight} → {max_inflight} (cluster cap {per_pod_peak}/GPU pod × {args.target_pods})")
-    print(f"  Tokens={args.max_tokens}  duration≤{args.duration}s  model={args.model}")
-    print(f"  Path: user → sandbox → inference.local → Envoy → GPU HPA")
-    print("=" * 70)
-
     stop_load = asyncio.Event()
     hpa_rows: list[dict[str, object]] = []
     max_replicas = 0
     reached_target = False
     hold_started: float | None = None
+
+    print("=" * 70)
+    print("  20 end users → 20 OpenClaw agent sandboxes → Envoy → GPU HPA")
+    print(f"  Users: {args.users}  sandbox prefix={args.prefix}")
+    print("  Query: openshell sandbox exec -- openclaw agent --agent main -m")
+    print("  Not: load-generator.ts pod-IP Job, not in-sandbox curl to Envoy")
+    print(f"  Concurrent prompts per user: {args.inflight_per_user}")
+    print(f"  GPU inference model={args.model}  HPA {args.hpa_namespace}/{args.hpa_name}")
+    print(f"  duration≤{args.duration}s  target replicas={args.target_pods}")
+    print("=" * 70)
 
     async def poll_hpa() -> None:
         nonlocal max_replicas, reached_target, hold_started
@@ -203,7 +218,10 @@ async def run_test(args: argparse.Namespace) -> int:
             if current >= args.target_pods:
                 if hold_started is None:
                     hold_started = time.monotonic()
-                    print(f"[hpa] reached {args.target_pods} replicas; holding {args.hold_sec}s then stopping sandbox load")
+                    print(
+                        f"[hpa] reached {args.target_pods} replicas; "
+                        f"holding {args.hold_sec}s then stopping user queries"
+                    )
                 if time.monotonic() - hold_started >= args.hold_sec:
                     reached_target = True
                     stop_load.set()
@@ -213,40 +231,28 @@ async def run_test(args: argparse.Namespace) -> int:
             except asyncio.TimeoutError:
                 continue
 
-    procs: list[asyncio.subprocess.Process] = []
     poll_task = asyncio.create_task(poll_hpa())
     user_tasks = [
         asyncio.create_task(
-            run_user_sandbox(
+            simulate_user(
                 user_id=i,
                 prefix=args.prefix,
-                script_b64=script_b64,
-                inflight=inflight,
-                max_inflight=max_inflight,
+                inflight=args.inflight_per_user,
                 duration_sec=args.duration,
-                max_tokens=args.max_tokens,
-                model=args.model,
+                timeout_sec=args.timeout,
+                stop_event=stop_load,
                 log_path=logs_dir / f"{sandbox_name(args.prefix, i)}.log",
-                procs=procs,
             )
         )
         for i in range(args.users)
     ]
 
     deadline = time.monotonic() + args.duration + 30
-    load_stopped = False
     while True:
-        if (stop_load.is_set() or time.monotonic() >= deadline) and not load_stopped:
-            load_stopped = True
+        if stop_load.is_set() or time.monotonic() >= deadline or all(t.done() for t in user_tasks):
             if time.monotonic() >= deadline and not stop_load.is_set():
-                print("[load] duration elapsed; stopping sandbox saturators", file=sys.stderr)
-                stop_load.set()
-            else:
-                print("[load] stopping sandbox saturators")
-            for proc in procs:
-                await terminate_proc(proc)
-            break
-        if all(task.done() for task in user_tasks):
+                print("[load] duration elapsed; stopping user queries", file=sys.stderr)
+            stop_load.set()
             break
         await asyncio.sleep(1)
 
@@ -258,11 +264,8 @@ async def run_test(args: argparse.Namespace) -> int:
         else:
             normalized.append({"error": str(item), "ok": 0, "err": 1})
     results = normalized
-
-    stop_load.set()
     await poll_task
 
-    # Wait for scale-down after load stops.
     scale_down_ok = False
     for _ in range(args.scale_down_wait_loops):
         current, desired = await asyncio.to_thread(read_hpa, args.hpa_namespace, args.hpa_name)
@@ -287,25 +290,16 @@ async def run_test(args: argparse.Namespace) -> int:
 
     successful = sum(int(r.get("ok") or 0) for r in results)
     failed = sum(int(r.get("err") or 0) for r in results)
-    if successful < 1:
-        for result in results:
-            log_file = result.get("log")
-            if not log_file:
-                continue
-            ok, err = parse_ok_err(Path(str(log_file)))
-            result["ok"] = ok
-            result["err"] = err
-        successful = sum(int(r.get("ok") or 0) for r in results)
-        failed = sum(int(r.get("err") or 0) for r in results)
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "path": "user -> sandbox openclaw agent -> inference.local -> Envoy -> GPU HPA",
         "users": args.users,
         "target_pods": args.target_pods,
         "hpa_max_replicas": max_replicas,
         "reached_target": reached_target or max_replicas >= args.target_pods,
         "scale_down_ok": scale_down_ok,
-        "successful_completions": successful,
-        "failed_completions": failed,
+        "successful_queries": successful,
+        "failed_queries": failed,
         "results": results,
     }
     summary_path = output_dir / f"summary_{args.users}users.json"
@@ -316,43 +310,48 @@ async def run_test(args: argparse.Namespace) -> int:
         f"HPA max={max_replicas} target={args.target_pods} "
         f"scale_up={'ok' if summary['reached_target'] else 'FAIL'} "
         f"scale_down={'ok' if scale_down_ok else 'FAIL'} "
-        f"completions ok={successful} err={failed}"
+        f"user→sandbox queries ok={successful} err={failed}"
     )
     if successful < 1:
-        print("No successful in-sandbox completions.", file=sys.stderr)
+        print("No successful user→sandbox OpenClaw queries.", file=sys.stderr)
         return 1
     if not summary["reached_target"]:
-        print(f"HPA did not scale to {args.target_pods} replicas under sandbox load.", file=sys.stderr)
+        print(
+            f"HPA did not scale to {args.target_pods} replicas under user→sandbox load.",
+            file=sys.stderr,
+        )
         return 1
     if not scale_down_ok:
-        print("HPA did not scale down to 1 replica after sandbox load stopped.", file=sys.stderr)
+        print("HPA did not scale down to 1 replica after user queries stopped.", file=sys.stderr)
         return 1
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="OpenClaw multi-sandbox GPU saturator")
+    parser = argparse.ArgumentParser(
+        description="20 end users send OpenClaw prompts into 20 sandboxes (not Envoy-direct)"
+    )
     parser.add_argument("--users", type=int, default=int(os.environ.get("E2E_USERS", "20")))
     parser.add_argument("--prefix", default=os.environ.get("SANDBOX_PREFIX", "openclaw-e2e-"))
     parser.add_argument("--output", default=os.environ.get("E2E_OUTPUT_DIR", "./e2e-results"))
     parser.add_argument("--model", default=os.environ.get("INFERENCE_MODEL", "llama3.2:3b"))
     parser.add_argument("--duration", type=int, default=int(os.environ.get("DURATION_SEC", "900")))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("MAX_TOKENS", "128")))
-    parser.add_argument("--inflight-per-gpu", type=int, default=int(os.environ.get("INFLIGHT_PER_GPU", "320")))
-    parser.add_argument("--load-multiplier", type=int, default=int(os.environ.get("LOAD_MULTIPLIER", "2")))
-    parser.add_argument("--max-inflight-per-pod", type=int, default=int(os.environ.get("MAX_INFLIGHT_PER_POD", "640")))
-    parser.add_argument("--bootstrap-inflight", type=int, default=int(os.environ.get("E2E_BOOTSTRAP_INFLIGHT", "32")))
+    parser.add_argument("--timeout", type=int, default=int(os.environ.get("E2E_PROMPT_TIMEOUT_SEC", "180")))
+    parser.add_argument(
+        "--inflight-per-user",
+        type=int,
+        default=int(os.environ.get("E2E_INFLIGHT_PER_USER", "4")),
+        help="Concurrent openclaw agent prompts each user sends into their sandbox",
+    )
     parser.add_argument("--target-pods", type=int, default=int(os.environ.get("TARGET_PODS", "8")))
     parser.add_argument("--hold-sec", type=float, default=float(os.environ.get("MAX_REPLICAS_HOLD_SEC", "0")))
     parser.add_argument("--hpa-namespace", default=os.environ.get("NAMESPACE", "nemoclaw-gpu"))
     parser.add_argument("--hpa-name", default=os.environ.get("HPA_NAME", "nemoclaw-gpu-metrics-proxy"))
     parser.add_argument("--hpa-poll-sec", type=float, default=float(os.environ.get("SCALE_UP_POLL_SEC", "10")))
     parser.add_argument("--scale-down-wait-loops", type=int, default=int(os.environ.get("SCALE_DOWN_WAIT_LOOPS", "40")))
-    default_script = Path(__file__).resolve().parent.parent / "files" / "e2e-sandbox-saturate.sh"
-    parser.add_argument("--saturate-script", default=str(default_script))
     args = parser.parse_args()
-    if args.users < 1:
-        print("--users must be >= 1", file=sys.stderr)
+    if args.users < 1 or args.inflight_per_user < 1:
+        print("--users and --inflight-per-user must be >= 1", file=sys.stderr)
         return 2
     return asyncio.run(run_test(args))
 

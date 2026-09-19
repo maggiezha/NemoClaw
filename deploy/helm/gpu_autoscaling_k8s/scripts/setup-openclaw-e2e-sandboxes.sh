@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Create, start, stop, or destroy N CPU-only OpenClaw sandboxes for the multi-user
-# end-to-end HPA test. Each sandbox is one simulated end user. Inference still
-# goes through the shared OpenShell inference.local route (Envoy LeastRequest when
-# a Gateway exists) onto the same GPU HPA backend as install-hpa.sh.
+# Create, start, stop, or destroy N CPU-only agent sandboxes (one per end user)
+# for the multi-user HPA test. Each sandbox runs the selected AGENT_NAME
+# (openclaw now; hermes / deepagents later). The model stays on GPU inference
+# pods. Traffic: sandbox → inference.local → Envoy → GPU HPA.
 #
 # Does not run openshell gateway start, nemoclaw launch, or the metrics-proxy
 # chat-completions Job (hpa-load-test-*.sh). Does not destroy sandboxes outside
@@ -46,22 +46,34 @@ require_cmd python3
 export PATH="${HOME}/.local/bin:${PATH}"
 
 ACTION="${1:-20}"
-SANDBOX_PREFIX="${SANDBOX_PREFIX:-openclaw-e2e-}"
+export AGENT_NAME="${AGENT_NAME:-openclaw}"
+agent_common_validate "${AGENT_NAME}"
+agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-ollama}"
+AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
+SANDBOX_PREFIX="${SANDBOX_PREFIX:-${AGENT_NAME}-e2e-}"
 [[ "${SANDBOX_PREFIX}" =~ ^[a-z][a-z0-9-]{0,40}$ ]] \
   || fail "SANDBOX_PREFIX must be a lowercase Kubernetes-style prefix"
 
-export AGENT_NAME=openclaw
-agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME:-ollama}"
 export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
 export INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 export NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 export RELEASE="${RELEASE:-nemoclaw-gpu}"
 export ENABLE_ENVOY_LB="${ENABLE_ENVOY_LB:-1}"
 export INFERENCE_SERVICE="${INFERENCE_SERVICE:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)}"
-export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba}"
+if [[ -z "${AGENT_SANDBOX_IMAGE:-}" ]]; then
+  case "${AGENT_NAME}" in
+    openclaw)
+      AGENT_SANDBOX_IMAGE="ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba"
+      ;;
+    *)
+      fail "set AGENT_SANDBOX_IMAGE for AGENT_NAME=${AGENT_NAME} (Hermes / Deep Agents e2e reuse this layout later)"
+      ;;
+  esac
+fi
+export AGENT_SANDBOX_IMAGE
 export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-2}"
 export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-4Gi}"
-export OPENSHELL_PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-onprem-ollama}"
+export OPENSHELL_PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
 
 STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/openclaw-gateways}"
 mkdir -p "${STATE_DIR}"
@@ -124,7 +136,7 @@ start_one_gateway() {
   fi
   if [[ ! -f "${pidfile}" ]]; then
     echo "  ${name}: starting /usr/local/bin/nemoclaw-start"
-    nohup openshell sandbox exec -n "${name}" --no-tty -- \
+    openshell sandbox exec -n "${name}" --no-tty -- \
       /usr/local/bin/nemoclaw-start >"${log}" 2>&1 &
     echo $! >"${pidfile}"
   fi
@@ -211,8 +223,9 @@ create_sandboxes() {
   openshell status >/dev/null \
     || fail "OpenShell gateway is not connected; port-forward service/openshell and re-register the gateway"
   hpa_common_verify_target_node 1 || exit 1
-  echo "Creating ${count} OpenClaw sandboxes (${SANDBOX_PREFIX}0000) on runtime ${INFERENCE_RUNTIME} model ${INFERENCE_MODEL}"
-  echo "Inference ns=${NAMESPACE} release=${RELEASE} ENABLE_ENVOY_LB=${ENABLE_ENVOY_LB}"
+  echo "Creating ${count} CPU-only ${AGENT_DISPLAY_NAME} agent sandboxes (${SANDBOX_PREFIX}0000 …)"
+  echo "  Agent: AGENT_NAME=${AGENT_NAME} (sandbox has no GPU; the agent runs here)"
+  echo "  GPU inference backend: runtime=${INFERENCE_RUNTIME} model=${INFERENCE_MODEL} ns=${NAMESPACE} release=${RELEASE} ENABLE_ENVOY_LB=${ENABLE_ENVOY_LB}"
   for ((i = 0; i < count; i += 1)); do
     name="$(sandbox_name "${i}")"
     if openshell sandbox get "${name}" >/dev/null 2>&1; then
@@ -220,10 +233,24 @@ create_sandboxes() {
       created=$((created + 1))
       continue
     fi
-    echo "  creating ${name} (user ${i})"
-    AGENT_SANDBOX_NAME="${name}" \
-      SKIP_CREATE_SMOKE="$([[ "${i}" -eq 0 ]] && echo 0 || echo 1)" \
-      "${SCRIPT_DIR}/create-agent-sandbox.sh"
+    echo "  creating ${name} (user ${i}, agent ${AGENT_NAME})"
+    created_ok=0
+    for attempt in 1 2 3 4 5; do
+      if AGENT_SANDBOX_NAME="${name}" \
+        SKIP_CREATE_SMOKE="$([[ "${i}" -eq 0 && "${attempt}" -eq 1 ]] && echo 0 || echo 1)" \
+        "${SCRIPT_DIR}/create-agent-sandbox.sh"; then
+        created_ok=1
+        break
+      fi
+      echo "  ${name}: waiting for OpenShell supervisor (attempt ${attempt}/5)"
+      sleep 15
+      if openshell sandbox get "${name}" >/dev/null 2>&1; then
+        echo "  ${name}: Ready, continuing"
+        created_ok=1
+        break
+      fi
+    done
+    [[ "${created_ok}" -eq 1 ]] || fail "failed to create ${name}"
     created=$((created + 1))
   done
   echo "Ready: ${created}/${count} sandboxes. Start gateways with:"

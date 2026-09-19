@@ -2,12 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end 8×H100 saturator: 20 end users, each with one OpenClaw sandbox.
-# Those 20 sandboxes generate the GPU load (inference.local → Envoy → HPA),
-# using the same inflight / token / minReplicas=1 / maxReplicas=8 knobs as
-# hpa-load-test-dgx-8xh100.sh. Default GPU runtime is Ollama (that Job's
-# backend). Point INFERENCE_RUNTIME/NAMESPACE/RELEASE at an already-running
-# vLLM or NIM release instead of scaling another runtime to zero.
+# End-to-end 8×H100 saturator: N end users, each with one CPU agent sandbox
+# (AGENT_NAME=openclaw today; hermes / deepagents later). Those sandboxes send
+# load through inference.local → Envoy → GPU HPA (the model runs on GPU pods,
+# not in the sandbox). Same inflight / token / minReplicas=1 / maxReplicas=8
+# knobs as hpa-load-test-dgx-8xh100.sh.
 # It does not start files/load-generator.ts (that Job talks to metrics-proxy
 # pod IPs). Does not source e2e-common.sh (pairing tests force
 # ENABLE_AUTOSCALING=0). Does not reinstall Prometheus, Envoy Gateway, or
@@ -35,10 +34,12 @@ fail() {
 }
 
 export PATH="${HOME}/.local/bin:${PATH}"
-export AGENT_NAME=openclaw
+export AGENT_NAME="${AGENT_NAME:-openclaw}"
+agent_common_validate "${AGENT_NAME}"
 export INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
 agent_common_validate_runtime_pairing "${AGENT_NAME}" "${INFERENCE_RUNTIME}"
 export INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
+AGENT_DISPLAY_NAME="$(agent_common_display_name "${AGENT_NAME}")"
 
 export NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 export RELEASE="${RELEASE:-nemoclaw-gpu}"
@@ -66,8 +67,9 @@ export SCALE_DOWN_WAIT_LOOPS="${SCALE_DOWN_WAIT_LOOPS:-40}"
 HPA_BASELINE_WAIT_SEC="${HPA_BASELINE_WAIT_SEC:-240}"
 # Per-sandbox start (20×32 = 640, the 1-GPU cap). Do not reuse the Job's BOOTSTRAP_INFLIGHT=160.
 E2E_BOOTSTRAP_INFLIGHT="${E2E_BOOTSTRAP_INFLIGHT:-32}"
+E2E_INFLIGHT_PER_USER="${E2E_INFLIGHT_PER_USER:-4}"
 E2E_OUTPUT_DIR="${E2E_OUTPUT_DIR:-${CHART_DIR}/e2e-results}"
-START_GATEWAYS="${START_GATEWAYS:-0}"
+START_GATEWAYS="${START_GATEWAYS:-1}"
 SKIP_INSTALL_HPA="${SKIP_INSTALL_HPA:-0}"
 SKIP_CREATE_SANDBOXES="${SKIP_CREATE_SANDBOXES:-0}"
 
@@ -138,7 +140,7 @@ if [[ "${START_GATEWAYS}" == "1" ]]; then
   E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-e2e-sandboxes.sh" start
 fi
 
-echo "Saturating 8 GPUs from ${E2E_USERS} users → ${E2E_USERS} sandboxes → Envoy (not load-generator.ts)"
+echo "20 users sending openclaw agent prompts into ${E2E_USERS} CPU ${AGENT_DISPLAY_NAME} sandboxes (not Envoy-direct, not load-generator.ts)"
 set +e
 python3 "${SCRIPT_DIR}/e2e-openclaw-load-test.py" \
   --users "${E2E_USERS}" \
@@ -146,11 +148,7 @@ python3 "${SCRIPT_DIR}/e2e-openclaw-load-test.py" \
   --output "${E2E_OUTPUT_DIR}" \
   --model "${INFERENCE_MODEL}" \
   --duration "${DURATION_SEC}" \
-  --max-tokens "${MAX_TOKENS}" \
-  --inflight-per-gpu "${INFLIGHT_PER_GPU}" \
-  --load-multiplier "${LOAD_MULTIPLIER}" \
-  --max-inflight-per-pod "${MAX_INFLIGHT_PER_POD}" \
-  --bootstrap-inflight "${E2E_BOOTSTRAP_INFLIGHT}" \
+  --inflight-per-user "${E2E_INFLIGHT_PER_USER}" \
   --target-pods "${TARGET_PODS}" \
   --hold-sec "${MAX_REPLICAS_HOLD_SEC}" \
   --hpa-namespace "${NAMESPACE}" \
@@ -163,5 +161,5 @@ hpa_common_print_hpa "${NAMESPACE}" || true
 if [[ "${LOAD_RC}" -ne 0 ]]; then
   fail "sandbox saturator failed (exit ${LOAD_RC}); results in ${E2E_OUTPUT_DIR}"
 fi
-echo "OK: ${E2E_USERS} OpenClaw sandboxes saturated GPU HPA ${NAMESPACE}/${RELEASE} through Envoy (1→8→1)."
+echo "OK: ${E2E_USERS} CPU ${AGENT_DISPLAY_NAME} agent sandboxes drove GPU HPA ${NAMESPACE}/${RELEASE} through Envoy (1→8→1)."
 echo "Tear down only these sandboxes with: ./scripts/setup-openclaw-e2e-sandboxes.sh cleanup"
