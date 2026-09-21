@@ -142,30 +142,52 @@ BASE_URL="$(
 OPENSHELL_LOG_DIR="${E2E_OPENSHELL_LOG_DIR:-${CHART_DIR}/e2e-results/openshell-create}"
 mkdir -p "${OPENSHELL_LOG_DIR}"
 OPENSHELL_LOG="${OPENSHELL_LOG_DIR}/${SANDBOX_NAME}.log"
+SANDBOX_NS="${OPENSHELL_NAMESPACE:-nemoclaw-sandboxes}"
+SANDBOX_READY_TIMEOUT_SEC="${SANDBOX_READY_TIMEOUT_SEC:-600}"
+
+# Provider + inference.local backend are gateway-scoped, not per-sandbox.
+# Parallel e2e creates serialize here so 10 sandboxes do not race the same API.
+configure_openshell_inference() {
+  if [[ "${SKIP_PROVIDER_SETUP:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ -f "${OPENSHELL_LOG_DIR}/.provider.done" ]]; then
+    return 0
+  fi
+  if openshell provider get "${PROVIDER_NAME}" >/dev/null 2>&1; then
+    OPENAI_API_KEY="${API_KEY}" openshell provider update "${PROVIDER_NAME}" \
+      --credential OPENAI_API_KEY \
+      --config "OPENAI_BASE_URL=${BASE_URL}" \
+      >>"${OPENSHELL_LOG}" 2>&1
+  else
+    OPENAI_API_KEY="${API_KEY}" openshell provider create \
+      --name "${PROVIDER_NAME}" \
+      --type openai \
+      --credential OPENAI_API_KEY \
+      --config "OPENAI_BASE_URL=${BASE_URL}" \
+      >>"${OPENSHELL_LOG}" 2>&1
+  fi
+  local -a inference_set_args=(
+    --provider "${PROVIDER_NAME}"
+    --model "${MODEL}"
+    --timeout 300
+  )
+  # Parallel e2e create must not run N chat/completions verifies against one GPU replica.
+  if [[ "${SKIP_INFERENCE_VERIFY:-0}" == "1" ]]; then
+    inference_set_args+=(--no-verify)
+  fi
+  openshell inference set "${inference_set_args[@]}" >>"${OPENSHELL_LOG}" 2>&1
+  touch "${OPENSHELL_LOG_DIR}/.provider.done"
+}
 
 # OpenShell 0.0.85 prints "Error: supervisor session not connected" / ssh 255
 # while the sandbox is still booting. That is a wait, not a failed create.
 # Keep the CLI output in a log and print a waiting line on the terminal.
-if openshell provider get "${PROVIDER_NAME}" >/dev/null 2>&1; then
-  OPENAI_API_KEY="${API_KEY}" openshell provider update "${PROVIDER_NAME}" \
-    --credential OPENAI_API_KEY \
-    --config "OPENAI_BASE_URL=${BASE_URL}" \
-    >>"${OPENSHELL_LOG}" 2>&1
-else
-  OPENAI_API_KEY="${API_KEY}" openshell provider create \
-    --name "${PROVIDER_NAME}" \
-    --type openai \
-    --credential OPENAI_API_KEY \
-    --config "OPENAI_BASE_URL=${BASE_URL}" \
-    >>"${OPENSHELL_LOG}" 2>&1
-fi
+(
+  flock 9
+  configure_openshell_inference
+) 9>"${OPENSHELL_LOG_DIR}/.provider.lock"
 unset API_KEY
-
-openshell inference set \
-  --provider "${PROVIDER_NAME}" \
-  --model "${MODEL}" \
-  --timeout 300 \
-  >>"${OPENSHELL_LOG}" 2>&1
 
 sandbox_already_present=0
 if openshell sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
@@ -184,6 +206,9 @@ SANDBOX_CREATE_ARGS=(
 # This recipe's OpenClaw + Ollama path must use INFERENCE_MODEL (llama3.2:3b).
 if [[ "${AGENT_NAME}" == "openclaw" ]]; then
   SANDBOX_CREATE_ARGS+=(--env "NEMOCLAW_MODEL_OVERRIDE=${MODEL}")
+  if [[ "${NEMOCLAW_MINIMAL_BOOTSTRAP:-}" == "1" ]]; then
+    SANDBOX_CREATE_ARGS+=(--env "NEMOCLAW_MINIMAL_BOOTSTRAP=1")
+  fi
 fi
 if [[ -n "${NEMOCLAW_TARGET_NODE:-}" ]]; then
   DRIVER_CONFIG_JSON="$(python3 - "${NEMOCLAW_TARGET_NODE}" <<'PYEOF'
@@ -209,8 +234,24 @@ fi
 
 wait_sandbox_ready() {
   local name="${1:?sandbox}"
-  local i phase
-  for ((i = 1; i <= 60; i += 1)); do
+  local i phase="" remaining
+  echo "  ${name}: waiting for Ready (up to ${SANDBOX_READY_TIMEOUT_SEC}s)"
+  for ((i = 1; i <= SANDBOX_READY_TIMEOUT_SEC; i += 2)); do
+    if kubectl get pod "${name}" -n "${SANDBOX_NS}" >/dev/null 2>&1; then
+      remaining=$((SANDBOX_READY_TIMEOUT_SEC - i + 2))
+      if ((remaining < 5)); then
+        remaining=5
+      fi
+      if kubectl wait --for=condition=Ready "pod/${name}" -n "${SANDBOX_NS}" \
+        --timeout="${remaining}s" >/dev/null 2>&1; then
+        echo "  ${name}: Ready"
+        return 0
+      fi
+      break
+    fi
+    sleep 2
+  done
+  for ((i = 1; i <= 30; i += 1)); do
     phase="$(
       python3 - "${name}" <<'PY'
 import json, subprocess, sys
@@ -226,12 +267,9 @@ PY
       echo "  ${name}: Ready"
       return 0
     fi
-    if [[ "${i}" -eq 1 ]]; then
-      echo "  ${name}: waiting (${phase:-starting})"
-    fi
     sleep 2
   done
-  echo "WARNING: ${name} did not report Ready within 120s (phase=${phase:-unknown})" >&2
+  echo "WARNING: ${name} did not report Ready (phase=${phase:-unknown})" >&2
   return 1
 }
 
@@ -239,13 +277,13 @@ wait_supervisor_exec() {
   local name="${1:?sandbox}"
   local i
   echo "  ${name}: waiting for OpenShell supervisor"
-  for ((i = 1; i <= 30; i += 1)); do
-    if timeout --foreground 20 openshell sandbox exec -n "${name}" --no-tty -- \
+  for ((i = 1; i <= 20; i += 1)); do
+    if timeout --foreground 8 openshell sandbox exec -n "${name}" --no-tty -- \
       /bin/true >>"${OPENSHELL_LOG}" 2>&1; then
       echo "  ${name}: supervisor ready"
       return 0
     fi
-    sleep 4
+    sleep 2
   done
   echo "  ${name}: still waiting for supervisor (continuing; see ${OPENSHELL_LOG})"
   return 1
@@ -255,16 +293,16 @@ wait_inference_local() {
   local name="${1:?sandbox}"
   local i
   echo "  ${name}: waiting for https://inference.local"
-  for ((i = 1; i <= 40; i += 1)); do
-    if timeout --foreground 25 openshell sandbox exec -n "${name}" --no-tty -- \
-      curl -fsS --http1.1 --max-time 10 https://inference.local/v1/models >>"${OPENSHELL_LOG}" 2>&1; then
+  for ((i = 1; i <= 20; i += 1)); do
+    if timeout --foreground 12 openshell sandbox exec -n "${name}" --no-tty -- \
+      curl -fsS --http1.1 --max-time 5 https://inference.local/v1/models >>"${OPENSHELL_LOG}" 2>&1; then
       echo "  ${name}: inference.local reachable"
       return 0
     fi
-    if [[ $((i % 10)) -eq 0 ]]; then
-      echo "  ${name}: still waiting for inference.local (${i}/40)"
+    if [[ $((i % 5)) -eq 0 ]]; then
+      echo "  ${name}: still waiting for inference.local (${i}/20)"
     fi
-    sleep 3
+    sleep 2
   done
   echo "ERROR: ${name}: https://inference.local not reachable (OpenShell MITM). The HPA Job uses metrics-proxy pod IPs and does not catch this." >&2
   return 1
@@ -288,21 +326,47 @@ else
   wait_sandbox_ready "${SANDBOX_NAME}" || true
 fi
 
+# Patch nproc via kubectl before any OpenShell exec. Connect-shell re-applies
+# nproc=512; RLIMIT_NPROC is per-UID on the node, so 10 e2e sandboxes EAGAIN.
+if [[ "${AGENT_NAME}" == "openclaw" ]]; then
+  echo "  ${SANDBOX_NAME}: skipping connect-shell nproc=512 (OpenShell exec EAGAIN)"
+  kubectl exec -n "${SANDBOX_NS}" "${SANDBOX_NAME}" -c agent -- bash -c '
+    cat > /etc/profile.d/nemoclaw-rlimits.sh << "EOF"
+# Connect-shell must not re-apply nproc=512 (RLIMIT_NPROC is per-UID on the node).
+true
+EOF
+    if [ -f /usr/local/lib/nemoclaw/sandbox-rlimits.sh ]; then
+      sed -i "s/^NEMOCLAW_SANDBOX_NPROC_LIMIT=512$/NEMOCLAW_SANDBOX_NPROC_LIMIT=8192/" \
+        /usr/local/lib/nemoclaw/sandbox-rlimits.sh
+    fi
+    rm -rf /sandbox/.openclaw/npm
+  ' >/dev/null 2>&1 || true
+fi
+
+# E2E create is light: pod Ready is enough. Supervisor SSH, NVIDIA policy, and
+# inference.local waits are the slow path and are not needed to schedule CPU
+# front ends. Pairing (SKIP_CREATE_SMOKE=0) still runs them.
+if [[ "${SKIP_CREATE_SMOKE:-0}" == "1" ]]; then
+  echo "  ${SANDBOX_NAME}: SKIP_CREATE_SMOKE=1; skipping supervisor/policy/smoke waits"
+  echo "${AGENT_DISPLAY_NAME} sandbox ${SANDBOX_NAME} is ready without a GPU."
+  exit 0
+fi
+
 wait_supervisor_exec "${SANDBOX_NAME}" || true
 
 if agent_common_grants_nvidia_endpoint "${AGENT_NAME}"; then
   policy_ok=0
-  for attempt in 1 2 3 4 5; do
-    echo "  ${SANDBOX_NAME}: waiting for sandbox policy (${attempt}/5)"
+  for attempt in 1 2 3; do
+    echo "  ${SANDBOX_NAME}: waiting for sandbox policy (${attempt}/3)"
     if openshell policy update "${SANDBOX_NAME}" \
       --remove-endpoint integrate.api.nvidia.com:443 \
       --wait \
-      --timeout 60 \
+      --timeout 20 \
       >>"${OPENSHELL_LOG}" 2>&1; then
       policy_ok=1
       break
     fi
-    sleep 8
+    sleep 3
   done
   if [[ "${policy_ok}" -ne 1 ]]; then
     echo "  ${SANDBOX_NAME}: policy still applying (continuing; see ${OPENSHELL_LOG})"
@@ -313,8 +377,18 @@ if grep -Fq 'integrate.api.nvidia.com' <<<"${EFFECTIVE_POLICY}"; then
   echo "WARNING: effective sandbox policy still lists integrate.api.nvidia.com" >&2
 fi
 unset EFFECTIVE_POLICY
-wait_inference_local "${SANDBOX_NAME}" \
-  || fail "${SANDBOX_NAME}: https://inference.local not reachable. OpenShell MITM must work before the agent starts; the HPA Job's pod-IP path does not cover this."
+case "${SKIP_WAIT_INFERENCE_LOCAL:-0}" in
+  1)
+    echo "  ${SANDBOX_NAME}: SKIP_WAIT_INFERENCE_LOCAL=1 (e2e checks inference.local in parallel after create)"
+    ;;
+  0)
+    wait_inference_local "${SANDBOX_NAME}" \
+      || fail "${SANDBOX_NAME}: https://inference.local not reachable. OpenShell MITM must work before the agent starts; the HPA Job's pod-IP path does not cover this."
+    ;;
+  *)
+    fail "SKIP_WAIT_INFERENCE_LOCAL must be 0 or 1"
+    ;;
+esac
 
 case "${SKIP_CREATE_SMOKE:-0}" in
   0)

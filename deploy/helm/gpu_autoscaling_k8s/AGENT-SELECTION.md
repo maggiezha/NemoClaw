@@ -209,7 +209,7 @@ Multi-user HPA e2e for Deep Agents is the same N-user / N-sandbox example as Ope
 | `AGENT_SANDBOX_IMAGE` | — (required) | Pushed image reference for the selected agent |
 | `AGENT_SANDBOX_NAME` | See [Comparison](#comparison) | OpenShell sandbox name |
 | `OPENSHELL_PROVIDER_NAME` | See [Comparison](#comparison) | OpenShell inference provider name |
-| `AGENT_SANDBOX_CPU` / `AGENT_SANDBOX_MEMORY` | `2` / `4Gi` | Sandbox pod requests |
+| `AGENT_SANDBOX_CPU` / `AGENT_SANDBOX_MEMORY` | Pairing `2` / `4Gi`; e2e `1` / `1Gi` | Sandbox pod requests. E2e sandboxes are light CPU front ends (inference is on GPUs). |
 | `NEMOCLAW_TARGET_NODE` | unset (portable) | Pin the sandbox to a specific node |
 | `VERIFY_HEALTH_TIMEOUT_SEC` | `90` | Plugin/version checks and OpenClaw/Hermes gateway readiness timeout |
 | `VERIFY_SMOKE_TIMEOUT_SEC` | `30` | `verify-agent-sandbox.sh` timeout for the Hermes/Deep Agents Code config-file existence checks and Deep Agents Code's `dcode --version` |

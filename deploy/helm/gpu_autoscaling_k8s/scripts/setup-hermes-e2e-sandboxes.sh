@@ -75,8 +75,9 @@ export ENABLE_ENVOY_LB="${ENABLE_ENVOY_LB:-1}"
 export INFERENCE_SERVICE="${INFERENCE_SERVICE:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)}"
 # Official complete Hermes image (not *-sandbox-base).
 export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/hermes-sandbox@sha256:28b9578ab9676ef046de37fa6feb9b7b61824b87d77fd08978758bd01c03cb54}"
-export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-2}"
-export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-4Gi}"
+# Light CPU front ends; inference stays on GPUs.
+export AGENT_SANDBOX_CPU="${AGENT_SANDBOX_CPU:-1}"
+export AGENT_SANDBOX_MEMORY="${AGENT_SANDBOX_MEMORY:-1Gi}"
 export OPENSHELL_PROVIDER_NAME="${OPENSHELL_PROVIDER_NAME:-$(agent_common_default_provider_name "${AGENT_NAME}")}"
 
 STATE_DIR="${E2E_STATE_DIR:-${CHART_DIR}/e2e-results/hermes-gateways}"
