@@ -37,12 +37,24 @@ def main() -> int:
     defaults.pop("heartbeat", None)
 
     provider = cfg.setdefault("models", {}).setdefault("providers", {}).setdefault("inference", {})
+    provider["baseUrl"] = "https://inference.local/v1"
+    provider["api"] = "openai-completions"
     models = provider.get("models")
     if not isinstance(models, list) or not models or not isinstance(models[0], dict):
         provider["models"] = [{}]
         models = provider["models"]
     models[0]["id"] = BARE
     models[0]["name"] = PRIMARY
+    # OpenClaw defaults to SSE. OpenShell MITM + the metrics-proxy truncates
+    # streamed bodies ("response truncated: upstream read error"). JSON
+    # chat.completions is the path that returns 200 with content.
+    params = models[0].get("params")
+    if not isinstance(params, dict):
+        params = {}
+        models[0]["params"] = params
+    params["stream"] = False
+    if models[0].get("maxTokens", 4096) > 256:
+        models[0]["maxTokens"] = 256
 
     plugins = cfg.setdefault("plugins", {})
     entries = plugins.setdefault("entries", {})

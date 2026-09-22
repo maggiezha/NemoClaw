@@ -101,7 +101,9 @@ async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[bool, str]:
+async def send_user_query(
+    sandbox: str, prompt: str, timeout_sec: int, session_key: str
+) -> tuple[bool, str]:
     """Send one prompt to the already-running OpenClaw agent. No extra Node CLI."""
     openshell = shutil.which("openshell")
     if not openshell:
@@ -128,7 +130,7 @@ async def send_user_query(sandbox: str, prompt: str, timeout_sec: int) -> tuple[
         helper_b64(),
         prompt,
         str(timeout_sec),
-        f"agent:main:{sandbox}",
+        session_key,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -172,7 +174,12 @@ async def simulate_user(
     async def one_turn(turn_id: int) -> None:
         nonlocal ok, err
         prompt = PROMPTS[(user_id + turn_id) % len(PROMPTS)]
-        success, detail = await send_user_query(sandbox, prompt, timeout_sec)
+        success, detail = await send_user_query(
+            sandbox,
+            prompt,
+            timeout_sec,
+            f"agent:main:{sandbox}:t{turn_id}",
+        )
         if success:
             ok += 1
             log_handle.write(f"ok turn={turn_id}\n")
@@ -220,10 +227,15 @@ async def run_test(args: argparse.Namespace) -> int:
     hold_started: float | None = None
 
     print("=" * 70)
-    print(f"  OpenClaw + Ollama e2e: {args.users} users → {args.users} sandboxes → Envoy → Ollama HPA")
-    print(f"  Users: {args.users}  sandbox prefix={args.prefix}")
-    print("  Query: chat.send to the already-running OpenClaw agent on :18789")
-    print("  Not: second Node CLI (openclaw agent -m), not load-generator.ts, not curl to Envoy")
+    print("  E2E test: OpenClaw + Ollama")
+    print(f"  {args.users} end users send requests to {args.users} OpenClaw agents")
+    print(f"  {args.users} agents run in {args.users} OpenShell sandboxes on CPU")
+    print(f"  LLM (Ollama {args.model}) runs on GPUs")
+    print("  When end-user demand increases, GPU HPA scales Ollama from 1 to 8 GPUs")
+    print(f"  Sandboxes: {args.prefix}0000 … {args.prefix}{args.users - 1:04d}")
+    print("  Each user prompts the already-running OpenClaw agent on :18789")
+    print("  Path: end user → CPU agent/sandbox → https://inference.local → Envoy → GPU Ollama HPA")
+    print("  One OpenShell gateway for all sandboxes. Not a second Node CLI, not load-generator.ts.")
     print(f"  Concurrent prompts per user: {args.inflight_per_user}")
     print(f"  GPU inference model={args.model}  HPA {args.hpa_namespace}/{args.hpa_name}")
     print(f"  duration≤{args.duration}s  target replicas={args.target_pods}")
@@ -246,7 +258,7 @@ async def run_test(args: argparse.Namespace) -> int:
                 if hold_started is None:
                     hold_started = time.monotonic()
                     print(
-                        f"[hpa] reached {args.target_pods} replicas; "
+                        f"[hpa] end-user demand scaled GPUs to {args.target_pods}; "
                         f"holding {args.hold_sec}s then stopping user queries"
                     )
                 if time.monotonic() - hold_started >= args.hold_sec:

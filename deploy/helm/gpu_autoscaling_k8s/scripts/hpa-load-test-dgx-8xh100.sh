@@ -49,8 +49,9 @@ RELEASE="${RELEASE:-nemoclaw-gpu}"
 JOB_NAME="${JOB_NAME:-nemoclaw-gpu-hpa-load-test}"
 INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
-# Pin generators to the H100 node so they do not land on other GPU nodes.
-HPA_LOAD_NODE_NAME="${HPA_LOAD_NODE_NAME:-${NEMOCLAW_TARGET_NODE:-dgx01}}"
+# Pin generators to the DGX 8× H100 node so they do not land on other GPU nodes.
+# Hostname comes from gitignored local.env (NEMOCLAW_TARGET_NODE).
+HPA_LOAD_NODE_NAME="${HPA_LOAD_NODE_NAME:-${NEMOCLAW_TARGET_NODE:-}}"
 # Shared kube-prometheus-stack only scrapes ServiceMonitors with this label.
 # Without it, GPU util still works (DCGM) but latency HPA stays ?/target.
 HPA_SERVICEMONITOR_RELEASE="${HPA_SERVICEMONITOR_RELEASE:-${PROM_RELEASE:-kube-prometheus-stack}}"

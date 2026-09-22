@@ -148,14 +148,18 @@ while ((SECONDS < deadline)); do
   sleep 5
 done
 
-if [[ "${SKIP_CREATE_SANDBOXES}" != "1" ]]; then
+if [[ "${SKIP_CREATE_SANDBOXES}" != "1" && "${START_AGENTS}" == "1" ]]; then
+  E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" bringup
+elif [[ "${SKIP_CREATE_SANDBOXES}" != "1" ]]; then
   "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" "${E2E_USERS}"
-fi
-if [[ "${START_AGENTS}" == "1" ]]; then
+elif [[ "${START_AGENTS}" == "1" ]]; then
   E2E_USERS="${E2E_USERS}" "${SCRIPT_DIR}/setup-openclaw-ollama-e2e-sandboxes.sh" start
 fi
 
-echo "OpenClaw + Ollama e2e: ${E2E_USERS} users sending prompts to ${E2E_USERS} already-running OpenClaw agents (not a second Node CLI, not Envoy-direct)"
+echo "E2E test: OpenClaw + Ollama — ${E2E_USERS} end users send requests to ${E2E_USERS} agents"
+echo "  ${E2E_USERS} agents run in ${E2E_USERS} OpenShell sandboxes on CPU; LLM runs on GPUs"
+echo "  When end-user demand increases, GPU HPA scales Ollama from 1 to 8 GPUs"
+echo "  All ${E2E_USERS} sandboxes share one OpenShell gateway."
 set +e
 python3 "${SCRIPT_DIR}/e2e-openclaw-ollama-load-test.py" \
   --users "${E2E_USERS}" \
@@ -176,5 +180,5 @@ hpa_common_print_hpa "${NAMESPACE}" || true
 if [[ "${LOAD_RC}" -ne 0 ]]; then
   fail "sandbox saturator failed (exit ${LOAD_RC}); results in ${E2E_OUTPUT_DIR}"
 fi
-echo "OK: OpenClaw + Ollama e2e — ${E2E_USERS} CPU sandboxes drove GPU HPA ${NAMESPACE}/${RELEASE} through Envoy (1→8→1)."
+echo "OK: OpenClaw + Ollama e2e — ${E2E_USERS} CPU agents in ${E2E_USERS} sandboxes; end-user demand scaled GPU HPA ${NAMESPACE}/${RELEASE} 1→8→1."
 echo "Tear down only these sandboxes with: ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh cleanup"

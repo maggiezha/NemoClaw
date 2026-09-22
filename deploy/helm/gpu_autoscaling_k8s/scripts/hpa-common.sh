@@ -785,7 +785,7 @@ hpa_common_metrics_proxy_service_base_url() {
 }
 
 # OpenShell inference.local backend. Same reason as files/load-generator.ts:
-# ClusterIP + kube-proxy iptables hairpin on dgx01 drops SYNs from sandbox
+# ClusterIP + kube-proxy iptables hairpin on a DGX H100 node drops SYNs from sandbox
 # supervisors (curl 35 / OpenClaw "network connection error"). The Job talks
 # HTTP to metrics-proxy pod IPs. With Envoy LeastRequest, use the Envoy
 # dataplane pod IP:targetPort so traffic still goes Envoy → Ollama HPA.

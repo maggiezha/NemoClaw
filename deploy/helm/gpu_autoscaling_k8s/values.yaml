@@ -299,7 +299,7 @@ autoscaling:
   enabled: false
   minReplicas: 1
   # Chart-level fallback only (used when Helm is invoked directly, without the recipe
-  # scripts). Defaults to 8 GPUs (an 8×H100 node like dgx02) — override per cluster with
+  # scripts). Defaults to 8 GPUs (on-prem DGX 8× H100) — override per cluster with
   # `--set autoscaling.maxReplicas=N --set autoscaling.maxGpus=N`, or use the
   # install-hpa.sh / hpa-reset.sh `MAX_REPLICAS` env var (and hpa-load-test.sh
   # `TARGET_PODS`), which auto-detect and pass through your cluster's actual allocatable

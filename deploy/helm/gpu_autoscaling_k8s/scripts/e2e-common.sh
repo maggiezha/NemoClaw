@@ -33,8 +33,8 @@ REGISTRY="${REGISTRY:-localhost:32000}"          # registry every cluster node c
 # export NIM_NGC_API_KEY=nvapi-...
 
 # Optional: pin everything to one GPU node (required on a shared cluster).
-# This host uses dgx01 via gitignored local.env; override only if you mean it.
-# export NEMOCLAW_TARGET_NODE=dgx01
+# On-prem validation is a DGX 8× H100 — set the hostname in gitignored local.env.
+# export NEMOCLAW_TARGET_NODE=
 
 # SECURITY (required — no default): this shortcut does not silently enable an insecure
 # configuration for you. It has exactly two supported modes:

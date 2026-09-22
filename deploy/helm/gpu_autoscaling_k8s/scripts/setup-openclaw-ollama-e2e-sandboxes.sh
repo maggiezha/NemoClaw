@@ -22,11 +22,15 @@
 # Usage:
 #   cd deploy/helm/gpu_autoscaling_k8s
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh          # default E2E_USERS=10
-#   E2E_USERS=10 ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh
-#   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh 10
+#   E2E_USERS=4 ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh bringup
+#   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh 4
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh start
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh stop
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh cleanup
+#
+# bringup creates N sandboxes and starts N OpenClaw agents in the same
+# parallel wave (one agent per sandbox). Do not wait for all sandboxes
+# before launching agents. All sandboxes share one OpenShell gateway.
 
 set -euo pipefail
 
@@ -170,6 +174,73 @@ install_sandbox_inference_key() {
   printf '%s' "${E2E_API_KEY}" | kubectl exec -i -n "${E2E_SANDBOX_NS}" "${name}" -c agent -- \
     tee /tmp/e2e-inference.key >/dev/null
   kubectl exec -n "${E2E_SANDBOX_NS}" "${name}" -c agent -- chmod 600 /tmp/e2e-inference.key
+}
+
+sandbox_pod_ready() {
+  local name="${1:?sandbox}"
+  kubectl get pod "${name}" -n "${E2E_SANDBOX_NS}" \
+    -o jsonpath='{.status.phase}' 2>/dev/null | grep -qx Running \
+    && [[ "$(kubectl get pod "${name}" -n "${E2E_SANDBOX_NS}" \
+      -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)" == "true" ]]
+}
+
+print_e2e_layout() {
+  local count="${1:?count}"
+  local i name sandbox_st agent_st
+  echo ""
+  echo "========================================================================"
+  echo "E2E test: OpenClaw + Ollama"
+  echo "  ${count} end users send requests to ${count} OpenClaw agents"
+  echo "  ${count} agents run in ${count} OpenShell sandboxes on CPU"
+  echo "  LLM (Ollama ${INFERENCE_MODEL}) runs on GPUs"
+  echo "  When end-user demand increases, GPU HPA scales Ollama from 1 to 8 GPUs"
+  echo "------------------------------------------------------------------------"
+  printf "  %-10s  %-24s  %-26s  %s\n" "end user" "CPU agent" "OpenShell sandbox" "sandbox"
+  for ((i = 0; i < count; i += 1)); do
+    name="$(sandbox_name "${i}")"
+    if sandbox_pod_ready "${name}"; then
+      sandbox_st="Ready (CPU)"
+    else
+      sandbox_st="NOT READY"
+    fi
+    if agent_health_ok "${name}"; then
+      agent_st="OpenClaw running :18789"
+    else
+      agent_st="OpenClaw not listening"
+    fi
+    printf "  %-10s  %-24s  %-26s  %s\n" "user-${i}" "${agent_st}" "${name}" "${sandbox_st}"
+  done
+  echo "------------------------------------------------------------------------"
+  echo "  GPU HPA: Ollama ${INFERENCE_MODEL} in ${NAMESPACE}/${RELEASE}  scales 1 → 8 GPUs as demand rises"
+  echo "  One OpenShell gateway; extra ${SANDBOX_PREFIX}* sandboxes are left idle."
+  echo "========================================================================"
+}
+
+refresh_openshell_inference_backend() {
+  # One gateway-scoped provider for all e2e sandboxes. Envoy dataplane pod IP,
+  # not ClusterIP (hairpin on a DGX H100 node drops SYNs).
+  load_e2e_inference_env
+  local log="${STATE_DIR}/openshell-provider.log"
+  mkdir -p "${STATE_DIR}"
+  if openshell provider get "${OPENSHELL_PROVIDER_NAME}" >/dev/null 2>&1; then
+    OPENAI_API_KEY="${E2E_API_KEY}" openshell provider update "${OPENSHELL_PROVIDER_NAME}" \
+      --credential OPENAI_API_KEY \
+      --config "OPENAI_BASE_URL=${E2E_INFERENCE_URL}" \
+      >>"${log}" 2>&1
+  else
+    OPENAI_API_KEY="${E2E_API_KEY}" openshell provider create \
+      --name "${OPENSHELL_PROVIDER_NAME}" \
+      --type openai \
+      --credential OPENAI_API_KEY \
+      --config "OPENAI_BASE_URL=${E2E_INFERENCE_URL}" \
+      >>"${log}" 2>&1
+  fi
+  openshell inference set \
+    --provider "${OPENSHELL_PROVIDER_NAME}" \
+    --model "${INFERENCE_MODEL}" \
+    --timeout 300 \
+    --no-verify \
+    >>"${log}" 2>&1
 }
 
 agent_health_ok() {
@@ -372,41 +443,92 @@ start_agents() {
   finish_pids=()
   finish_names=()
   wait_names_healthy "${pending[@]}" || fail "parallel agent start timed out; logs in ${STATE_DIR}"
-  for name in "${names[@]}"; do
-    finish_one_agent "${name}" &
-    finish_pids+=("$!")
-    finish_names+=("${name}")
-  done
-  for i in "${!finish_pids[@]}"; do
-    if ! wait "${finish_pids[$i]}"; then
-      failed+=("${finish_names[$i]}")
-    fi
-  done
-  if ((${#failed[@]} > 0)); then
-    fail "Envoy inference check failed for: ${failed[*]}"
-  fi
+  wait_inference_local_parallel "${names[@]}" \
+    || fail "Envoy inference check failed after parallel agent start"
   echo "Ready: ${count}/${count} OpenClaw agents in $((SECONDS - started_at))s (parallel)."
+  print_e2e_layout "${count}"
 }
 
 stop_agents() {
   local name
-  echo "Stopping OpenClaw agent start processes for ${SANDBOX_PREFIX}*"
+  local -a pids=()
+  echo "Stopping OpenClaw agent start processes for ${SANDBOX_PREFIX}* in parallel"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
-    stop_one_agent "${name}"
+    stop_one_agent "${name}" &
+    pids+=("$!")
   done < <(list_prefix_sandboxes)
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || true
+  done
 }
 
 cleanup_sandboxes() {
   local name
+  local -a names=() pids=()
   stop_agents || true
-  echo "Destroying sandboxes named ${SANDBOX_PREFIX}*"
+  echo "Destroying sandboxes named ${SANDBOX_PREFIX}* in parallel"
   while IFS= read -r name; do
     [[ -z "${name}" ]] && continue
+    names+=("${name}")
     echo "  destroying ${name}"
-    openshell sandbox destroy "${name}" --force >/dev/null 2>&1 || true
+    openshell sandbox destroy "${name}" --force >/dev/null 2>&1 &
+    pids+=("$!")
   done < <(list_prefix_sandboxes)
-  echo "Cleanup complete."
+  for pid in "${pids[@]}"; do
+    wait "${pid}" || true
+  done
+  echo "Cleanup complete (${#names[@]} ${SANDBOX_PREFIX}* sandboxes). hermes-onprem was not touched."
+}
+
+bringup_one() {
+  local name="${1:?sandbox}"
+  if sandbox_pod_ready "${name}"; then
+    echo "  ${name}: reusing existing OpenShell sandbox"
+  else
+    create_one_sandbox "${name}" || return 1
+  fi
+  slim_one_sandbox "${name}" || return 1
+  stop_one_agent "${name}" >/dev/null || true
+  launch_one_agent "${name}"
+  wait_names_healthy "${name}" || return 1
+}
+
+bringup_sandboxes() {
+  local count="${1:?count}"
+  local i name started_at="${SECONDS}"
+  local -a names=() pids=() failed=()
+  [[ "${count}" =~ ^[1-9][0-9]*$ ]] || fail "sandbox count must be a positive integer"
+  ((count <= 200)) || fail "refusing more than 200 sandboxes in one run"
+  openshell status >/dev/null \
+    || fail "OpenShell gateway is not connected; port-forward service/openshell and re-register the gateway"
+  hpa_common_verify_target_node 1 || exit 1
+  echo "E2E test: OpenClaw + Ollama — ${count} end users send requests to ${count} CPU agents in ${count} sandboxes (LLM on GPUs)"
+  echo "  Reuse a Ready OpenShell sandbox when it already exists. Start the ${count} agents in parallel."
+  echo "  One OpenShell gateway for all sandboxes. Do not destroy extras."
+  rm -f "${E2E_OPENSHELL_LOG_DIR:-${CHART_DIR}/e2e-results/openshell-create}/.provider.done"
+  echo "  pointing OpenShell inference backend at Envoy/metrics-proxy dataplane pod IP (not ClusterIP)"
+  refresh_openshell_inference_backend \
+    || fail "could not update OpenShell provider ${OPENSHELL_PROVIDER_NAME} to ${E2E_INFERENCE_URL:-unknown}"
+  for ((i = 0; i < count; i += 1)); do
+    names+=("$(sandbox_name "${i}")")
+  done
+  for name in "${names[@]}"; do
+    bringup_one "${name}" &
+    pids+=("$!")
+  done
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      failed+=("${names[$i]}")
+    fi
+  done
+  if ((${#failed[@]} > 0)); then
+    fail "bringup failed for: ${failed[*]}"
+  fi
+  wait_inference_local_parallel "${names[@]}" \
+    || fail "Envoy inference check failed after parallel agent start"
+  echo "Ready: ${count} end users → ${count} CPU OpenClaw agents in ${count} sandboxes; LLM on GPUs ($((SECONDS - started_at))s)"
+  print_e2e_layout "${count}"
 }
 
 create_one_sandbox() {
@@ -429,36 +551,20 @@ create_one_sandbox() {
 wait_inference_local_parallel() {
   local timeout_sec="${INFERENCE_LOCAL_TIMEOUT_SEC:-180}"
   local deadline=$((SECONDS + timeout_sec))
-  local -a pending=("$@")
-  local -a still hpids hnames
-  local i name
-  ((${#pending[@]} > 0)) || return 0
-  echo "Checking https://inference.local on ${#pending[@]} sandboxes in parallel (up to ${timeout_sec}s)"
-  while ((${#pending[@]} > 0)); do
-    if ((SECONDS >= deadline)); then
-      echo "ERROR: inference.local still failing for: ${pending[*]}" >&2
-      return 1
-    fi
-    still=()
-    hpids=()
-    hnames=()
-    for name in "${pending[@]}"; do
-      inference_local_ok "${name}" &
-      hpids+=("$!")
-      hnames+=("${name}")
-    done
-    for i in "${!hpids[@]}"; do
-      if wait "${hpids[$i]}"; then
-        echo "  ${hnames[$i]}: inference.local ok"
-      else
-        still+=("${hnames[$i]}")
+  local name
+  ((${#} > 0)) || return 0
+  echo "Checking https://inference.local on ${#} sandboxes one at a time (up to ${timeout_sec}s)"
+  for name in "$@"; do
+    echo "  ${name}: checking inference.local"
+    while ! inference_local_ok "${name}"; do
+      if ((SECONDS >= deadline)); then
+        echo "ERROR: inference.local still failing for: ${name}" >&2
+        return 1
       fi
+      echo "  ${name}: still waiting for inference.local"
+      sleep 2
     done
-    pending=("${still[@]}")
-    if ((${#pending[@]} > 0)); then
-      echo "  still waiting for inference.local (${#pending[@]}): ${pending[*]}"
-      sleep 3
-    fi
+    echo "  ${name}: inference.local ok"
   done
 }
 
@@ -528,6 +634,12 @@ case "${ACTION}" in
   cleanup)
     cleanup_sandboxes
     ;;
+  bringup)
+    bringup_sandboxes "${E2E_USERS}"
+    ;;
+  layout)
+    print_e2e_layout "${E2E_USERS}"
+    ;;
   start)
     start_agents "${E2E_USERS:-$(count_from_existing)}"
     ;;
@@ -535,7 +647,7 @@ case "${ACTION}" in
     stop_agents
     ;;
   '' | *[!0-9]*)
-    fail "usage: $0 <count>|start|stop|cleanup"
+    fail "usage: $0 <count>|bringup|layout|start|stop|cleanup"
     ;;
   *)
     create_sandboxes "${ACTION}"
