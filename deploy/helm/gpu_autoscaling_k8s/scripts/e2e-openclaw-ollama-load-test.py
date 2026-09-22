@@ -122,10 +122,12 @@ async def send_user_query(
         "-c",
         (
             "set -euo pipefail; "
-            # proxy-env withholds the token unless OPENCLAW_GATEWAY_URL is loopback
-            # ws://; OpenShell often injects http(s) and a stale sandbox token.
-            "unset OPENCLAW_GATEWAY_URL || true; "
+            # OpenShell injects the sandbox-create token; nemoclaw-start rotates
+            # gateway.auth.token. Prefer json in the helper. Drop both URL and
+            # token before proxy-env so a stale env token cannot win.
+            "unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN || true; "
             ". /tmp/nemoclaw-proxy-env.sh; "
+            "unset OPENCLAW_GATEWAY_TOKEN || true; "
             "export E2E_PROMPT_TIMEOUT_SEC=\"$3\" E2E_SESSION_KEY=\"$4\"; "
             "echo \"$1\" | base64 -d | python3 - \"$2\""
         ),

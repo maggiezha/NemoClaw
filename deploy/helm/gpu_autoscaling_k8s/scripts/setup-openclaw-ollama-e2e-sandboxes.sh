@@ -392,11 +392,14 @@ stop_one_agent() {
     fi
     rm -f "${pidfile}"
   fi
-  # Host-side openshell exec can die while openclaw-gateway and prompt helpers
-  # stay in the sandbox netns (AUTH_RATE_LIMITED survives). fuser is not in the image.
+  # Host-side openshell exec can die while openclaw-gateway stays in the
+  # sandbox (AUTH_RATE_LIMITED survives). killall is not always installed;
+  # match the process name from ps. Do not pkill -f the e2e script name.
   kubectl exec -n "${E2E_SANDBOX_NS}" "${name}" -c agent -- bash -c '
-    killall -q openclaw-gateway 2>/dev/null || true
-    ps -eo pid=,args= | awk "/E2E_SESSION_KEY/ && !/awk/ {print \$1}" | xargs -r kill 2>/dev/null || true
+    ps -eo pid=,args= | awk "
+      /openclaw-gateway/ && !/awk/ {print \$1}
+      /E2E_SESSION_KEY/ && !/awk/ {print \$1}
+    " | xargs -r kill 2>/dev/null || true
   ' >/dev/null 2>&1 || true
   echo "  ${name}: OpenClaw agent start process stopped"
 }
@@ -432,24 +435,17 @@ start_agents() {
       || fail "sandbox ${name} does not exist"
     names+=("${name}")
   done
+  echo "  stopping leftover OpenClaw gateways so start does not reuse a rotated token"
+  for name in "${names[@]}"; do
+    stop_one_agent "${name}"
+  done
   echo "  patching nproc + slim OpenClaw config (nemoclaw plugin only)"
   for name in "${names[@]}"; do
     slim_one_sandbox "${name}" || fail "could not slim ${name}"
   done
   for name in "${names[@]}"; do
-    agent_health_ok "${name}" &
-    finish_pids+=("$!")
-    finish_names+=("${name}")
-  done
-  for i in "${!finish_pids[@]}"; do
-    name="${finish_names[$i]}"
-    if wait "${finish_pids[$i]}"; then
-      echo "  ${name}: OpenClaw agent already healthy"
-      already+=("${name}")
-    else
-      launch_one_agent "${name}"
-      pending+=("${name}")
-    fi
+    launch_one_agent "${name}"
+    pending+=("${name}")
   done
   finish_pids=()
   finish_names=()
