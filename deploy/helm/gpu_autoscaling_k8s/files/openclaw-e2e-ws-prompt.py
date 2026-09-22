@@ -84,12 +84,27 @@ def _text(message: object) -> str:
     return ""
 
 
+def _gateway_token() -> str:
+    # Connect-shell env can still hold the OpenShell-injected token from
+    # sandbox create. After nemoclaw-start, the running gateway uses
+    # gateway.auth.token in openclaw.json (rotated on each start).
+    try:
+        with open("/sandbox/.openclaw/openclaw.json", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        token = ((cfg.get("gateway") or {}).get("auth") or {}).get("token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    except (OSError, json.JSONDecodeError):
+        pass
+    return os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+
+
 def main() -> int:
     prompt = sys.argv[1] if len(sys.argv) > 1 else ""
     if not prompt:
         print("missing prompt", file=sys.stderr)
         return 2
-    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+    token = _gateway_token()
     port = int(os.environ.get("OPENCLAW_GATEWAY_PORT", "18789"))
     timeout = float(os.environ.get("E2E_PROMPT_TIMEOUT_SEC", "120"))
     session = os.environ.get("E2E_SESSION_KEY", "agent:main:e2e")

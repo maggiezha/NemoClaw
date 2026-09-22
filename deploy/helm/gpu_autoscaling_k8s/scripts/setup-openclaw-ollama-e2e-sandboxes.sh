@@ -25,6 +25,7 @@
 #   E2E_USERS=4 ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh bringup
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh 4
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh start
+#   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh refresh-inference
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh stop
 #   ./scripts/setup-openclaw-ollama-e2e-sandboxes.sh cleanup
 #
@@ -222,25 +223,26 @@ refresh_openshell_inference_backend() {
   load_e2e_inference_env
   local log="${STATE_DIR}/openshell-provider.log"
   mkdir -p "${STATE_DIR}"
+  echo "  OpenShell provider ${OPENSHELL_PROVIDER_NAME} → Envoy dataplane ${E2E_INFERENCE_URL} (pod IP, not ClusterIP)"
   if openshell provider get "${OPENSHELL_PROVIDER_NAME}" >/dev/null 2>&1; then
     OPENAI_API_KEY="${E2E_API_KEY}" openshell provider update "${OPENSHELL_PROVIDER_NAME}" \
       --credential OPENAI_API_KEY \
       --config "OPENAI_BASE_URL=${E2E_INFERENCE_URL}" \
-      >>"${log}" 2>&1
+      >>"${log}" 2>&1 || fail "openshell provider update ${OPENSHELL_PROVIDER_NAME} failed (see ${log})"
   else
     OPENAI_API_KEY="${E2E_API_KEY}" openshell provider create \
       --name "${OPENSHELL_PROVIDER_NAME}" \
       --type openai \
       --credential OPENAI_API_KEY \
       --config "OPENAI_BASE_URL=${E2E_INFERENCE_URL}" \
-      >>"${log}" 2>&1
+      >>"${log}" 2>&1 || fail "openshell provider create ${OPENSHELL_PROVIDER_NAME} failed (see ${log})"
   fi
   openshell inference set \
     --provider "${OPENSHELL_PROVIDER_NAME}" \
     --model "${INFERENCE_MODEL}" \
     --timeout 300 \
     --no-verify \
-    >>"${log}" 2>&1
+    >>"${log}" 2>&1 || fail "openshell inference set ${OPENSHELL_PROVIDER_NAME}/${INFERENCE_MODEL} failed (see ${log})"
 }
 
 agent_health_ok() {
@@ -390,6 +392,12 @@ stop_one_agent() {
     fi
     rm -f "${pidfile}"
   fi
+  # Host-side openshell exec can die while openclaw-gateway and prompt helpers
+  # stay in the sandbox netns (AUTH_RATE_LIMITED survives). fuser is not in the image.
+  kubectl exec -n "${E2E_SANDBOX_NS}" "${name}" -c agent -- bash -c '
+    killall -q openclaw-gateway 2>/dev/null || true
+    ps -eo pid=,args= | awk "/E2E_SESSION_KEY/ && !/awk/ {print \$1}" | xargs -r kill 2>/dev/null || true
+  ' >/dev/null 2>&1 || true
   echo "  ${name}: OpenClaw agent start process stopped"
 }
 
@@ -415,6 +423,9 @@ start_agents() {
   echo "Starting ${count} OpenClaw agents in parallel (${SANDBOX_PREFIX}0000…). Cluster still has one OpenShell gateway and one Envoy Gateway."
   echo "  Light CPU sandboxes (${AGENT_SANDBOX_CPU} / ${AGENT_SANDBOX_MEMORY}); GPUs do inference."
   echo "  One agent per sandbox (nemoclaw-start, NEMOCLAW_MINIMAL_BOOTSTRAP=1). Not sequential :18789 waits."
+  echo "  pointing OpenShell inference backend at Envoy dataplane pod IP (not ClusterIP)"
+  refresh_openshell_inference_backend \
+    || fail "could not update OpenShell provider ${OPENSHELL_PROVIDER_NAME} to ${E2E_INFERENCE_URL:-unknown}"
   for ((i = 0; i < count; i += 1)); do
     name="$(sandbox_name "${i}")"
     kubectl get pod "${name}" -n "${E2E_SANDBOX_NS}" >/dev/null 2>&1 \
@@ -643,11 +654,15 @@ case "${ACTION}" in
   start)
     start_agents "${E2E_USERS:-$(count_from_existing)}"
     ;;
+  refresh-inference)
+    refresh_openshell_inference_backend \
+      || fail "could not update OpenShell provider ${OPENSHELL_PROVIDER_NAME} to ${E2E_INFERENCE_URL:-unknown}"
+    ;;
   stop)
     stop_agents
     ;;
   '' | *[!0-9]*)
-    fail "usage: $0 <count>|bringup|layout|start|stop|cleanup"
+    fail "usage: $0 <count>|bringup|layout|start|stop|refresh-inference|cleanup"
     ;;
   *)
     create_sandboxes "${ACTION}"
