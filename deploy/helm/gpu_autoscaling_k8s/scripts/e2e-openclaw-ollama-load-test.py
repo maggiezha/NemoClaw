@@ -53,6 +53,7 @@ PROMPTS = [
 
 HELPER_PATH = Path(__file__).resolve().parent.parent / "files" / "openclaw-e2e-ws-prompt.py"
 _HELPER_B64 = ""
+SANDBOX_NS = os.environ.get("OPENSHELL_NAMESPACE", "nemoclaw-sandboxes")
 
 
 def sandbox_name(prefix: str, user_id: int) -> str:
@@ -101,123 +102,107 @@ async def terminate_proc(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-async def send_user_query(
-    sandbox: str, prompt: str, timeout_sec: int, session_key: str
-) -> tuple[bool, str]:
-    """Send one prompt to the already-running OpenClaw agent. No extra Node CLI."""
-    openshell = shutil.which("openshell")
-    if not openshell:
-        return False, "openshell is not on PATH"
-    if not HELPER_PATH.is_file():
-        return False, f"missing {HELPER_PATH}"
-    proc = await asyncio.create_subprocess_exec(
-        openshell,
-        "sandbox",
-        "exec",
-        "-n",
-        sandbox,
-        "--no-tty",
-        "--",
-        "bash",
-        "-c",
-        (
-            "set -euo pipefail; "
-            # OpenShell injects the sandbox-create token; nemoclaw-start rotates
-            # gateway.auth.token. Prefer json in the helper. Drop both URL and
-            # token before proxy-env so a stale env token cannot win.
-            "unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN || true; "
-            ". /tmp/nemoclaw-proxy-env.sh; "
-            "unset OPENCLAW_GATEWAY_TOKEN || true; "
-            "export E2E_PROMPT_TIMEOUT_SEC=\"$3\" E2E_SESSION_KEY=\"$4\"; "
-            "echo \"$1\" | base64 -d | python3 - \"$2\""
-        ),
-        "bash",
-        helper_b64(),
-        prompt,
-        str(timeout_sec),
-        session_key,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec + 30)
-    except asyncio.TimeoutError:
-        await terminate_proc(proc)
-        return False, f"timed out after {timeout_sec}s"
-    stdout = stdout_b.decode("utf-8", errors="replace").strip()
-    stderr = stderr_b.decode("utf-8", errors="replace").strip()
-    combined = f"{stdout}\n{stderr}"
-    if proc.returncode != 0:
-        return False, stderr or stdout or f"exit {proc.returncode}"
-    if FALLBACK_RE.search(combined):
-        return False, "OpenClaw used embedded fallback instead of the managed gateway"
-    if not stdout:
-        return False, "empty OpenClaw response"
-    if "LLM request failed" in combined or "network connection error" in combined:
-        return False, stdout or stderr
-    return True, stdout
-
-
 async def simulate_user(
     user_id: int,
     prefix: str,
     inflight: int,
+    inflight_start: int,
     duration_sec: int,
     timeout_sec: int,
     stop_event: asyncio.Event,
     log_path: Path,
 ) -> dict[str, object]:
+    """One kubectl exec per sandbox. In-process threads keep inflight chats.
+
+    Many parallel openshell/kubectl execs OOMKill the 4Gi CPU sandbox (exit 137).
+    """
     sandbox = sandbox_name(prefix, user_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    kubectl = shutil.which("kubectl")
+    if not kubectl:
+        return {"user_id": user_id, "sandbox": sandbox, "ok": 0, "err": 1, "error": "kubectl missing"}
+    if not HELPER_PATH.is_file():
+        return {"user_id": user_id, "sandbox": sandbox, "ok": 0, "err": 1, "error": f"missing {HELPER_PATH}"}
+    script = (
+        "set -euo pipefail; "
+        "ns=''; "
+        "for n in /run/netns/*; do [ -e \"$n\" ] || continue; ns=$n; break; done; "
+        "[ -n \"$ns\" ] || { echo no-sandbox-netns >&2; exit 1; }; "
+        "unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN || true; "
+        "if [ -f /tmp/nemoclaw-proxy-env.sh ]; then . /tmp/nemoclaw-proxy-env.sh; fi; "
+        "unset OPENCLAW_GATEWAY_TOKEN || true; "
+        "export E2E_DURATION_SEC=\"$3\" E2E_INFLIGHT=\"$4\" E2E_INFLIGHT_MAX=\"$5\" "
+        "E2E_PROMPT_TIMEOUT_SEC=\"$6\" E2E_SESSION_KEY=\"$7\" "
+        "E2E_ESCALATE_INTERVAL_SEC=15 E2E_ESCALATE_FACTOR=0.35; "
+        "echo \"$1\" | base64 -d | nsenter --net=\"$ns\" python3 -"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        kubectl,
+        "exec",
+        "-n",
+        SANDBOX_NS,
+        sandbox,
+        "-c",
+        "agent",
+        "--",
+        "bash",
+        "-c",
+        script,
+        "bash",
+        helper_b64(),
+        "Say OK in one word.",
+        str(duration_sec),
+        str(inflight_start),
+        str(inflight),
+        str(timeout_sec),
+        f"agent:main:{sandbox}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    log_handle = log_path.open("w")
     ok = 0
     err = 0
     started = time.monotonic()
-    end = started + duration_sec
-    turn = 0
-    log_handle = log_path.open("w")
 
-    async def one_turn(turn_id: int) -> None:
-        nonlocal ok, err
-        prompt = PROMPTS[(user_id + turn_id) % len(PROMPTS)]
-        success, detail = await send_user_query(
-            sandbox,
-            prompt,
-            timeout_sec,
-            f"agent:main:{sandbox}:t{turn_id}",
-        )
-        if success:
-            ok += 1
-            log_handle.write(f"ok turn={turn_id}\n")
-        else:
-            err += 1
-            log_handle.write(f"err turn={turn_id} {detail}\n")
-            print(f"[user {user_id} {sandbox}] turn {turn_id} error: {detail}", file=sys.stderr)
-        log_handle.flush()
-
-    pending: set[asyncio.Task[None]] = set()
-    try:
-        while time.monotonic() < end and not stop_event.is_set():
-            while len(pending) < inflight and time.monotonic() < end and not stop_event.is_set():
-                pending.add(asyncio.create_task(one_turn(turn)))
-                turn += 1
-            if not pending:
+    async def pump() -> None:
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
                 break
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                await task
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            text = line.decode("utf-8", errors="replace")
+            log_handle.write(text)
+            log_handle.flush()
+            print(f"[user {user_id} {sandbox}] {text.rstrip()}", flush=True)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while proc.returncode is None and not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+        if stop_event.is_set() and proc.returncode is None:
+            await terminate_proc(proc)
+        else:
+            await proc.wait()
     finally:
-        log_handle.write(f"ok={ok} err={err}\n")
+        await pump_task
         log_handle.close()
+    rc = proc.returncode if proc.returncode is not None else 1
+    if rc == 0:
+        ok = 1
+    else:
+        err = 1
     return {
         "user_id": user_id,
         "sandbox": sandbox,
         "ok": ok,
         "err": err,
-        "turns": turn,
+        "turns": inflight,
         "duration": time.monotonic() - started,
         "log": str(log_path),
+        "exit": rc,
     }
 
 
@@ -240,8 +225,11 @@ async def run_test(args: argparse.Namespace) -> int:
     print(f"  Sandboxes: {args.prefix}0000 … {args.prefix}{args.users - 1:04d}")
     print("  Each user prompts the already-running OpenClaw agent on :18789")
     print("  Path: end user → CPU agent/sandbox → https://inference.local → Envoy → GPU Ollama HPA")
-    print("  One OpenShell gateway for all sandboxes. Not a second Node CLI, not load-generator.ts.")
-    print(f"  Concurrent prompts per user: {args.inflight_per_user}")
+    print("  One kubectl exec per sandbox (in-process inflight). Not N execs, not load-generator.ts.")
+    print(
+        f"  Concurrent prompts per user: start={args.inflight_start} max={args.inflight_per_user} "
+        "(keep this small; OpenClaw RAM is the CPU-sandbox limit)"
+    )
     print(f"  GPU inference model={args.model}  HPA {args.hpa_namespace}/{args.hpa_name}")
     print(f"  duration≤{args.duration}s  target replicas={args.target_pods}")
     print("=" * 70)
@@ -258,7 +246,10 @@ async def run_test(args: argparse.Namespace) -> int:
                     "desired_replicas": desired,
                 }
             )
-            print(f"[hpa] {args.hpa_namespace}/{args.hpa_name} current={current} desired={desired}")
+            print(
+                f"[hpa] {args.hpa_namespace}/{args.hpa_name} current={current} desired={desired}",
+                flush=True,
+            )
             if current >= args.target_pods:
                 if hold_started is None:
                     hold_started = time.monotonic()
@@ -282,6 +273,7 @@ async def run_test(args: argparse.Namespace) -> int:
                 user_id=i,
                 prefix=args.prefix,
                 inflight=args.inflight_per_user,
+                inflight_start=args.inflight_start,
                 duration_sec=args.duration,
                 timeout_sec=args.timeout,
                 stop_event=stop_load,
@@ -385,7 +377,13 @@ def main() -> int:
         "--inflight-per-user",
         type=int,
         default=int(os.environ.get("E2E_INFLIGHT_PER_USER", "1")),
-        help="Concurrent prompts each user sends to their already-running agent (keep 1 to stay light)",
+        help="Max concurrent chats per agent. Keep well below Job 640/pod — OpenClaw RAM OOMs the CPU sandbox.",
+    )
+    parser.add_argument(
+        "--inflight-start",
+        type=int,
+        default=int(os.environ.get("E2E_INFLIGHT_START_PER_USER", "1")),
+        help="Bootstrap concurrent chats per agent before ramping (1–2 keeps CPU RAM low)",
     )
     parser.add_argument("--target-pods", type=int, default=int(os.environ.get("TARGET_PODS", "8")))
     parser.add_argument("--hold-sec", type=float, default=float(os.environ.get("MAX_REPLICAS_HOLD_SEC", "0")))
@@ -394,9 +392,11 @@ def main() -> int:
     parser.add_argument("--hpa-poll-sec", type=float, default=float(os.environ.get("SCALE_UP_POLL_SEC", "10")))
     parser.add_argument("--scale-down-wait-loops", type=int, default=int(os.environ.get("SCALE_DOWN_WAIT_LOOPS", "40")))
     args = parser.parse_args()
-    if args.users < 1 or args.inflight_per_user < 1:
-        print("--users and --inflight-per-user must be >= 1", file=sys.stderr)
+    if args.users < 1 or args.inflight_per_user < 1 or args.inflight_start < 1:
+        print("--users, --inflight-per-user, and --inflight-start must be >= 1", file=sys.stderr)
         return 2
+    if args.inflight_start > args.inflight_per_user:
+        args.inflight_start = args.inflight_per_user
     return asyncio.run(run_test(args))
 
 

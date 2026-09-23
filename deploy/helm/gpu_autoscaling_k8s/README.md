@@ -482,7 +482,8 @@ openshell status
 On 8× H100 both of these keep `minReplicas=1` and `maxReplicas=8`. **Keep the Job.** The sandbox e2e does not replace it.
 
 - **Fast HPA-only (keep):** `./scripts/hpa-load-test-dgx-8xh100.sh` — Kubernetes Job (`files/load-generator.ts`) talks to metrics-proxy **pod IPs**, then checks Envoy. Use this for GPU-util HPA and for `HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000`.
-- **Longer architecture e2e (additional):** `./scripts/test-openclaw-ollama-e2e-hpa.sh` — OpenClaw + Ollama: N end users, each with one **light** OpenClaw sandbox (1 CPU / 1Gi) and one OpenClaw **agent**. Those sandboxes send load through `https://inference.local` → Envoy → **Ollama** HPA in `nemoclaw-gpu`. Create skips smoke/supervisor waits; start uses `NEMOCLAW_MINIMAL_BOOTSTRAP=1` and only the nemoclaw plugin. Parallel create/start wall-clock is about one sandbox/agent (plus image pull), not N sequential hours. Still **one** OpenShell gateway and **one** Envoy Gateway.
+- **Longer architecture e2e (additional):** `./scripts/test-openclaw-ollama-e2e-hpa.sh` — OpenClaw + Ollama **GPU util** HPA: N end users, each with one **light** OpenClaw sandbox (1 CPU / 1Gi) and one OpenClaw **agent**. Those sandboxes send load through `https://inference.local` → Envoy → **Ollama** HPA in `nemoclaw-gpu`.
+- **Longer latency e2e (additional):** `./scripts/test-openclaw-ollama-e2e-latency-hpa.sh` — same user→sandbox path, but HPA uses **LLM latency** (`HPA_METRIC=latency_avg`, target **3000 ms**), the same gauge the Job uses (`nemoclaw_llm_latency_avg_milliseconds` from metrics-proxy). Keep per-agent inflight small so CPU sandboxes do not OOM.
 - `./scripts/test-hermes-e2e-hpa.sh` — Hermes + vLLM, next step. Do not run it while the OpenClaw + Ollama e2e owns the GPUs.
 
 `E2E_USERS=10` (10 end users → 10 sandboxes) is **only an example** for the OpenClaw + Ollama test, and for the Hermes + vLLM step after that. Set `E2E_USERS` to whatever the node’s CPU can hold. Size from CPU, not GPU count: e2e sandboxes are light CPU front ends (`AGENT_SANDBOX_CPU` default **1**, `AGENT_SANDBOX_MEMORY` default **1Gi**). They do not run the model; GPUs do. Pairing (`create-agent-sandbox.sh`) still defaults to 2 CPU / 4Gi for interactive use. This recipe does not publish a DGX user cap.
@@ -520,8 +521,12 @@ export PATH="${HOME}/.local/bin:${PATH}"
 # Official complete OpenClaw image (not *-sandbox-base). Override if you already built locally.
 export AGENT_SANDBOX_IMAGE="${AGENT_SANDBOX_IMAGE:-ghcr.io/nvidia/nemoclaw/openclaw-sandbox@sha256:bd935f0198b99889d9479fea123b62a59e3797da13e392dcc2160f114216c1ba}"
 
-# OpenClaw + Ollama in nemoclaw-gpu (same GPU backend as hpa-load-test-dgx-8xh100.sh).
+# OpenClaw + Ollama in nemoclaw-gpu (GPU util HPA).
 ./scripts/test-openclaw-ollama-e2e-hpa.sh
+
+# Same path, LLM latency HPA (metrics-proxy rolling avg, target 3000 ms).
+# Light per-agent inflight so CPU sandboxes do not OOM.
+./scripts/test-openclaw-ollama-e2e-latency-hpa.sh
 ```
 
 Pass: HPA scales **1→8** under sandbox load, then back to **1** after the saturators stop. Results land in `e2e-results/openclaw-ollama/` (gitignored). Watch with `./scripts/get-hpa.sh -n nemoclaw-gpu -w`.
@@ -544,7 +549,8 @@ Same user → sandbox path after OpenClaw + Ollama is done: load generator → N
 | Hardware | Command | Kind |
 |----------|---------|------|
 | **8× H100** on-prem | `./scripts/hpa-load-test-dgx-8xh100.sh` | Fast HPA-only Job (keep) |
-| **8× H100** on-prem | `./scripts/test-openclaw-ollama-e2e-hpa.sh` | Longer OpenClaw + Ollama e2e (additional; example `E2E_USERS=10`) |
+| **8× H100** on-prem | `./scripts/test-openclaw-ollama-e2e-hpa.sh` | Longer OpenClaw + Ollama GPU-util e2e (additional; example `E2E_USERS=10`) |
+| **8× H100** on-prem | `./scripts/test-openclaw-ollama-e2e-latency-hpa.sh` | Longer OpenClaw + Ollama **latency** e2e (`latency_avg` 3000 ms; light per-agent inflight) |
 | **8× H100** on-prem | `./scripts/test-hermes-e2e-hpa.sh` | Longer Hermes + vLLM e2e (next; example `E2E_USERS=10`) |
 | **4× L40S** on AWS (Brev) | `./scripts/hpa-load-test-brev-4xl40s.sh` | Fast HPA-only Job |
 
@@ -556,8 +562,10 @@ Each run waits for HPA **1/1** Ready (up to 240s, `HPA_BASELINE_WAIT_SEC`) so a 
 ./scripts/hpa-load-test-dgx-8xh100.sh
 # Fast HPA-only (keep; latency):
 HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-dgx-8xh100.sh
-# Longer OpenClaw + Ollama e2e (additional; not a replacement for the Job):
+# Longer OpenClaw + Ollama e2e (GPU util):
 ./scripts/test-openclaw-ollama-e2e-hpa.sh
+# Longer OpenClaw + Ollama e2e (LLM latency, same metric as the Job):
+./scripts/test-openclaw-ollama-e2e-latency-hpa.sh
 # 4× L40S:
 ./scripts/hpa-load-test-brev-4xl40s.sh
 HPA_METRIC=latency_avg HPA_TARGET_LATENCY_MS=3000 ./scripts/hpa-load-test-brev-4xl40s.sh
@@ -649,5 +657,17 @@ helm uninstall nemoclaw-gpu -n nemoclaw-gpu
 ```
 
 Shared Prometheus, Adapter, Envoy, and Agent Sandbox CRDs are left in place.
+
+## FAQ
+
+### Agents and sandboxes run on CPU — what limits how many I can run?
+
+**Agents and OpenShell sandboxes run on CPU, not on GPUs.** CPU **RAM** limits both how many agents you can start and how much concurrent work each agent can take. `MAX_REPLICAS` is GPU pods only.
+
+On this recipe’s 8×H100 path, pairing sandboxes are **2 CPU / 4Gi**. Four agents ramping toward **640** in-flight chats (the Job’s per-GPU-pod peak) **OOMKilled** OpenClaw (`exit 137`) at ~3.2–3.9 GiB. Ten agents at **16–64** in-flight stayed around **2–2.8 GiB**. Prefer **more agents × fewer prompts** over packing Job-sized inflight into one sandbox. The latency e2e (`test-openclaw-ollama-e2e-latency-hpa.sh`) caps per-agent inflight at 32 for that reason.
+
+### How is LLM latency calculated for HPA?
+
+The **metrics-proxy** times the in-pod `chat/completions` fetch until the full response (including streams). That duration is **not** client→Envoy time. It is stored in a rolling window of 128 samples and exported as `nemoclaw_llm_latency_avg_milliseconds`. After 60s with no samples the gauge resets to 0 so HPA can scale down. Prometheus scrapes `/metrics`; the adapter exposes the same name; HPA uses Pods `AverageValue` **3000** (milliseconds). `kubectl get hpa` TARGETS like `46514/3000` means 46514 ms vs 3000 ms. GPU-util TARGETS like `20666m/40` are a different metric (`gpu_utilization_percent`).
 
 Third-party notices: [THIRD-PARTY-NOTICES](../../../../THIRD-PARTY-NOTICES).
