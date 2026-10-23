@@ -15,19 +15,21 @@ vi.mock("../adapters/docker", () => ({
 
 import {
   createDeepAgentsCodeBaseImageResolutionOptions,
+  deepAgentsCodeBaseImageMatchesSandboxIdentity,
   deepAgentsCodeBaseImageMatchesVersion,
 } from "./deep-agents-code-base-image";
+import { DEEP_AGENTS_CODE_SANDBOX_USER } from "./deep-agents-code-runtime-identity";
 
 describe("Deep Agents Code base image compatibility", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    mocks.dockerCapture.mockReset();
   });
 
   it("accepts only the exact installed distribution version (#6456)", () => {
-    mocks.dockerCapture.mockReturnValueOnce("0.1.34\n").mockReturnValueOnce("0.1.12\n");
+    mocks.dockerCapture.mockReturnValueOnce("0.1.55\n").mockReturnValueOnce("0.1.12\n");
 
-    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:current", "0.1.34")).toBe(true);
-    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:stale", "0.1.34")).toBe(false);
+    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:current", "0.1.55")).toBe(true);
+    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:stale", "0.1.55")).toBe(false);
   });
 
   it("binds the manifest version and source files into resolution options (#6456)", () => {
@@ -39,22 +41,138 @@ describe("Deep Agents Code base image compatibility", () => {
       }),
       "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
     );
-    mocks.dockerCapture.mockReturnValue("9.8.7");
+    mocks.dockerCapture
+      .mockReturnValueOnce("9.8.7")
+      .mockReturnValueOnce("nemoclaw-dcode-sandbox-identity-ok")
+      .mockReturnValueOnce("nemoclaw-dcode-dos2unix-ok")
+      .mockReturnValueOnce("nemoclaw-security-inventory-ok");
 
     expect(options).toMatchObject({
       inputPaths: [
         "/test/root/agents/langchain-deepagents-code/manifest.yaml",
         "/test/root/agents/langchain-deepagents-code/requirements.lock",
+        "src/lib/agent/deep-agents-code-runtime-identity.json",
       ],
-      validationDescription: "deepagents-code==9.8.7",
+      validationDescription:
+        "deepagents-code==9.8.7, sandbox identity, dos2unix, and the immutable security package inventory",
     });
     expect(options?.validateImage?.("dcode-base:manifest-version")).toBe(true);
   });
 
-  it("runs the version probe in a locked-down container (#6456)", () => {
-    mocks.dockerCapture.mockReturnValue("0.1.34");
+  it("rejects a base whose sandbox account does not match the cleanup identity", () => {
+    mocks.dockerCapture.mockReturnValueOnce("0.1.71").mockReturnValueOnce("");
+    const options = createDeepAgentsCodeBaseImageResolutionOptions(
+      makeAgent({ name: "langchain-deepagents-code", expectedVersion: "0.1.71" }),
+      "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
+    );
 
-    deepAgentsCodeBaseImageMatchesVersion("dcode-base:current", "0.1.34");
+    expect(options?.validateImage?.("dcode-base:wrong-sandbox-user")).toBe(false);
+    expect(mocks.dockerCapture).toHaveBeenCalledTimes(2);
+    expect(mocks.dockerCapture.mock.calls[1]?.[0].at(-1)).toContain(
+      `id -u sandbox):$(id -g sandbox)" = "${DEEP_AGENTS_CODE_SANDBOX_USER}`,
+    );
+  });
+
+  it("probes sandbox identity without granting the image network or extra capabilities", () => {
+    mocks.dockerCapture.mockReturnValue("nemoclaw-dcode-sandbox-identity-ok");
+
+    expect(deepAgentsCodeBaseImageMatchesSandboxIdentity("dcode-base:current")).toBe(true);
+    expect(mocks.dockerCapture.mock.calls[0]?.[0]).toEqual(
+      expect.arrayContaining([
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--entrypoint",
+        "/bin/sh",
+      ]),
+    );
+  });
+
+  it("rejects a matching distribution from a base without dos2unix (#8870)", () => {
+    const options = createDeepAgentsCodeBaseImageResolutionOptions(
+      makeAgent({
+        name: "langchain-deepagents-code",
+        displayName: "LangChain Deep Agents Code",
+        expectedVersion: "0.1.34",
+      }),
+      "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
+    );
+    mocks.dockerCapture
+      .mockReturnValueOnce("0.1.34")
+      .mockReturnValueOnce("nemoclaw-dcode-sandbox-identity-ok")
+      .mockReturnValueOnce("");
+
+    expect(options?.validateImage?.("dcode-base:missing-dos2unix")).toBe(false);
+    expect(mocks.dockerCapture).toHaveBeenCalledTimes(3);
+    expect(mocks.dockerCapture.mock.calls[2]?.[0]).toEqual(
+      expect.arrayContaining([
+        "run",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--user",
+        "999:999",
+        "--entrypoint",
+        "/bin/sh",
+        "dcode-base:missing-dos2unix",
+        "-eu",
+        "-c",
+      ]),
+    );
+    expect(mocks.dockerCapture.mock.calls[2]?.[0].at(-1)).toContain("test -x /usr/bin/dos2unix");
+    expect(mocks.dockerCapture.mock.calls[2]?.[0].at(-1)).toContain("dos2unix --version");
+  });
+
+  it("rejects a matching distribution from a base with an old security inventory (#7809)", () => {
+    const options = createDeepAgentsCodeBaseImageResolutionOptions(
+      makeAgent({
+        name: "langchain-deepagents-code",
+        displayName: "LangChain Deep Agents Code",
+        expectedVersion: "0.1.55",
+      }),
+      "/test/root/agents/langchain-deepagents-code/Dockerfile.base",
+    );
+    mocks.dockerCapture
+      .mockReturnValueOnce("0.1.55")
+      .mockReturnValueOnce("nemoclaw-dcode-sandbox-identity-ok")
+      .mockReturnValueOnce("nemoclaw-dcode-dos2unix-ok")
+      .mockReturnValueOnce("");
+
+    expect(options?.validateImage?.("dcode-base:v0.0.96")).toBe(false);
+    expect(mocks.dockerCapture).toHaveBeenCalledTimes(4);
+    expect(mocks.dockerCapture.mock.calls[3]?.[0]).toEqual(
+      expect.arrayContaining([
+        "run",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--entrypoint",
+        "/bin/sh",
+        "dcode-base:v0.0.96",
+        "-c",
+      ]),
+    );
+    expect(mocks.dockerCapture.mock.calls[3]?.[0].at(-1)).toContain(
+      `cmp -s - "$security_inventory"`,
+    );
+  });
+
+  it("runs the version probe in a locked-down container (#6456)", () => {
+    mocks.dockerCapture.mockReturnValue("0.1.55");
+
+    deepAgentsCodeBaseImageMatchesVersion("dcode-base:current", "0.1.55");
 
     expect(mocks.dockerCapture).toHaveBeenCalledWith(
       [
@@ -82,14 +200,14 @@ describe("Deep Agents Code base image compatibility", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     mocks.dockerCapture.mockReturnValue("");
 
-    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:unreadable", "0.1.34")).toBe(false);
+    expect(deepAgentsCodeBaseImageMatchesVersion("dcode-base:unreadable", "0.1.55")).toBe(false);
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining("dcode-base:unreadable returned no Deep Agents Code version output"),
     );
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining("the container or metadata probe may have failed"),
     );
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("deepagents-code==0.1.34"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("deepagents-code==0.1.55"));
     warn.mockRestore();
   });
 });

@@ -6,11 +6,12 @@ import { describe, expect, it } from "vitest";
 import { isProcessControlEnvName, PROCESS_CONTROL_ENV_NAMES } from "./process-control-env";
 
 describe("credential-handoff process-control environment policy", () => {
-  it("blocks every canonical exact environment name (#5048)", () => {
-    for (const name of PROCESS_CONTROL_ENV_NAMES) {
+  it.each(Array.from(PROCESS_CONTROL_ENV_NAMES, (value) => [value]))(
+    "blocks the canonical environment name %s (#5048)",
+    (name) => {
       expect(isProcessControlEnvName(name)).toBe(true);
-    }
-  });
+    },
+  );
 
   it.each([
     "BASH_FUNC_ECHO%%",
@@ -47,6 +48,7 @@ describe("credential-handoff process-control environment policy", () => {
     "LOCPATH",
     "NETRC",
     "NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL",
+    "NEMOCLAW_BOOTSTRAP_FETCH_REF",
     "NEMOCLAW_BOOTSTRAP_PAYLOAD",
     "NEMOCLAW_INSTALL_REF",
     "NEMOCLAW_INSTALL_TAG",
@@ -86,11 +88,10 @@ describe("credential-handoff process-control environment policy", () => {
     expect(isProcessControlEnvName(name)).toBe(true);
   });
 
-  it.each([
-    "LANG",
-    "PUBLIC_ID",
-    "SAFE_SETTING",
-  ])("allows unrelated environment name %s (#5048)", (name) => {
-    expect(isProcessControlEnvName(name)).toBe(false);
-  });
+  it.each(["LANG", "PUBLIC_ID", "SAFE_SETTING"])(
+    "allows unrelated environment name %s (#5048)",
+    (name) => {
+      expect(isProcessControlEnvName(name)).toBe(false);
+    },
+  );
 });

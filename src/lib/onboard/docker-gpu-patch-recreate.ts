@@ -17,6 +17,7 @@ import {
   buildDockerGpuCloneRunArgs,
   buildDockerGpuCloneRunOptions,
   dockerContainerName,
+  getDockerGpuCloneFallbackDns,
   parseDockerInspectJson,
   sameContainerId,
   validateRequiredDockerUlimits,
@@ -25,7 +26,7 @@ import {
   DOCKER_GPU_PATCH_STOP_TIMEOUT_MS,
   DOCKER_GPU_PATCH_TIMEOUT_MS,
 } from "./docker-gpu-patch-constants";
-import { reconcileSupervisorReconnect } from "./docker-gpu-patch-finalize";
+import { finalizeDockerGpuPatchBackup } from "./docker-gpu-patch-finalize";
 import { selectDockerGpuPatchMode } from "./docker-gpu-patch-mode";
 import { restoreDockerGpuPatchBackupAfterRecreateFailure } from "./docker-gpu-patch-rollback";
 import type {
@@ -38,6 +39,7 @@ import type {
 import { waitForOpenShellSupervisorReconnect } from "./docker-gpu-supervisor-reconnect";
 import { openshellSandboxCommandEnvValue } from "./docker-startup-command-env";
 import { findOpenShellDockerSandboxContainerIds } from "./openshell-docker-sandbox-containers";
+import { isFatalContainerDnsProbeFailure, probeContainerDns } from "./preflight";
 
 const DOCKER_GPU_PATCH_WAIT_SECS = 180;
 const MAX_DOCKER_CONTAINER_NAME_LENGTH = 253;
@@ -55,6 +57,7 @@ type RecreateDeps = Required<
     | "sleep"
     | "now"
     | "detectSandboxFallbackDns"
+    | "probeContainerDns"
     | "detectTegraDeviceGroupGids"
   >
 > &
@@ -74,6 +77,7 @@ function recreateDeps(deps: DockerGpuPatchDeps): RecreateDeps {
     },
     now: () => new Date(),
     detectSandboxFallbackDns: () => detectSandboxFallbackDns(),
+    probeContainerDns: (options) => probeContainerDns(options),
     detectTegraDeviceGroupGids: () => detectTegraDeviceGroupGids(),
     ...deps,
   };
@@ -145,21 +149,31 @@ export function getDockerGpuPatchFailureContext(
   return null;
 }
 
+type RecreateOpenShellDockerSandboxContainerOptions = {
+  sandboxName: string;
+  gpuDevice?: string | null;
+  timeoutSecs?: number;
+  waitForSupervisor?: boolean;
+  openshellSandboxCommand?: readonly string[] | null;
+  requiredUlimits?: readonly import("./docker-gpu-patch-types").DockerUlimit[] | null;
+  expectedOldContainerId?: string | null;
+  backend?: "generic" | "jetson";
+  dockerDesktopWsl?: boolean;
+  modeOverride?: DockerGpuPatchMode;
+};
+
 export function recreateOpenShellDockerSandboxContainer(
-  options: {
-    sandboxName: string;
-    gpuDevice?: string | null;
-    timeoutSecs?: number;
-    waitForSupervisor?: boolean;
-    openshellSandboxCommand?: readonly string[] | null;
-    requiredUlimits?: readonly import("./docker-gpu-patch-types").DockerUlimit[] | null;
-    expectedOldContainerId?: string | null;
-    backend?: "generic" | "jetson";
-    dockerDesktopWsl?: boolean;
-    modeOverride?: DockerGpuPatchMode;
-  },
+  options: RecreateOpenShellDockerSandboxContainerOptions & { waitForSupervisor: false },
+  deps?: DockerGpuPatchDeps,
+): DockerGpuPatchResult;
+export function recreateOpenShellDockerSandboxContainer(
+  options: RecreateOpenShellDockerSandboxContainerOptions,
+  deps?: DockerGpuPatchDeps,
+): Promise<DockerGpuPatchResult>;
+export function recreateOpenShellDockerSandboxContainer(
+  options: RecreateOpenShellDockerSandboxContainerOptions,
   deps: DockerGpuPatchDeps = {},
-): DockerGpuPatchResult {
+): DockerGpuPatchResult | Promise<DockerGpuPatchResult> {
   const d = recreateDeps(deps);
   const context: DockerGpuPatchFailureContext = {
     sandboxName: options.sandboxName,
@@ -234,14 +248,38 @@ export function recreateOpenShellDockerSandboxContainer(
     cloneOptions.requiredUlimits = options.requiredUlimits ?? null;
     const sandboxFallbackDns = d.detectSandboxFallbackDns();
     if (sandboxFallbackDns) cloneOptions.sandboxFallbackDns = sandboxFallbackDns;
+    const cloneFallbackDns = getDockerGpuCloneFallbackDns(inspect, cloneOptions);
+    if (cloneFallbackDns) {
+      const dnsProbe = d.probeContainerDns({ dnsServer: cloneFallbackDns });
+      if (isFatalContainerDnsProbeFailure(dnsProbe)) {
+        const detail = String(dnsProbe.details || "")
+          .trim()
+          .split("\n")
+          .slice(-4)
+          .join("\n");
+        throw new Error(
+          `Sandbox DNS preflight failed using --dns ${cloneFallbackDns} ` +
+            `(reason: ${dnsProbe.reason ?? "unknown"}) before container recreation.` +
+            (detail ? `\n${detail}` : ""),
+        );
+      }
+      if (dnsProbe.ok) {
+        console.log(`  ✓ Sandbox fallback DNS works with --dns ${cloneFallbackDns}`);
+      } else {
+        console.warn(
+          `  ⚠ Sandbox fallback DNS probe inconclusive with --dns ${cloneFallbackDns} ` +
+            `(reason: ${dnsProbe.reason ?? "unknown"}); continuing without blocking recreation.`,
+        );
+      }
+    }
     if (selection.mode.kind !== "startup-command" && options.backend === "jetson") {
       const tegraGroupGids = d.detectTegraDeviceGroupGids();
       if (tegraGroupGids.length > 0) {
         cloneOptions.extraGroupGids = tegraGroupGids;
         console.log(
-          `  ✓ Granting sandbox user access to Jetson Tegra GPU device nodes via --group-add ${tegraGroupGids.join(
+          `  ✓ Granting sandbox user the detected Jetson GPU device groups via --group-add ${tegraGroupGids.join(
             ", ",
-          )} (so CUDA can open /dev/nvmap)`,
+          )} (so CUDA can initialize as a non-root user)`,
         );
       } else {
         console.warn(
@@ -360,27 +398,59 @@ export function recreateOpenShellDockerSandboxContainer(
     });
     if (options.waitForSupervisor === false) return result(false);
 
-    const execReady = waitForOpenShellSupervisorReconnect(
-      options.sandboxName,
-      options.timeoutSecs ?? DOCKER_GPU_PATCH_WAIT_SECS,
-      deps,
-    );
-    const reconcile = reconcileSupervisorReconnect(
-      execReady,
-      { newContainerId, backupContainerName, originalName },
-      deps,
-    );
-    if (!reconcile.execReady) {
-      context.rolledBack = reconcile.rolledBack;
-      throw reconcile.error;
-    }
-    return result(reconcile.backupRemoved);
+    const patchResult = result(false);
+    return (async () => {
+      const execReady = deps.commandExecutor
+        ? await waitForOpenShellSupervisorReconnect(
+            options.sandboxName,
+            options.timeoutSecs ?? DOCKER_GPU_PATCH_WAIT_SECS,
+            {
+              commandExecutor: deps.commandExecutor,
+              runCaptureOpenshell: deps.runCaptureOpenshell,
+              sleep: deps.sleep,
+              errorPhaseDebouncePolls: deps.errorPhaseDebouncePolls,
+            },
+          )
+        : false;
+      const finalization = await (execReady
+        ? finalizeDockerGpuPatchBackup(
+            {
+              result: patchResult,
+              supervisorReady: true,
+              sandboxName: options.sandboxName,
+              finalHandoffTimeoutSecs: options.timeoutSecs ?? DOCKER_GPU_PATCH_WAIT_SECS,
+            },
+            deps,
+          )
+        : finalizeDockerGpuPatchBackup({ result: patchResult, supervisorReady: false }, deps));
+      context.rolledBack = finalization.rolledBack;
+      context.backupRemoved = finalization.backupRemoved;
+      context.replacementStopConfirmed = finalization.replacementStopConfirmed;
+      context.replacementRemovalConfirmed = finalization.replacementRemovalConfirmed;
+      context.replacementPresence = finalization.replacementPresence;
+      context.lastSandboxPhase = finalization.lastSandboxPhase;
+      if (!execReady) {
+        throw new Error(
+          finalization.rolledBack
+            ? "OpenShell supervisor did not reconnect to the GPU-enabled container; pre-patch sandbox restored."
+            : "OpenShell supervisor did not reconnect to the GPU-enabled container and rollback failed; pre-patch sandbox was NOT restored.",
+        );
+      }
+      if (finalization.finalHandoffAcknowledged) return result(true);
+      const rebuildRequired = finalization.backupRemoved
+        ? " The previous container was removed at the final handoff commit point; automatic rollback is unavailable. Rebuild the sandbox before retrying."
+        : "";
+      throw new Error(
+        finalization.lastSandboxPhase
+          ? `OpenShell did not acknowledge the final replacement handoff; last sandbox phase was ${finalization.lastSandboxPhase}.${rebuildRequired}`
+          : `OpenShell did not acknowledge the final replacement handoff.${rebuildRequired}`,
+      );
+    })().catch((error) => {
+      throw decoratePatchError(error instanceof Error ? error : new Error(String(error)), context);
+    });
   } catch (error) {
     throw decoratePatchError(error instanceof Error ? error : new Error(String(error)), context);
   }
 }
 
-export const recreateOpenShellDockerSandboxWithGpu: (
-  options: Omit<Parameters<typeof recreateOpenShellDockerSandboxContainer>[0], "modeOverride">,
-  deps?: DockerGpuPatchDeps,
-) => DockerGpuPatchResult = recreateOpenShellDockerSandboxContainer;
+export const recreateOpenShellDockerSandboxWithGpu = recreateOpenShellDockerSandboxContainer;

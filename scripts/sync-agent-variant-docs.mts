@@ -9,17 +9,19 @@ import { parse } from "yaml";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const docsRoot = path.join(repoRoot, "docs");
 const generatedDocsRoot = path.join(repoRoot, "docs/_build/agent-variants");
-const agentVariants = ["openclaw", "hermes", "deepagents"] as const;
+export const agentVariants = ["openclaw", "hermes", "deepagents", "pi"] as const;
 
 type AgentVariant = (typeof agentVariants)[number];
+const defaultSharedAgentVariants = new Set<AgentVariant>(["openclaw", "hermes", "deepagents"]);
 type RenderedFile = {
   path: string;
   contents: string;
 };
-type RenderTarget = {
+export type RenderTarget = {
   sourcePath: string;
   variant: AgentVariant;
 };
+type NavigationVariantMembership = Map<string, Set<AgentVariant>>;
 type RenderAgentVariantOptions = {
   outputPath?: string;
   sourcePath?: string;
@@ -53,23 +55,28 @@ function main(): void {
   const generatedVariantPages = renderGeneratedAgentVariantPages();
 
   if (checkOnly) {
-    writeGeneratedFiles(generatedVariantPages);
+    if (!checkGeneratedFiles(generatedVariantPages)) {
+      process.exitCode = 1;
+    }
     return;
   }
 
   writeGeneratedFiles(generatedVariantPages);
 }
 
-function splitFrontmatter(source: string): { frontmatter: string; body: string } {
+function splitFrontmatter(
+  source: string,
+  sourceLabel = "source page",
+): { frontmatter: string; body: string } {
   const match = source.match(/^(\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n)([\s\S]*)$/);
   if (!match) {
-    throw new Error("commands.mdx must start with YAML frontmatter");
+    throw new Error(`${sourceLabel} must start with YAML frontmatter`);
   }
   return { frontmatter: match[1], body: match[2] };
 }
 
 function replaceFrontmatterLine(frontmatter: string, key: string, value: string): string {
-  const pattern = new RegExp(`^${escapeRegExp(key)}:.*$`, "m");
+  const pattern = new RegExp(`^${escapeRegExp(key)}:[^\\r\\n]*(?:\\r?\\n[ \\t]+[^\\r\\n]*)*`, "m");
   if (!pattern.test(frontmatter)) {
     throw new Error(`commands.mdx frontmatter is missing '${key}'`);
   }
@@ -177,6 +184,130 @@ function assertStaticallyResolvedVariantPage(
   );
 }
 
+type VariantLine =
+  | { kind: "blank" }
+  | { kind: "content" }
+  | { kind: "fence"; marker: string }
+  | { kind: "comment"; closed: boolean }
+  | { kind: "heading"; level: number; text: string; setext?: boolean };
+
+// MDX parses `{...}` as a JavaScript expression, so whitespace is allowed
+// between the comment terminator and the closing brace.
+const JSX_COMMENT_END = /\*\/\s*\}/u;
+
+/** Whatever a line renders once its complete comments are removed. */
+function textOutsideComments(line: string): string {
+  return line.replace(/\{\/\*[\s\S]*?\*\/\s*\}/gu, "").trim();
+}
+
+/** The heading level a Setext underline gives the paragraph line above it. */
+function setextHeadingLevel(nextLine: string | undefined): number | undefined {
+  const underline = nextLine?.match(/^ {0,3}(=+|-+) *$/u);
+  if (!underline) return undefined;
+  return underline[1].startsWith("=") ? 1 : 2;
+}
+
+/** Classify one line that sits outside any open fence or comment. */
+function classifyVariantLine(rawLine: string, nextLine?: string): VariantLine {
+  const line = rawLine.trim();
+  if (line === "") return { kind: "blank" };
+  if (line.startsWith("{/*")) {
+    const closed = JSX_COMMENT_END.test(line);
+    // A comment can be followed by text that still renders.
+    if (closed && textOutsideComments(line) !== "") return { kind: "content" };
+    return { kind: "comment", closed };
+  }
+  // An indented code block is content. Classifying it would turn a Markdown
+  // example into a heading or a fence.
+  if (/^(?: {4,}|\t)/u.test(rawLine)) return { kind: "content" };
+  // A backtick info string cannot contain a backtick, so an inline code span
+  // is not a fence. A tilde info string may contain anything.
+  const fence = line.match(/^(`{3,})[^`]*$/u) ?? line.match(/^(~{3,})/u);
+  if (fence) return { kind: "fence", marker: fence[1] };
+  const heading = line.match(/^(#{1,6})(?:[ \t]|$)/u);
+  if (heading) return { kind: "heading", level: heading[1].length, text: line };
+  // A Setext underline turns the paragraph line above it into a heading.
+  const setext = setextHeadingLevel(nextLine);
+  if (setext) return { kind: "heading", level: setext, text: line, setext: true };
+  return { kind: "content" };
+}
+
+/**
+ * A closing fence is the opening marker alone, at least as long, and indented
+ * by less than the four spaces that would make it a code block.
+ */
+function closesFence(rawLine: string, marker: string): boolean {
+  if (/^(?: {4,}|\t)/u.test(rawLine)) return false;
+  return new RegExp(`^${marker[0]}{${String(marker.length)},}\\s*$`, "u").test(rawLine.trim());
+}
+
+/**
+ * A heading whose body sits in an `<AgentOnly>` block for another variant
+ * renders with nothing beneath it. Reject that here so `npm run docs` catches
+ * it, including on documentation-only changes that skip the test lanes.
+ *
+ * The message names the heading rather than a line number, because this runs on
+ * the rendered body and its line numbers do not match the shared source page.
+ */
+function assertNoEmptyVariantSections(
+  body: string,
+  activeVariant: AgentVariant,
+  sourcePath?: string,
+): void {
+  const empty: string[] = [];
+  let open: { heading: string; level: number } | undefined;
+  let fence: string | undefined;
+  let comment = false;
+  let setextUnderline = false;
+  const lines = body.split("\n");
+
+  lines.forEach((rawLine, index) => {
+    if (fence !== undefined) {
+      if (closesFence(rawLine, fence)) fence = undefined;
+      return;
+    }
+    // The underline belongs to the heading above it, not to its section.
+    if (setextUnderline) {
+      setextUnderline = false;
+      return;
+    }
+    if (comment) {
+      if (!JSX_COMMENT_END.test(rawLine)) return;
+      comment = false;
+      // Text after the terminator still renders, so it closes the section.
+      if (rawLine.replace(/^[\s\S]*?\*\/\s*\}/u, "").trim() !== "") open = undefined;
+      return;
+    }
+
+    const line = classifyVariantLine(rawLine, lines[index + 1]);
+    if (line.kind === "blank") return;
+    if (line.kind === "comment") {
+      comment = !line.closed;
+      return;
+    }
+    if (line.kind === "fence") {
+      fence = line.marker;
+      open = undefined;
+      return;
+    }
+    if (line.kind === "heading") {
+      if (open && line.level <= open.level) empty.push(open.heading);
+      open = { heading: line.text, level: line.level };
+      setextUnderline = line.setext === true;
+      return;
+    }
+    open = undefined;
+  });
+
+  if (open) empty.push(open.heading);
+  if (empty.length === 0) return;
+
+  const source = sourcePath ? path.relative(repoRoot, sourcePath) : "agent variant source";
+  throw new Error(
+    `${source} renders ${empty.join(", ")} with no content in the ${activeVariant} generated variant. Move the heading inside the AgentOnly block that holds its body.`,
+  );
+}
+
 export function renderAgentVariantPage(
   source: string,
   variant: AgentVariant,
@@ -194,6 +325,7 @@ export function renderAgentVariantPage(
     .replace(/\n{3,}/g, "\n\n")
     .trimStart();
   assertStaticallyResolvedVariantPage(renderedBody, variant, options.sourcePath);
+  assertNoEmptyVariantSections(renderedBody, variant, options.sourcePath);
 
   if (options.sourcePath && options.outputPath) {
     renderedBody = rewriteRelativePaths(renderedBody, options.sourcePath, options.outputPath);
@@ -235,7 +367,7 @@ function updateCommandsFrontmatter(frontmatter: string, variant: AgentVariant): 
       "keywords",
       '["nemohermes cli commands", "hermes command reference", "nemohermes command reference"]',
     );
-  } else {
+  } else if (variant === "deepagents") {
     next = replaceFrontmatterLine(next, "title", '"NemoDeepAgents CLI Commands Reference"');
     next = replaceFrontmatterLine(
       next,
@@ -251,6 +383,23 @@ function updateCommandsFrontmatter(frontmatter: string, variant: AgentVariant): 
       next,
       "keywords",
       '["nemo-deepagents cli commands", "deep agents command reference", "nemo-deepagents command reference"]',
+    );
+  } else {
+    next = replaceFrontmatterLine(next, "title", '"NemoClaw for Pi CLI Commands Reference"');
+    next = replaceFrontmatterLine(
+      next,
+      "description",
+      '"Full CLI reference for Pi sandboxes and the Pi terminal runtime."',
+    );
+    next = replaceFrontmatterLine(
+      next,
+      "description-agent",
+      '"Includes NemoClaw lifecycle commands and Pi interactive and headless commands. Use when operating a Pi sandbox."',
+    );
+    next = replaceFrontmatterLine(
+      next,
+      "keywords",
+      '["nemoclaw pi commands", "pi agent command reference", "pi sandbox commands"]',
     );
   }
   next = replaceFrontmatterLine(next, "sidebar-title", '"Commands"');
@@ -280,7 +429,13 @@ function renderGeneratedAgentVariantPages(): RenderedFile[] {
 }
 
 function findAgentVariantTargets(): RenderTarget[] {
-  const sharedSources = findSharedNavigationSourcePaths();
+  const variantMembership = findNavigationVariantMembership();
+  assertDeclaredAgentVariantScope(variantMembership);
+  const sharedSources = new Set(
+    [...variantMembership.entries()]
+      .filter(([, variants]) => variants.size > 1)
+      .map(([sourcePath]) => sourcePath),
+  );
   assertNoUnsharedPlaceholders(sharedSources);
   return findGeneratedNavigationTargets().sort((left, right) => {
     const sourceOrder = left.sourcePath.localeCompare(right.sourcePath);
@@ -288,7 +443,7 @@ function findAgentVariantTargets(): RenderTarget[] {
   });
 }
 
-function findGeneratedNavigationTargets(): RenderTarget[] {
+export function findGeneratedNavigationTargets(): RenderTarget[] {
   const docsIndex = parse(readFileSync(path.join(docsRoot, "index.yml"), "utf8")) as DocsIndex;
   const userGuide = docsIndex.navigation?.find((item) => Array.isArray(item.variants));
   if (!userGuide?.variants) {
@@ -314,18 +469,29 @@ function collectGeneratedTargets(nodes: NavigationNode[], variant: AgentVariant)
   });
 }
 
-function findSharedNavigationSourcePaths(): Set<string> {
+function findNavigationVariantMembership(): NavigationVariantMembership {
   const docsIndex = parse(readFileSync(path.join(docsRoot, "index.yml"), "utf8")) as DocsIndex;
   const userGuide = docsIndex.navigation?.find((item) => Array.isArray(item.variants));
-  const openclaw = userGuide?.variants?.find((variant) => variant.slug === "openclaw");
-  const hermes = userGuide?.variants?.find((variant) => variant.slug === "hermes");
-  if (!openclaw?.layout || !hermes?.layout) {
-    throw new Error("docs/index.yml must define openclaw and hermes navigation variants");
+  if (!userGuide?.variants) {
+    throw new Error("docs/index.yml must define navigation variants");
   }
 
-  const openclawPaths = collectSourcePaths(openclaw.layout);
-  const hermesPaths = collectSourcePaths(hermes.layout);
-  return new Set([...openclawPaths].filter((sourcePath) => hermesPaths.has(sourcePath)));
+  const membership: NavigationVariantMembership = new Map();
+  for (const variant of userGuide.variants) {
+    if (!isAgentVariant(variant.slug) || !variant.layout) continue;
+    for (const sourcePath of collectSourcePaths(variant.layout)) {
+      const variants = membership.get(sourcePath) ?? new Set<AgentVariant>();
+      variants.add(variant.slug);
+      membership.set(sourcePath, variants);
+    }
+  }
+
+  for (const variant of agentVariants) {
+    if (!userGuide.variants.some((entry) => entry.slug === variant && entry.layout)) {
+      throw new Error(`docs/index.yml must define the ${variant} navigation variant`);
+    }
+  }
+  return membership;
 }
 
 function collectSourcePaths(nodes: NavigationNode[]): Set<string> {
@@ -353,7 +519,7 @@ function normalizeNavigationSourcePath(navPath: string | undefined): string | nu
 function normalizeGeneratedNavigationSourcePath(navPath: string | undefined): string | null {
   if (!navPath) return null;
   const generatedMatch = navPath.match(
-    /^_build\/agent-variants\/(.+)\.(?:openclaw|hermes|deepagents)\.generated\.mdx$/,
+    /^_build\/agent-variants\/(.+)\.(?:openclaw|hermes|deepagents|pi)\.generated\.mdx$/,
   );
   return generatedMatch?.[1] ? `${generatedMatch[1]}.mdx` : null;
 }
@@ -368,6 +534,84 @@ function normalizeLegacyVariantSource(navPath: string): string {
   return navPath;
 }
 
+function assertDeclaredAgentVariantScope(membership: NavigationVariantMembership): void {
+  const violations: string[] = [];
+
+  for (const [sourcePath, publishedVariants] of [...membership.entries()].sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    const sourceFilePath = path.join(docsRoot, sourcePath);
+    const declaredVariants = readDeclaredAgentVariants(
+      readFileSync(sourceFilePath, "utf8"),
+      sourcePath,
+    );
+    const published = orderedAgentVariants(publishedVariants);
+
+    if (!declaredVariants) {
+      const completeDefaultScope =
+        publishedVariants.size === defaultSharedAgentVariants.size &&
+        [...defaultSharedAgentVariants].every((variant) => publishedVariants.has(variant));
+      if (publishedVariants.size < agentVariants.length && !completeDefaultScope) {
+        violations.push(
+          `docs/${sourcePath} is published for [${published.join(", ")}] but does not declare agent-variants`,
+        );
+      }
+      continue;
+    }
+
+    const declared = orderedAgentVariants(declaredVariants);
+    if (
+      declared.length !== published.length ||
+      declared.some((variant, index) => variant !== published[index])
+    ) {
+      violations.push(
+        `docs/${sourcePath} declares agent-variants [${declared.join(", ")}] but navigation publishes [${published.join(", ")}]`,
+      );
+    }
+  }
+
+  if (violations.length > 0) {
+    throw new Error(
+      [
+        "Guide variant scope does not match docs/index.yml:",
+        ...violations.map((violation) => `  - ${violation}`),
+        "Publish each source page in every applicable guide variant, or declare the intentional subset in frontmatter.",
+      ].join("\n"),
+    );
+  }
+}
+
+function readDeclaredAgentVariants(source: string, sourcePath: string): Set<AgentVariant> | null {
+  const { frontmatter } = splitFrontmatter(source, `docs/${sourcePath}`);
+  const frontmatterSource = frontmatter
+    .replace(/^\uFEFF?---\r?\n/, "")
+    .replace(/\r?\n---\r?\n$/, "");
+  const parsed = parse(frontmatterSource) as { "agent-variants"?: unknown } | null;
+  const value = parsed?.["agent-variants"];
+  if (value === undefined) return null;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`docs/${sourcePath} agent-variants must be a non-empty list`);
+  }
+
+  const variants = new Set<AgentVariant>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || !isAgentVariant(entry)) {
+      throw new Error(
+        `docs/${sourcePath} agent-variants contains unsupported value ${JSON.stringify(entry)}`,
+      );
+    }
+    if (variants.has(entry)) {
+      throw new Error(`docs/${sourcePath} agent-variants repeats ${entry}`);
+    }
+    variants.add(entry);
+  }
+  return variants;
+}
+
+function orderedAgentVariants(variants: ReadonlySet<AgentVariant>): AgentVariant[] {
+  return agentVariants.filter((variant) => variants.has(variant));
+}
+
 function assertNoUnsharedPlaceholders(sharedSources: Set<string>): void {
   const offenderPaths: string[] = [];
   for (const sourcePath of findPlaceholderSourcePaths()) {
@@ -378,7 +622,7 @@ function assertNoUnsharedPlaceholders(sharedSources: Set<string>): void {
       [
         "The following non-shared nav pages contain $$nemoclaw and would render it literally:",
         ...offenderPaths.map((offenderPath) => `  - docs/${offenderPath}`),
-        "Use a literal CLI name on single-variant pages, or add the page to both nav variants.",
+        "Use a literal CLI name on single-variant pages, or publish the page in every applicable variant.",
       ].join("\n"),
     );
   }
@@ -474,6 +718,37 @@ function writeGeneratedFiles(files: RenderedFile[]): void {
   }
 }
 
+function checkGeneratedFiles(files: RenderedFile[]): boolean {
+  const expectedPaths = new Set(files.map((file) => file.path));
+  let upToDate = true;
+
+  for (const file of files) {
+    const currentContents = readOptionalFile(file.path);
+    const relativePath = path.relative(repoRoot, file.path);
+    if (currentContents === file.contents) {
+      console.log(`${relativePath} is already up to date`);
+      continue;
+    }
+
+    upToDate = false;
+    const status = currentContents === null ? "Missing" : "Out of sync";
+    console.error(`${status} ${relativePath}`);
+  }
+
+  for (const filePath of listGeneratedFiles(generatedDocsRoot)) {
+    if (expectedPaths.has(filePath)) continue;
+    upToDate = false;
+    console.error(`Stale ${path.relative(repoRoot, filePath)}`);
+  }
+
+  if (!upToDate) {
+    console.error(
+      "Generated agent variant docs are out of sync. Run `npm run docs:sync-agent-variants`.",
+    );
+  }
+  return upToDate;
+}
+
 function pruneStaleGeneratedFiles(expectedPaths: Set<string>): void {
   for (const filePath of listGeneratedFiles(generatedDocsRoot)) {
     if (expectedPaths.has(filePath)) continue;
@@ -524,6 +799,7 @@ const PROTECTED_LITERALS = [
     "nemoclaw onboard --agent langchain-deepagents-code",
     "__NEMOCLAW_ONBOARD_AGENT_LANGCHAIN_DEEPAGENTS_CODE__",
   ],
+  ["nemoclaw onboard --agent pi", "__NEMOCLAW_ONBOARD_AGENT_PI__"],
 ] as const;
 
 function protectNonAliasableLiterals(body: string): string {

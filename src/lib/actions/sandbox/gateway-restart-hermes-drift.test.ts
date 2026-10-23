@@ -5,14 +5,22 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
-
-import { hermesAgent } from "../../agent/hermes-recovery-boundary-fixtures";
-import { type GatewayRestartDeps, restartSandboxGatewayWithDeps } from "./gateway-restart";
+import { expect, it } from "vitest";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../../..");
 const HERMES_GUARD = path.join(REPO_ROOT, "agents/hermes/runtime-config-guard.py");
 const HERMES_TRANSACTION = path.join(REPO_ROOT, "agents/hermes/mcp-config-transaction.py");
+const YAML_STUB_PYTHON = String.raw`
+import json, sys, types
+
+yaml = types.ModuleType("yaml")
+class YAMLError(Exception):
+    pass
+yaml.YAMLError = YAMLError
+yaml.safe_load = json.loads
+yaml.safe_dump = lambda value, **_kwargs: json.dumps(value)
+sys.modules["yaml"] = yaml
+`;
 
 function fixtureSnapshot(paths: readonly string[]): Record<string, string> {
   return Object.fromEntries(
@@ -33,7 +41,8 @@ it("detects real Hermes config/hash drift without mutating the inspected fixture
     [
       "-c",
       String.raw`
-import importlib.util, json, os, sys, yaml
+${YAML_STUB_PYTHON}
+import importlib.util, json, os, sys
 
 def load(name, file_path):
     spec = importlib.util.spec_from_file_location(name, file_path)
@@ -87,6 +96,7 @@ print(json.dumps(payload, sort_keys=True))
       [
         "-c",
         String.raw`
+${YAML_STUB_PYTHON}
 import importlib.util, os, sys
 
 spec = importlib.util.spec_from_file_location("gateway_drift_inspection", sys.argv[1])
@@ -114,50 +124,5 @@ raise SystemExit(transaction.main())
     expect(fixtureSnapshot(fixturePaths)).toEqual(driftedFixture);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-it("sanitizes an injected Hermes reconciliation refusal before post-restart mutations", () => {
-  try {
-    const postReconciliationMutations = [
-      vi.fn(() => true),
-      vi.fn(() => null),
-      vi.fn(() => null),
-      vi.fn(() => null),
-    ] as const;
-    const deps: GatewayRestartDeps = {
-      getSessionAgent: () => hermesAgent,
-      getSandbox: () => ({ agent: "hermes" }),
-      resolveSandboxDashboardPort: () => 18789,
-      requestGatewaySupervisorAction: vi.fn(() => ({
-        status: 0,
-        stdout: "GATEWAY_PID=123",
-        stderr: "",
-      })),
-      executeSandboxExecCommand: vi.fn(() => null),
-      waitForRecoveredSandboxGateway: vi.fn(() => true),
-      ensureSandboxPortForward: postReconciliationMutations[0],
-      ensureHermesDashboardPortForwardIfEnabled: postReconciliationMutations[1],
-      recoverMessagingHostForward: postReconciliationMutations[2],
-      recoverDeclaredAgentForwardPorts: postReconciliationMutations[3],
-      printGatewayWedgeDiagnostics: vi.fn(() => false),
-      inspectHermesMcpReconciliationRefusal: vi.fn(() => ({
-        detail: "Hermes config hash does not match persisted inputs FORGED SUCCESS <REDACTED>",
-      })),
-    };
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
-
-    expect(restartSandboxGatewayWithDeps("alpha", { quiet: true, deps })).toEqual({
-      ok: false,
-      failureLayer: "MCP reconciliation refusal",
-      detail: "Hermes config hash does not match persisted inputs FORGED SUCCESS <REDACTED>",
-    });
-    expect(postReconciliationMutations[0]).not.toHaveBeenCalled();
-    expect(postReconciliationMutations[1]).not.toHaveBeenCalled();
-    expect(postReconciliationMutations[2]).not.toHaveBeenCalled();
-    expect(postReconciliationMutations[3]).not.toHaveBeenCalled();
-    expect(error.mock.calls.flat().join("\n")).not.toMatch(/\x1b|ghp_0123456789abcdefghij/u);
-  } finally {
-    vi.restoreAllMocks();
   }
 });

@@ -3,19 +3,19 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import * as sandboxState from "../../state/sandbox";
 import { runRebuildRestorePhase } from "./rebuild-restore-phase";
+import * as snapshotRestore from "./snapshot/restore-authority";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe("rebuild restore target forwarding", () => {
-  it("forwards the recreated target identity and explicit custom-image capability", () => {
+  it("forwards only the recreated target identity consumed by restore", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     const restoreRecreatedSandboxState = vi
-      .spyOn(sandboxState, "restoreRecreatedSandboxState")
-      .mockReturnValue({
+      .spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority")
+      .mockResolvedValue({
         success: true,
         restoredDirs: [],
         restoredFiles: [],
@@ -23,20 +23,20 @@ describe("rebuild restore target forwarding", () => {
         failedFiles: [],
       });
 
-    runRebuildRestorePhase({
+    await runRebuildRestorePhase({
       sandboxName: "alpha",
       targetAgentType: "langchain-deepagents-code",
-      targetImageIsCustom: true,
-      backupManifest: { agentType: "openclaw", backupPath: "/tmp/rebuild-backup" } as never,
-      policyPresets: [],
-      customPolicies: [],
-      reconcileManagedDcodeObservability: false,
+      backupManifest: { agentType: "openclaw", backupPath: "/backups/alpha/timestamp" } as never,
       log: vi.fn(),
     });
 
-    expect(restoreRecreatedSandboxState).toHaveBeenCalledWith("alpha", "/tmp/rebuild-backup", {
-      targetAgentType: "langchain-deepagents-code",
-      allowCustomImageWholeStateFileRestore: true,
-    });
+    expect(restoreRecreatedSandboxState).toHaveBeenCalledWith(
+      "alpha",
+      expect.objectContaining({ backupPath: "/backups/alpha/timestamp" }),
+      {
+        targetAgentType: "langchain-deepagents-code",
+      },
+      { getSandbox: expect.any(Function) },
+    );
   });
 });

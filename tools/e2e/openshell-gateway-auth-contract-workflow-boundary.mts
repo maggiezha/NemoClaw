@@ -12,14 +12,22 @@ import { UPLOAD_E2E_ARTIFACTS_ACTION } from "./upload-e2e-artifacts-workflow-bou
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "e2e.yaml");
 const JOB_NAME = "openshell-gateway-auth-contract";
+const OPENSHELL_RELEASE_VERSION = "${{ needs.generate-matrix.outputs.openshell_version }}";
+const OPENSHELL_INSTALL_RUN =
+  "env -u DOCKER_CONFIG -u DOCKERHUB_USERNAME -u DOCKERHUB_TOKEN -u NVIDIA_API_KEY -u NVIDIA_INFERENCE_API_KEY -u GITHUB_TOKEN bash scripts/install-openshell.sh";
 const FULL_SHA_ACTION = /^[^\s@]+@[0-9a-f]{40}$/u;
-const EXPLICIT_ONLY_CONDITION =
-  "${{ contains(format(',{0},', inputs.jobs), ',openshell-gateway-auth-contract,') || contains(format(',{0},', inputs.targets), ',openshell-gateway-auth-contract,') }}";
+const TRUSTED_PLAN_CONDITION = `\${{ contains(fromJSON(needs.generate-matrix.outputs.selected_jobs), '${JOB_NAME}') }}`;
 const GATEWAY_PROBE_IMAGE =
-  "node:22-trixie-slim@sha256:e6d9a389d34ff9678438af985c9913fbd1eb6ed36e80fea56644f4b4f6dd70ba";
+  "node:24.18.1-trixie-slim@sha256:ac39e4b5fcb2b1b34b20364fd58b2e898f3bb80731ee6f62a7536f9df3d6aadc";
+const ARTIFACT_SAFETY_GATED_UPLOAD =
+  "${{ always() && steps.artifact_safety.outcome == 'success' && steps.artifact_safety.outputs.approved_path != '' }}";
+const APPROVED_ARTIFACT_PATH = "${{ steps.artifact_safety.outputs.approved_path }}";
+const ARTIFACT_SAFETY_COMMAND =
+  'node --no-warnings tools/e2e/openshell-gateway-auth-artifact-safety.mts "$E2E_ARTIFACT_DIR"';
 
 type WorkflowStep = {
   env?: Record<string, unknown>;
+  id?: string;
   if?: string;
   name?: string;
   run?: string;
@@ -79,8 +87,8 @@ export function validateOpenShellGatewayAuthContractWorkflow(
   if (job.needs !== "generate-matrix") {
     errors.push(`${JOB_NAME} must depend on generate-matrix`);
   }
-  if (job.if !== EXPLICIT_ONLY_CONDITION) {
-    errors.push(`${JOB_NAME} must run only when explicitly selected`);
+  if (job.if !== TRUSTED_PLAN_CONDITION) {
+    errors.push(`${JOB_NAME} must use the trusted execution plan`);
   }
   if (job["runs-on"] !== "ubuntu-latest") {
     errors.push(`${JOB_NAME} must run on ubuntu-latest`);
@@ -93,7 +101,7 @@ export function validateOpenShellGatewayAuthContractWorkflow(
   const expectedEnv = {
     DOCKER_GRPC_PROBE_IMAGE: GATEWAY_PROBE_IMAGE,
     E2E_ARTIFACT_DIR: "${{ github.workspace }}/e2e-artifacts/live/openshell-gateway-auth-contract",
-    E2E_DEFAULT_ENABLED: "0",
+    NEMOCLAW_CANDIDATE_VERSION: OPENSHELL_RELEASE_VERSION,
     NEMOCLAW_NON_INTERACTIVE: "1",
     NEMOCLAW_RUN_LIVE_E2E: "1",
   };
@@ -101,8 +109,8 @@ export function validateOpenShellGatewayAuthContractWorkflow(
     if (env[name] !== value) errors.push(`${JOB_NAME} must set ${name}=${value}`);
   }
   const pinVersion = env.NEMOCLAW_OPENSHELL_PIN_VERSION;
-  if (typeof pinVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(pinVersion)) {
-    errors.push(`${JOB_NAME} must set NEMOCLAW_OPENSHELL_PIN_VERSION to an exact version`);
+  if (pinVersion !== OPENSHELL_RELEASE_VERSION) {
+    errors.push(`${JOB_NAME} must set NEMOCLAW_OPENSHELL_PIN_VERSION=${OPENSHELL_RELEASE_VERSION}`);
   }
   for (const secret of [
     "DOCKERHUB_USERNAME",
@@ -132,17 +140,9 @@ export function validateOpenShellGatewayAuthContractWorkflow(
   }
 
   const install = findStep(job, "Install OpenShell CLI");
-  for (const variable of [
-    "DOCKER_CONFIG",
-    "DOCKERHUB_USERNAME",
-    "DOCKERHUB_TOKEN",
-    "NVIDIA_API_KEY",
-    "NVIDIA_INFERENCE_API_KEY",
-    "GITHUB_TOKEN",
-  ]) {
-    requireRunContains(errors, install, `-u ${variable}`);
+  if (install.run !== OPENSHELL_INSTALL_RUN) {
+    errors.push(`${JOB_NAME} must run only the canonical credential-free OpenShell install`);
   }
-  requireRunContains(errors, install, "bash scripts/install-openshell.sh");
 
   const prePull = findStep(job, "Pre-pull pinned gateway auth probe image");
   requireRunContains(errors, prePull, 'docker pull "$DOCKER_GRPC_PROBE_IMAGE"');
@@ -155,9 +155,26 @@ export function validateOpenShellGatewayAuthContractWorkflow(
     errors.push(`${JOB_NAME} live test must not receive workflow credentials`);
   }
 
+  const artifactSafetyName = "Validate final OpenShell gateway auth contract artifacts";
+  const artifactSafety = findStep(job, artifactSafetyName);
+  if (artifactSafety.id !== "artifact_safety" || artifactSafety.if !== "always()") {
+    errors.push(`${JOB_NAME} final artifact safety scan must run unconditionally with a stable id`);
+  }
+  if (artifactSafety.run?.trim() !== ARTIFACT_SAFETY_COMMAND) {
+    errors.push(
+      `${JOB_NAME} step '${artifactSafety.name ?? "<missing>"}' must run exactly: ${ARTIFACT_SAFETY_COMMAND}`,
+    );
+  }
+
   const upload = findStep(job, "Upload OpenShell gateway auth contract artifacts");
-  if (upload.uses !== UPLOAD_E2E_ARTIFACTS_ACTION || upload.if !== "always()") {
-    errors.push(`${JOB_NAME} must always use the reviewed artifact uploader`);
+  if (upload.uses !== UPLOAD_E2E_ARTIFACTS_ACTION) {
+    errors.push(`${JOB_NAME} must use the reviewed artifact uploader`);
+  }
+  if (upload.if !== ARTIFACT_SAFETY_GATED_UPLOAD) {
+    errors.push(`${JOB_NAME} must upload artifacts only after this run attempt passes safety scan`);
+  }
+  if (upload.with?.path !== APPROVED_ARTIFACT_PATH) {
+    errors.push(`${JOB_NAME} must upload only the immutable approved artifact payload`);
   }
 
   requireStepOrder(errors, steps, "Prepare E2E workspace", "Install OpenShell CLI");
@@ -168,6 +185,13 @@ export function validateOpenShellGatewayAuthContractWorkflow(
     "Pre-pull pinned gateway auth probe image",
   );
   requireStepOrder(errors, steps, "Pre-pull pinned gateway auth probe image", runName);
+  requireStepOrder(errors, steps, runName, artifactSafetyName);
+  requireStepOrder(
+    errors,
+    steps,
+    artifactSafetyName,
+    "Upload OpenShell gateway auth contract artifacts",
+  );
   requireStepOrder(errors, steps, runName, "Upload OpenShell gateway auth contract artifacts");
 
   return errors;

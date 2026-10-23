@@ -14,9 +14,18 @@ import type { CurlProbeOptions, CurlProbeResult } from "../adapters/http/probe";
 import { runCurlProbe } from "../adapters/http/probe";
 import { normalizeCredentialValue, resolveProviderCredential } from "../credentials/store";
 import { getProviderSelectionConfig } from "./config";
-import type { LocalProviderHealthProbeOptions } from "./local";
-import { probeLocalProviderHealth } from "./local";
+import {
+  getResolvedOllamaHost,
+  loadPersistedOllamaHost,
+  type LocalProviderHealthProbeOptions,
+  OLLAMA_PORT,
+  probeOllamaEndpointInventory,
+  probeLocalProviderHealth,
+  type RunCaptureFn,
+} from "./local";
+import { MIN_PROBE_REPLY_TOKENS, resolveProbeReplyTokens } from "./max-tokens-field";
 import { getChatCompletionsProbeCurlArgs } from "./onboard-probes";
+import { usesNvidiaEndpointProbePayload } from "./openai-probe-models";
 import { BUILD_ENDPOINT_URL } from "./provider-models";
 
 export interface ProviderHealthStatus {
@@ -51,10 +60,35 @@ export interface ProviderHealthProbeOptions {
   model?: string | null;
   getCredentialImpl?: (envName: string) => string | null | undefined;
   isWsl?: boolean;
+  /** Sandbox route endpoint recorded at onboard; selects the bearerless local vLLM host port. */
+  recordedEndpointUrl?: string | null;
+}
+
+export type OllamaHostInventoryProbeOptions = {
+  getOllamaHost?: () => string;
+  runCaptureImpl?: RunCaptureFn;
+  prepareDockerEnvironment?: Parameters<typeof probeOllamaEndpointInventory>[3];
+};
+
+/** Probe the persisted raw Ollama daemon through its platform-specific host transport. */
+export function probeOllamaHostInventory(options: OllamaHostInventoryProbeOptions = {}): {
+  endpoint: string;
+  inventory: string[] | null;
+} {
+  const host = options.getOllamaHost
+    ? options.getOllamaHost()
+    : (loadPersistedOllamaHost() ?? getResolvedOllamaHost());
+  const endpoint = `http://${host}:${OLLAMA_PORT}/api/tags`;
+  const inventory = probeOllamaEndpointInventory(
+    host,
+    options.runCaptureImpl,
+    5_000,
+    options.prepareDockerEnvironment,
+  );
+  return { endpoint, inventory };
 }
 
 const COMPATIBLE_PROVIDERS = new Set(["compatible-endpoint", "compatible-anthropic-endpoint"]);
-const NVIDIA_MANAGED_PROVIDERS = new Set(["nvidia-prod", "nvidia-nim"]);
 const NVIDIA_HEALTH_CREDENTIAL_ENV = "NVIDIA_INFERENCE_API_KEY";
 const HEALTH_PROBE_CONNECT_TIMEOUT_SECONDS = "3";
 const HEALTH_PROBE_MAX_TIME_SECONDS = "5";
@@ -70,7 +104,7 @@ const GEMINI_CHAT_COMPLETIONS_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const ANTHROPIC_MESSAGES_ENDPOINT = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION_HEADER = "anthropic-version: 2023-06-01";
-const HEALTH_PROBE_MAX_TOKENS = 8;
+const HEALTH_PROBE_MAX_TOKENS = MIN_PROBE_REPLY_TOKENS;
 const CURL_TIMEOUT_STATUS = 28;
 const NODE_SPAWN_TIMEOUT_STATUS = -110;
 
@@ -105,35 +139,24 @@ function useStatusProbeTiming(argv: string[]): string[] {
   );
 }
 
-function capStatusProbeOutput(argv: string[]): string[] {
-  const next = [...argv];
-  const dataIndex = next.indexOf("-d");
-  if (dataIndex < 0 || dataIndex + 1 >= next.length) return next;
-  const payload = parseJsonRecord(next[dataIndex + 1]);
-  if (!payload) return next;
-  if ("max_tokens" in payload) payload.max_tokens = HEALTH_PROBE_MAX_TOKENS;
-  if ("max_completion_tokens" in payload) {
-    payload.max_completion_tokens = HEALTH_PROBE_MAX_TOKENS;
-  }
-  next[dataIndex + 1] = JSON.stringify(payload);
-  return next;
-}
-
+/** Build curl arguments for an authenticated chat-completions health probe. */
 function buildChatCompletionsStatusProbeCurlArgs(
   model: string,
   endpoint: string,
   authArgs: readonly string[],
   isWsl?: boolean,
+  useNvidiaEndpointProbePayload = false,
+  replyBudget: number = HEALTH_PROBE_MAX_TOKENS,
 ): string[] {
-  const args = capStatusProbeOutput(
-    useStatusProbeTiming(
-      getChatCompletionsProbeCurlArgs({
-        credentialArgs: [],
-        model,
-        url: endpoint,
-        isWsl,
-      }),
-    ),
+  const args = useStatusProbeTiming(
+    getChatCompletionsProbeCurlArgs({
+      credentialArgs: [],
+      model,
+      url: endpoint,
+      isWsl,
+      useNvidiaEndpointProbePayload,
+      replyBudget,
+    }),
   );
   const url = args.pop() || endpoint;
   return [...args, ...authArgs, url];
@@ -165,7 +188,7 @@ function buildAnthropicMessagesProbeCurlArgs(
   ];
 }
 
-type ResponseValidation = { ok: true } | { ok: false; reason: string };
+export type InferenceResponseValidation = { ok: true } | { ok: false; reason: string };
 
 function isJsonRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -215,21 +238,22 @@ function hasValidChatMessageFields(
   allowStreamingDelta: boolean,
 ): boolean {
   let recognizedField = false;
-  for (const field of ["content", "reasoning_content", "refusal"] as const) {
+  for (const field of ["content", "reasoning_content", "reasoning", "refusal"] as const) {
     if (!(field in message)) continue;
-    recognizedField = true;
     const value = message[field];
     const valid =
       field === "content" ? isValidChatContent(value) : value === null || typeof value === "string";
     if (!valid) return false;
+    if (value !== null) recognizedField = true;
   }
   if ("tool_calls" in message) {
-    recognizedField = true;
-    if (
-      !Array.isArray(message.tool_calls) ||
-      message.tool_calls.length === 0 ||
-      !message.tool_calls.every(isValidChatToolCall)
-    ) {
+    const toolCalls = message.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      if (toolCalls.length > 0) {
+        if (!toolCalls.every(isValidChatToolCall)) return false;
+        recognizedField = true;
+      }
+    } else if (toolCalls !== null && toolCalls !== undefined) {
       return false;
     }
   }
@@ -271,24 +295,35 @@ function isValidAnthropicContentBlock(value: unknown): boolean {
   return false;
 }
 
-function validateChatCompletionsResponse(body: string): ResponseValidation {
+function notChatCompletionsResult(observed: string): InferenceResponseValidation {
+  return { ok: false, reason: `response was not a Chat Completions result: ${observed}` };
+}
+
+function validateChatCompletionsResponse(body: string): InferenceResponseValidation {
   const parsed = parseJsonRecord(body);
   if (parsed) {
     if (hasProviderErrorEnvelope(parsed)) {
       return { ok: false, reason: "provider returned an error envelope" };
     }
+    if (!Array.isArray(parsed.choices) || parsed.choices.length === 0) {
+      return notChatCompletionsResult("the JSON body carried no choices");
+    }
     return hasChatCompletionsChoice(parsed, false)
       ? { ok: true }
-      : { ok: false, reason: "response was not a Chat Completions result" };
+      : notChatCompletionsResult(
+          "no choice carried a message with text content, reasoning_content, reasoning, a refusal, or tool calls",
+        );
   }
 
   // DeepSeek V4 Pro's model-specific probe requests streaming output. Accept
   // only a stream containing at least one structured Chat Completions chunk;
   // a bare 2xx, malformed SSE, or an SSE error envelope is not health proof.
   let hasValidChunk = false;
+  let hasStreamData = false;
   for (const line of body.split("\n")) {
     const match = /^data:\s*(.+)$/i.exec(line.trim());
     if (!match) continue;
+    hasStreamData = true;
     const data = match[1].trim();
     if (data === "[DONE]") continue;
     const event = parseJsonRecord(data);
@@ -298,12 +333,40 @@ function validateChatCompletionsResponse(body: string): ResponseValidation {
     }
     if (hasChatCompletionsChoice(event, true)) hasValidChunk = true;
   }
-  return hasValidChunk
-    ? { ok: true }
-    : { ok: false, reason: "response was not a Chat Completions result" };
+  if (hasValidChunk) return { ok: true };
+  return notChatCompletionsResult(
+    hasStreamData
+      ? "the stream carried no Chat Completions chunk"
+      : "the body was neither JSON nor a Chat Completions stream",
+  );
 }
 
-function validateAnthropicMessagesResponse(body: string): ResponseValidation {
+function isValidResponsesContentBlock(value: unknown): boolean {
+  if (!isJsonRecord(value) || typeof value.type !== "string") return false;
+  if (value.type === "output_text") return typeof value.text === "string";
+  if (value.type === "refusal") return typeof value.refusal === "string";
+  return false;
+}
+
+function validateResponsesResponse(body: string): InferenceResponseValidation {
+  const parsed = parseJsonRecord(body);
+  if (!parsed) return { ok: false, reason: "response was not a Responses result" };
+  if (hasProviderErrorEnvelope(parsed)) {
+    return { ok: false, reason: "provider returned an error envelope" };
+  }
+  if (!Array.isArray(parsed.output) || parsed.output.length === 0) {
+    return { ok: false, reason: "response was not a Responses result" };
+  }
+  const hasMessage = parsed.output.some((item) => {
+    if (!isJsonRecord(item) || item.type !== "message" || !Array.isArray(item.content)) {
+      return false;
+    }
+    return item.content.length > 0 && item.content.every(isValidResponsesContentBlock);
+  });
+  return hasMessage ? { ok: true } : { ok: false, reason: "response was not a Responses result" };
+}
+
+function validateAnthropicMessagesResponse(body: string): InferenceResponseValidation {
   const parsed = parseJsonRecord(body);
   if (!parsed) return { ok: false, reason: "response was not an Anthropic Messages result" };
   if (hasProviderErrorEnvelope(parsed)) {
@@ -318,9 +381,20 @@ function validateAnthropicMessagesResponse(body: string): ResponseValidation {
     : { ok: false, reason: "response was not an Anthropic Messages result" };
 }
 
+export function validateInferenceResponseBody(
+  inferenceApi: string,
+  body: string,
+): InferenceResponseValidation {
+  if (inferenceApi === "anthropic-messages") return validateAnthropicMessagesResponse(body);
+  if (inferenceApi === "openai-responses" || inferenceApi === "responses") {
+    return validateResponsesResponse(body);
+  }
+  return validateChatCompletionsResponse(body);
+}
+
 function validateInvocationProbeResult(
   result: CurlProbeResult,
-  validateResponse: (body: string) => ResponseValidation,
+  validateResponse: (body: string) => InferenceResponseValidation,
 ): CurlProbeResult {
   if (!result.ok) return result;
   const validation = validateResponse(result.body);
@@ -356,10 +430,25 @@ function buildInvocationProbeDetail(
   credentialEnv: string,
   healthy: boolean,
   result: CurlProbeResult,
+  responseUnread: boolean,
 ): string {
   const route = `${providerLabel} model-invocation probe`;
   if (healthy) {
     return `${route} succeeded at ${endpoint}.`;
+  }
+  if (responseUnread) {
+    return (
+      `${route} at ${endpoint} was answered, but the probe could not read the response ` +
+      `as proof that the model ran. (${result.message})`
+    );
+  }
+  if (classifyHealthProbeFailureLabel(result) === "unauthorized") {
+    return (
+      `${endpoint} rejected the ${route} request. ` +
+      `This probe authenticates with the host credential in ${credentialEnv}, not the provider ` +
+      `credential stored in the gateway. Check ${credentialEnv} where you run this command. ` +
+      `(${result.message})`
+    );
   }
   return (
     `${route} at ${endpoint} did not succeed. ` +
@@ -433,6 +522,8 @@ function probeChatCompletionsProviderHealth(
   credentialEnv: string,
   endpoint: string,
   options: ProviderHealthProbeOptions,
+  useNvidiaEndpointProbePayload = false,
+  replyBudget: number = HEALTH_PROBE_MAX_TOKENS,
 ): ProviderHealthStatus {
   let apiKey = "";
   try {
@@ -456,7 +547,14 @@ function probeChatCompletionsProviderHealth(
   const rawResult = (() => {
     try {
       return runCurlProbeImpl(
-        buildChatCompletionsStatusProbeCurlArgs(model, endpoint, authConfig.args, options.isWsl),
+        buildChatCompletionsStatusProbeCurlArgs(
+          model,
+          endpoint,
+          authConfig.args,
+          options.isWsl,
+          useNvidiaEndpointProbePayload,
+          replyBudget,
+        ),
         { trustedConfigFiles: authConfig.trustedConfigFiles },
       );
     } finally {
@@ -474,7 +572,14 @@ function probeChatCompletionsProviderHealth(
     probed: true,
     providerLabel,
     endpoint,
-    detail: buildInvocationProbeDetail(providerLabel, endpoint, credentialEnv, healthy, result),
+    detail: buildInvocationProbeDetail(
+      providerLabel,
+      endpoint,
+      credentialEnv,
+      healthy,
+      result,
+      rawResult.ok && !healthy,
+    ),
     ...(healthy ? {} : { failureLabel: classifyHealthProbeFailureLabel(result) }),
   };
 }
@@ -534,7 +639,14 @@ function probeAnthropicMessagesProviderHealth(
     probed: true,
     providerLabel,
     endpoint,
-    detail: buildInvocationProbeDetail(providerLabel, endpoint, credentialEnv, healthy, result),
+    detail: buildInvocationProbeDetail(
+      providerLabel,
+      endpoint,
+      credentialEnv,
+      healthy,
+      result,
+      rawResult.ok && !healthy,
+    ),
     ...(healthy ? {} : { failureLabel: classifyHealthProbeFailureLabel(result) }),
   };
 }
@@ -571,13 +683,15 @@ export function probeRemoteProviderHealth(
 
   if (!config?.model) return null;
 
-  if (NVIDIA_MANAGED_PROVIDERS.has(provider)) {
+  if (usesNvidiaEndpointProbePayload(provider)) {
     return probeChatCompletionsProviderHealth(
       providerLabel,
       config.model,
       NVIDIA_HEALTH_CREDENTIAL_ENV,
       `${BUILD_ENDPOINT_URL}/chat/completions`,
       options,
+      true,
+      resolveProbeReplyTokens(provider, config.model),
     );
   }
 
@@ -598,6 +712,8 @@ export function probeRemoteProviderHealth(
       config.credentialEnv,
       GEMINI_CHAT_COMPLETIONS_ENDPOINT,
       options,
+      false,
+      resolveProbeReplyTokens(provider),
     );
   }
 
@@ -625,6 +741,7 @@ export function probeProviderHealth(
   const localOptions: LocalProviderHealthProbeOptions = {
     model: options.model,
     runCurlProbeImpl: options.runCurlProbeImpl,
+    recordedEndpointUrl: options.recordedEndpointUrl,
   };
   const local = probeLocalProviderHealth(provider, localOptions);
   if (local) {

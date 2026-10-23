@@ -3,51 +3,106 @@
 
 import * as onboardSession from "../state/onboard-session";
 import * as registry from "../state/registry";
-import { isSafeModelId } from "../validation";
+import {
+  isValidOpenShellInferenceRoute,
+  type OpenShellSynchronousInferenceRouteObserver,
+} from "../adapters/openshell/inference-route";
+import {
+  createSynchronousCliOpenShellInferenceRouteObserver,
+  type CaptureOpenShellInferenceRouteSynchronously,
+} from "../adapters/openshell/inference-route-cli";
+import { getPersistedSandboxTargetGatewayName } from "../actions/sandbox/gateway-target";
 import {
   type InferenceEndpointSource,
   normalizeInferenceEndpointSource,
 } from "../inference/selection";
+import {
+  persistedProviderNameToSelectionKey,
+  type RemoteProviderConfigEntryLike,
+} from "./inference-providers/provider-selection-keys";
 
-export type RemoteProviderConfigEntryLike = { providerName?: string };
+export type { RemoteProviderConfigEntryLike } from "./inference-providers/provider-selection-keys";
+
+interface VllmInstallResumeSession {
+  readonly vllmInstallModel?: string | null;
+  readonly steps?: {
+    readonly provider_selection?: { readonly status?: string | null } | null;
+  } | null;
+}
+
+interface VllmInstallResumeSessionAccess {
+  loadSession(): VllmInstallResumeSession | null;
+  checkpointVllmInstallModel(modelId: string): unknown;
+}
+
+export interface VllmInstallResumeDeps {
+  getNonInteractiveProvider(): string | null;
+  getVllmInstallResumeModel?(): string | null;
+  checkpointVllmInstallModel?(modelId: string): void;
+}
+
+export function readVllmInstallResumeModel(
+  access: Pick<VllmInstallResumeSessionAccess, "loadSession"> = onboardSession,
+): string | null {
+  return access.loadSession()?.vllmInstallModel ?? null;
+}
+
+export function applyVllmInstallResumeDefaults<T extends VllmInstallResumeDeps>(
+  deps: T,
+  access: Pick<VllmInstallResumeSessionAccess, "loadSession"> = onboardSession,
+): T {
+  return {
+    ...deps,
+    getNonInteractiveProvider: () =>
+      deps.getNonInteractiveProvider() ??
+      (readVllmInstallResumeModel(access) ? "install-vllm" : null),
+    getVllmInstallResumeModel: () =>
+      deps.getVllmInstallResumeModel?.() ?? readVllmInstallResumeModel(access),
+  };
+}
+
+export function vllmInstallRecoveryOptions(
+  deps: Pick<VllmInstallResumeDeps, "checkpointVllmInstallModel" | "getVllmInstallResumeModel">,
+  access: VllmInstallResumeSessionAccess = onboardSession,
+): {
+  checkpointInstallIntent?: (modelId: string) => void;
+  modelIntent?: string;
+} {
+  const resumeModel = deps.getVllmInstallResumeModel?.() ?? null;
+  const checkpoint =
+    deps.checkpointVllmInstallModel ??
+    (access.loadSession()?.steps?.provider_selection?.status === "in_progress"
+      ? access.checkpointVllmInstallModel
+      : undefined);
+  return {
+    ...(checkpoint ? { checkpointInstallIntent: checkpoint } : {}),
+    ...(resumeModel ? { modelIntent: resumeModel } : {}),
+  };
+}
 
 export function providerNameToOptionKey(
   remoteProviderConfig: Record<string, RemoteProviderConfigEntryLike>,
   name: string | null | undefined,
-  opts: { hasNimContainer?: boolean } = {},
+  opts: { hasManagedLlamaCpp?: boolean; hasNimContainer?: boolean } = {},
 ): string | null {
   if (!name) return null;
-  if (name === "nvidia-router") return "routed";
-  if (name === "ollama-local") return "ollama";
-  // Local NIM and standalone vLLM both persist as provider="vllm-local". NIM
-  // is positively identified by a nimContainer record; the absence of one in
-  // registry/session recovery reliably means standalone vLLM (the standalone
-  // path never records a container), so default to "vllm" there. Live-gateway
-  // recovery doesn't carry container info either, but the caller's
-  // option-availability check still gates on whether vllm is actually running.
-  if (name === "vllm-local") return opts.hasNimContainer ? "nim-local" : "vllm";
-  // `nvidia-nim` is a legacy alias for cloud NVIDIA Endpoints (see
-  // setupInference: it routes nvidia-nim through REMOTE_PROVIDER_CONFIG.build),
-  // not a marker for Local NIM. Local NIM persists as vllm-local + nimContainer.
-  if (name === "nvidia-nim") return "build";
-  for (const [key, cfg] of Object.entries(remoteProviderConfig)) {
-    if (cfg.providerName === name) return key;
-  }
-  return null;
+  return persistedProviderNameToSelectionKey(name, opts, remoteProviderConfig);
 }
 
 export interface ProviderRecoveryDeps {
-  parseGatewayInference(
-    output: string | null,
-  ): { provider: string | null; model: string | null } | null;
-  runCaptureOpenshell(args: string[], opts?: Record<string, unknown>): string | null;
+  inferenceRouteObserver: OpenShellSynchronousInferenceRouteObserver;
+  selectedGatewayName: () => string;
   warn?(message: string): void;
 }
 
-export interface ProviderRecoveryHelpers {
-  readLiveInference(
-    sandboxName: string | null | undefined,
-  ): { provider: string | null; model: string | null } | null;
+export interface CliProviderRecoveryDeps extends Omit<
+  ProviderRecoveryDeps,
+  "inferenceRouteObserver"
+> {
+  captureOpenshell: CaptureOpenShellInferenceRouteSynchronously;
+}
+
+export interface ProviderSelectionRecoveryReaderBundle {
   readRecordedProvider(
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
@@ -56,10 +111,25 @@ export interface ProviderRecoveryHelpers {
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
   ): string | null;
+  readRecordedManagedLlamaCpp(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): boolean;
+  readRecordedManagedLlamaCppRecipeId(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): string | null;
   readRecordedModel(
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
   ): string | null;
+}
+
+export interface ProviderRecoveryHelpers extends ProviderSelectionRecoveryReaderBundle {
+  readonly providerSelectionReaders: ProviderSelectionRecoveryReaderBundle;
+  readLiveInference(
+    sandboxName: string | null | undefined,
+  ): { provider: string | null; model: string | null } | null;
   readRecordedEndpointUrl(
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
@@ -82,10 +152,6 @@ export interface RecordedInferenceRoute {
   preferredInferenceApi: string;
   source: "registry" | "session";
 }
-
-const MAX_LIVE_PROVIDER_LENGTH = 128;
-const MAX_LIVE_MODEL_LENGTH = 512;
-const SAFE_LIVE_PROVIDER = /^[A-Za-z0-9._:-]+$/;
 
 export type SandboxRecoveryAuthority = "missing" | "authorized" | "unauthorized";
 
@@ -137,17 +203,9 @@ export function validateLiveGatewayInference(
 ): { provider: string; model: string } | null {
   const provider = typeof value?.provider === "string" ? value.provider.trim() : "";
   const model = typeof value?.model === "string" ? value.model.trim() : "";
-  if (
-    !provider ||
-    provider.length > MAX_LIVE_PROVIDER_LENGTH ||
-    !SAFE_LIVE_PROVIDER.test(provider) ||
-    !model ||
-    model.length > MAX_LIVE_MODEL_LENGTH ||
-    !isSafeModelId(model)
-  ) {
-    return null;
-  }
-  return { provider, model };
+  if (!provider || !model) return null;
+  const route = { provider, model };
+  return isValidOpenShellInferenceRoute(route) ? route : null;
 }
 
 function completeRecordedInferenceRoute(
@@ -178,6 +236,28 @@ function completeRecordedInferenceRoute(
 }
 
 export function createProviderRecoveryHelpers(deps: ProviderRecoveryDeps): ProviderRecoveryHelpers {
+  const isManagedLlamaCppState = (value: {
+    provider?: string | null;
+    servingProfileProvenance?: { recipe: { backend: string; id?: string } } | null;
+    hostLocalInferenceProvenance?: unknown;
+  }): boolean =>
+    value.provider === "llama-cpp-local" &&
+    (value.servingProfileProvenance?.recipe.backend === "install-llama-cpp" ||
+      value.hostLocalInferenceProvenance != null);
+
+  const managedLlamaCppRecipeId = (value: {
+    provider?: string | null;
+    servingProfileProvenance?: { recipe: { backend: string; id?: string } } | null;
+  }): string | null => {
+    const recipe = value.servingProfileProvenance?.recipe;
+    return value.provider === "llama-cpp-local" &&
+      recipe?.backend === "install-llama-cpp" &&
+      typeof recipe.id === "string" &&
+      recipe.id.length > 0
+      ? recipe.id
+      : null;
+  };
+
   function refuseRecoveryAfterRegistryError(sandboxName: string, error: unknown): null {
     const detail = error instanceof Error ? error.message : String(error);
     deps.warn?.(
@@ -199,11 +279,19 @@ export function createProviderRecoveryHelpers(deps: ProviderRecoveryDeps): Provi
       // that the gateway will swap to on their next connect.
       const trustGateway = sandboxName === defaultSandbox || sandboxes.length === 0;
       if (!trustGateway) return null;
-      const output = deps.runCaptureOpenshell(["inference", "get"], { ignoreError: true });
-      // `openshell inference get` is a display boundary, not a typed API.
-      // Accept it only when both routing fields are complete, bounded, and safe;
-      // partial or malformed output must not steer a rebuild.
-      return validateLiveGatewayInference(deps.parseGatewayInference(output));
+      const sandbox = sandboxes.find((entry) => entry.name === sandboxName);
+      const result = deps.inferenceRouteObserver.observeInferenceRoute({
+        target: {
+          kind: "named",
+          gatewayName: sandbox
+            ? getPersistedSandboxTargetGatewayName(sandbox)
+            : deps.selectedGatewayName(),
+        },
+      });
+      if (!result.ok || result.value.state === "unconfigured") return null;
+      // Recovery applies tighter bounds to the complete route returned by the
+      // typed observer; partial or malformed output must not steer a rebuild.
+      return validateLiveGatewayInference(result.value.route);
     } catch {
       return null;
     }
@@ -240,6 +328,46 @@ export function createProviderRecoveryHelpers(deps: ProviderRecoveryDeps): Provi
       return live.provider;
     }
     return null;
+  }
+
+  function readRecordedManagedLlamaCpp(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): boolean {
+    if (!sandboxName) return false;
+    try {
+      const { authority, entry } = readRegistryRecoveryState(sandboxName, recoverySessionId);
+      if (authority === "unauthorized") return false;
+      if (entry) return isManagedLlamaCppState(entry);
+    } catch {
+      return false;
+    }
+    try {
+      const session = onboardSession.loadSession();
+      return Boolean(session?.sandboxName === sandboxName && isManagedLlamaCppState(session));
+    } catch {
+      return false;
+    }
+  }
+
+  function readRecordedManagedLlamaCppRecipeId(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): string | null {
+    if (!sandboxName) return null;
+    try {
+      const { authority, entry } = readRegistryRecoveryState(sandboxName, recoverySessionId);
+      if (authority === "unauthorized") return null;
+      if (entry) return managedLlamaCppRecipeId(entry);
+    } catch {
+      return null;
+    }
+    try {
+      const session = onboardSession.loadSession();
+      return session?.sandboxName === sandboxName ? managedLlamaCppRecipeId(session) : null;
+    } catch {
+      return null;
+    }
   }
 
   function readRecordedNimContainer(
@@ -377,12 +505,32 @@ export function createProviderRecoveryHelpers(deps: ProviderRecoveryDeps): Provi
   }
 
   return {
+    providerSelectionReaders: {
+      readRecordedProvider,
+      readRecordedNimContainer,
+      readRecordedManagedLlamaCpp,
+      readRecordedManagedLlamaCppRecipeId,
+      readRecordedModel,
+    },
     readLiveInference,
     readRecordedProvider,
     readRecordedNimContainer,
+    readRecordedManagedLlamaCpp,
+    readRecordedManagedLlamaCppRecipeId,
     readRecordedModel,
     readRecordedEndpointUrl,
     readRecordedInferenceRoute,
     readRecordedProviderEndpoints,
   };
+}
+
+/** Keep provider recovery scoped to the named base gateway; unsupported scope is terminal. */
+export function createCliProviderRecoveryHelpers(
+  deps: CliProviderRecoveryDeps,
+): ProviderRecoveryHelpers {
+  const { captureOpenshell, ...recoveryDeps } = deps;
+  return createProviderRecoveryHelpers({
+    ...recoveryDeps,
+    inferenceRouteObserver: createSynchronousCliOpenShellInferenceRouteObserver(captureOpenshell),
+  });
 }

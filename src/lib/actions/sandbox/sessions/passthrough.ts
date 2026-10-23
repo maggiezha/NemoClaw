@@ -1,10 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { captureOpenshell } from "../../../adapters/openshell/runtime";
+import type {
+  OpenShellSandboxBufferedCommandCompletion,
+  OpenShellSandboxBufferedCommandExecutor,
+} from "../../../adapters/openshell/sandbox-command";
 import { CLI_NAME } from "../../../cli/branding";
+import {
+  deferSandboxLifecycleExit,
+  runWithDeferredSandboxLifecycleExit,
+} from "../../../core/process-exit";
+import { assertHermesPortableCommandUnavailable } from "../../../onboard/experimental/portable-agent-lifecycle";
+import { withMcpLifecycleLock } from "../../../state/mcp-lifecycle-lock-acquisition";
 import * as registry from "../../../state/registry";
-import { buildOpenshellExecArgs, computeExitCode, execSandbox } from "../exec";
+import { execSandbox } from "../exec";
 import { ensureLiveSandboxOrExit } from "../gateway-state";
 import { isWarmupSessionId, WARMUP_SESSION_ID_PREFIX } from "../warmup-session";
 import { balancedJsonCandidates, parseSessionIndex } from "./session-index";
@@ -16,6 +25,10 @@ export type SessionsPassthroughVerb = "list";
 export interface SessionsPassthroughOptions {
   verb?: SessionsPassthroughVerb;
   extraArgs?: readonly string[];
+}
+
+export interface SessionsPassthroughDependencies {
+  sandboxCommandExecutor: OpenShellSandboxBufferedCommandExecutor;
 }
 
 export function hasSessionsPassthroughHelpToken(args: readonly string[]): boolean {
@@ -48,6 +61,7 @@ export function printSessionsPassthroughHelp(verb?: SessionsPassthroughVerb): vo
     "  list output and OpenClaw-specific flags are forwarded verbatim. Hermes sandboxes pass",
   );
   console.log("  through their native output unchanged.");
+  console.log("  Session listing is not supported for Deep Code sandboxes.");
   console.log("");
 }
 
@@ -132,14 +146,6 @@ function writeWithTrailingNewline(stream: NodeJS.WriteStream, value: string | un
   stream.write(value.endsWith("\n") ? value : `${value}\n`);
 }
 
-function capturedStdout(result: { output: string; stdout?: string }): string {
-  return typeof result.stdout === "string" ? result.stdout.trim() : result.output;
-}
-
-function capturedStderr(result: { stderr?: string }): string {
-  return typeof result.stderr === "string" ? result.stderr.trim() : "";
-}
-
 function printJsonParseFailure(): void {
   console.error(
     "  Could not parse `openclaw sessions list --json` output as a session index. Check the OpenClaw version pinned in agents/openclaw/manifest.yaml.",
@@ -154,8 +160,8 @@ function printSessionsListCaptureBufferFailure(): void {
   );
 }
 
-function isCaptureBufferFailure(result: { error?: Error }): boolean {
-  return (result.error as NodeJS.ErrnoException | undefined)?.code === "ENOBUFS";
+function isCaptureBufferFailure(result: OpenShellSandboxBufferedCommandCompletion): boolean {
+  return result.outcome.kind === "failed" && result.outcome.error.kind === "capture";
 }
 
 export function filterWarmupSessionsListJson(output: string): string | null {
@@ -209,11 +215,34 @@ export function filterWarmupSessionsListText(output: string): string {
     .join("\n");
 }
 
-export async function runSessionsPassthrough(
+export function createSessionsPassthrough({
+  sandboxCommandExecutor,
+}: SessionsPassthroughDependencies) {
+  return async function runSessionsPassthrough(
+    sandboxName: string,
+    { verb, extraArgs = [] }: SessionsPassthroughOptions = {},
+  ): Promise<void> {
+    return runWithDeferredSandboxLifecycleExit(async () => {
+      await withMcpLifecycleLock(sandboxName, () => {
+        assertHermesPortableCommandUnavailable(sandboxName, `sandbox:sessions:${verb ?? "list"}`);
+        return runSessionsPassthroughUnlocked(sandboxCommandExecutor, sandboxName, {
+          verb,
+          extraArgs,
+        });
+      });
+    });
+  };
+}
+
+async function runSessionsPassthroughUnlocked(
+  sandboxCommandExecutor: OpenShellSandboxBufferedCommandExecutor,
   sandboxName: string,
   { verb, extraArgs = [] }: SessionsPassthroughOptions = {},
 ): Promise<void> {
-  await ensureLiveSandboxOrExit(sandboxName, { allowNonReadyPhase: true });
+  await ensureLiveSandboxOrExit(sandboxName, {
+    allowNonReadyPhase: true,
+    exit: deferSandboxLifecycleExit,
+  });
   // Hermes sandboxes ship the `hermes` binary in place of OpenClaw's
   // `openclaw` binary, and `openclaw` does not exist inside them (#6247).
   // Route the passthrough at the in-sandbox agent's own binary name and
@@ -222,22 +251,39 @@ export async function runSessionsPassthrough(
   // Trust boundary: `registry.getSandbox()` reads the host-side, user-owned
   // `~/.nemoclaw/sandboxes.json` registry (`REGISTRY_FILE`). Sandbox processes
   // cannot access the host filesystem to change this agent selection; unknown
-  // or missing values deliberately default to `openclaw` below.
+  // or missing values deliberately default to `openclaw` below. Deep Code
+  // has no session-listing integration and must not use that fallback.
   const sandboxAgent = registry.getSandbox(sandboxName)?.agent;
+  if (sandboxAgent === "langchain-deepagents-code") {
+    console.error(
+      `  Session listing is not supported for sandbox '${sandboxName}' with the '${sandboxAgent}' agent.`,
+    );
+    deferSandboxLifecycleExit(1);
+  }
   const inSandboxBinary = sandboxAgent === "hermes" ? "hermes" : "openclaw";
   const command = [inSandboxBinary, "sessions"];
   if (verb) command.push(verb);
   else if (inSandboxBinary === "hermes") command.push("list");
   for (const arg of extraArgs) command.push(arg);
   if (isFilterableListPassthrough(verb) && inSandboxBinary === "openclaw") {
-    const result = captureOpenshell(buildOpenshellExecArgs(sandboxName, command), {
-      ignoreError: true,
-      includeStreams: true,
-      maxBuffer: SESSIONS_LIST_CAPTURE_MAX_BUFFER_BYTES,
-    });
-    const { code, errorMessage } = computeExitCode(result);
-    const capturedOutput = capturedStdout(result);
-    const capturedError = capturedStderr(result);
+    let result: OpenShellSandboxBufferedCommandCompletion;
+    try {
+      result = await sandboxCommandExecutor.runBuffered({
+        sandboxName,
+        target: { kind: "selected" },
+        command,
+        outputLimitBytes: SESSIONS_LIST_CAPTURE_MAX_BUFFER_BYTES,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`  Failed to invoke openshell: ${detail}`);
+      deferSandboxLifecycleExit(1);
+    }
+    const code = result.outcome.kind === "completed" ? result.outcome.exitCode : 1;
+    const errorMessage =
+      result.outcome.kind === "failed" ? result.outcome.error.message : undefined;
+    const capturedOutput = result.stdout.trim();
+    const capturedError = result.stderr.trim();
     if (code !== 0) {
       writeWithTrailingNewline(process.stdout, capturedOutput);
       writeWithTrailingNewline(process.stderr, capturedError);
@@ -246,7 +292,7 @@ export async function runSessionsPassthrough(
       } else if (errorMessage) {
         console.error(`  Failed to invoke openshell: ${errorMessage}`);
       }
-      process.exit(code);
+      deferSandboxLifecycleExit(code);
     }
 
     if (isJsonOutput(extraArgs)) {
@@ -256,7 +302,7 @@ export async function runSessionsPassthrough(
         // an internal warm-up session.
         if (capturedOutput.includes(WARMUP_SESSION_ID_PREFIX)) {
           printJsonParseFailure();
-          process.exit(1);
+          deferSandboxLifecycleExit(1);
         }
         writeWithTrailingNewline(process.stdout, capturedOutput);
         writeWithTrailingNewline(process.stderr, capturedError);
@@ -272,5 +318,5 @@ export async function runSessionsPassthrough(
     writeWithTrailingNewline(process.stderr, capturedError);
     return;
   }
-  await execSandbox(sandboxName, command);
+  await execSandbox(sandboxName, command, {}, { exit: deferSandboxLifecycleExit });
 }

@@ -9,37 +9,78 @@ import type {
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
+import { redirectInheritedChildStdoutToStderr } from "./cli/stdout-guard";
+import { REPOSITORY_ROOT } from "./core/repository-root";
 import { shellQuote } from "./core/shell-quote";
-import { NAME_ALLOWED_FORMAT, NAME_MAX_LENGTH, NAME_VALID_PATTERN } from "./name-validation";
+import { isPodmanGatewayRuntimeEnabled } from "./onboard/runtime-provider/configured-runtime";
 import { detectDockerHost } from "./platform";
-import { redact, redactError, writeRedactedResult } from "./security/redact";
-import { buildSubprocessEnv } from "./subprocess-env";
+import {
+  diagnosticPreview,
+  NAME_ALLOWED_FORMAT,
+  NAME_MAX_LENGTH,
+  NAME_VALID_PATTERN,
+} from "./sandbox-name-contract";
+import {
+  redact,
+  redactError,
+  redactFull,
+  redactFullWithUrls,
+  writeRedactedResult,
+} from "./security/redact";
+import { buildDockerSubprocessEnv, buildSubprocessEnv } from "./subprocess-env";
 
-const ROOT = path.resolve(__dirname, "..", "..");
+const ROOT = REPOSITORY_ROOT;
 const SCRIPTS = path.join(ROOT, "scripts");
 
 type RunnerOptions = SpawnSyncOptions & {
   ignoreError?: boolean;
+  /** Use only opts.env instead of merging the sanitized parent environment. */
+  replaceEnv?: boolean;
   suppressOutput?: boolean;
 };
 
 type CaptureOptions = Omit<SpawnSyncOptionsWithStringEncoding, "encoding"> & {
   ignoreError?: boolean;
+  /** Use only opts.env instead of merging the sanitized parent environment. */
+  replaceEnv?: boolean;
+  /**
+   * Append captured stderr to the returned stdout. This opt-in output is raw
+   * and unredacted; callers must not log it without applying redaction first.
+   */
+  includeStderr?: boolean;
 };
 
 type SpawnResult = SpawnSyncReturns<string | Buffer>;
 
-const dockerHost = detectDockerHost();
-if (dockerHost) {
-  process.env.DOCKER_HOST = dockerHost.dockerHost;
+const dockerAuthority = isPodmanGatewayRuntimeEnabled() ? null : detectDockerHost();
+if (dockerAuthority) {
+  process.env.DOCKER_HOST = dockerAuthority.dockerHost;
+  // The selected authority is now explicit. Keep no context selector that can
+  // override it if the process environment changes after initialization.
+  delete process.env.DOCKER_CONTEXT;
 }
 
-function buildRunnerEnv(extraEnv?: NodeJS.ProcessEnv): Record<string, string> {
+function buildRunnerEnv(
+  extraEnv?: NodeJS.ProcessEnv,
+  executable?: string,
+  replaceEnv = false,
+): Record<string, string> {
   const normalizedExtra: Record<string, string> = {};
   if (extraEnv) {
     for (const [key, value] of Object.entries(extraEnv)) {
       if (value !== undefined) normalizedExtra[key] = value;
     }
+  }
+  if (replaceEnv) return normalizedExtra;
+  if (executable !== undefined && path.basename(executable) === "docker") {
+    const selectedDockerHost =
+      String(normalizedExtra.DOCKER_HOST ?? "").trim() ||
+      String(process.env.DOCKER_HOST ?? "").trim();
+    return buildDockerSubprocessEnv(process.env, selectedDockerHost || undefined, normalizedExtra, {
+      preserveDockerConfig:
+        selectedDockerHost !== "" &&
+        (normalizedExtra.DOCKER_CONFIG !== undefined || process.env.DOCKER_CONFIG !== undefined),
+    });
   }
   return buildSubprocessEnv(normalizedExtra);
 }
@@ -95,6 +136,8 @@ function spawnAndHandle(
 ): SpawnResult {
   const safeFile = normalizeSpawnFile(file, "spawnAndHandle");
   const safeArgs = normalizeSpawnArgs(args, "spawnAndHandle");
+  const { ignoreError, replaceEnv, suppressOutput, env: extraEnv, ...spawnOpts } = opts;
+  const effectiveStdio = redirectInheritedChildStdoutToStderr(stdio);
   // All non-shell runner paths pass argv arrays and force shell=false; runShell
   // and runInteractiveShell enter here with a literal `bash -c` executable and
   // an explicitly named shell boundary. Extra environment values are filtered by
@@ -102,22 +145,22 @@ function spawnAndHandle(
   // lgtm[js/indirect-command-line-injection]
   // lgtm[js/shell-command-injection-from-environment]
   const result = spawnSync(safeFile, safeArgs, {
-    ...opts,
+    ...spawnOpts,
     shell: false,
-    stdio,
+    stdio: effectiveStdio,
     cwd: ROOT,
-    env: buildRunnerEnv(opts.env),
+    env: buildRunnerEnv(extraEnv, safeFile, replaceEnv),
   });
-  if (!opts.suppressOutput) {
-    writeRedactedResult(result, stdio);
+  if (!suppressOutput) {
+    writeRedactedResult(result, effectiveStdio);
   }
-  if (result.error && !opts.ignoreError) {
+  if (result.error && !ignoreError) {
     console.error(
       `  Command failed: ${redact(renderedCommand).slice(0, 80)}: ${result.error.message}`,
     );
     process.exit(1);
   }
-  if (result.status !== 0 && !opts.ignoreError) {
+  if (result.status !== 0 && !ignoreError) {
     console.error(
       `  Command failed (exit ${result.status}): ${redact(renderedCommand).slice(0, 80)}`,
     );
@@ -162,14 +205,21 @@ function runArrayCmd(
   callerName = "run",
 ): SpawnResult {
   const [exe, args] = normalizeArgv(cmd, callerName);
-  const { ignoreError, suppressOutput, env: extraEnv, stdio: stdioCfg, ...spawnOpts } = opts;
+  const {
+    ignoreError,
+    replaceEnv,
+    suppressOutput,
+    env: extraEnv,
+    stdio: stdioCfg,
+    ...spawnOpts
+  } = opts;
 
   // Guard: re-enabling shell interpretation defeats the purpose of argv arrays.
   if (spawnOpts.shell) {
     throw new Error(`${callerName}: shell option is forbidden when passing an argv array`);
   }
 
-  const stdio = stdioCfg ?? defaultStdio;
+  const stdio = redirectInheritedChildStdoutToStderr(stdioCfg ?? defaultStdio);
 
   // run() always uses argv arrays, rejects `shell: true` above, and validates
   // the executable/argv for process-spawn metacharacters such as NUL bytes.
@@ -180,7 +230,7 @@ function runArrayCmd(
     shell: false,
     stdio,
     cwd: ROOT,
-    env: buildRunnerEnv(extraEnv),
+    env: buildRunnerEnv(extraEnv, exe, replaceEnv),
   });
   if (!suppressOutput) {
     writeRedactedResult(result, stdio);
@@ -195,7 +245,12 @@ function runArrayCmd(
   if (result.status !== 0 && !ignoreError) {
     const cmdStr = cmd.join(" ");
     console.error(`  Command failed (exit ${result.status}): ${redact(cmdStr).slice(0, 80)}`);
-    logOpenshellRuntimeHint(exe);
+    // logOpenshellRuntimeHint's bash branch expects the inner shell command
+    // (matching what runShell's spawnAndHandle path passes), not the
+    // "bash -c ..." wrapper itself — otherwise `run(["bash", "-c",
+    // "openshell ..."])` never matches the leading-`openshell` regex.
+    const renderedCommand = exe === "bash" && args[0] === "-c" ? (args[1] ?? "") : cmdStr;
+    logOpenshellRuntimeHint(exe, renderedCommand);
     process.exit(result.status || 1);
   }
   return result;
@@ -242,17 +297,36 @@ function runFile(
 /**
  * Run a program directly with argv-style arguments and capture trimmed stdout.
  * Throws a redacted error on failure, or returns '' when opts.ignoreError is true.
+ * When opts.includeStderr is true, ignored failures instead return combined
+ * stdout and raw, unredacted stderr; callers must redact before logging it.
  *
  * Shell-string capture is intentionally unsupported. If you truly need shell
  * parsing, spell it out explicitly at the call site (for example
  * ["sh", "-c", script]) so reviews and static checks can see the boundary.
  */
+function capturedRunCaptureOutput(
+  result: SpawnSyncReturns<string>,
+  includeStderr: boolean,
+): string {
+  const stdout = (result.stdout || "").trim();
+  if (!includeStderr) return stdout;
+  const stderr = (result.stderr || "").trim();
+  return [stdout, stderr].filter(Boolean).join("\n").trim();
+}
+
 function runCapture(cmd: readonly string[], opts: CaptureOptions = {}): string {
   if (!Array.isArray(cmd)) {
     throw new Error("runCapture no longer accepts shell strings; pass an argv array instead");
   }
   const [exe, args] = normalizeArgv(cmd, "runCapture");
-  const { ignoreError, env: extraEnv, stdio: _stdio, ...spawnOpts } = opts;
+  const {
+    ignoreError,
+    includeStderr,
+    replaceEnv,
+    env: extraEnv,
+    stdio: _stdio,
+    ...spawnOpts
+  } = opts;
 
   // Guard: re-enabling shell interpretation defeats the purpose of argv arrays.
   if (spawnOpts.shell) {
@@ -269,23 +343,24 @@ function runCapture(cmd: readonly string[], opts: CaptureOptions = {}): string {
       ...spawnOpts,
       shell: false,
       cwd: ROOT,
-      env: buildRunnerEnv(extraEnv),
+      env: buildRunnerEnv(extraEnv, exe, replaceEnv),
       stdio: ["pipe", "pipe", "pipe"],
       encoding: "utf-8",
     });
 
     // Check result.error first — spawnSync sets this (with status === null) when
     // the executable is missing (ENOENT), the call times out, or the spawn fails.
+    const output = capturedRunCaptureOutput(result, includeStderr === true);
     if (result.error) {
-      if (ignoreError) return "";
+      if (ignoreError) return includeStderr === true ? output : "";
       throw result.error;
     }
     if (result.status !== 0) {
-      if (ignoreError) return "";
+      if (ignoreError) return includeStderr === true ? output : "";
       throw new Error(`Command failed with status ${result.status}`);
     }
 
-    return (result.stdout || "").trim();
+    return output;
   } catch (err) {
     if (ignoreError) return "";
     throw redactError(err);
@@ -318,7 +393,7 @@ function runCaptureEx(
     throw new Error("runCaptureEx: cmd must be a non-empty argv array");
   }
   const [exe, args] = normalizeArgv(cmd, "runCaptureEx");
-  const { env: extraEnv, stdio: _stdio, ...spawnOpts } = opts as CaptureOptions;
+  const { replaceEnv, env: extraEnv, stdio: _stdio, ...spawnOpts } = opts as CaptureOptions;
   try {
     // runCaptureEx() follows the same argv-only, shell=false boundary as
     // runCapture(), while returning structured timeout diagnostics.
@@ -332,7 +407,7 @@ function runCaptureEx(
       // NO_PROXY=localhost,127.0.0.1 is injected when HTTP_PROXY is set.
       // Otherwise curl probes against localhost (Ollama validation, etc.)
       // tunnel through the user's host proxy and fail with HTTP 500.
-      env: buildRunnerEnv(extraEnv),
+      env: buildRunnerEnv(extraEnv, exe, replaceEnv),
       stdio: ["pipe", "pipe", "pipe"],
       encoding: "utf-8",
     });
@@ -351,7 +426,8 @@ function runCaptureEx(
 }
 
 /**
- * Validate a name (sandbox, instance, container) against RFC 1123 label rules.
+ * Validate a name (sandbox, instance, container) against the canonical
+ * OpenShell-compatible label rules.
  * Rejects shell metacharacters, path traversal, and empty/overlength names.
  */
 function validateName(name: string, label = "name"): string {
@@ -360,18 +436,23 @@ function validateName(name: string, label = "name"): string {
   }
   if (name.length > NAME_MAX_LENGTH) {
     throw new Error(
-      `${label} too long (max ${NAME_MAX_LENGTH} chars): '${name.slice(0, 20)}...'. Allowed format: ${NAME_ALLOWED_FORMAT}.`,
+      `${label} too long (max ${NAME_MAX_LENGTH} chars): ${diagnosticPreview(name)}. Allowed format: ${NAME_ALLOWED_FORMAT}.`,
     );
   }
   if (!NAME_VALID_PATTERN.test(name)) {
-    throw new Error(`Invalid ${label}: '${name}'. Allowed format: ${NAME_ALLOWED_FORMAT}.`);
+    throw new Error(
+      `Invalid ${label}: ${diagnosticPreview(name)}. Allowed format: ${NAME_ALLOWED_FORMAT}.`,
+    );
   }
   return name;
 }
 
 export {
   ROOT,
+  buildSubprocessEnv,
   redact,
+  redactFull,
+  redactFullWithUrls,
   run,
   runCapture,
   runCaptureEx,

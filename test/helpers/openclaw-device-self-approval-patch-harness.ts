@@ -3,6 +3,7 @@
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 
@@ -21,8 +22,31 @@ const process = { env: {} };
 const GATEWAY_CLIENT_NAMES = { CLI: "cli", GATEWAY_CLIENT: "gateway-client" };
 const GATEWAY_CLIENT_MODES = { CLI: "cli", BACKEND: "backend" };
 let storedOperatorDeviceAuthToken = false;
+let forcedDeviceIdentity = { deviceId: "device-1" };
+let deviceIdentityLoadCount = 0;
+const gatewayCallDeps = {
+  createGatewayClient(options) {
+    return options;
+  },
+  loadOrCreateDeviceIdentity() {
+    deviceIdentityLoadCount += 1;
+    return forcedDeviceIdentity;
+  }
+};
 function isLoopbackGatewayUrl(url) { return url.startsWith("ws://127.0.0.1:"); }
-function resolveDeviceIdentityForGatewayCall() { return { deviceId: "device-1" }; }
+function normalizeOptionalString(value) {
+  if (typeof value !== "string") return;
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function resolveDeviceIdentityForGatewayCall() {
+  try {
+    return gatewayCallDeps.loadOrCreateDeviceIdentity();
+  } catch {
+    return null;
+  }
+}
 function hasStoredOperatorDeviceAuthToken() { return storedOperatorDeviceAuthToken; }
 function shouldOmitDeviceIdentityForGatewayCall(params) {
   const mode = params.opts.mode ?? GATEWAY_CLIENT_MODES.CLI;
@@ -33,16 +57,183 @@ function shouldOmitDeviceIdentityForGatewayCall(params) {
   const isLocalCliSharedAuth = mode === GATEWAY_CLIENT_MODES.CLI && clientName === GATEWAY_CLIENT_NAMES.CLI && hasSharedSecretAuth && isLoopback;
   return isLocalBackendSharedAuth || isLocalCliSharedAuth;
 }
+async function executeGatewayRequestWithScopes(params) {
+  const { opts, deviceIdentity } = params;
+  return await new Promise((resolve) => {
+    const client = gatewayCallDeps.createGatewayClient({
+      url: opts.url,
+      deviceIdentity,
+      minProtocol: opts.minProtocol ?? 4,
+      maxProtocol: opts.maxProtocol ?? 4
+    });
+    resolve(client);
+  });
+}
+function gatewayClientOptions(opts) {
+  return executeGatewayRequestWithScopes({ opts, deviceIdentity: forcedDeviceIdentity });
+}
 function setForceDevicePairing(value) {
   if (value) process.env.NEMOCLAW_OPENCLAW_FORCE_DEVICE_PAIRING = "1";
   else delete process.env.NEMOCLAW_OPENCLAW_FORCE_DEVICE_PAIRING;
 }
+function setForcedDeviceIdentity(identity, expectedDeviceId) {
+  forcedDeviceIdentity = identity;
+  process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING = "1";
+  if (expectedDeviceId === undefined) delete process.env.NEMOCLAW_OPENCLAW_EXPECTED_DEVICE_ID;
+  else process.env.NEMOCLAW_OPENCLAW_EXPECTED_DEVICE_ID = expectedDeviceId;
+}
+function getDeviceIdentityLoadCount() { return deviceIdentityLoadCount; }
 function setStoredOperatorDeviceAuthToken(value) { storedOperatorDeviceAuthToken = value; }
+`);
+}
+
+function currentGatewayCallFixture(): string {
+  return compiledIndent(`
+const descriptorFiles = new Map();
+const descriptorReads = [];
+const descriptorFs = {
+  fstatSync(fd) {
+    const value = descriptorFiles.get(fd);
+    if (value === undefined) throw new Error("unknown descriptor");
+    return {
+      dev: 1,
+      ino: fd,
+      size: Buffer.byteLength(value),
+      nlink: 0,
+      mtimeMs: 1,
+      isFile: () => true
+    };
+  },
+  readSync(fd, buffer, offset, length, position) {
+    const value = descriptorFiles.get(fd);
+    if (value === undefined) throw new Error("unknown descriptor");
+    descriptorReads.push({ fd, position });
+    const source = Buffer.from(value);
+    const count = Math.min(length, Math.max(0, source.length - position));
+    if (count > 0) source.copy(buffer, offset, position, position + count);
+    return count;
+  }
+};
+const descriptorCrypto = {
+  createPublicKey() {
+    return {
+      asymmetricKeyType: "ed25519",
+      export: () => Buffer.from("matching-key")
+    };
+  },
+  createPrivateKey(key) {
+    return { asymmetricKeyType: "ed25519", privateKey: key };
+  },
+  createHash() {
+    return {
+      update() { return this; },
+      digest() { return "a".repeat(64); }
+    };
+  }
+};
+const process = {
+  env: {},
+  getBuiltinModule(name) {
+    if (name === "node:fs") return descriptorFs;
+    if (name === "node:crypto") return descriptorCrypto;
+    throw new Error("unexpected builtin module");
+  }
+};
+const GATEWAY_CLIENT_NAMES = { CLI: "cli", GATEWAY_CLIENT: "gateway-client" };
+const GATEWAY_CLIENT_MODES = { CLI: "cli", BACKEND: "backend" };
+function normalizeOptionalString(value) {
+  if (typeof value !== "string") return;
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+function loadDeviceIdentityIfPresent() { return null; }
+let createdIdentityCount = 0;
+function loadOrCreateDeviceIdentity() {
+  createdIdentityCount += 1;
+  return { deviceId: "ordinary-device" };
+}
+function resolveDeviceIdentityForGatewayCall(sharedStateMode) {
+  try {
+    return sharedStateMode === "read-only" ? loadDeviceIdentityIfPresent() : loadOrCreateDeviceIdentity();
+  } catch {
+    return null;
+  }
+}
+function loadStoredOperatorDeviceAuthToken() { return null; }
+function isLoopbackGatewayUrl(url) { return url.startsWith("ws://127.0.0.1:"); }
+function shouldOmitDeviceIdentityForGatewayCall(params) {
+  const mode = params.opts.mode ?? GATEWAY_CLIENT_MODES.CLI;
+  const clientName = params.opts.clientName ?? GATEWAY_CLIENT_NAMES.CLI;
+  const hasSharedSecretAuth = params.authMode === "token" && Boolean(params.token) || params.authMode === "password" && Boolean(params.password);
+  const isLoopback = isLoopbackGatewayUrl(params.url);
+  const isLocalBackendSharedAuth = mode === GATEWAY_CLIENT_MODES.BACKEND && clientName === GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT && (hasSharedSecretAuth || params.allowAuthNone === true) && isLoopback;
+  const isLocalCliSharedAuth = mode === GATEWAY_CLIENT_MODES.CLI && clientName === GATEWAY_CLIENT_NAMES.CLI && hasSharedSecretAuth && isLoopback;
+  return isLocalBackendSharedAuth || isLocalCliSharedAuth;
+}
+function gatewayClientOptions(opts, password, authMode) {
+  const deviceAuthScope = "operator.pairing";
+  return shouldOmitDeviceIdentityForGatewayCall({
+    opts,
+    authMode,
+    password,
+    allowAuthNone: opts.requireLocalBackendSharedAuth === true && authMode === "none"
+  });
+}
+function setForcedIdentityDescriptor(value) {
+  process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING = "1";
+  process.env.NEMOCLAW_OPENCLAW_EXPECTED_DEVICE_ID = "a".repeat(64);
+  process.env.NEMOCLAW_OPENCLAW_IDENTITY_FD = "43";
+  descriptorFiles.set(43, JSON.stringify(value));
+  descriptorReads.length = 0;
+}
+function setForceDevicePairing(value) {
+  if (value) process.env.NEMOCLAW_OPENCLAW_FORCE_DEVICE_PAIRING = "1";
+  else delete process.env.NEMOCLAW_OPENCLAW_FORCE_DEVICE_PAIRING;
+}
+function getCreatedIdentityCount() { return createdIdentityCount; }
+function identityDescriptorReads() { return [...descriptorReads]; }
 `);
 }
 
 function cliFixture(): string {
   return compiledIndent(`
+const descriptorFiles = new Map();
+const descriptorReads = [];
+const process = {
+  env: {},
+  stdout: globalThis.process?.stdout ?? {
+    write(_chunk, callback) { callback?.(); }
+  },
+  stderr: globalThis.process?.stderr ?? {
+    write(_chunk, callback) { callback?.(); }
+  },
+  getBuiltinModule(name) {
+    if (name !== "node:fs") throw new Error("unexpected builtin module");
+    return {
+      fstatSync(fd) {
+        const value = descriptorFiles.get(fd);
+        if (value === undefined) throw new Error("unknown descriptor");
+        return {
+          dev: 1,
+          ino: fd,
+          size: Buffer.byteLength(value),
+          nlink: 0,
+          mtimeMs: 1,
+          isFile: () => true
+        };
+      },
+      readSync(fd, buffer, offset, length, position) {
+        const value = descriptorFiles.get(fd);
+        if (value === undefined) throw new Error("unknown descriptor");
+        descriptorReads.push({ fd, position });
+        const source = Buffer.from(value);
+        const count = Math.min(length, Math.max(0, source.length - position));
+        if (count > 0) source.copy(buffer, offset, position, position + count);
+        return count;
+      }
+    };
+  }
+};
 const ADMIN_SCOPE = "operator.admin";
 const PAIRING_SCOPE = "operator.pairing";
 const OPERATOR_ROLE = "operator";
@@ -53,15 +244,65 @@ const gatewayCalls = [];
 let pairingList = { pending: [], paired: [] };
 let localPairingList = { pending: [], paired: [] };
 let approvalFailures = [];
+let gatewayListFailure = null;
+let localPairingReadCount = 0;
+let localApprovalCount = 0;
 function setPairingLists(localList, liveList = localList) {
   localPairingList = localList;
   pairingList = liveList;
 }
+function setPairedTokenEnvironment(overrides = {}) {
+  process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING = "1";
+  descriptorFiles.clear();
+  descriptorReads.length = 0;
+  const pendingFd = Object.hasOwn(overrides, "pendingFd") ? overrides.pendingFd : "41";
+  const pairedFd = Object.hasOwn(overrides, "pairedFd") ? overrides.pairedFd : "42";
+  if (pendingFd === undefined) delete process.env.NEMOCLAW_OPENCLAW_PENDING_FD;
+  else process.env.NEMOCLAW_OPENCLAW_PENDING_FD = pendingFd;
+  if (pairedFd === undefined) delete process.env.NEMOCLAW_OPENCLAW_PAIRED_FD;
+  else process.env.NEMOCLAW_OPENCLAW_PAIRED_FD = pairedFd;
+  const pendingJson = Object.hasOwn(overrides, "pendingJson")
+    ? overrides.pendingJson
+    : JSON.stringify(Object.fromEntries(localPairingList.pending.map((request) => [request.requestId, request])));
+  const pairedJson = Object.hasOwn(overrides, "pairedJson")
+    ? overrides.pairedJson
+    : JSON.stringify(Object.fromEntries(localPairingList.paired.map((device) => [device.deviceId, device])));
+  if (typeof pendingFd === "string" && /^[1-9]\\d*$/.test(pendingFd) && pendingJson !== undefined) descriptorFiles.set(Number(pendingFd), pendingJson);
+  if (typeof pairedFd === "string" && /^[1-9]\\d*$/.test(pairedFd) && pairedJson !== undefined) descriptorFiles.set(Number(pairedFd), pairedJson);
+  const pinnedUrl = Object.hasOwn(overrides, "pinnedUrl") ? overrides.pinnedUrl : "ws://127.0.0.1:18789";
+  const gatewayUrl = Object.hasOwn(overrides, "gatewayUrl") ? overrides.gatewayUrl : pinnedUrl;
+  if (pinnedUrl === undefined) delete process.env.NEMOCLAW_OPENCLAW_PINNED_GATEWAY_URL;
+  else process.env.NEMOCLAW_OPENCLAW_PINNED_GATEWAY_URL = pinnedUrl;
+  if (gatewayUrl === undefined) delete process.env.OPENCLAW_GATEWAY_URL;
+  else process.env.OPENCLAW_GATEWAY_URL = gatewayUrl;
+  for (const [name, value] of [
+    ["OPENCLAW_GATEWAY_TOKEN", overrides.envToken],
+    ["OPENCLAW_GATEWAY_PASSWORD", overrides.password],
+    ["OPENCLAW_GATEWAY_PORT", overrides.port]
+  ]) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+function pairingDescriptorReads() { return [...descriptorReads]; }
+function setGatewayListFailure(error) { gatewayListFailure = error; }
+function setApprovalFailures(errors) { approvalFailures = [...errors]; }
+function pairingStats() { return { localPairingReadCount, localApprovalCount }; }
 function withProgress(_options, callback) { return callback(); }
 function parseTimeoutMsWithFallback(value, fallback) { return value ?? fallback; }
 async function callGateway(options) {
-  gatewayCalls.push(options);
-  if (options.method === "device.pair.list") return pairingList;
+  gatewayCalls.push({
+    ...options,
+    credentialSource: options.token ? "option" : process.env.OPENCLAW_GATEWAY_TOKEN ? "environment" : "none",
+    signedIdentityForced: process.env.NEMOCLAW_OPENCLAW_FORCE_DEVICE_PAIRING === "1" || process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING === "1",
+    cliArgUrl: options.cliArgUrl,
+    cliArgToken: options.cliArgToken,
+    cliArgPassword: options.cliArgPassword
+  });
+  if (options.method === "device.pair.list") {
+    if (gatewayListFailure) throw gatewayListFailure;
+    return pairingList;
+  }
   if (options.method === "device.pair.approve" && approvalFailures.length > 0) {
     throw approvalFailures.shift();
   }
@@ -75,6 +316,9 @@ const callGatewayCli = async (method, opts, params, callOpts) => withProgress({
   url: opts.url,
   token: opts.token,
   password: opts.password,
+  cliArgUrl: opts.url,
+  cliArgToken: opts.token,
+  cliArgPassword: opts.password,
   method,
   params,
   timeoutMs: parseTimeoutMsWithFallback(opts.timeout, 10000),
@@ -132,13 +376,14 @@ function lookupPairedDevice(pairedByDeviceId, request) {
   return pairedByDeviceId.get(normalizeOptionalString(request.deviceId));
 }
 async function listDevicePairing() {
+  localPairingReadCount += 1;
   return localPairingList;
 }
 async function listPairingWithFallback(opts) {
   try {
     return parseDevicePairingList(await callGatewayCli("device.pair.list", opts, {}));
-  } catch (error) {
-    throw error;
+  } catch {
+    return parseDevicePairingList(await listDevicePairing());
   }
 }
 function resolveApprovePairingScopesForRequest(request, paired) {
@@ -174,14 +419,141 @@ async function resolveApprovePairingGatewayContext(opts, requestId) {
 function isDevicePairingApprovalDenied(error) {
   return String(error?.message ?? error).toLowerCase().includes("device pairing approval denied");
 }
+function isUnknownRequestIdError(error) {
+  return String(error?.message ?? error).toLowerCase().includes("unknown requestid");
+}
+function resolveLocalPairingFallback(_opts, error) {
+  return String(error?.message ?? error).toLowerCase().includes("scope-upgrade-pending") ? {} : null;
+}
+async function approveDevicePairing(requestId) {
+  localApprovalCount += 1;
+  return { status: "approved", requestId, device: { deviceId: "device-1" } };
+}
 async function approvePairingWithFallback(opts, requestId) {
   const { scopes, originalRequest } = await resolveApprovePairingGatewayContext(opts, requestId);
   try {
     return await callGatewayCli("device.pair.approve", opts, { requestId }, scopes ? { scopes } : void 0);
   } catch (error) {
-    if (isDevicePairingApprovalDenied(error) && !scopes?.includes("operator.admin")) return await callGatewayCli("device.pair.approve", opts, { requestId }, { scopes: [ADMIN_SCOPE] });
-    throw error;
+    if (isDevicePairingApprovalDenied(error) && !scopes?.includes("operator.admin")) try {
+      return await callGatewayCli("device.pair.approve", opts, { requestId }, { scopes: [ADMIN_SCOPE] });
+    } catch (adminError) {
+      if (isUnknownRequestIdError(adminError)) return null;
+      throw adminError;
+    }
+    const fallback = resolveLocalPairingFallback(opts, error);
+    if (!fallback) {
+      if (isUnknownRequestIdError(error)) return null;
+      throw error;
+    }
+    return await approveDevicePairing(originalRequest?.requestId ?? requestId);
   }
+}
+const defaultRuntime = {
+  logs: [],
+  exits: [],
+  jsonWrites: [],
+  log(value) { this.logs.push(String(value)); },
+  writeJson(value) { this.jsonWrites.push(value); },
+  exit(code) { this.exits.push(code); }
+};
+const theme = {
+  success(value) { return value; },
+  command(value) { return value; },
+  muted(value) { return value; }
+};
+const resolvedRequestId = "request-1";
+function runDevicesApproveSuccess(result, opts) {
+  if (opts.json) {
+    defaultRuntime.writeJson(result);
+    return;
+  }
+  const resultRequestId = result?.requestId;
+  const approvedRequestId = typeof resultRequestId === "string" && resultRequestId.trim().length > 0 ? resultRequestId : resolvedRequestId;
+  const deviceId = result?.device?.deviceId;
+  defaultRuntime.log(\`\${theme.success("Approved")} \${theme.command(deviceId ?? "ok")} \${theme.muted(\`(\${approvedRequestId})\`)}\`);
+}
+`);
+}
+
+function deviceIdentityFixture(): string {
+  return compiledIndent(`
+const descriptorFiles = new Map();
+const descriptorReads = [];
+const fs = {
+  fstatSync(fd) {
+    const value = descriptorFiles.get(fd);
+    if (value === undefined) throw new Error("unknown descriptor");
+    return {
+      dev: 1,
+      ino: fd,
+      size: Buffer.byteLength(value),
+      nlink: 1,
+      mtimeMs: 1,
+      isFile: () => true
+    };
+  },
+  readSync(fd, buffer, offset, length, position) {
+    const value = descriptorFiles.get(fd);
+    if (value === undefined) throw new Error("unknown descriptor");
+    descriptorReads.push({ fd, position });
+    const source = Buffer.from(value);
+    const count = Math.min(length, Math.max(0, source.length - position));
+    if (count > 0) source.copy(buffer, offset, position, position + count);
+    return count;
+  }
+};
+const process = {
+  env: {},
+  getBuiltinModule(name) {
+    if (name !== "node:fs") throw new Error("unexpected builtin module");
+    return fs;
+  }
+};
+let ordinaryLoadCount = 0;
+let defaultPathResolveCount = 0;
+function resolveDefaultIdentityPath() {
+  defaultPathResolveCount += 1;
+  return "/ordinary/identity/device.json";
+}
+function normalizeStoredIdentity(parsed) {
+  if (!parsed || typeof parsed !== "object" || parsed.version !== 1) return null;
+  if (parsed.validForReadOnly !== true || typeof parsed.deviceId !== "string") {
+    return { kind: "recognized-invalid" };
+  }
+  return {
+    kind: "identity",
+    validForReadOnly: true,
+    identity: {
+      deviceId: parsed.deviceId,
+      publicKeyPem: parsed.publicKeyPem,
+      privateKeyPem: parsed.privateKeyPem
+    }
+  };
+}
+function loadOrCreateDeviceIdentity(filePath = resolveDefaultIdentityPath()) {
+  try {
+    ordinaryLoadCount += 1;
+    return { deviceId: "ordinary-device", filePath };
+  } catch {
+    return { deviceId: "ordinary-fallback" };
+  }
+}
+function setForcedIdentityDescriptor(fd, value) {
+  process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING = "1";
+  if (fd === undefined) delete process.env.NEMOCLAW_OPENCLAW_IDENTITY_FD;
+  else process.env.NEMOCLAW_OPENCLAW_IDENTITY_FD = fd;
+  descriptorFiles.clear();
+  descriptorReads.length = 0;
+  if (typeof fd === "string" && /^[1-9]\\d*$/.test(fd) && value !== undefined) {
+    descriptorFiles.set(Number(fd), typeof value === "string" ? value : JSON.stringify(value));
+  }
+}
+function clearForcedIdentityDescriptor() {
+  delete process.env.NEMOCLAW_OPENCLAW_RESTORED_CLONE_PAIRING;
+  delete process.env.NEMOCLAW_OPENCLAW_IDENTITY_FD;
+}
+function identityStats() {
+  return { descriptorReads: [...descriptorReads], ordinaryLoadCount, defaultPathResolveCount };
 }
 `);
 }
@@ -300,6 +672,7 @@ async function resolveConnectAuthDecisionCore(params) {
   }
   return finish();
 }
+
 async function resolveConnectAuthDecision(params) { return resolveConnectAuthDecisionCore(params); }
 async function connect(connectParams, verifyDeviceToken) {
   const role = connectParams.role;
@@ -327,6 +700,45 @@ async function connect(connectParams, verifyDeviceToken) {
 `);
 }
 
+function gatewayAuthSqliteFixture(): string {
+  return compiledIndent(`
+const GATEWAY_CLIENT_IDS = { CLI: "cli" };
+const GATEWAY_CLIENT_MODES = { CLI: "cli" };
+const connectParams = { client: { id: "cli", mode: "cli" } };
+const clientId = connectParams.client.id;
+async function verifyDeviceToken() { return { ok: false, reason: "scope-mismatch" }; }
+const authDeps = {
+    async verifyDeviceToken(paramsLocal) {
+      return await verifyDeviceToken({
+        ...paramsLocal,
+        requiredSharedGatewaySessionGeneration: getRequiredSharedGatewaySessionGeneration?.()
+      });
+    }
+};
+function getRequiredSharedGatewaySessionGeneration() { return 1; }
+function normalizeSortedUniqueTrimmedStringList(values) {
+  return [...new Set((values ?? []).map((value) => typeof value === "string" ? value.trim() : "").filter(Boolean))].sort();
+}
+function resolvePairedAccessScopes(device) { return device?.scopes ?? []; }
+function resolvePairingOutcome(input) {
+  const {
+    authMethod,
+    connectParams,
+    devicePublicKey,
+    existingPairedDevice,
+    pairing,
+    plan,
+    reason,
+    role,
+    scopes,
+    trustedProxyApprovalScopes,
+  } = input;
+      const inlineApprovalAttempted = trustedProxyApprovalScopes !== null || pairing.request.silent === true;
+  return inlineApprovalAttempted ? "approved" : "pending";
+}
+`);
+}
+
 function stateFixture(): string {
   return compiledIndent(`
 const PENDING_TTL_MS = 300 * 1e3;
@@ -337,6 +749,7 @@ const writes = [];
 let delayedPairedWrite = null;
 let failNextPendingWrite = false;
 let failCommittedJournalAfterWrite = false;
+let failNextIdleJournalWrite = false;
 let driftOnBuild = null;
 function cloneJson(value) { return value === null || value === undefined ? value : JSON.parse(JSON.stringify(value)); }
 function createAsyncLock() {
@@ -349,9 +762,10 @@ function createAsyncLock() {
     try { return await fn(); } finally { release(); }
   };
 }
-function resolvePairingPaths(baseDir) {
+function resolvePairingPaths(baseDir, subdir = "devices") {
   const root = baseDir ?? "/fixture";
-  return { pendingPath: \`\${root}/pending.json\`, pairedPath: \`\${root}/paired.json\` };
+  const dir = \`\${root}/\${subdir}\`;
+  return { dir, pendingPath: \`\${dir}/pending.json\`, pairedPath: \`\${dir}/paired.json\` };
 }
 function coercePairingStateRecord(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function pruneExpiredPending() {}
@@ -369,6 +783,10 @@ async function writeJson(file, value, options) {
     delayed.started();
     await delayed.gate;
   }
+  if (file.endsWith(".nemoclaw-self-approval-journal") && value?.phase === "idle" && failNextIdleJournalWrite) {
+    failNextIdleJournalWrite = false;
+    throw new Error("idle journal cleanup failed");
+  }
   files.set(file, cloneJson(value));
   if (file.endsWith(".nemoclaw-self-approval-journal") && value?.phase === "committed" && failCommittedJournalAfterWrite) {
     failCommittedJournalAfterWrite = false;
@@ -377,14 +795,38 @@ async function writeJson(file, value, options) {
 }
 function setPairingState(pendingById, pairedByDeviceId, baseDir = "/fixture") {
   const { pendingPath, pairedPath } = resolvePairingPaths(baseDir, "devices");
+  const authPath = \`\${resolvePairingPaths(baseDir, "identity").dir}/device-auth.json\`;
   files.set(pendingPath, cloneJson(pendingById));
   files.set(pairedPath, cloneJson(pairedByDeviceId));
+  const pairedDevice = Object.values(pairedByDeviceId)[0];
+  const tokens = pairedDevice?.tokens;
+  const operator = Array.isArray(tokens)
+    ? tokens.find((entry) => entry?.role === "operator")
+    : tokens?.operator;
+  if (typeof operator?.token === "string" && operator.token) {
+    files.set(authPath, cloneJson({
+      version: 1,
+      deviceId: pairedDevice.deviceId,
+      tokens: {
+        operator: {
+          token: operator.token,
+          role: "operator",
+          scopes: operator.scopes,
+          updatedAtMs: 1,
+        },
+      },
+    }));
+  }
 }
 function setFile(file, value) { files.set(file, cloneJson(value)); }
 function getFile(file) { return files.has(file) ? cloneJson(files.get(file)) : null; }
 function getPairingPaths(baseDir = "/fixture") {
   const paths = resolvePairingPaths(baseDir, "devices");
-  return { ...paths, journalPath: \`\${paths.pendingPath}.nemoclaw-self-approval-journal\` };
+  return {
+    ...paths,
+    authPath: \`\${resolvePairingPaths(baseDir, "identity").dir}/device-auth.json\`,
+    journalPath: \`\${paths.pendingPath}.nemoclaw-self-approval-journal\`,
+  };
 }
 function armLateWriterFailure() {
   failNextPendingWrite = true;
@@ -397,6 +839,7 @@ function armLateWriterFailure() {
 }
 function releaseLateWriter() { delayedPairedWrite?.release(); }
 function armCommittedJournalFailure() { failCommittedJournalAfterWrite = true; }
+function armIdleJournalFailure() { failNextIdleJournalWrite = true; }
 function armStateDrift(file, value) { driftOnBuild = { file, value: cloneJson(value) }; }
 async function loadState(baseDir) {
   const { pendingPath, pairedPath } = resolvePairingPaths(baseDir, "devices");
@@ -518,25 +961,108 @@ async function approveBootstrapDevicePairing(requestId, bootstrapProfile, option
 
 export function writeFixtureDist(dist: string): void {
   fs.writeFileSync(path.join(dist, "call-fixture.js"), gatewayCallFixture());
+  fs.writeFileSync(path.join(dist, "device-identity-fixture.js"), deviceIdentityFixture());
   fs.writeFileSync(path.join(dist, "devices-cli.runtime-fixture.js"), cliFixture());
   fs.writeFileSync(path.join(dist, "message-handler-fixture.js"), gatewayAuthFixture());
   fs.writeFileSync(path.join(dist, "devices-fixture.js"), handlerFixture());
   fs.writeFileSync(path.join(dist, "device-pairing-fixture.js"), stateFixture());
 }
 
+export function writeCurrentGatewayCallFixtureDist(dist: string): void {
+  fs.writeFileSync(path.join(dist, "call-current-fixture.js"), currentGatewayCallFixture());
+  fs.writeFileSync(path.join(dist, "devices-cli.runtime-fixture.js"), cliFixture());
+  fs.writeFileSync(path.join(dist, "message-handler-fixture.js"), gatewayAuthSqliteFixture());
+  fs.writeFileSync(path.join(dist, "devices-fixture.js"), handlerFixture());
+  fs.writeFileSync(path.join(dist, "device-pairing-fixture.js"), stateFixture());
+}
+
 export function runPatch(dist: string, audit = false) {
-  return spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PATCH_SCRIPT, ...(audit ? ["--audit"] : []), dist],
-    {
-      encoding: "utf8",
-      timeout: 10_000,
-    },
-  );
+  return spawnSync(process.execPath, [PATCH_SCRIPT, ...(audit ? ["--audit"] : []), dist], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
 }
 
 export function runFixture<T>(source: string, expression: string): T {
-  return vm.runInNewContext(`${source}\n${expression}`, {}) as T;
+  return vm.runInNewContext(`${source}\n${expression}`, { Buffer, URL }) as T;
+}
+
+export interface PairingFixtureRuntime {
+  writes: Array<{ file: string; value: unknown; options?: Record<string, unknown> }>;
+  setPairingState(
+    pendingById: Record<string, unknown>,
+    pairedByDeviceId: Record<string, unknown>,
+    baseDir?: string,
+  ): void;
+  setFile(file: string, value: unknown): void;
+  getFile(file: string): unknown;
+  getPairingPaths(baseDir?: string): {
+    authPath: string;
+    pendingPath: string;
+    pairedPath: string;
+    journalPath: string;
+  };
+  listDevicePairing(baseDir?: string): Promise<{
+    pending: Array<Record<string, unknown>>;
+    paired: Array<Record<string, unknown>>;
+  }>;
+  getPairedDevice(deviceId: string, baseDir?: string): Promise<Record<string, unknown> | null>;
+  getPendingDevicePairing(
+    requestId: string,
+    baseDir?: string,
+  ): Promise<Record<string, unknown> | null>;
+  approveDevicePairing(
+    requestId: string,
+    options: Record<string, unknown>,
+    baseDir?: string,
+  ): Promise<Record<string, unknown> | null>;
+  approveBootstrapDevicePairing(
+    requestId: string,
+    bootstrapProfile: Record<string, unknown>,
+    baseDir?: string,
+  ): Promise<Record<string, unknown> | null>;
+  armLateWriterFailure(): Promise<void>;
+  releaseLateWriter(): void;
+  armCommittedJournalFailure(): void;
+  armIdleJournalFailure(): void;
+  armStateDrift(file: string, value: unknown): void;
+}
+
+export function openPatchedPairingFixture(): {
+  runtime: PairingFixtureRuntime;
+  source: string;
+  tmp: string;
+} {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-device-state-runtime-"));
+  const dist = path.join(tmp, "dist");
+  fs.mkdirSync(dist);
+  writeFixtureDist(dist);
+  const apply = runPatch(dist);
+  if (apply.status !== 0) {
+    throw new Error(`OpenClaw pairing fixture patch failed: ${apply.stdout}${apply.stderr}`);
+  }
+  const source = fs.readFileSync(path.join(dist, "device-pairing-fixture.js"), "utf8");
+  const runtime = runFixture<PairingFixtureRuntime>(
+    source,
+    `({
+      writes,
+      setPairingState,
+      setFile,
+      getFile,
+      getPairingPaths,
+      listDevicePairing,
+      getPairedDevice,
+      getPendingDevicePairing,
+      approveDevicePairing,
+      approveBootstrapDevicePairing,
+      armLateWriterFailure,
+      releaseLateWriter,
+      armCommittedJournalFailure,
+      armIdleJournalFailure,
+      armStateDrift
+    })`,
+  );
+  return { runtime, source, tmp };
 }
 
 export function validPending(overrides: Record<string, unknown> = {}) {
@@ -569,6 +1095,91 @@ export function validPaired(overrides: Record<string, unknown> = {}) {
   };
 }
 
+export function selfApprovalTransactionSnapshots() {
+  const pending = validPending({ ts: 100 });
+  const pairedBefore = validPaired({
+    approvedAtMs: 100,
+    tokens: {
+      operator: { token: "token-before", role: "operator", scopes: ["operator.pairing"] },
+    },
+  });
+  const pairedAfter = validPaired({
+    approvedAtMs: 200,
+    scopes: ["operator.pairing", "operator.read", "operator.write"],
+    approvedScopes: ["operator.pairing", "operator.read", "operator.write"],
+    tokens: {
+      operator: {
+        token: "token-after",
+        role: "operator",
+        scopes: ["operator.pairing", "operator.read", "operator.write"],
+      },
+    },
+  });
+  return {
+    before: {
+      auth: {
+        version: 1,
+        deviceId: "device-1",
+        tokens: {
+          operator: {
+            token: "token-before",
+            role: "operator",
+            scopes: ["operator.pairing"],
+            updatedAtMs: 1,
+          },
+        },
+      },
+      pendingById: { "request-1": pending },
+      pairedByDeviceId: { "device-1": pairedBefore },
+    },
+    after: {
+      auth: {
+        version: 1,
+        deviceId: "device-1",
+        tokens: {
+          operator: {
+            token: "token-after",
+            role: "operator",
+            scopes: ["operator.pairing", "operator.read", "operator.write"],
+            updatedAtMs: 1,
+          },
+        },
+      },
+      pendingById: {},
+      pairedByDeviceId: { "device-1": pairedAfter },
+    },
+  };
+}
+
+export function selfApprovalTransactionJournal(
+  phase: "prepared" | "committed",
+  snapshots: ReturnType<typeof selfApprovalTransactionSnapshots>,
+) {
+  return {
+    version: 2,
+    kind: "nemoclaw-self-approval",
+    phase,
+    requestId: "request-1",
+    deviceId: "device-1",
+    before: snapshots.before,
+    after: snapshots.after,
+  };
+}
+
+export function selfApprovalOptions() {
+  return {
+    callerScopes: ["operator.pairing"],
+    nemoclawSelfApprovalIdentity: {
+      deviceId: "device-1",
+      publicKey: "public-key-1",
+      role: "operator",
+      clientId: "cli",
+      clientMode: "cli",
+      deviceToken: "token-before",
+    },
+  };
+}
+
 export function validClient(overrides: Record<string, unknown> = {}) {
   return {
     isDeviceTokenAuth: true,
@@ -580,6 +1191,7 @@ export function validClient(overrides: Record<string, unknown> = {}) {
     connect: {
       role: "operator",
       scopes: ["operator.pairing"],
+      auth: { token: "token-before" },
       device: { id: "device-1", publicKey: "public-key-1" },
       client: { id: "cli", mode: "cli" },
     },

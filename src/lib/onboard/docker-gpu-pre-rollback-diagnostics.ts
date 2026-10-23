@@ -5,7 +5,10 @@ import {
   dockerCapture as defaultDockerCapture,
   dockerLogs as defaultDockerLogs,
 } from "../adapters/docker";
-import { discoverDockerGpuDiagnosticSensitiveValues } from "./docker-gpu-diagnostic-redaction";
+import {
+  createDockerGpuDiagnosticRedactor,
+  discoverDockerGpuDiagnosticSensitiveValues,
+} from "./docker-gpu-diagnostic-redaction";
 import {
   captureDockerGpuPatchSandboxSnapshot,
   classifyDockerGpuPatchFailure,
@@ -17,16 +20,23 @@ import type {
   DockerContainerInspect,
   DockerGpuPatchDeps,
   DockerGpuPatchDiagnostics,
+  DockerGpuPatchFailureClassification,
   DockerGpuPatchFailureContext,
   DockerGpuPatchResult,
 } from "./docker-gpu-patch-types";
+import { captureDockerContainerFailureEvidence } from "./compute/docker-container-failure-evidence";
 
 const PRE_ROLLBACK_DIAGNOSTICS_TOTAL_BUDGET_MS = 10_000;
 const PRE_ROLLBACK_DIAGNOSTICS_CALL_TIMEOUT_MS = 2_000;
 
 type PreRollbackDiagnosticsDeps = Pick<
   DockerGpuPatchDeps,
-  "runCaptureOpenshell" | "dockerCapture" | "dockerLogs" | "homedir" | "now"
+  | "runCaptureOpenshell"
+  | "openShellGpuDiagnostics"
+  | "dockerCapture"
+  | "dockerLogs"
+  | "homedir"
+  | "now"
 >;
 
 /**
@@ -44,7 +54,9 @@ type PreRollbackDiagnosticsDeps = Pick<
  * removalCondition: remove only when the replacement path emits equivalent bounded, redacted
  *   evidence before rollback, or no longer replaces a container.
  */
-function boundedDiagnosticsDeps(deps: PreRollbackDiagnosticsDeps): PreRollbackDiagnosticsDeps {
+function boundedDiagnosticsDeps(
+  deps: PreRollbackDiagnosticsDeps,
+): PreRollbackDiagnosticsDeps & Required<Pick<DockerGpuPatchDeps, "dockerCapture" | "dockerLogs">> {
   const capture = deps.dockerCapture ?? defaultDockerCapture;
   const logs = deps.dockerLogs ?? defaultDockerLogs;
   const deadline = Date.now() + PRE_ROLLBACK_DIAGNOSTICS_TOTAL_BUDGET_MS;
@@ -73,6 +85,21 @@ function boundedDiagnosticsDeps(deps: PreRollbackDiagnosticsDeps): PreRollbackDi
           const bounded = boundedOptions(options);
           if (!bounded) return "";
           return deps.runCaptureOpenshell?.(args, bounded) ?? "";
+        }
+      : undefined,
+    openShellGpuDiagnostics: deps.openShellGpuDiagnostics
+      ? {
+          collect: (request) => {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) return [];
+            return (
+              deps.openShellGpuDiagnostics?.collect({
+                ...request,
+                deadlineMs: deadline,
+                timeoutMs: Math.min(PRE_ROLLBACK_DIAGNOSTICS_CALL_TIMEOUT_MS, remaining),
+              }) ?? []
+            );
+          },
         }
       : undefined,
   };
@@ -118,11 +145,22 @@ function primeSensitiveDiagnosticValues(
   return [...sensitiveValues];
 }
 
+/**
+ * Diagnostics bundle plus the verdict computed while the replacement container
+ * was still inspectable. The failure path cannot rely on that replacement
+ * remaining inspectable after rollback, so `classification` preserves the
+ * exit-state evidence for the caller's user-facing failure message (#7996).
+ */
+export type DockerGpuPreRollbackDiagnostics = {
+  classification: DockerGpuPatchFailureClassification;
+  diagnostics: DockerGpuPatchDiagnostics | null;
+};
+
 export function captureDockerGpuPreRollbackDiagnostics(
   sandboxName: string,
   result: DockerGpuPatchResult,
   deps: PreRollbackDiagnosticsDeps = {},
-): DockerGpuPatchDiagnostics | null {
+): DockerGpuPreRollbackDiagnostics | null {
   const context: DockerGpuPatchFailureContext = {
     sandboxName,
     oldContainerId: result.oldContainerId,
@@ -131,17 +169,29 @@ export function captureDockerGpuPreRollbackDiagnostics(
     selectedMode: result.mode,
   };
   const diagnosticDeps = boundedDiagnosticsDeps(deps);
+  // Preserve the short-lived failure verdict before optional inspect
+  // enrichment can consume the shared capture budget. The replacement State
+  // is the only source of its exit code once rollback removes the container.
+  const failureEvidence = captureDockerContainerFailureEvidence(
+    result.newContainerId,
+    diagnosticDeps,
+    { enrichInspect: false },
+  );
+  const snapshot = {
+    ...captureDockerGpuPatchSandboxSnapshot(sandboxName, {}, diagnosticDeps),
+    patchedContainerState: failureEvidence.state,
+  };
   const additionalSensitiveValues = primeSensitiveDiagnosticValues(
     sandboxName,
     result,
     diagnosticDeps,
   );
-  const snapshot = captureDockerGpuPatchSandboxSnapshot(
-    sandboxName,
-    { patchedContainerId: result.newContainerId },
-    diagnosticDeps,
-  );
-  const classification = classifyDockerGpuPatchFailure(snapshot, result.mode);
+  const classification = classifyDockerGpuPatchFailure(snapshot, result.mode, {
+    managedStartupCommandMissing: failureEvidence.managedStartupCommandMissing,
+  });
+  const redactedClassification = createDockerGpuDiagnosticRedactor(
+    additionalSensitiveValues,
+  ).redactValue(classification) as DockerGpuPatchFailureClassification;
   let dockerTopOutput: string | null = null;
   try {
     const dockerCapture = diagnosticDeps.dockerCapture ?? defaultDockerCapture;
@@ -161,11 +211,10 @@ export function captureDockerGpuPreRollbackDiagnostics(
       classification,
       additionalSensitiveValues,
       dockerTopOutput,
+      cleanupDisposition: "pending-rollback",
     },
     diagnosticDeps,
   );
-  if (!diagnostics) return null;
-
-  console.error(`  Pre-rollback diagnostics saved: ${diagnostics.dir}`);
-  return diagnostics;
+  if (diagnostics) console.error(`  Pre-rollback diagnostics saved: ${diagnostics.dir}`);
+  return { classification: redactedClassification, diagnostics };
 }

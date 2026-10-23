@@ -14,7 +14,7 @@ import * as defs from "../../agent/defs";
 import * as store from "../../credentials/store";
 import * as policy from "../../policy";
 import * as registry from "../../state/registry";
-import { addSandboxChannel } from "./policy-channel";
+import { addSandboxChannel, startSandboxChannel, stopSandboxChannel } from "./policy-channel";
 import { policyChannelDependencies } from "./policy-channel-dependencies";
 
 function agentFixture(name: string): defs.AgentDefinition {
@@ -67,11 +67,11 @@ beforeEach(() => {
   runOpenshellMock = vi.spyOn(runtime, "runOpenshell").mockReturnValue(successfulOpenshellResult());
   loadPresetForSandboxMock = vi
     .spyOn(policy, "loadPresetForSandbox")
-    .mockReturnValue("network_policies:\n  stub: {}\n");
+    .mockResolvedValue("network_policies:\n  stub: {}\n");
   vi.spyOn(policy, "parsePresetPolicyKeys").mockReturnValue(["stub"]);
   vi.spyOn(policy, "listPresets").mockReturnValue([]);
-  applyPresetMock = vi.spyOn(policy, "applyPreset").mockReturnValue(true);
-  vi.spyOn(policy, "getAppliedPresets").mockReturnValue([]);
+  applyPresetMock = vi.spyOn(policy, "applyPreset").mockResolvedValue(true);
+  vi.spyOn(policy, "getAppliedPresets").mockResolvedValue([]);
   getCredentialMock = vi.spyOn(store, "getCredential").mockReturnValue(null);
   saveCredentialMock = vi.spyOn(store, "saveCredential").mockImplementation(() => undefined);
   promptMock = vi.spyOn(store, "prompt").mockResolvedValue("");
@@ -97,9 +97,8 @@ describe("addSandboxChannel agent gate", () => {
     const errorText = (errSpy.mock.calls as unknown[][])
       .map((call) => call.map(String).join(" "))
       .join("\n");
-    expect(errorText).toMatch(/Channel 'discord' does not support agent 'custom-agent'/);
-    expect(errorText).toMatch(/Channel-supported agents: openclaw, hermes/);
-    expect(errorText).toMatch(/Channels supported by agent 'custom-agent': \(none\)/);
+    expect(errorText).toContain("This channel does not support the configured agent.");
+    expect(errorText).not.toContain("custom-agent");
 
     expect(loadPresetForSandboxMock).not.toHaveBeenCalled();
     expect(applyPresetMock).not.toHaveBeenCalled();
@@ -149,4 +148,47 @@ describe("addSandboxChannel agent gate", () => {
     void exitMock;
     void logSpy;
   });
+});
+
+describe("channel lifecycle agent gate", () => {
+  it.each([
+    ["start", ["googlechat"], () => startSandboxChannel("da-test", { channel: "googlechat" })],
+    ["stop", [], () => stopSandboxChannel("da-test", { channel: "googlechat" })],
+  ])(
+    "rejects a stale channel during %s before reading channel state or mutating the sandbox",
+    async (_verb, disabledChannels, run) => {
+      // googlechat now supports openclaw + hermes, so exercise the unsupported-pair
+      // lifecycle gate with a non-messaging custom agent (supported by no channel).
+      getSandboxMock.mockReturnValue({ name: "da-test", agent: "custom-agent" });
+      vi.spyOn(defs, "loadAgent").mockReturnValue(agentFixture("custom-agent"));
+      const configuredChannelsMock = vi
+        .spyOn(registry, "getConfiguredMessagingChannelsFromEntry")
+        .mockReturnValue(["googlechat"]);
+      const disabledChannelsMock = vi
+        .spyOn(registry, "getDisabledChannels")
+        .mockReturnValue(disabledChannels);
+
+      let caught: unknown;
+      try {
+        await run();
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(exitCodeFromError(caught)).toBe(1);
+      const errorText = (errSpy.mock.calls as unknown[][])
+        .map((call) => call.map(String).join(" "))
+        .join("\n");
+      expect(errorText).toContain("This channel does not support the configured agent.");
+      expect(errorText).not.toContain("custom-agent");
+
+      expect(configuredChannelsMock).not.toHaveBeenCalled();
+      expect(disabledChannelsMock).not.toHaveBeenCalled();
+      expect(loadPresetForSandboxMock).not.toHaveBeenCalled();
+      expect(applyPresetMock).not.toHaveBeenCalled();
+      expect(updateSandboxMock).not.toHaveBeenCalled();
+      expect(rebuildMock).not.toHaveBeenCalled();
+      expect(runOpenshellMock).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -81,6 +81,22 @@ describe("sandbox GPU mode helpers", () => {
     expect(explicitFlagEnable.errors).toEqual([]);
   });
 
+  it("rejects an empty CDI identifier from environment and CLI selectors", () => {
+    const fromEnvironment = resolveSandboxGpuConfig(gpu(), {
+      env: { NEMOCLAW_SANDBOX_GPU: "1", NEMOCLAW_SANDBOX_GPU_DEVICE: "nvidia.com/gpu=" },
+    });
+    expect(fromEnvironment.sandboxGpuDevice).toBeNull();
+    expect(fromEnvironment.errors.join("\n")).toContain("must include an identifier");
+
+    const fromCli = resolveSandboxGpuConfig(gpu(), {
+      flag: "enable",
+      device: "nvidia.com/gpu=",
+      env: {},
+    });
+    expect(fromCli.sandboxGpuDevice).toBeNull();
+    expect(fromCli.errors.join("\n")).toContain("must include an identifier");
+  });
+
   it("enables sandbox GPU on Jetson without rejecting the platform", () => {
     const jetson = gpu({ platform: "jetson" });
     const auto = resolveSandboxGpuConfig(jetson, { env: {} });
@@ -122,8 +138,10 @@ describe("sandbox GPU mode helpers", () => {
 
     const resumedDisabled = getResumeSandboxGpuOverrides(
       { sandboxGpuMode: "0", sandboxGpuDevice: null },
-      false,
+      true,
+      { mode: "1", device: "nvidia.com/gpu=0" },
     );
+    expect(resumedDisabled).toEqual({ flag: "disable", device: null });
     expect(resolveSandboxGpuConfig(gpu(), { ...resumedDisabled, env: {} }).sandboxGpuEnabled).toBe(
       false,
     );

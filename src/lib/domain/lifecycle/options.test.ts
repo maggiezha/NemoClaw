@@ -116,19 +116,75 @@ describe("lifecycle option normalization", () => {
       });
     });
 
-    it("recognises common truthy/falsy spellings of NEMOCLAW_CLEANUP_GATEWAY", () => {
-      for (const truthy of ["1", "true", "TRUE", "Yes"]) {
-        process.env[ENV_KEY] = truthy;
+    it.each(["1", "true", "TRUE", "Yes"])(
+      "recognises truthy NEMOCLAW_CLEANUP_GATEWAY spelling %#",
+      (value) => {
+        process.env[ENV_KEY] = value;
         expect(normalizeDestroySandboxOptions({}).cleanupGateway).toBe(true);
-      }
-      for (const falsy of ["0", "false", "No"]) {
-        process.env[ENV_KEY] = falsy;
+      },
+    );
+    it.each(["0", "false", "No"])(
+      "recognises falsy NEMOCLAW_CLEANUP_GATEWAY spelling %#",
+      (value) => {
+        process.env[ENV_KEY] = value;
         expect(normalizeDestroySandboxOptions({}).cleanupGateway).toBe(false);
-      }
-      for (const noise of ["", "  ", "maybe", "later"]) {
-        process.env[ENV_KEY] = noise;
+      },
+    );
+    it.each(["", "  ", "maybe", "later"])(
+      "ignores unrecognized NEMOCLAW_CLEANUP_GATEWAY spelling %#",
+      (value) => {
+        process.env[ENV_KEY] = value;
         expect(normalizeDestroySandboxOptions({}).cleanupGateway).toBeUndefined();
-      }
+      },
+    );
+  });
+
+  describe("destroy keepVllm resolution", () => {
+    const ENV_KEY = "NEMOCLAW_KEEP_VLLM";
+
+    beforeEach(() => {
+      vi.stubEnv(ENV_KEY, undefined);
+    });
+
+    it("leaves keepVllm unset by default so destroy retires the last managed vLLM container", () => {
+      expect(normalizeDestroySandboxOptions(["--yes"])).toEqual({ force: false, yes: true });
+      expect(normalizeDestroySandboxOptions({ yes: true })).toEqual({ yes: true });
+    });
+
+    it("threads --keep-vllm through argv", () => {
+      expect(normalizeDestroySandboxOptions(["--yes", "--keep-vllm"])).toEqual({
+        force: false,
+        yes: true,
+        keepVllm: true,
+      });
+    });
+
+    it("falls back to NEMOCLAW_KEEP_VLLM when no flag is passed", () => {
+      vi.stubEnv(ENV_KEY, "1");
+      expect(normalizeDestroySandboxOptions(["--yes"])).toEqual({
+        force: false,
+        yes: true,
+        keepVllm: true,
+      });
+      expect(normalizeDestroySandboxOptions({ yes: true })).toEqual({ yes: true, keepVllm: true });
+    });
+
+    it("explicit option object wins over env var", () => {
+      vi.stubEnv(ENV_KEY, "1");
+      expect(normalizeDestroySandboxOptions({ yes: true, keepVllm: false })).toEqual({
+        yes: true,
+        keepVllm: false,
+      });
+    });
+
+    it.each(["0", "false", "No"])("recognises falsy NEMOCLAW_KEEP_VLLM spelling %#", (value) => {
+      vi.stubEnv(ENV_KEY, value);
+      expect(normalizeDestroySandboxOptions({}).keepVllm).toBe(false);
+    });
+
+    it.each(["", "maybe"])("ignores unrecognized NEMOCLAW_KEEP_VLLM spelling %#", (value) => {
+      vi.stubEnv(ENV_KEY, value);
+      expect(normalizeDestroySandboxOptions({}).keepVllm).toBeUndefined();
     });
   });
 

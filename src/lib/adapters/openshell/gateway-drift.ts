@@ -15,13 +15,37 @@ import {
   hostGatewayCmdlineMatches,
   resolveDockerDriverGatewayStateDir,
 } from "../../onboard/host-gateway-process";
+import { readGatewayProcEntry } from "../../onboard/gateway/process-proc-entry";
+import { isPodmanGatewayRuntimeEnabled } from "../../onboard/runtime-provider/configured-runtime";
 import { isOpenShellProtobufSchemaMismatch } from "../../runtime-recovery";
-import { isGatewayHealthy } from "../../state/gateway";
+import {
+  type GatewayReuseState,
+  getGatewayReuseState,
+  isGatewayHealthy,
+} from "../../domain/gateway-reuse";
 import { dockerContainerInspectFormat } from "../docker";
-import { parseVersionFromText, stripAnsi } from "./client";
+import { type ManagedGatewayEndpointBinding, parseVersionFromText, stripAnsi } from "./client";
+import {
+  classifyManagedGatewayEndpointBinding,
+  OPENSHELL_PROBE_TIMEOUT_MS,
+} from "./command-execution";
 import { resolveOpenshell } from "./resolve";
 import { captureOpenshell, getInstalledOpenshellVersionOrNull } from "./runtime";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "./timeouts";
+import { createCliOpenShellGatewayReuseObserver } from "./gateway-reuse-cli";
+import type { OpenShellGatewayReuseObserver } from "./gateway-reuse";
+import type { OpenShellRuntimeSelection } from "./runtime-selection";
+
+export type { GatewayReuseState, ManagedGatewayEndpointBinding };
+// Gateway observation consumers use the established drift adapter as their
+// OpenShell parsing and state boundary.
+export {
+  getGatewayReuseState,
+  isGatewayHealthy,
+  OPENSHELL_PROBE_TIMEOUT_MS,
+  classifyManagedGatewayEndpointBinding,
+  parseVersionFromText,
+  stripAnsi,
+};
 
 const DEFAULT_GATEWAY_NAME = "nemoclaw";
 
@@ -62,10 +86,10 @@ export type OpenShellStateRpcIssue =
       output: string;
     };
 
-type GatewayDriftDeps = {
+export type GatewayDriftDeps = {
   getInstalledOpenshellVersion?: () => string | null;
   getGatewayClusterImageRef?: (gatewayName: string) => string | null;
-  isGatewayClusterActive?: (gatewayName: string) => boolean;
+  isGatewayClusterActive?: (gatewayName: string) => boolean | Promise<boolean>;
   getHostProcessGatewayRuntime?: () => HostProcessGatewayRuntime | null;
 };
 
@@ -75,10 +99,18 @@ export function isHostProcessGatewayDrift(
   return !!drift && "gatewayBin" in drift;
 }
 
-type GatewayDriftOptions = {
+export type GatewayDriftOptions = {
   gatewayName?: string;
   deps?: GatewayDriftDeps;
+  runtimeSelection?: OpenShellRuntimeSelection;
   timeoutMs?: number;
+};
+
+export type GatewayVersionCompatibility = "compatible" | "drift" | "unknown";
+export type GatewayVersionSource = "host-process" | "legacy-cluster";
+
+export type GatewayVersionCompatibilityOptions = GatewayDriftOptions & {
+  source: GatewayVersionSource;
 };
 
 type StateRpcResult = {
@@ -128,6 +160,7 @@ export function getGatewayClusterImageRef(
   gatewayName = DEFAULT_GATEWAY_NAME,
   { timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS }: { timeoutMs?: number } = {},
 ): string | null {
+  if (isPodmanGatewayRuntimeEnabled()) return null;
   const imageRef = dockerContainerInspectFormat(
     "{{.Config.Image}}",
     getGatewayClusterContainerName(gatewayName),
@@ -139,18 +172,21 @@ export function getGatewayClusterImageRef(
   return imageRef || null;
 }
 
-function parseGatewayEndpointPort(output: string): string | null {
-  const match = stripAnsi(output).match(/^\s*Gateway endpoint:\s+(\S+)\s*$/m);
-  if (!match) return null;
-  try {
-    const url = new URL(match[1]);
-    if (url.port) return url.port;
-    if (url.protocol === "http:") return "80";
-    if (url.protocol === "https:") return "443";
-  } catch {
-    return null;
+function observedGatewayEndpointPort(endpoints: readonly (string | null)[]): string | null {
+  const ports = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (!endpoint) return null;
+    try {
+      const url = new URL(endpoint);
+      if (url.port) ports.add(url.port);
+      else if (url.protocol === "http:") ports.add("80");
+      else if (url.protocol === "https:") ports.add("443");
+      else return null;
+    } catch {
+      return null;
+    }
   }
-  return null;
+  return ports.size === 1 ? [...ports][0] : null;
 }
 
 function getGatewayClusterPublishedHostPorts(
@@ -183,29 +219,41 @@ function getGatewayClusterPublishedHostPorts(
   }
 }
 
-export function isGatewayClusterActiveForGateway(
+export async function isGatewayClusterActiveForGateway(
   gatewayName = DEFAULT_GATEWAY_NAME,
-  { timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS }: { timeoutMs?: number } = {},
-): boolean {
-  const status = captureOpenshell(["status"], {
-    ignoreError: true,
-    timeout: timeoutMs,
+  {
+    expectedGatewayPort,
+    runtimeSelection,
+    timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
+    observer,
+  }: {
+    expectedGatewayPort?: number;
+    runtimeSelection?: OpenShellRuntimeSelection;
+    timeoutMs?: number;
+    observer?: OpenShellGatewayReuseObserver;
+  } = {},
+): Promise<boolean> {
+  if (isPodmanGatewayRuntimeEnabled()) return false;
+  if (runtimeSelection && runtimeSelection.gatewayName !== gatewayName) return false;
+  const observed = await (
+    observer ??
+    createCliOpenShellGatewayReuseObserver((args, options) => captureOpenshell(args, options))
+  ).observeGatewayReuse({
+    target: { kind: "named", gatewayName },
+    expectedGatewayPort,
+    ...(runtimeSelection ? { runtimeSelection } : {}),
+    timeoutMs,
   });
-  const gatewayInfo = captureOpenshell(["gateway", "info", "-g", gatewayName], {
-    ignoreError: true,
-    timeout: timeoutMs,
-  });
-  const activeGatewayInfo = captureOpenshell(["gateway", "info"], {
-    ignoreError: true,
-    timeout: timeoutMs,
-  });
-  if (!isGatewayHealthy(status.output, gatewayInfo.output, activeGatewayInfo.output, gatewayName)) {
+  if (
+    observed.error ||
+    !observed.healthy ||
+    !observed.namedMetadata ||
+    observed.gatewayReuseState !== "healthy"
+  ) {
     return false;
   }
-
-  const endpointPort =
-    parseGatewayEndpointPort(activeGatewayInfo.output) ??
-    parseGatewayEndpointPort(gatewayInfo.output);
+  if (expectedGatewayPort !== undefined && observed.endpointBinding !== "match") return false;
+  const endpointPort = observedGatewayEndpointPort(observed.endpoints);
   if (!endpointPort) return false;
 
   const containerName = getGatewayClusterContainerName(gatewayName);
@@ -218,22 +266,30 @@ export function isGatewayClusterActiveForGateway(
   return getGatewayClusterPublishedHostPorts(containerName, timeoutMs).has(endpointPort);
 }
 
-export function getGatewayClusterImageDrift({
+export async function getGatewayClusterImageDrift({
   gatewayName = DEFAULT_GATEWAY_NAME,
   deps = {},
+  runtimeSelection,
   timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
-}: GatewayDriftOptions = {}): GatewayClusterImageDrift | null {
+}: GatewayDriftOptions = {}): Promise<GatewayClusterImageDrift | null> {
   if (isGatewayDriftPreflightDisabled(deps)) {
     return null;
   }
   const expectedVersion =
-    deps.getInstalledOpenshellVersion?.() ??
-    getInstalledOpenshellVersionOrNull({ timeout: timeoutMs });
-  const clusterActive =
-    deps.isGatewayClusterActive?.(gatewayName) ??
-    (typeof deps.getGatewayClusterImageRef === "function"
-      ? true
-      : isGatewayClusterActiveForGateway(gatewayName, { timeoutMs }));
+    typeof deps.getInstalledOpenshellVersion === "function"
+      ? deps.getInstalledOpenshellVersion()
+      : getInstalledOpenshellVersionOrNull({ timeout: timeoutMs });
+  let clusterActive: boolean;
+  if (deps.isGatewayClusterActive) {
+    clusterActive = await deps.isGatewayClusterActive(gatewayName);
+  } else if (typeof deps.getGatewayClusterImageRef === "function") {
+    clusterActive = true;
+  } else {
+    clusterActive = await isGatewayClusterActiveForGateway(gatewayName, {
+      runtimeSelection,
+      timeoutMs,
+    });
+  }
   if (!clusterActive) {
     return null;
   }
@@ -283,9 +339,10 @@ function isLiveGatewayProcess(pid: number | null | undefined, gatewayBin: string
     if ((err as NodeJS.ErrnoException).code !== "EPERM") return false;
   }
   let cmdline = "";
-  try {
-    cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8").replace(/\0/g, " ").trim();
-  } catch {
+  const procCmdline = readGatewayProcEntry(pid as number, "cmdline");
+  if (procCmdline !== null) {
+    cmdline = procCmdline.replace(/\0/g, " ").trim();
+  } else {
     try {
       const ps = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
         encoding: "utf-8",
@@ -374,11 +431,12 @@ export function getHostProcessGatewayRuntimeOrNull({
  * `openshell-cluster-*` container to inspect; cluster-image drift is handled
  * by {@link getGatewayClusterImageDrift}.
  */
-export function getGatewayHostProcessDrift({
+export async function getGatewayHostProcessDrift({
   gatewayName = DEFAULT_GATEWAY_NAME,
   deps = {},
+  runtimeSelection,
   timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
-}: GatewayDriftOptions = {}): GatewayHostProcessDrift | null {
+}: GatewayDriftOptions = {}): Promise<GatewayHostProcessDrift | null> {
   if (isGatewayDriftPreflightDisabled(deps)) {
     return null;
   }
@@ -394,9 +452,9 @@ export function getGatewayHostProcessDrift({
       ? deps.getGatewayClusterImageRef(gatewayName)
       : getGatewayClusterImageRef(gatewayName, { timeoutMs });
   if (clusterImage) {
-    const clusterActive =
-      deps.isGatewayClusterActive?.(gatewayName) ??
-      isGatewayClusterActiveForGateway(gatewayName, { timeoutMs });
+    const clusterActive = deps.isGatewayClusterActive
+      ? await deps.isGatewayClusterActive(gatewayName)
+      : await isGatewayClusterActiveForGateway(gatewayName, { runtimeSelection, timeoutMs });
     if (clusterActive) {
       return null;
     }
@@ -408,7 +466,9 @@ export function getGatewayHostProcessDrift({
     return null;
   }
   const runtime =
-    deps.getHostProcessGatewayRuntime?.() ?? getHostProcessGatewayRuntimeOrNull({ timeoutMs });
+    typeof deps.getHostProcessGatewayRuntime === "function"
+      ? deps.getHostProcessGatewayRuntime()
+      : getHostProcessGatewayRuntimeOrNull({ timeoutMs });
   if (!runtime || !runtime.runningVersion || runtime.runningVersion === expectedVersion) {
     return null;
   }
@@ -419,30 +479,87 @@ export function getGatewayHostProcessDrift({
   };
 }
 
-export function detectOpenShellStateRpcPreflightIssue({
+/**
+ * Observe managed gateway version compatibility without conflating a missing
+ * version with a proven match. Drift-only helpers return `null` for both cases;
+ * readiness needs this three-state result so it can fail closed when either
+ * side of the comparison is unavailable.
+ */
+export async function observeOpenShellGatewayVersionCompatibility({
+  source,
   gatewayName = DEFAULT_GATEWAY_NAME,
   deps = {},
+  runtimeSelection,
   timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
-}: GatewayDriftOptions = {}): OpenShellStateRpcIssue | null {
-  const imageDrift = getGatewayClusterImageDrift({ gatewayName, deps, timeoutMs });
+}: GatewayVersionCompatibilityOptions): Promise<GatewayVersionCompatibility> {
+  if (isGatewayDriftPreflightDisabled(deps)) return "unknown";
+  const expectedVersion =
+    typeof deps.getInstalledOpenshellVersion === "function"
+      ? deps.getInstalledOpenshellVersion()
+      : getInstalledOpenshellVersionOrNull({ timeout: timeoutMs });
+  if (!expectedVersion) return "unknown";
+
+  if (source === "legacy-cluster") {
+    const clusterActive = deps.isGatewayClusterActive
+      ? await deps.isGatewayClusterActive(gatewayName)
+      : await isGatewayClusterActiveForGateway(gatewayName, { runtimeSelection, timeoutMs });
+    if (!clusterActive) return "unknown";
+    const clusterImage =
+      typeof deps.getGatewayClusterImageRef === "function"
+        ? deps.getGatewayClusterImageRef(gatewayName)
+        : getGatewayClusterImageRef(gatewayName, { timeoutMs });
+    const currentVersion = parseGatewayClusterImageVersion(clusterImage);
+    if (!currentVersion) return "unknown";
+    return currentVersion === expectedVersion ? "compatible" : "drift";
+  }
+
+  // The caller must first bind this source to a positively identified live
+  // host-process listener. Do not inspect a legacy cluster or fall between
+  // runtime authorities here: missing host-process evidence stays unknown.
+  const runtime =
+    typeof deps.getHostProcessGatewayRuntime === "function"
+      ? deps.getHostProcessGatewayRuntime()
+      : getHostProcessGatewayRuntimeOrNull({ timeoutMs });
+  if (!runtime?.runningVersion) return "unknown";
+  return runtime.runningVersion === expectedVersion ? "compatible" : "drift";
+}
+
+export async function detectOpenShellStateRpcPreflightIssue({
+  gatewayName = DEFAULT_GATEWAY_NAME,
+  deps = {},
+  runtimeSelection,
+  timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
+}: GatewayDriftOptions = {}): Promise<OpenShellStateRpcIssue | null> {
+  const imageDrift = await getGatewayClusterImageDrift({
+    gatewayName,
+    deps,
+    runtimeSelection,
+    timeoutMs,
+  });
   if (imageDrift) {
     return { kind: "image_drift", drift: imageDrift };
   }
-  const hostDrift = getGatewayHostProcessDrift({ gatewayName, deps, timeoutMs });
+  const hostDrift = await getGatewayHostProcessDrift({
+    gatewayName,
+    deps,
+    runtimeSelection,
+    timeoutMs,
+  });
   if (hostDrift) {
     return { kind: "host_process_drift", drift: hostDrift };
   }
   return null;
 }
 
-export function detectOpenShellStateRpcResultIssue(
+export async function detectOpenShellStateRpcResultIssue(
   result: StateRpcResult,
   {
     gatewayName = DEFAULT_GATEWAY_NAME,
     deps = {},
+    runtimeSelection,
     timeoutMs = OPENSHELL_PROBE_TIMEOUT_MS,
   }: GatewayDriftOptions = {},
-): OpenShellStateRpcIssue | null {
+): Promise<OpenShellStateRpcIssue | null> {
   const output = String(result.output || "");
   if (!isOpenShellProtobufSchemaMismatch(output)) {
     return null;
@@ -451,8 +568,18 @@ export function detectOpenShellStateRpcResultIssue(
     kind: "protobuf_mismatch",
     drift: isGatewayDriftPreflightDisabled(deps)
       ? null
-      : (getGatewayClusterImageDrift({ gatewayName, deps, timeoutMs }) ??
-        getGatewayHostProcessDrift({ gatewayName, deps, timeoutMs })),
+      : ((await getGatewayClusterImageDrift({
+          gatewayName,
+          deps,
+          runtimeSelection,
+          timeoutMs,
+        })) ??
+        (await getGatewayHostProcessDrift({
+          gatewayName,
+          deps,
+          runtimeSelection,
+          timeoutMs,
+        }))),
     output,
   };
 }

@@ -6,11 +6,15 @@
 // onboard.setupInference (#767). Bedrock Runtime is delegated to
 // `onboard/bedrock-runtime.ts` exactly as the inline branch did.
 
-import { getCompatibleAnthropicOpenAiSurfaceBaseUrl } from "../../inference/config";
+import * as inference from "../../inference/config";
 import type { TrustedPrivateEndpointCapability } from "../../inference/endpoint-ssrf-preflight";
+import {
+  noAuthProxy as noAuth,
+  withOllamaProxyLifecycleTransaction,
+} from "../../inference/ollama/proxy";
 import { OPENROUTER_PROVIDER_NAME } from "../../inference/openrouter";
-import { readGatewayProviderMetadata } from "../gateway-provider-metadata";
-import { deleteProviderWithRecovery, parseAttachedSandboxes } from "../sandbox-provider-cleanup";
+import { deleteProviderWithRecovery } from "../sandbox-provider-cleanup";
+import { createManagedProviderAdapter } from "../../adapters/openshell/managed-provider-adapter";
 import {
   gatewayReachableCompatibleEndpointUrl,
   reuseRegisteredProviderWithGatewayEndpoint,
@@ -25,6 +29,12 @@ const { probeOpenAiLikeEndpointOptimized } = require("../../inference/onboard-pr
     options?: Record<string, unknown>,
   ) => Promise<{ ok: boolean; message?: string }>;
 };
+const { getRemoteProviderConfigForName } = require("../providers") as {
+  getRemoteProviderConfigForName: (
+    providerName: string,
+    remoteProviderConfig: RemoteProviderDeps["REMOTE_PROVIDER_CONFIG"],
+  ) => RemoteProviderDeps["REMOTE_PROVIDER_CONFIG"][string] | null;
+};
 
 type StaleProviderReplaceResult = { ok: boolean; status?: number | null; message?: string };
 
@@ -36,46 +46,69 @@ type StaleProviderReplaceResult = { ok: boolean; status?: number | null; message
  * Security containment: force-detach recovery may only touch the sandbox being
  * onboarded. The authorized set is exactly the confirmed `sandboxName`; every
  * attachment reported by the delete failure is revalidated against it before
- * any detach, and the same set is threaded into `removeGatewayProvider` so its
- * own re-parse also fails closed on an outside sandbox. With no confirmed
+ * any detach by `deleteProviderWithRecovery`. With no confirmed
  * sandbox (`sandboxName === null`) there is nothing to authorize against, so
  * force-detach recovery is refused with an actionable error rather than run
  * unconstrained. A provider still attached to other live sandboxes fails closed
  * too — flipping its type would silently break their Anthropic routing.
  */
-function replaceStaleAnthropicProviderForOpenAiSurface(args: {
+async function replaceStaleAnthropicProviderForOpenAiSurface(args: {
   provider: string;
   sandboxName: string | null;
   runOpenshell: RemoteProviderDeps["runOpenshell"];
-  readProviderMetadata: NonNullable<RemoteProviderDeps["readGatewayProviderMetadata"]>;
-  removeGatewayProvider: NonNullable<RemoteProviderDeps["deleteGatewayProvider"]>;
+  providerAdapter: RemoteProviderDeps["providerAdapter"];
   redact: RemoteProviderDeps["redact"];
   compactText: RemoteProviderDeps["compactText"];
-}): StaleProviderReplaceResult {
-  const {
-    provider,
-    sandboxName,
-    runOpenshell,
-    readProviderMetadata,
-    removeGatewayProvider,
-    redact,
-    compactText,
-  } = args;
-  const live = readProviderMetadata(provider, runOpenshell);
-  if (!live || live.type === "openai") return { ok: true };
-  const attempt = runOpenshell(["provider", "delete", provider], {
-    ignoreError: true,
-    suppressOutput: true,
+}): Promise<StaleProviderReplaceResult> {
+  const { provider, sandboxName, runOpenshell, providerAdapter, redact, compactText } = args;
+  const adapter =
+    providerAdapter ??
+    createManagedProviderAdapter((command, options) => {
+      const result = runOpenshell(command, options);
+      return {
+        ...result,
+        stdout:
+          typeof result.stdout === "string" || Buffer.isBuffer(result.stdout)
+            ? result.stdout
+            : null,
+        stderr:
+          typeof result.stderr === "string" || Buffer.isBuffer(result.stderr)
+            ? result.stderr
+            : null,
+      };
+    });
+  const result = await adapter.getProvider({
+    target: { kind: "selected" },
+    providerName: provider,
   });
-  if (attempt.status === 0) return { ok: true };
-  const raw = `${attempt.stderr || ""}\n${attempt.stdout || ""}`;
-  const attached = parseAttachedSandboxes(raw);
+  if (!result.ok) {
+    if (result.error.kind === "command" && result.error.reason === "not_found") {
+      return { ok: true };
+    }
+    const detail = compactText(redact(result.error.message));
+    return {
+      ok: false,
+      status: 1,
+      message: `Failed to inspect provider '${provider}' before replacement${detail ? `: ${detail}` : "."}`,
+    };
+  }
+  if (result.value.type === "openai") return { ok: true };
+  const attempt = await deleteProviderWithRecovery(provider, {
+    providerAdapter: adapter,
+    allowedSandboxes: sandboxName === null ? [] : [sandboxName],
+  });
+  if (attempt.ok) return { ok: true };
+  const raw = attempt.error.message;
+  const attached =
+    attempt.error.kind === "command" && attempt.error.reason === "attached"
+      ? [...(attempt.error.attachedSandboxes ?? [])]
+      : [];
   const allowedSandboxes = sandboxName === null ? [] : [sandboxName];
   const foreign = attached.filter((name) => !allowedSandboxes.includes(name));
   if (sandboxName === null && attached.length > 0) {
     return {
       ok: false,
-      status: attempt.status ?? 1,
+      status: 1,
       message:
         `Provider '${provider}' is attached to sandbox(es) (${attached.join(", ")}) ` +
         `but no target sandbox was confirmed, so it cannot be safely force-detached ` +
@@ -83,21 +116,10 @@ function replaceStaleAnthropicProviderForOpenAiSurface(args: {
         `explicit sandbox, or remove those sandboxes first.`,
     };
   }
-  if (attached.length > 0 && foreign.length === 0) {
-    const recovery = removeGatewayProvider(provider, { runOpenshell, allowedSandboxes });
-    const detail = compactText(redact(`${recovery.stderr || ""} ${recovery.stdout || ""}`));
-    return recovery.ok
-      ? { ok: true }
-      : {
-          ok: false,
-          status: recovery.status ?? 1,
-          message: `Failed to replace provider '${provider}' for the OpenAI-compatible route${detail ? `: ${detail}` : "."}`,
-        };
-  }
   if (foreign.length > 0) {
     return {
       ok: false,
-      status: attempt.status ?? 1,
+      status: 1,
       message:
         `Provider '${provider}' is attached to other sandbox(es) (${foreign.join(", ")}) ` +
         `and cannot be re-registered for the OpenAI-compatible route without breaking ` +
@@ -105,11 +127,14 @@ function replaceStaleAnthropicProviderForOpenAiSurface(args: {
         `endpoint or remove those sandboxes first.`,
     };
   }
+  const recovery = attempt.recoveryFailures
+    .map((failure) => compactText(redact(`${failure.sandbox}: ${failure.output}`)))
+    .join("; ");
   const detail = compactText(redact(raw));
   return {
     ok: false,
-    status: attempt.status ?? 1,
-    message: `Failed to replace provider '${provider}' for the OpenAI-compatible route${detail ? `: ${detail}` : "."}`,
+    status: 1,
+    message: `Failed to replace provider '${provider}' for the OpenAI-compatible route${detail ? `: ${detail}` : "."}${recovery ? ` (detach failures: ${recovery})` : ""}`,
   };
 }
 
@@ -127,6 +152,7 @@ export async function setupRemoteProviderInference(
     endpointUrl: string | null;
     credentialEnv: string | null;
     reuseGatewayCredentialWithoutLocalKey?: boolean;
+    allowLegacyRecordedNoAuthEndpoint?: boolean;
     skipHostInferenceSmoke?: boolean;
     preferredInferenceApi?: string | null;
     pinnedAddresses?: readonly string[];
@@ -142,6 +168,7 @@ export async function setupRemoteProviderInference(
     endpointUrl,
     credentialEnv,
     reuseGatewayCredentialWithoutLocalKey,
+    allowLegacyRecordedNoAuthEndpoint,
     skipHostInferenceSmoke,
     preferredInferenceApi,
     pinnedAddresses,
@@ -150,11 +177,14 @@ export async function setupRemoteProviderInference(
   } = args;
   const {
     runOpenshell,
+    inferenceRouteMutator,
+    gatewayName,
     upsertProvider,
     verifyInferenceRoute,
     verifyOnboardInferenceSmoke,
     isNonInteractive,
     registry,
+    reserveSandboxInferenceRoute,
     exitProcess,
     error,
     log,
@@ -169,10 +199,7 @@ export async function setupRemoteProviderInference(
     compactText,
   } = deps;
 
-  const config =
-    provider === "nvidia-nim"
-      ? REMOTE_PROVIDER_CONFIG.build
-      : Object.values(REMOTE_PROVIDER_CONFIG).find((entry) => entry.providerName === provider);
+  const config = getRemoteProviderConfigForName(provider, REMOTE_PROVIDER_CONFIG);
   if (!config) {
     error(`  Unsupported provider configuration: ${provider}`);
     return exitProcess(1);
@@ -184,7 +211,8 @@ export async function setupRemoteProviderInference(
     endpointUrl,
     credentialEnv,
     isNonInteractive,
-    runOpenshell,
+    gatewayName,
+    inferenceRouteMutator,
     upsertProvider,
     verifyInferenceRoute,
     verifyOnboardInferenceSmoke,
@@ -206,7 +234,8 @@ export async function setupRemoteProviderInference(
     reuseGatewayCredentialWithoutLocalKey,
     skipHostInferenceSmoke,
     isNonInteractive,
-    runOpenshell,
+    gatewayName,
+    inferenceRouteMutator,
     upsertProvider,
     verifyInferenceRoute,
     verifyOnboardInferenceSmoke,
@@ -226,160 +255,301 @@ export async function setupRemoteProviderInference(
   const useOpenAiSurface =
     provider === "compatible-anthropic-endpoint" && preferredInferenceApi === "openai-completions";
   const probeOpenAiSurface = deps.probeOpenAiLikeEndpoint ?? probeOpenAiLikeEndpointOptimized;
-  // The concrete modules type their openshell runners independently; the deps
-  // runner is call-compatible with both, so bridge the nominal mismatch here.
-  const readProviderMetadata =
-    deps.readGatewayProviderMetadata ??
-    (readGatewayProviderMetadata as unknown as NonNullable<
-      RemoteProviderDeps["readGatewayProviderMetadata"]
-    >);
-  const removeGatewayProvider =
-    deps.deleteGatewayProvider ??
-    (deleteProviderWithRecovery as unknown as NonNullable<
-      RemoteProviderDeps["deleteGatewayProvider"]
-    >);
-  while (true) {
-    const resolvedCredentialEnv = credentialEnv || (config && config.credentialEnv);
-    const resolvedEndpointUrl = endpointUrl || (config && config.endpointUrl);
-    const gatewayEndpointUrl = gatewayReachableCompatibleEndpointUrl(provider, resolvedEndpointUrl);
-    let providerResult;
-    if (reuseGatewayCredentialWithoutLocalKey) {
-      providerResult = reuseRegisteredProviderWithGatewayEndpoint({
-        provider,
-        providerType: config.providerType,
-        credentialEnv: resolvedCredentialEnv,
-        endpointUrl: resolvedEndpointUrl,
-        gatewayEndpointUrl,
-        runOpenshell,
-        upsertProvider,
-      });
-    } else {
-      const credentialValue = hydrateCredentialEnv(resolvedCredentialEnv);
-      const env =
-        resolvedCredentialEnv && credentialValue
-          ? { [resolvedCredentialEnv]: credentialValue }
-          : {};
-      if (!credentialValue) {
-        providerResult = {
-          ok: false,
-          status: 1,
-          message: `A host credential is required to configure provider '${provider}'.`,
-        };
-      } else if (useOpenAiSurface) {
-        // The anthropic-flavor endpoint normalization strips a trailing /v1
-        // (core/url-utils), while OpenShell resolves openai_chat_completions
-        // to <OPENAI_BASE_URL>/v1/chat/completions, deduping only bases that
-        // already end in /v1. Re-add the suffix so the probe and the runtime
-        // route exercise the identical URL.
-        const openAiSurfaceBaseUrl =
-          getCompatibleAnthropicOpenAiSurfaceBaseUrl(resolvedEndpointUrl);
-        const surfaceProbe = await probeOpenAiSurface(
-          openAiSurfaceBaseUrl,
-          model,
-          credentialValue,
-          {
-            skipResponsesProbe: true,
-            pinnedAddresses,
-            trustedPrivateCapability,
-          },
-        );
-        if (!surfaceProbe.ok) {
-          providerResult = {
-            ok: false,
-            status: 1,
-            message: compactText(
-              redact(
-                `The selected agent requires an OpenAI-compatible /v1/chat/completions surface, ` +
-                  `but the endpoint did not answer it${surfaceProbe.message ? `: ${surfaceProbe.message}` : "."} ` +
-                  `Use an endpoint that also serves /v1/chat/completions, or onboard an agent that ` +
-                  `uses the native Anthropic Messages route (for example, OpenClaw).`,
-              ),
-            ),
-          };
+  const configureProvider = async (): Promise<
+    { done: true; result: SetupInferenceResult } | { done: false }
+  > => {
+    const previousProxyCredential = credentialEnv ? process.env[credentialEnv] : undefined;
+    const proxy =
+      credentialEnv === inference.OLLAMA_LOCAL_CREDENTIAL_ENV
+        ? allowLegacyRecordedNoAuthEndpoint
+          ? noAuth(endpointUrl!, { allowLegacyRecordedEndpoint: true })
+          : noAuth(endpointUrl!)
+        : null;
+    if (proxy) process.env[credentialEnv!] = proxy.credentialValue;
+    let proxySettled = proxy === null;
+    const restoreUncommittedProxy = () => {
+      if (!proxy || proxySettled) return;
+      try {
+        proxy.restore();
+      } finally {
+        if (previousProxyCredential === undefined) {
+          delete process.env[credentialEnv!];
         } else {
-          // `provider update` cannot change --type, so a provider left behind
-          // by an earlier Anthropic-Messages registration must be replaced.
-          const replaced = replaceStaleAnthropicProviderForOpenAiSurface({
-            provider,
-            sandboxName,
-            runOpenshell,
-            readProviderMetadata,
-            removeGatewayProvider,
-            redact,
-            compactText,
-          });
-          providerResult = replaced.ok
-            ? upsertProvider(provider, "openai", resolvedCredentialEnv, openAiSurfaceBaseUrl, env)
-            : {
-                ok: false,
-                status: replaced.status || 1,
-                message: replaced.message ?? `Failed to replace provider '${provider}'.`,
-              };
+          process.env[credentialEnv!] = previousProxyCredential;
         }
-      } else {
-        providerResult = upsertProvider(
-          provider,
-          config.providerType,
-          resolvedCredentialEnv,
-          gatewayEndpointUrl,
-          env,
+        proxySettled = true;
+      }
+    };
+    try {
+      if (proxy && !sandboxName) {
+        throw new Error(
+          "A named sandbox is required before configuring a proxy-backed inference route.",
         );
       }
-    }
-    if (!providerResult.ok) {
-      capabilityCache?.invalidate();
-      error(`  ${providerResult.message}`);
-      if (isNonInteractive()) {
-        return exitProcess(providerResult.status || 1);
+      while (true) {
+        const resolvedCredentialEnv = credentialEnv || (config && config.credentialEnv);
+        const resolvedEndpointUrl = endpointUrl || (config && config.endpointUrl);
+        const gatewayEndpointUrl =
+          proxy?.baseUrl ?? gatewayReachableCompatibleEndpointUrl(provider, resolvedEndpointUrl);
+        let providerResult;
+        if (deps.nativeLocalInference && reuseGatewayCredentialWithoutLocalKey) {
+          providerResult = await upsertProvider(
+            provider,
+            config.providerType,
+            resolvedCredentialEnv,
+            gatewayEndpointUrl,
+            {},
+          );
+        } else if (reuseGatewayCredentialWithoutLocalKey) {
+          providerResult = await reuseRegisteredProviderWithGatewayEndpoint({
+            provider,
+            providerType: config.providerType,
+            credentialEnv: resolvedCredentialEnv,
+            endpointUrl: resolvedEndpointUrl,
+            gatewayEndpointUrl,
+            runOpenshell,
+            upsertProvider,
+          });
+        } else {
+          const credentialValue = hydrateCredentialEnv(resolvedCredentialEnv);
+          const env =
+            resolvedCredentialEnv && credentialValue
+              ? { [resolvedCredentialEnv]: credentialValue }
+              : {};
+          if (!credentialValue) {
+            providerResult = {
+              ok: false,
+              status: 1,
+              message: `A host credential is required to configure provider '${provider}'.`,
+            };
+          } else if (useOpenAiSurface) {
+            // The anthropic-flavor endpoint normalization strips a trailing /v1
+            // (core/url-utils), while OpenShell resolves openai_chat_completions
+            // to <OPENAI_BASE_URL>/v1/chat/completions, deduping only bases that
+            // already end in /v1. Re-add the suffix so the probe and the runtime
+            // route exercise the identical URL.
+            const openAiSurfaceBaseUrl =
+              inference.getCompatibleAnthropicOpenAiSurfaceBaseUrl(resolvedEndpointUrl);
+            const surfaceProbe = await probeOpenAiSurface(
+              openAiSurfaceBaseUrl,
+              model,
+              credentialValue,
+              {
+                skipResponsesProbe: true,
+                pinnedAddresses,
+                trustedPrivateCapability,
+              },
+            );
+            if (!surfaceProbe.ok) {
+              providerResult = {
+                ok: false,
+                status: 1,
+                message: compactText(
+                  redact(
+                    `The selected agent requires an OpenAI-compatible /v1/chat/completions surface, ` +
+                      `but the endpoint did not answer it${surfaceProbe.message ? `: ${surfaceProbe.message}` : "."} ` +
+                      `Use an endpoint that also serves /v1/chat/completions, or onboard an agent that ` +
+                      `uses the native Anthropic Messages route (for example, OpenClaw).`,
+                  ),
+                ),
+              };
+            } else {
+              // `provider update` cannot change --type, so a provider left behind
+              // by an earlier Anthropic-Messages registration must be replaced.
+              const replaced = await replaceStaleAnthropicProviderForOpenAiSurface({
+                provider,
+                sandboxName,
+                runOpenshell,
+                providerAdapter: deps.providerAdapter,
+                redact,
+                compactText,
+              });
+              providerResult = replaced.ok
+                ? await upsertProvider(
+                    provider,
+                    "openai",
+                    resolvedCredentialEnv,
+                    openAiSurfaceBaseUrl,
+                    env,
+                  )
+                : {
+                    ok: false,
+                    status: replaced.status || 1,
+                    message: replaced.message ?? `Failed to replace provider '${provider}'.`,
+                  };
+            }
+          } else {
+            providerResult = await upsertProvider(
+              provider,
+              config.providerType,
+              resolvedCredentialEnv,
+              gatewayEndpointUrl,
+              env,
+            );
+          }
+        }
+        if (!providerResult.ok) {
+          capabilityCache?.invalidate();
+          error(`  ${providerResult.message}`);
+          if (isNonInteractive()) {
+            restoreUncommittedProxy();
+            return exitProcess(providerResult.status || 1);
+          }
+          const retry = await promptValidationRecovery(
+            config.label,
+            classifyApplyFailure(providerResult.message || ""),
+            resolvedCredentialEnv,
+            config.helpUrl,
+          );
+          if (retry === "credential" || retry === "retry") {
+            continue;
+          }
+          if (retry === "selection" || retry === "model") {
+            restoreUncommittedProxy();
+            return { done: true, result: { retry: "selection" } };
+          }
+          restoreUncommittedProxy();
+          return exitProcess(providerResult.status || 1);
+        }
+        if (deps.nativeLocalInference) {
+          if (proxy && sandboxName) {
+            // Preserve the proxy owner before releasing its lifecycle lock.
+            // A failed registry write may already have committed, so retain it.
+            proxy.persist();
+            proxySettled = true;
+            let reservationFailure: string | null = null;
+            try {
+              if (!reserveSandboxInferenceRoute(sandboxName, { model, provider })) {
+                reservationFailure = "reservation returned false";
+              }
+            } catch (reservationError) {
+              reservationFailure = compactText(
+                redact(
+                  reservationError instanceof Error
+                    ? reservationError.message
+                    : String(reservationError),
+                ),
+              );
+            }
+            if (reservationFailure) {
+              throw new Error(
+                `Native local inference could not publish its proxy owner: ${reservationFailure}. The proxy was retained.`,
+              );
+            }
+          }
+          break;
+        }
+        const applyResult = await inferenceRouteMutator.setInferenceRoute({
+          target: { kind: "named", gatewayName },
+          route: { provider, model },
+          verification:
+            config.skipVerify || gatewayEndpointUrl !== resolvedEndpointUrl ? "skip" : "required",
+          ...(provider === "compatible-endpoint"
+            ? { verificationTimeoutSeconds: LOCAL_INFERENCE_TIMEOUT_SECS }
+            : {}),
+        });
+        if (applyResult.ok) {
+          // Publish the pending owner before releasing the proxy lifecycle lock.
+          // Otherwise concurrent teardown can stop the newly configured proxy.
+          let reservationFailure: string | null = null;
+          if (proxy && sandboxName) {
+            try {
+              if (reserveSandboxInferenceRoute(sandboxName, { model, provider }) === false) {
+                reservationFailure = `Could not reserve the inference route for sandbox '${sandboxName}'.`;
+              }
+            } catch (reservationError) {
+              reservationFailure =
+                reservationError instanceof Error
+                  ? reservationError.message
+                  : String(reservationError);
+            }
+          }
+          if (proxy && reservationFailure) {
+            // The confirmed route depends on this proxy. A failed ownership
+            // publication cannot authorize tearing the dependency down.
+            proxy.persist();
+            proxySettled = true;
+            throw new Error(
+              `OpenShell committed the inference route, but NemoClaw could not publish its proxy ownership: ${reservationFailure} ` +
+                `The proxy was retained. Inspect gateway '${gatewayName}', then rerun onboarding to reconcile ownership.`,
+            );
+          }
+          proxy?.persist();
+          proxySettled = true;
+          break;
+        }
+        const message = applyResult.error.message;
+        capabilityCache?.invalidate();
+        error(`  ${message}`);
+        if (applyResult.ambiguous) {
+          // The route may depend on this proxy. Retain it until a same-gateway
+          // observation can establish whether the write took effect. The
+          // pending route reservation is ownership, not route-success
+          // publication, and prevents concurrent teardown from stopping it.
+          if (proxy) {
+            if (!sandboxName) {
+              proxy.persist();
+              proxySettled = true;
+              throw new Error(
+                "Cannot retain an ambiguously selected inference proxy without a sandbox route owner.",
+              );
+            }
+            let reserved: boolean;
+            try {
+              reserved = reserveSandboxInferenceRoute(sandboxName, { model, provider });
+            } catch (reservationError) {
+              // Persistence may have succeeded before its readback failed. Do
+              // not destroy a proxy that an ambiguous live route may use.
+              proxy.persist();
+              proxySettled = true;
+              throw reservationError;
+            }
+            if (!reserved) {
+              proxy.persist();
+              proxySettled = true;
+              throw new Error(
+                `Could not reserve durable ownership for the ambiguous inference route for sandbox '${sandboxName}'. The proxy was retained because the live route may depend on it.`,
+              );
+            }
+          }
+          proxy?.persist();
+          proxySettled = true;
+          error(
+            `  The route update result is unknown. Inspect gateway '${gatewayName}' before retrying onboarding.`,
+          );
+          return exitProcess(1);
+        }
+        if (isNonInteractive()) {
+          restoreUncommittedProxy();
+          return exitProcess(
+            applyResult.error.kind === "command" ? (applyResult.error.exitCode ?? 1) : 1,
+          );
+        }
+        const retry = await promptValidationRecovery(
+          config.label,
+          classifyApplyFailure(message),
+          resolvedCredentialEnv,
+          config.helpUrl,
+        );
+        if (retry === "credential" || retry === "retry") {
+          continue;
+        }
+        if (retry === "selection" || retry === "model") {
+          restoreUncommittedProxy();
+          return { done: true, result: { retry: "selection" } };
+        }
+        restoreUncommittedProxy();
+        return exitProcess(
+          applyResult.error.kind === "command" ? (applyResult.error.exitCode ?? 1) : 1,
+        );
       }
-      const retry = await promptValidationRecovery(
-        config.label,
-        classifyApplyFailure(providerResult.message || ""),
-        resolvedCredentialEnv,
-        config.helpUrl,
-      );
-      if (retry === "credential" || retry === "retry") {
-        continue;
-      }
-      if (retry === "selection" || retry === "model") {
-        return { done: true, result: { retry: "selection" } };
-      }
-      return exitProcess(providerResult.status || 1);
+      return { done: false } as const;
+    } finally {
+      restoreUncommittedProxy();
     }
-    const argsv = ["inference", "set"];
-    if (config.skipVerify || gatewayEndpointUrl !== resolvedEndpointUrl) {
-      // Host-side verification cannot resolve the sandbox-only bridge URL.
-      argsv.push("--no-verify");
-    }
-    argsv.push("--provider", provider, "--model", model);
-    if (provider === "compatible-endpoint") {
-      argsv.push("--timeout", String(LOCAL_INFERENCE_TIMEOUT_SECS));
-    }
-    const applyResult = runOpenshell(argsv, { ignoreError: true });
-    if (applyResult.status === 0) {
-      break;
-    }
-    const message =
-      compactText(redact(`${applyResult.stderr || ""} ${applyResult.stdout || ""}`)) ||
-      `Failed to configure inference provider '${provider}'.`;
-    capabilityCache?.invalidate();
-    error(`  ${message}`);
-    if (isNonInteractive()) {
-      return exitProcess(applyResult.status || 1);
-    }
-    const retry = await promptValidationRecovery(
-      config.label,
-      classifyApplyFailure(message),
-      resolvedCredentialEnv,
-      config.helpUrl,
-    );
-    if (retry === "credential" || retry === "retry") {
-      continue;
-    }
-    if (retry === "selection" || retry === "model") {
-      return { done: true, result: { retry: "selection" } };
-    }
-    return exitProcess(applyResult.status || 1);
-  }
-  return { done: false };
+  };
+
+  return credentialEnv === inference.OLLAMA_LOCAL_CREDENTIAL_ENV
+    ? withOllamaProxyLifecycleTransaction(configureProvider)
+    : configureProvider();
 }

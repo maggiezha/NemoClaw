@@ -15,7 +15,6 @@ import type {
   DockerGpuPatchMode,
   DockerGpuPatchResult,
   DockerGpuPatchSandboxSnapshot,
-  DockerUlimit,
 } from "./docker-gpu-patch-types";
 
 export { detectSandboxFallbackDns } from "./docker-gpu-dns-fallback";
@@ -28,13 +27,10 @@ export {
   parseDockerInspectJson,
 } from "./docker-gpu-patch-clone";
 
-import {
-  collectDockerGpuPatchDiagnostics,
-  dockerGpuPatchCleanupCommands,
-} from "./docker-gpu-patch-diagnostics";
+import { collectDockerGpuPatchDiagnostics } from "./docker-gpu-patch-diagnostics";
+import { formatDockerContainerState } from "./compute/docker-container-failure-evidence";
 import {
   getDockerGpuPatchFailureContext,
-  recreateOpenShellDockerSandboxContainer,
   recreateOpenShellDockerSandboxWithGpu,
 } from "./docker-gpu-patch-recreate";
 import {
@@ -101,15 +97,33 @@ export {
   waitForOpenShellSupervisorReconnect,
 };
 
-function printDockerGpuPatchCleanup(sandboxName: string): void {
-  console.error("  The failed sandbox/container has been left in place for inspection.");
-  console.error("  Manual cleanup:");
-  for (const command of dockerGpuPatchCleanupCommands(sandboxName)) {
-    console.error(`    ${command}`);
+function printDockerGpuPatchCleanup(
+  context: DockerGpuPatchFailureContext | null,
+  diagnostics: ReturnType<typeof collectDockerGpuPatchDiagnostics>,
+): void {
+  if (context?.rolledBack === true) {
+    console.error("  The pre-patch sandbox container was restored and started.");
+    if (diagnostics?.cleanupDisposition === "manual") {
+      console.error("  The failed replacement container may still be present.");
+      console.error("  Manual cleanup:");
+      for (const command of diagnostics.cleanupCommands) console.error(`    ${command}`);
+    } else if (
+      !diagnostics ||
+      diagnostics.cleanupDisposition === "unknown" ||
+      diagnostics.cleanupDisposition === "pending_rollback"
+    ) {
+      console.error(
+        "  Replacement container cleanup could not be confirmed. Inspect the diagnostics before removing any container.",
+      );
+    }
+    return;
   }
+  console.error(
+    "  The failed sandbox and container state is uncertain. Inspect the diagnostics before removing any container.",
+  );
 }
 
-export function applyDockerGpuPatchOrExit(
+export async function applyDockerGpuPatchOrExit(
   options: {
     sandboxName: string;
     gpuDevice?: string | null;
@@ -123,15 +137,19 @@ export function applyDockerGpuPatchOrExit(
     openshellSandboxCommand?: readonly string[] | null;
     dockerDesktopWsl?: boolean;
   },
-  deps: Pick<DockerGpuPatchDeps, "runOpenshell" | "runCaptureOpenshell" | "sleep">,
-): DockerGpuPatchResult {
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "commandExecutor" | "openShellGpuDiagnostics" | "runOpenshell" | "runCaptureOpenshell" | "sleep"
+  >,
+): Promise<DockerGpuPatchResult> {
   console.log("  Recreating OpenShell Docker sandbox container with NVIDIA GPU access...");
   try {
-    const result = recreateOpenShellDockerSandboxWithGpu(options, deps);
+    const result = await recreateOpenShellDockerSandboxWithGpu(options, deps);
     console.log(`  ✓ Docker GPU mode selected: ${result.mode.label}`);
     return result;
   } catch (error) {
     printDockerGpuPatchFailureAndExit(options.sandboxName, error, {
+      openShellGpuDiagnostics: deps.openShellGpuDiagnostics,
       runCaptureOpenshell: deps.runCaptureOpenshell,
     });
   }
@@ -143,6 +161,7 @@ function printDockerGpuPatchClassificationLines(
   if (!classification) return;
   if (classification.headline) console.error(`  ${classification.headline}`);
   for (const line of classification.summaryLines) console.error(`    ${line}`);
+  for (const hint of classification.hints ?? []) console.error(`  ${hint}`);
 }
 
 function patchedContainerIdFromContext(
@@ -157,37 +176,92 @@ function patchedContainerIdFromContext(
 }
 
 function snapshotInspectDeps(
-  deps: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture">,
-): Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> {
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  >,
+): Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"> {
   // `depsWithDefaults` spreads the caller's `deps`, so passing an explicit
   // `dockerCapture: undefined` would shadow the module's default Docker
   // adapter and disable downstream `docker ps`/`inspect`/`logs` capture.
   // Build the inner deps object with only the keys the caller actually
   // supplied so defaults stay in place.
-  const inner: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> = {};
+  const inner: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  > = {};
   if (deps.runCaptureOpenshell) inner.runCaptureOpenshell = deps.runCaptureOpenshell;
   if (deps.dockerCapture) inner.dockerCapture = deps.dockerCapture;
+  if (deps.openShellGpuDiagnostics) {
+    inner.openShellGpuDiagnostics = deps.openShellGpuDiagnostics;
+  }
   return inner;
 }
+
+function classificationMatchesSelectedMode(
+  classification: DockerGpuPatchFailureClassification,
+  selectedMode: DockerGpuPatchMode | null,
+): boolean {
+  if (!selectedMode) return false;
+  return classification.selectedModeKind === selectedMode.kind;
+}
+
+/**
+ * Whether the selected post-create operation is a GPU handling step. The
+ * `startup-command` mode is the non-GPU restart-persistence recreation, so a
+ * failure in that operation must not wear GPU failure wording (#12080).
+ */
+function selectedOperationIsGpu(selectedMode: DockerGpuPatchMode | null): boolean {
+  return selectedMode === null || selectedMode.kind !== "startup-command";
+}
+
+const GPU_ESCAPE_HATCH_LINES: readonly string[] = [
+  "NEMOCLAW_DOCKER_GPU_PATCH=1  use only the Docker GPU compatibility path.",
+  "NEMOCLAW_DOCKER_GPU_PATCH=0  use native OpenShell GPU injection (ignored on Docker Desktop WSL; Jetson also defaults to the compatibility path).",
+  "NEMOCLAW_SANDBOX_GPU=0      skip GPU passthrough entirely (or rerun with --no-gpu).",
+];
+
+const NO_GPU_NEXT_ACTION_LINES: readonly string[] = [
+  "Rebuild the sandbox image, then rerun onboarding to recreate it.",
+];
 
 export function printDockerGpuPatchFailureAndExit(
   sandboxName: string,
   error: unknown,
-  deps: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> & {
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  > & {
     context?: DockerGpuPatchFailureContext | null;
     selectedMode?: DockerGpuPatchMode | null;
     additionalSummaryLines?: readonly string[];
-  },
+    /**
+     * Classification captured while the replacement container still existed.
+     * The failure path cannot rely on that replacement remaining inspectable
+     * after rollback, so a fresh snapshot can lose its exit state (#7996).
+     */
+    preRollbackClassification?: DockerGpuPatchFailureClassification | null;
+  } & Pick<DockerGpuPatchDeps, "dockerLogs" | "homedir" | "now">,
 ): never {
   const context = deps.context || getDockerGpuPatchFailureContext(error) || null;
   const selectedMode = deps.selectedMode || context?.selectedMode || null;
+  const gpuInvolved = selectedOperationIsGpu(selectedMode);
   const inspectDeps = snapshotInspectDeps(deps);
   const snapshot = captureDockerGpuPatchSandboxSnapshot(
     sandboxName,
     { patchedContainerId: patchedContainerIdFromContext(context) },
     inspectDeps,
   );
-  const classification = classifyDockerGpuPatchFailure(snapshot, selectedMode);
+  // Prefer the earlier verdict only when the fresh snapshot cannot inspect the
+  // replacement container after rollback and the verdict describes this
+  // failure's exact create option (#7996).
+  const observedClassification = classifyDockerGpuPatchFailure(snapshot, selectedMode);
+  const classification =
+    deps.preRollbackClassification?.kind === "patched_container_failed" &&
+    snapshot.patchedContainerState === null &&
+    classificationMatchesSelectedMode(deps.preRollbackClassification, selectedMode)
+      ? deps.preRollbackClassification
+      : observedClassification;
   const diagnostics = collectDockerGpuPatchDiagnostics(
     sandboxName,
     {
@@ -198,14 +272,16 @@ export function printDockerGpuPatchFailureAndExit(
       classification,
       additionalSummaryLines: deps.additionalSummaryLines,
     },
-    inspectDeps,
+    deps,
   );
   const errorMessage =
     error instanceof Error && error.message
       ? createDockerGpuDiagnosticRedactor().redactText(error.message)
       : "";
   console.error("");
-  console.error("  Docker GPU patch failed.");
+  console.error(
+    gpuInvolved ? "  Docker GPU patch failed." : "  Docker startup-command patch failed.",
+  );
   if (errorMessage) {
     console.error(`  ${errorMessage}`);
   }
@@ -213,22 +289,24 @@ export function printDockerGpuPatchFailureAndExit(
   if (diagnostics) {
     console.error(`  Diagnostics saved: ${diagnostics.dir}`);
   }
-  console.error("  Escape hatches:");
-  console.error("    NEMOCLAW_DOCKER_GPU_PATCH=1  use only the Docker GPU compatibility path.");
-  console.error(
-    "    NEMOCLAW_DOCKER_GPU_PATCH=0  use native OpenShell GPU injection (ignored on Docker Desktop WSL; Jetson also defaults to the compatibility path).",
-  );
-  console.error(
-    "    NEMOCLAW_SANDBOX_GPU=0      skip GPU passthrough entirely (or rerun with --no-gpu).",
-  );
-  printDockerGpuPatchCleanup(sandboxName);
+  if (gpuInvolved) {
+    console.error("  Escape hatches:");
+    for (const line of GPU_ESCAPE_HATCH_LINES) console.error(`    ${line}`);
+  } else {
+    console.error("  Next action:");
+    for (const line of NO_GPU_NEXT_ACTION_LINES) console.error(`    ${line}`);
+  }
+  printDockerGpuPatchCleanup(context, diagnostics);
   process.exit(1);
 }
 
 export function printDockerGpuReadinessFailure(
   sandboxName: string,
   selectedMode: DockerGpuPatchMode | null,
-  deps: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> & {
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  > & {
     context?: DockerGpuPatchFailureContext | null;
     additionalSummaryLines?: readonly string[];
   },
@@ -256,14 +334,17 @@ export function printDockerGpuReadinessFailure(
   if (diagnostics) {
     console.error(`  Docker GPU diagnostics saved: ${diagnostics.dir}`);
   }
-  printDockerGpuPatchCleanup(sandboxName);
+  printDockerGpuPatchCleanup(context, diagnostics);
 }
 
 export function printDockerGpuProofFailure(
   sandboxName: string,
   error: unknown,
   selectedMode: DockerGpuPatchMode | null,
-  deps: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> & {
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  > & {
     context?: DockerGpuPatchFailureContext | null;
     additionalSummaryLines?: readonly string[];
   },
@@ -294,7 +375,7 @@ export function printDockerGpuProofFailure(
   if (diagnostics) {
     console.error(`  Diagnostics saved: ${diagnostics.dir}`);
   }
-  printDockerGpuPatchCleanup(sandboxName);
+  printDockerGpuPatchCleanup(context, diagnostics);
 }
 
 const SANDBOX_FAILURE_PHASE_TOKENS = new Set(["Error", "Failed", "CrashLoopBackOff"]);
@@ -323,6 +404,16 @@ function parseSandboxPhaseFromGetOutput(output: string): string | null {
 
 function parseSandboxPhaseFromListOutput(output: string, sandboxName: string): string | null {
   return parseLiveSandboxEntries(output).find((entry) => entry.name === sandboxName)?.phase ?? null;
+}
+
+function completedOpenShellArtifactContent(
+  artifacts: NonNullable<DockerGpuPatchSandboxSnapshot["openShellDiagnosticArtifacts"]>,
+  name: "openshell-sandbox-get.txt" | "openshell-sandbox-list.txt",
+): string | null {
+  const artifact = artifacts.find((candidate) => candidate.name === name);
+  return artifact?.outcome.kind === "completed" && artifact.outcome.exitCode === 0
+    ? artifact.content
+    : null;
 }
 
 function isFailurePhase(phase: string | null | undefined): boolean {
@@ -368,11 +459,48 @@ export function captureDockerGpuPatchSandboxSnapshot(
   options: {
     patchedContainerId?: string | null;
   } = {},
-  deps: Pick<DockerGpuPatchDeps, "runCaptureOpenshell" | "dockerCapture"> = {},
+  deps: Pick<
+    DockerGpuPatchDeps,
+    "runCaptureOpenshell" | "dockerCapture" | "openShellGpuDiagnostics"
+  > = {},
 ): DockerGpuPatchSandboxSnapshot {
   let sandboxPhase: string | null = null;
   let sandboxListLine: string | null = null;
-  if (deps.runCaptureOpenshell) {
+  let openShellDiagnosticArtifacts: DockerGpuPatchSandboxSnapshot["openShellDiagnosticArtifacts"];
+  if (deps.openShellGpuDiagnostics) {
+    // An empty array records that the typed collector was attempted. The
+    // diagnostics writer must not repeat an external call that already failed.
+    openShellDiagnosticArtifacts = [];
+    try {
+      const redactor = createDockerGpuDiagnosticRedactor();
+      openShellDiagnosticArtifacts = deps.openShellGpuDiagnostics.collect({
+        target: { kind: "selected" },
+        sandboxName,
+        timeoutMs: DOCKER_GPU_PATCH_TIMEOUT_MS,
+        redact: redactor.redactText,
+      });
+      const typedGetOutput = completedOpenShellArtifactContent(
+        openShellDiagnosticArtifacts,
+        "openshell-sandbox-get.txt",
+      );
+      if (typedGetOutput) {
+        sandboxPhase = parseSandboxPhaseFromGetOutput(typedGetOutput);
+      }
+      const typedListOutput = completedOpenShellArtifactContent(
+        openShellDiagnosticArtifacts,
+        "openshell-sandbox-list.txt",
+      );
+      if (typedListOutput) {
+        sandboxListLine = findSandboxListLine(typedListOutput, sandboxName);
+        if (sandboxListLine) {
+          const listPhase = parseSandboxPhaseFromListOutput(typedListOutput, sandboxName);
+          if (listPhase) sandboxPhase = listPhase;
+        }
+      }
+    } catch {
+      /* best effort */
+    }
+  } else if (deps.runCaptureOpenshell) {
     try {
       const getOutput = deps.runCaptureOpenshell(["sandbox", "get", sandboxName], {
         ignoreError: true,
@@ -416,23 +544,22 @@ export function captureDockerGpuPatchSandboxSnapshot(
     }
   }
 
-  return { sandboxPhase, sandboxListLine, patchedContainerState };
+  return {
+    sandboxPhase,
+    sandboxListLine,
+    patchedContainerState,
+    ...(openShellDiagnosticArtifacts ? { openShellDiagnosticArtifacts } : {}),
+  };
 }
 
-function describePatchedContainerState(state: DockerContainerState | null): string[] {
-  if (!state) return [];
-  const lines: string[] = [];
-  if (state.Status) lines.push(`patched_container_status=${state.Status}`);
-  if (typeof state.ExitCode === "number")
-    lines.push(`patched_container_exit_code=${state.ExitCode}`);
-  if (state.OOMKilled) lines.push("patched_container_oom_killed=true");
-  if (state.Error) lines.push(`patched_container_error=${state.Error}`);
-  if (state.Health?.Status) lines.push(`patched_container_health=${state.Health.Status}`);
-  if (state.FinishedAt && state.FinishedAt !== "0001-01-01T00:00:00Z") {
-    lines.push(`patched_container_finished_at=${state.FinishedAt}`);
-  }
-  return lines;
-}
+// Exit code 127 alone is ambiguous because `env` propagates a child process's
+// status. Missing-startup guidance therefore requires a separate exact signal
+// from the replacement container's captured logs (#7996).
+const SANDBOX_STARTUP_COMMAND_NOT_FOUND_EXIT_CODE = 127;
+const SANDBOX_STARTUP_COMMAND_NOT_FOUND_HINTS: readonly string[] = [
+  "Container logs show that the sandbox image does not provide the NemoClaw-managed `nemoclaw-start` command.",
+  "Rebuild the sandbox image from the complete Dockerfile and source context for the selected agent and NemoClaw release.",
+];
 
 function patchedContainerLooksFailed(state: DockerContainerState | null): boolean {
   if (!state) return false;
@@ -449,6 +576,15 @@ function patchedContainerLooksFailed(state: DockerContainerState | null): boolea
   return false;
 }
 
+function patchedContainerIsHealthyAndRunning(state: DockerContainerState | null): boolean {
+  return (
+    state?.Status?.toLowerCase() === "running" &&
+    state.Running === true &&
+    state.ExitCode === 0 &&
+    state.Health?.Status?.toLowerCase() === "healthy"
+  );
+}
+
 /**
  * Turn the snapshot + selected GPU mode into a user-facing classification
  * that distinguishes "the patched container itself died" from "the sandbox
@@ -461,32 +597,56 @@ function patchedContainerLooksFailed(state: DockerContainerState | null): boolea
 export function classifyDockerGpuPatchFailure(
   snapshot: DockerGpuPatchSandboxSnapshot,
   selectedMode: DockerGpuPatchMode | null,
-  options: { proofError?: unknown } = {},
+  options: { proofError?: unknown; managedStartupCommandMissing?: boolean } = {},
 ): DockerGpuPatchFailureClassification {
   const lines: string[] = [];
   if (snapshot.sandboxPhase) lines.push(`sandbox_phase=${snapshot.sandboxPhase}`);
   if (snapshot.sandboxListLine) lines.push(`sandbox_list_row=${snapshot.sandboxListLine}`);
-  lines.push(...describePatchedContainerState(snapshot.patchedContainerState));
+  lines.push(...formatDockerContainerState(snapshot.patchedContainerState, "patched_container_"));
   if (selectedMode) lines.push(`patched_create_option=${selectedMode.label}`);
 
   const containerFailed = patchedContainerLooksFailed(snapshot.patchedContainerState);
+  const healthyContainerInDeletingPhase =
+    snapshot.sandboxPhase === "Deleting" &&
+    patchedContainerIsHealthyAndRunning(snapshot.patchedContainerState);
   const sandboxInErrorPhase = isFailurePhase(snapshot.sandboxPhase);
   const sandboxNotLive =
     !!snapshot.sandboxPhase && !SANDBOX_LIVE_PHASE_TOKENS.has(snapshot.sandboxPhase);
 
+  const hints: string[] = [];
   let kind: DockerGpuPatchFailureKind = "unknown";
   let headline: string;
+  const gpuOperation = selectedOperationIsGpu(selectedMode);
+  const containerNoun = gpuOperation
+    ? "Patched GPU container"
+    : "Startup-command replacement container";
   if (containerFailed) {
     kind = "patched_container_failed";
     const exit = snapshot.patchedContainerState?.ExitCode;
     const opt = selectedMode ? ` (${selectedMode.label})` : "";
     headline =
       typeof exit === "number" && exit !== 0
-        ? `Patched GPU container exited with code ${exit}${opt}.`
-        : `Patched GPU container is not running${opt}.`;
+        ? `${containerNoun} exited with code ${exit}${opt}.`
+        : `${containerNoun} is not running${opt}.`;
+    if (
+      exit === SANDBOX_STARTUP_COMMAND_NOT_FOUND_EXIT_CODE &&
+      options.managedStartupCommandMissing === true
+    ) {
+      hints.push(...SANDBOX_STARTUP_COMMAND_NOT_FOUND_HINTS);
+    }
   } else if (sandboxInErrorPhase) {
     kind = "sandbox_error_phase";
-    headline = `OpenShell sandbox entered ${snapshot.sandboxPhase} phase before the GPU proof could run.`;
+    headline = `OpenShell sandbox entered ${snapshot.sandboxPhase} phase ${
+      gpuOperation ? "before the GPU proof could run" : "during startup-command restart persistence"
+    }.`;
+  } else if (healthyContainerInDeletingPhase) {
+    kind = "sandbox_deleting_phase";
+    headline =
+      "OpenShell kept the sandbox in Deleting after the replacement container became healthy.";
+    lines.push("lifecycle_authority=openshell");
+    hints.push(
+      "OpenShell owns the sandbox lifecycle phase. NemoClaw does not accept Docker container health as lifecycle success.",
+    );
   } else if (sandboxNotLive && (snapshot.patchedContainerState || options.proofError)) {
     // Cover the non-live-but-non-terminal case (e.g. Provisioning / NotReady)
     // BEFORE the proof-error branch — a proof failing while the sandbox
@@ -506,7 +666,9 @@ export function classifyDockerGpuPatchFailure(
     kind = "proof_failure";
     headline = "GPU proof failed inside an executable sandbox.";
   } else {
-    headline = "Docker GPU patch did not complete successfully.";
+    headline = gpuOperation
+      ? "Docker GPU patch did not complete successfully."
+      : "Docker startup-command patch did not complete successfully.";
   }
 
   if (options.proofError) {
@@ -514,5 +676,11 @@ export function classifyDockerGpuPatchFailure(
       options.proofError instanceof Error ? options.proofError.message : String(options.proofError);
     if (proofText) lines.push(`proof_error=${proofText}`);
   }
-  return { kind, headline, summaryLines: lines };
+  const classification = {
+    kind,
+    headline,
+    selectedModeKind: selectedMode?.kind ?? null,
+    summaryLines: lines,
+  };
+  return hints.length > 0 ? { ...classification, hints } : classification;
 }

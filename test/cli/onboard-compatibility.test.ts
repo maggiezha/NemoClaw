@@ -10,6 +10,9 @@ import OnboardCliCommand from "../../src/commands/onboard";
 import SetupCliCommand from "../../src/commands/setup";
 import SetupSparkCliCommand from "../../src/commands/setup-spark";
 import { runOnboardAction } from "../../src/lib/actions/global";
+import { emitOnboardMachineEvent } from "../../src/lib/onboard/machine/events";
+import { deriveCheckpointFromSession } from "../../src/lib/state/onboard-checkpoint-migrate";
+import { createSession } from "../../src/lib/state/onboard-session";
 
 import { PARSER_EXIT_CODE, run, runWithEnv } from "./helpers";
 
@@ -24,6 +27,14 @@ vi.mock("../../src/lib/actions/global", () => ({
 const rootDir = process.cwd();
 let previousExitCode: typeof process.exitCode;
 
+const expectedOnboardRuntimeDeps = () =>
+  expect.objectContaining({
+    googlechatTunnelRuntime: expect.objectContaining({
+      loadServices: expect.any(Function),
+      loadWebhookProxy: expect.any(Function),
+    }),
+  });
+
 function writeOpenShellVersionStub(localBin: string): void {
   fs.writeFileSync(
     path.join(localBin, "openshell"),
@@ -37,45 +48,31 @@ function writeOpenShellVersionStub(localBin: string): void {
 }
 
 function writeIncompleteResumeSession(nemoclawDir: string): void {
+  const session = createSession({
+    sessionId: "session-1",
+    mode: "interactive",
+    provider: "nvidia-prod",
+    model: "nvidia/nemotron-3-super-120b-a12b",
+    lastStepStarted: "inference",
+    lastCompletedStep: "inference",
+    metadata: { gatewayName: "nemoclaw", fromDockerfile: null },
+    steps: {
+      preflight: { status: "complete", startedAt: null, completedAt: null, error: null },
+      gateway: { status: "complete", startedAt: null, completedAt: null, error: null },
+      provider_selection: {
+        status: "complete",
+        startedAt: null,
+        completedAt: null,
+        error: null,
+      },
+      inference: { status: "complete", startedAt: null, completedAt: null, error: null },
+      sandbox: { status: "pending", startedAt: null, completedAt: null, error: null },
+    },
+  });
+  session.checkpoint = deriveCheckpointFromSession(session, { profile: "default" });
   fs.writeFileSync(
     path.join(nemoclawDir, "onboard-session.json"),
-    JSON.stringify(
-      {
-        version: 1,
-        sessionId: "session-1",
-        resumable: true,
-        status: "in_progress",
-        mode: "interactive",
-        startedAt: "2026-05-03T00:00:00.000Z",
-        updatedAt: "2026-05-03T00:00:00.000Z",
-        lastStepStarted: "inference",
-        lastCompletedStep: "inference",
-        failure: null,
-        sandboxName: null,
-        provider: "nvidia-prod",
-        model: "nvidia/nemotron-3-super-120b-a12b",
-        endpointUrl: null,
-        credentialEnv: null,
-        preferredInferenceApi: null,
-        nimContainer: null,
-        policyPresets: null,
-        metadata: { gatewayName: "nemoclaw" },
-        steps: {
-          preflight: { status: "complete", startedAt: null, completedAt: null, error: null },
-          gateway: { status: "complete", startedAt: null, completedAt: null, error: null },
-          provider_selection: {
-            status: "complete",
-            startedAt: null,
-            completedAt: null,
-            error: null,
-          },
-          inference: { status: "complete", startedAt: null, completedAt: null, error: null },
-          sandbox: { status: "pending", startedAt: null, completedAt: null, error: null },
-        },
-      },
-      null,
-      2,
-    ),
+    JSON.stringify(session, null, 2),
     { mode: 0o600 },
   );
 }
@@ -89,6 +86,7 @@ describe("CLI onboard compatibility", () => {
 
   afterEach(() => {
     process.exitCode = previousExitCode;
+    vi.restoreAllMocks();
   });
 
   it("onboard --help exits 0 and shows usage", () => {
@@ -101,6 +99,7 @@ describe("CLI onboard compatibility", () => {
     expect(r.out).toContain("--from <Dockerfile>");
     expect(r.out).toContain("--yes");
     expect(r.out).toContain("--sandbox-gpu-device=<value>");
+    expect(r.out).toContain("--events=jsonl");
     expect(r.out).toContain(
       "Agent runtime to onboard (openclaw, hermes, langchain-deepagents-code;",
     );
@@ -143,7 +142,66 @@ describe("CLI onboard compatibility", () => {
         "yes-i-accept-third-party-software": true,
         yes: true,
       }),
+      expectedOnboardRuntimeDeps(),
     );
+  });
+
+  it("keeps canonical JSONL output parseable while routing human progress to stderr (#6403)", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation(((
+      chunk: unknown,
+      encodingOrCallback?: unknown,
+      callback?: unknown,
+    ) => {
+      stdout.push(String(chunk));
+      const done = (typeof encodingOrCallback === "function" ? encodingOrCallback : callback) as
+        | (() => void)
+        | undefined;
+      done?.();
+      return true;
+    }) as typeof process.stdout.write);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+    vi.mocked(runOnboardAction).mockImplementationOnce(async () => {
+      process.stdout.write("human progress\n");
+      emitOnboardMachineEvent({
+        version: 1,
+        type: "state.entered",
+        occurredAt: "2026-07-19T18:00:00.000Z",
+        sessionId: "1784426400000-123e4567-e89b-42d3-a456-426614174000",
+        state: "inference",
+        step: "inference",
+        context: {},
+        error: null,
+        metadata: {},
+      });
+    });
+
+    await OnboardCliCommand.run(["--events=jsonl"], rootDir);
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ events: "jsonl" }),
+      expectedOnboardRuntimeDeps(),
+    );
+    const lines = stdout.join("").trimEnd().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toMatchObject({
+      schemaVersion: 1,
+      session: "1784426400000-123e4567-e89b-42d3-a456-426614174000",
+      type: "state.entered",
+    });
+    expect(stdout.join("")).not.toContain("human progress");
+    expect(stderr.join("")).toBe("human progress\n");
+  });
+
+  it("does not expose the canonical event stream on deprecated setup aliases", async () => {
+    await expect(SetupCliCommand.run(["--events=jsonl"], rootDir)).rejects.toThrow(
+      "Nonexistent flag: --events",
+    );
+    expect(runOnboardAction).not.toHaveBeenCalled();
   });
 
   it("lets oclif reject conflicting sandbox GPU flags", async () => {
@@ -216,19 +274,15 @@ describe("CLI onboard compatibility", () => {
         "yes-i-accept-third-party-software": true,
         yes: true,
       }),
+      expectedOnboardRuntimeDeps(),
     );
   });
 
-  it("resume rejection clarifies --resume semantics and points to onboard (#2281)", () => {
+  it("resume rejection reports the missing session without choosing an agent CLI (#9035)", () => {
     // Keep the real executable/runtime exit contract for the user-facing diagnostic.
     const r = run("onboard --resume --non-interactive --yes-i-accept-third-party-software --yes");
     expect(r.code).toBe(1);
-    expect(r.out.includes("No resumable onboarding session was found")).toBeTruthy();
-    expect(r.out.includes("--resume only continues an interrupted onboarding run")).toBeTruthy();
-    expect(
-      r.out.includes("To change configuration on an existing sandbox, rebuild it"),
-    ).toBeTruthy();
-    expect(r.out.includes("nemoclaw onboard")).toBeTruthy();
+    expect(r.out.trim()).toBe("No resumable onboarding session was found.");
   });
 
   it("does not let whitespace-only NEMOCLAW_SANDBOX_NAME satisfy the resume guard (#2753)", () => {
@@ -241,7 +295,7 @@ describe("CLI onboard compatibility", () => {
     const localBin = path.join(home, "bin");
     const nemoclawDir = path.join(home, ".nemoclaw");
     fs.mkdirSync(localBin, { recursive: true });
-    fs.mkdirSync(nemoclawDir, { recursive: true });
+    fs.mkdirSync(nemoclawDir, { recursive: true, mode: 0o700 });
     writeOpenShellVersionStub(localBin);
     writeIncompleteResumeSession(nemoclawDir);
 
@@ -276,13 +330,15 @@ describe("CLI onboard compatibility", () => {
         "yes-i-accept-third-party-software": true,
         yes: true,
       }),
+      expectedOnboardRuntimeDeps(),
     );
   });
 
-  it("deploy --help exits 0 and shows deprecated usage", () => {
+  it("treats deploy as a sandbox name after the command is removed (#10572)", () => {
     const r = run("deploy --help");
     expect(r.code).toBe(0);
-    expect(r.out).toContain("deploy [instance-name]");
-    expect(r.out).toContain("Deprecated Brev-specific bootstrap path");
+    expect(r.out).toContain("Usage: nemoclaw deploy connect [--probe-only]");
+    expect(r.out).not.toContain("deploy [instance-name]");
+    expect(r.out).not.toContain("Deprecated Brev-specific bootstrap path");
   });
 });

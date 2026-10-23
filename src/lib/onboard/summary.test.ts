@@ -81,6 +81,71 @@ describe("onboard summary helpers", () => {
     assert.ok(tavilySummary.includes("enabled (Tavily Search)"));
   });
 
+  it("shows resolved serving profile provenance and download estimates (#8384)", () => {
+    const summary = formatOnboardConfigSummary({
+      provider: "vllm-local",
+      model: "example/model",
+      webSearchConfig: null,
+      sandboxName: "profile-test",
+      servingProfileProvenance: {
+        schemaVersion: 1,
+        catalogDigest: `sha256:${"1".repeat(64)}`,
+        preset: {
+          id: "vllm.dgx-spark-gb10.single.example",
+          digest: `sha256:${"2".repeat(64)}`,
+          displayName: "Example Spark profile",
+          supportState: "experimental",
+        },
+        recipe: {
+          id: "vllm.dgx-spark-gb10.single.example",
+          digest: `sha256:${"3".repeat(64)}`,
+          backend: "vllm",
+        },
+        model: { id: "example/model", revision: "revision-1" },
+        runtimeImage: `example.invalid/vllm@sha256:${"4".repeat(64)}`,
+        estimatedImageDownloadBytes: 1024 ** 3,
+        estimatedModelDownloadBytes: 2 * 1024 ** 3,
+      },
+    });
+
+    assert.match(summary, /Example Spark profile.*vllm\.dgx-spark-gb10\.single\.example/u);
+    assert.match(summary, /Recipe:.*vllm\.dgx-spark-gb10\.single\.example/u);
+    assert.match(summary, /Support:.*experimental/u);
+    assert.match(summary, /Runtime image:.*example\.invalid\/vllm@sha256/u);
+    assert.match(summary, /Downloads:.*image 1\.0 GiB, model 2\.0 GiB/u);
+  });
+
+  it("names the declared model beside the served alias the route carries (#9563)", () => {
+    const summary = formatOnboardConfigSummary({
+      provider: "vllm-local",
+      model: "muse-glimmer",
+      webSearchConfig: null,
+      sandboxName: "profile-test",
+      servingProfileProvenance: {
+        schemaVersion: 1,
+        catalogDigest: `sha256:${"1".repeat(64)}`,
+        preset: {
+          id: "vllm.dgx-spark-gb10.single.muse-glimmer-30b-nvfp4-w4a4",
+          digest: `sha256:${"2".repeat(64)}`,
+          displayName: "Muse Glimmer 30B NVFP4 W4A4 on one DGX Spark",
+          supportState: "experimental",
+        },
+        recipe: {
+          id: "vllm.muse-glimmer-30b-nvfp4-w4a4.spark-single.v1",
+          digest: `sha256:${"3".repeat(64)}`,
+          backend: "vllm",
+        },
+        model: { id: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4", revision: "revision-1" },
+        runtimeImage: `example.invalid/vllm@sha256:${"4".repeat(64)}`,
+        estimatedImageDownloadBytes: 1024 ** 3,
+        estimatedModelDownloadBytes: 2 * 1024 ** 3,
+      },
+    });
+
+    assert.match(summary, /Model: {9}Inferact\/Muse-Glimmer-30B-NVFP4-W4A4/u);
+    assert.match(summary, /Served model: {2}muse-glimmer/u);
+  });
+
   it("formatSandboxBuildEstimateNote warns when runtime is under-provisioned (#2514)", () => {
     const note = formatSandboxBuildEstimateNote({
       isContainerRuntimeUnderProvisioned: true,

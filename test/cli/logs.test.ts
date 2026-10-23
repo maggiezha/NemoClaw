@@ -38,12 +38,38 @@ describe("CLI dispatch", () => {
     expect(r.out).toContain(FAKE_OPENSHELL_LOG_LINE);
   });
 
+  it("reads logs without changing audit settings when automatic enablement is disabled", ({
+    resources,
+  }) => {
+    const setup = createLogsTestSetup(resources, "nemoclaw-cli-logs-audit-opt-out-");
+    const result = setup.runLogs("alpha logs", { NEMOCLAW_NO_AUTO_AUDIT_LOGS: "1" });
+
+    expect(result.code).toBe(0);
+    expect(setup.readCalls().filter((call) => call.startsWith("settings set"))).toEqual([]);
+    expect(result.out).toContain(FAKE_OPENSHELL_LOG_LINE);
+  });
+
+  it("preserves a failed exec result without enabling audit settings when opted out", ({
+    resources,
+  }) => {
+    const setup = createLogsTestSetup(resources, "nemoclaw-cli-exec-audit-opt-out-", [
+      'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ]; then',
+      "  exit 56",
+      "fi",
+    ]);
+    const result = setup.runLogs("alpha exec -- false", { NEMOCLAW_NO_AUTO_AUDIT_LOGS: "1" });
+
+    expect(result.code).toBe(56);
+    expect(setup.readCalls()).toContain("logs -g nemoclaw alpha -n 200 --source all");
+    expect(setup.readCalls().filter((call) => call.startsWith("settings set"))).toEqual([]);
+  });
+
   it("shows logs help without calling OpenShell", ({ resources }) => {
     const setup = createLogsTestSetup(resources, "nemoclaw-cli-logs-help-");
     const r = setup.runLogs("alpha logs --help");
 
     expect(r.code).toBe(0);
-    expect(r.out).toContain("$ nemoclaw sandbox logs <name>");
+    expect(r.out).toContain("$ nemoclaw alpha logs");
     expect(r.out).toContain("--follow");
     expect(r.out).toContain("--tail");
     expect(r.out).toContain("--since");
@@ -68,7 +94,7 @@ describe("CLI dispatch", () => {
       "fi",
     ]);
 
-    const r = setup.runLogs("alpha logs 2>&1", { NEMOCLAW_LOGS_PROBE_TIMEOUT_MS: "50" });
+    const r = setup.runLogs("alpha logs 2>&1", { NEMOCLAW_LOGS_PROBE_TIMEOUT_MS: "500" });
 
     expect(r.code).toBe(0);
     expect(r.out).toContain("OpenClaw log source unavailable");
@@ -85,8 +111,9 @@ describe("CLI dispatch", () => {
     expect(calls).toContain("settings set alpha --key ocsf_json_enabled --value true");
     expect(calls).toContain("sandbox exec -n alpha -- tail -n 200 -f /tmp/gateway.log");
     expect(calls).toContain("logs alpha -n 200 --source all --tail");
-    expect(r.out).toContain(FAKE_OPENCLAW_LOG_LINE);
-    expect(r.out).toContain(FAKE_OPENSHELL_LOG_LINE);
+    const outputLines = r.out.split("\n");
+    expect(outputLines).toContain(`[gateway] ${FAKE_OPENCLAW_LOG_LINE}`);
+    expect(outputLines).toContain(FAKE_OPENSHELL_LOG_LINE);
   });
 
   it("starts OpenClaw logs before enabling audit logs for logs --follow", ({ resources }) => {
@@ -145,7 +172,6 @@ describe("CLI dispatch", () => {
               model: "test-model",
               provider: "nvidia-prod",
               gpuEnabled: false,
-              policies: [],
             },
           },
           defaultSandbox: "alpha",
@@ -316,7 +342,6 @@ describe("CLI dispatch", () => {
             model: "test-model",
             provider: "nvidia-prod",
             gpuEnabled: false,
-            policies: [],
             messaging: {
               schemaVersion: 1,
               plan: {
@@ -412,7 +437,6 @@ describe("CLI dispatch", () => {
             model: "test-model",
             provider: "nvidia-prod",
             gpuEnabled: false,
-            policies: [],
           },
         },
         defaultSandbox: "alpha",

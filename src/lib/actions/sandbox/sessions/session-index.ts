@@ -24,7 +24,7 @@ export interface SessionIndexEntry {
 //     legacy shape, and NemoClaw cannot rev the upstream CLI from this side.
 //   - Regression-test coverage: `session-index.test.ts > parseSessionIndex`
 //     covers each accepted shape plus the log-noise prefix; CLI-level
-//     coverage in `test/sandbox-sessions-export-cli.test.ts` exercises the
+//     coverage in `test/runtime/sandbox/sandbox-sessions-export-cli.test.ts` exercises the
 //     array and wrapped-object forms via the stub openshell.
 //   - Removal condition: once OpenClaw documents a single stable JSON
 //     contract for `sessions list --json` in its release notes, this
@@ -54,7 +54,7 @@ export function parseSessionIndex(output: string): SessionIndexEntry[] | null {
 
 export function balancedJsonCandidates(text: string): string[] {
   const candidates: string[] = [];
-  const lineStartJson = /^(\s*)([\[{])/gm;
+  const lineStartJson = /^(\s*)([[{])/gm;
   let match: RegExpExecArray | null;
   while ((match = lineStartJson.exec(text)) !== null) {
     const candidate = balancedJsonFrom(text, match.index + match[1].length);

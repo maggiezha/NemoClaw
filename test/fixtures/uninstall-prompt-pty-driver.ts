@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Process-level driver for the uninstall confirm-prompt pty tests. Loaded by
-// test/uninstall-prompt-pty.test.ts via `tsx <driver>` under `script -qec`
+// test/install/uninstall-prompt-pty.test.ts via `tsx <driver>` under `script -qec`
 // (a pseudo-TTY), so fd 0 is a real terminal device; not picked up by
 // Vitest's discovery (lives under test/fixtures/, which is excluded from the
 // test glob).
@@ -17,7 +17,7 @@
 //   PTY_DRIVER_POISON_STDIN=1  touch `process.stdin` first, flipping fd 0
 //                              non-blocking — the exact regression condition.
 //   PTY_DRIVER_PRESERVABLE=1   pretend ~/.nemoclaw user data exists so the
-//                              second "Also remove them? [y/N]" prompt runs.
+//                              second user-data and fresh-backup prompt runs.
 //
 // Accepts and ignores argv so `bash uninstall.sh` can exec it through its
 // NEMOCLAW_NODE/NEMOCLAW_CLI_JS overrides (`internal uninstall run-plan`).
@@ -48,30 +48,45 @@ if (preservable) {
   fs.mkdirSync(path.join(home, ".nemoclaw", "backups"), { recursive: true });
 }
 const okResult: RunResult = { status: 0, stdout: "", stderr: "" };
+const knownGatewayListResult: RunResult = {
+  status: 0,
+  stdout: JSON.stringify([{ name: "nemoclaw" }]),
+  stderr: "",
+};
 
-const { exitCode } = runUninstallPlan(
-  { assumeYes: false, deleteModels: false, keepOpenShell: true },
-  {
-    commandExists: () => false,
-    // Hermetic env: the runtime merges the real process.env, so a developer
-    // shell exporting NEMOCLAW_* knobs (non-interactive mode, destroy-user-
-    // data acknowledgement, agent branding) would change which prompts run
-    // and what they print. Pin them empty so scenarios behave identically on
-    // every machine.
-    env: {
-      HOME: home,
-      NEMOCLAW_AGENT: "",
-      NEMOCLAW_NON_INTERACTIVE: "",
-      NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "",
-      TMPDIR: home,
-    } as NodeJS.ProcessEnv,
-    existsSync: fs.existsSync,
-    kill: () => true,
-    rmSync: (() => {}) as never,
-    run: () => okResult,
-    runDocker: () => okResult,
-    // readLine and isTty are deliberately NOT injected: the default
-    // readLineFromStdin/isStdinTty pair reading the pty is what is under test.
-  },
-);
-process.exit(exitCode);
+async function main(): Promise<void> {
+  const { exitCode } = await runUninstallPlan(
+    { assumeYes: false, deleteModels: false, keepOpenShell: true },
+    {
+      commandExists: (command) => command === "openshell",
+      // Hermetic env: the runtime merges the real process.env, so a developer
+      // shell exporting NEMOCLAW_* knobs (non-interactive mode, destroy-user-
+      // data acknowledgement, agent branding) would change which prompts run
+      // and what they print. Pin them empty so scenarios behave identically on
+      // every machine.
+      env: {
+        HOME: home,
+        NEMOCLAW_AGENT: "",
+        NEMOCLAW_NON_INTERACTIVE: "",
+        NEMOCLAW_UNINSTALL_DESTROY_USER_DATA: "",
+        TMPDIR: home,
+      } as NodeJS.ProcessEnv,
+      existsSync: fs.existsSync,
+      kill: () => true,
+      rmSync: (() => {}) as never,
+      run: (command, args) =>
+        command === "openshell" && args[0] === "gateway" && args[1] === "list"
+          ? knownGatewayListResult
+          : okResult,
+      runDocker: () => okResult,
+      // readLine and isTty are deliberately NOT injected: the default
+      // readLineFromStdin/isStdinTty pair reading the pty is what is under test.
+    },
+  );
+  process.exit(exitCode);
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

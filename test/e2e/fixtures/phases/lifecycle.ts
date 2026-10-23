@@ -1,11 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { buildAvailabilityProbeEnv } from "../availability-env.ts";
+import { buildGatewayRuntimeStartScript } from "../gateway-runtime-start.ts";
+import { REPO_ROOT } from "../paths.ts";
 import { assertExitZero, outputContainsReadySandbox } from "../clients/command.ts";
 import type { GatewayClient, HostGatewayRuntime } from "../clients/gateway.ts";
 import type { HostCliClient } from "../clients/host.ts";
 import type { SandboxClient } from "../clients/sandbox.ts";
+import { RuntimeProviderPrerequisite } from "../runtime-provider.ts";
 import type { ShellProbeResult } from "../shell-probe.ts";
 import {
   type DcodeInvalidCredentialRebuildOptions,
@@ -19,53 +27,171 @@ export {
   dcodeInvalidCredentialRebuildOptionsFromRegistryEntry,
 } from "./lifecycle-dcode-invalid-credential.ts";
 
-// Mirror of `OPENSHELL_SANDBOX_NAME_LABEL` in
-// `src/lib/onboard/docker-gpu-patch.ts`. Duplicated here because the
-// fixture layer must not import from `src/lib/**` (CLI source) — that
-// boundary keeps the live runner honest about probing only host-
-// observable state. Drift is caught by the integration test that wires
-// a real onboarded sandbox through the docker-sandbox-container-present
-// probe.
-const OPENSHELL_SANDBOX_NAME_LABEL = "openshell.ai/sandbox-name";
-const DOCKER_PROBE_TIMEOUT_MS = 15_000;
-// Status invocation can take several minutes on unfixed code while
-// the gateway recovery path retries. Keep the budget generous; the
-// bug is independent of latency.
-const STATUS_TIMEOUT_MS = 5 * 60_000;
 const REBUILD_TIMEOUT_MS = 20 * 60_000;
 const SANDBOX_READY_ATTEMPTS = 30;
 const SANDBOX_READY_DELAY_MS = 5_000;
+const USER_SERVICE_UNAVAILABLE_EXIT = 75;
+const NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE =
+  "# NEMOCLAW_MANAGED_OPENSHELL_GATEWAY=1";
+const NEMOCLAW_INSTALLER = fileURLToPath(
+  new URL("../../../../scripts/install.sh", import.meta.url),
+);
+const USER_SERVICE_STAGE_RESULT_PREFIX = "NEMOCLAW_E2E_GATEWAY_USER_SERVICE=";
+const USER_SERVICE_STOP_RESULT_PREFIX = "NEMOCLAW_E2E_STOPPED_GATEWAY_USER_SERVICE=";
 
-export type LifecycleProfile = "post-reboot-recovery" | "dcode-rebuild-invalid-credential";
+type UserServiceSelection =
+  | "homebrew:homebrew.mxcl.openshell"
+  | "homebrew:sh.brew.openshell"
+  | "systemd:nemoclaw-openshell-gateway.service"
+  | "systemd:openshell-gateway.service";
+
+export function buildOpenShellGatewayUserServiceStageScript(): string {
+  return [
+    "set -eu",
+    `marker='${NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE}'`,
+    `result_prefix='${USER_SERVICE_STAGE_RESULT_PREFIX}'`,
+    "installer=$1",
+    `if [ "$(uname -s)" != Linux ]; then exit ${USER_SERVICE_UNAVAILABLE_EXIT}; fi`,
+    `if ! command -v systemctl >/dev/null 2>&1; then exit ${USER_SERVICE_UNAVAILABLE_EXIT}; fi`,
+    'case "${XDG_CONFIG_HOME:-}" in',
+    '  /*) config_home="$XDG_CONFIG_HOME" ;;',
+    '  *) config_home="$HOME/.config" ;;',
+    "esac",
+    'unit="$config_home/systemd/user/nemoclaw-openshell-gateway.service"',
+    "had_marked_unit=0",
+    'if [ -f "$unit" ] && grep -Fxq "$marker" "$unit"; then had_marked_unit=1; fi',
+    "created=0",
+    "cleanup_failed_stage() {",
+    "  status=$?",
+    "  trap - EXIT",
+    '  if [ "$status" -ne 0 ] && [ "$created" -eq 1 ] && [ ! -L "$unit" ] && [ -f "$unit" ] && grep -Fxq "$marker" "$unit"; then',
+    '    rm -f -- "$unit"',
+    "    systemctl --user daemon-reload >/dev/null 2>&1 || true",
+    "  fi",
+    "  if declare -F _global_cleanup >/dev/null 2>&1; then _global_cleanup; fi",
+    '  exit "$status"',
+    "}",
+    "trap cleanup_failed_stage EXIT",
+    'if [ ! -f "$installer" ] || [ -L "$installer" ]; then',
+    '  printf "NemoClaw installer is unavailable: %s\\n" "$installer" >&2',
+    "  exit 1",
+    "fi",
+    'source "$installer"',
+    "trap cleanup_failed_stage EXIT",
+    'if [ "$had_marked_unit" -eq 0 ]; then created=1; fi',
+    "install_nemoclaw_openshell_gateway_user_service",
+    "systemctl --user daemon-reload",
+    "if systemctl --user cat openshell-gateway >/dev/null 2>&1; then",
+    `  printf '%s%s\\n' "$result_prefix" upstream`,
+    "  trap - EXIT",
+    "  exit 0",
+    "fi",
+    `if [ ! -f "$unit" ] || ! grep -Fxq "$marker" "$unit"; then exit ${USER_SERVICE_UNAVAILABLE_EXIT}; fi`,
+    'if [ "$had_marked_unit" -eq 0 ]; then outcome=staged; else outcome=existing; fi',
+    "systemctl --user enable nemoclaw-openshell-gateway >/dev/null",
+    `printf '%s%s\\n' "$result_prefix" "$outcome"`,
+    "trap - EXIT",
+  ].join("\n");
+}
+
+export function buildOpenShellGatewayUserServiceRemovalScript(): string {
+  return [
+    "set -eu",
+    `marker='${NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE}'`,
+    'case "${XDG_CONFIG_HOME:-}" in',
+    '  /*) config_home="$XDG_CONFIG_HOME" ;;',
+    '  *) config_home="$HOME/.config" ;;',
+    "esac",
+    'unit="$config_home/systemd/user/nemoclaw-openshell-gateway.service"',
+    'if [ ! -e "$unit" ] && [ ! -L "$unit" ]; then exit 0; fi',
+    'if [ -L "$unit" ] || [ ! -f "$unit" ] || ! grep -Fxq "$marker" "$unit"; then',
+    '  printf "Refusing to remove foreign OpenShell gateway user service: %s\\n" "$unit" >&2',
+    "  exit 1",
+    "fi",
+    "systemctl --user stop nemoclaw-openshell-gateway",
+    "systemctl --user disable nemoclaw-openshell-gateway >/dev/null",
+    'rm -f -- "$unit"',
+    "systemctl --user daemon-reload",
+  ].join("\n");
+}
+
+export function buildOpenShellGatewayUserServiceStopScript(
+  options: { permanent?: boolean } = {},
+): string {
+  return [
+    "set -eu",
+    "installer=$1",
+    'if [ ! -f "$installer" ] || [ -L "$installer" ]; then',
+    '  printf "NemoClaw installer is unavailable: %s\\n" "$installer" >&2',
+    "  exit 1",
+    "fi",
+    'source "$installer"',
+    'if [ "$(uname -s)" = Linux ] && command -v systemctl >/dev/null 2>&1; then',
+    '  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
+    '  export XDG_RUNTIME_DIR="$runtime_dir"',
+    '  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$runtime_dir/bus}"',
+    "fi",
+    ...(options.permanent
+      ? [
+          'if [ "$(uname -s)" = Linux ] && command -v systemctl >/dev/null 2>&1; then',
+          `  systemctl --user show-environment >/dev/null 2>&1 || exit ${USER_SERVICE_UNAVAILABLE_EXIT}`,
+          "fi",
+        ]
+      : []),
+    "selection=",
+    "if stop_active_openshell_gateway_user_service selection; then",
+    '  case "$selection" in',
+    "    homebrew:homebrew.mxcl.openshell|homebrew:sh.brew.openshell|systemd:nemoclaw-openshell-gateway.service|systemd:openshell-gateway.service|unavailable) ;;",
+    "    *) exit 1 ;;",
+    "  esac",
+    `  printf '%s%s\\n' '${USER_SERVICE_STOP_RESULT_PREFIX}' "$selection"`,
+    "  exit 0",
+    "else",
+    "  status=$?",
+    `  if [ "$status" -eq 1 ]; then exit ${USER_SERVICE_UNAVAILABLE_EXIT}; fi`,
+    '  exit "$status"',
+    "fi",
+  ].join("\n");
+}
+
+export function buildOpenShellGatewayUserServiceRestartScript(): string {
+  return [
+    "set -eu",
+    "installer=$1",
+    "selection=$2",
+    'if [ ! -f "$installer" ] || [ -L "$installer" ]; then',
+    '  printf "NemoClaw installer is unavailable: %s\\n" "$installer" >&2',
+    "  exit 1",
+    "fi",
+    'source "$installer"',
+    'restart_selected_openshell_gateway_user_service "$selection"',
+  ].join("\n");
+}
+
+export function buildOpenShellGatewayUserServiceDiagnosticsScript(): string {
+  return [
+    "set +e",
+    "service=openshell-gateway",
+    'if ! systemctl --user cat "$service" >/dev/null 2>&1; then',
+    "  service=nemoclaw-openshell-gateway",
+    "fi",
+    'printf "OpenShell gateway user service: %s\\n" "$service"',
+    'systemctl --user show "$service" --no-pager --property=ActiveState --property=SubState --property=Result --property=ExecMainCode --property=ExecMainStatus',
+    'systemctl --user status "$service" --no-pager --full',
+    "if command -v journalctl >/dev/null 2>&1; then",
+    '  journalctl --user --unit "$service" --no-pager --lines=200',
+    "fi",
+    "exit 0",
+  ].join("\n");
+}
+
+export type LifecycleProfile = "dcode-rebuild-invalid-credential";
 
 export interface LifecycleCleanup {
   add(name: string, run: () => Promise<void> | void): void;
 }
 
-/**
- * How the post-reboot-recovery profile leaves Docker before the test
- * exits the lifecycle phase:
- *
- *   - `stop-original`  — `docker stop` the labeled container in place.
- *                        Matches the common Spark reboot path: the
- *                        container exists, is exited, retains its
- *                        OpenShell labels, but is no longer running.
- *
- *   - `rename-to-gpu-backup` — stop the labeled container, then
- *                        `docker rename` it to `<original>-nemoclaw-
- *                        gpu-backup-<ts>`. Reproduces the rarer GPU-
- *                        patch reboot path where only the backup
- *                        sibling survives and recovery has to rename
- *                        it back. Mirrors `buildBackupContainerName()`
- *                        in `src/lib/onboard/docker-gpu-patch.ts`.
- */
-export type PostRebootMode = "stop-original" | "rename-to-gpu-backup";
-
-export interface PostRebootOptions {
-  mode?: PostRebootMode;
-}
-
-export type LifecycleSimulationOptions = PostRebootOptions | DcodeInvalidCredentialRebuildOptions;
+export type LifecycleSimulationOptions = DcodeInvalidCredentialRebuildOptions;
 
 export interface LifecycleResult {
   profile: LifecycleProfile;
@@ -80,12 +206,18 @@ export interface RebuildSandboxOptions {
   verbose?: boolean;
 }
 
-export interface SandboxReadyAfterRebuildOptions {
+export interface SandboxReadyOptions {
   attempts?: number;
   delayMs?: number;
   env?: NodeJS.ProcessEnv;
   artifactNamePrefix?: string;
   timeoutMs?: number;
+}
+
+export interface StopGatewayRuntimeOptions {
+  env?: NodeJS.ProcessEnv;
+  /** Lifecycle stops restart a selected service during cleanup; permanent stops do not. */
+  userServiceMode?: "lifecycle" | "permanent";
 }
 
 function sleep(ms: number): Promise<void> {
@@ -98,12 +230,45 @@ function instanceName(instance: NemoClawInstance | string): string {
 }
 
 export class LifecyclePhaseFixture {
+  private readonly runtimeProvider: RuntimeProviderPrerequisite;
+  private stoppedOpenShellGatewayUserService: UserServiceSelection | null = null;
+
   constructor(
     private readonly host: HostCliClient,
     private readonly sandbox: SandboxClient,
     private readonly cleanup: LifecycleCleanup,
     private readonly gateway?: GatewayClient,
-  ) {}
+    runtimeProvider?: RuntimeProviderPrerequisite,
+  ) {
+    this.runtimeProvider =
+      runtimeProvider ??
+      new RuntimeProviderPrerequisite(host, (reason) => {
+        throw new Error(reason);
+      });
+  }
+
+  private requireRuntimeProvider(): RuntimeProviderPrerequisite {
+    return this.runtimeProvider;
+  }
+
+  trackInstallerGatewayUserService(): void {
+    const env = buildAvailabilityProbeEnv();
+    const configured = env.XDG_CONFIG_HOME;
+    const configHome =
+      configured && path.isAbsolute(configured)
+        ? configured
+        : path.join(env.HOME ?? os.homedir(), ".config");
+    const unit = path.join(configHome, "systemd", "user", "nemoclaw-openshell-gateway.service");
+    try {
+      fs.lstatSync(unit);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    this.cleanup.add("lifecycle.remove-installer-gateway-user-service", () =>
+      this.removeStagedOpenShellGatewayUserService(env),
+    );
+  }
 
   async rebuildSandbox(
     instance: NemoClawInstance | string,
@@ -127,7 +292,22 @@ export class LifecyclePhaseFixture {
 
   async assertSandboxReadyAfterRebuild(
     instance: NemoClawInstance | string,
-    options: SandboxReadyAfterRebuildOptions = {},
+    options: SandboxReadyOptions = {},
+  ): Promise<ShellProbeResult> {
+    return await this.waitForSandboxReady(instance, options, "after rebuild");
+  }
+
+  async waitForSandboxReadyAfterGatewayRestart(
+    instance: NemoClawInstance | string,
+    options: SandboxReadyOptions = {},
+  ): Promise<ShellProbeResult> {
+    return await this.waitForSandboxReady(instance, options, "after gateway restart");
+  }
+
+  private async waitForSandboxReady(
+    instance: NemoClawInstance | string,
+    options: SandboxReadyOptions,
+    transition: "after rebuild" | "after gateway restart",
   ): Promise<ShellProbeResult> {
     const sandboxName = instanceName(instance);
     const attempts = options.attempts ?? SANDBOX_READY_ATTEMPTS;
@@ -148,20 +328,18 @@ export class LifecyclePhaseFixture {
     }
     const detail = last ? `${last.stdout}\n${last.stderr}`.trim() : "no probe result";
     throw new Error(
-      `sandbox ${sandboxName} did not become Ready after rebuild within ${attempts} attempts: ${detail}`,
+      `sandbox ${sandboxName} did not become Ready ${transition} within ${attempts} attempts: ${detail}`,
     );
   }
 
   async simulate(
     profile: LifecycleProfile,
     instance: NemoClawInstance,
-    options: LifecycleSimulationOptions = {},
+    options?: LifecycleSimulationOptions,
   ): Promise<LifecycleResult> {
     switch (profile) {
-      case "post-reboot-recovery":
-        return await this.simulatePostReboot(instance, options as PostRebootOptions);
       case "dcode-rebuild-invalid-credential":
-        if (!isDcodeInvalidCredentialRebuildOptions(options)) {
+        if (!options || !isDcodeInvalidCredentialRebuildOptions(options)) {
           throw new Error(
             "dcode-rebuild-invalid-credential requires gateway/provider/credential/model options",
           );
@@ -170,6 +348,7 @@ export class LifecyclePhaseFixture {
           host: this.host,
           sandbox: this.sandbox,
           cleanup: this.cleanup,
+          runtimeProvider: this.requireRuntimeProvider(),
         });
       default: {
         const _exhaustive: never = profile;
@@ -178,133 +357,43 @@ export class LifecyclePhaseFixture {
     }
   }
 
-  /**
-   * Reproduce the host-side conditions of a DGX Spark / Linux Docker-driver
-   * reboot AND drive the user-visible action that exposes the bug:
-   *
-   *   1. Locate the OpenShell-labeled Docker container for the
-   *      target's sandbox name and either stop it (default) or
-   *      stop+rename it to a `*-nemoclaw-gpu-backup-*` sibling.
-   *      The gateway runtime is left HEALTHY — attempting to stop
-   *      and restart it from the OpenShell CLI is unreliable on
-   *      `ubuntu-latest` (no `gateway start` subcommand) and the
-   *      remaining bug class for #4423 specifically requires a
-   *      `healthy_named` gateway when status runs (otherwise
-   *      #4578's mitigation takes over and masks the signal).
-   *
-   *   2. Invoke `nemoclaw <name> status` — the user-visible action
-   *      that documented the regression in #4423. On unfixed `main`
-   *      the destructive `missing` branch in `status.ts` wipes the
-   *      registry entry. On the PR-A fix branch the new Docker-driver
-   *      recovery helper restarts the labeled container before
-   *      stale-removal can fire.
-   *
-   *   We deliberately do NOT assert on the status exit code here
-   *   because the bug is precisely that status "succeeds" at
-   *   destroying state. The state-validation phase that follows is
-   *   what catches the regression via the
-   *   `local-registry-entry-present` and `docker-sandbox-container-present`
-   *   probes.
-   *
-   * Cleanups (run in reverse order at end of test):
-   *   - rename the backup sibling back to the original name (if we
-   *     created one);
-   *   - `docker start` the labeled container so the sandbox returns
-   *     to a usable state for any teardown that expects it live.
-   */
-  async simulatePostReboot(
-    instance: NemoClawInstance,
-    options: PostRebootOptions = {},
-  ): Promise<LifecycleResult> {
-    const mode: PostRebootMode = options.mode ?? "stop-original";
-    const steps: LifecycleResult["steps"] = [];
-
-    const containerNames = await this.discoverLabeledContainerNames(instance);
-    if (containerNames.length === 0) {
-      throw new Error(
-        `lifecycle.post-reboot-recovery expected at least one Docker container labeled ` +
-          `'${OPENSHELL_SANDBOX_NAME_LABEL}=${instance.sandboxName}', but docker ps -a returned none. ` +
-          `Did onboarding create the sandbox?`,
-      );
-    }
-    const originalName = containerNames[0];
-
-    const stop = await this.host.command("docker", ["stop", originalName], {
-      artifactName: `lifecycle-post-reboot-docker-stop-${originalName}`,
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
-    });
-    assertExitZero(stop, `docker stop ${originalName}`);
-    steps.push({ id: `docker-stop:${originalName}`, results: [stop] });
-    this.cleanup.add(`lifecycle.docker-start:${originalName}`, async () => {
-      await this.host.command("docker", ["start", originalName], {
-        artifactName: `lifecycle-cleanup-docker-start-${originalName}`,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
-      });
-    });
-
-    if (mode === "rename-to-gpu-backup") {
-      const backupName = buildBackupContainerName(originalName, Date.now());
-      const rename = await this.host.command("docker", ["rename", originalName, backupName], {
-        artifactName: `lifecycle-post-reboot-docker-rename-${originalName}`,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
-      });
-      assertExitZero(rename, `docker rename ${originalName} ${backupName}`);
-      steps.push({
-        id: `docker-rename:${originalName}->${backupName}`,
-        results: [rename],
-      });
-      this.cleanup.add(`lifecycle.docker-rename-back:${backupName}`, async () => {
-        await this.host.command("docker", ["rename", backupName, originalName], {
-          artifactName: `lifecycle-cleanup-docker-rename-back-${backupName}`,
-          env: buildAvailabilityProbeEnv(),
-          timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
-        });
-      });
-    }
-
-    // Final step: drive the user-visible action that exposed #4423.
-    // We invoke status through the host CLI client so artifacts are
-    // captured and the command goes through the same
-    // shellProbe/redaction layer the rest of the fixture code uses.
-    // Status is allowed to fail (exit non-zero) because on unfixed
-    // code it intentionally fails after destroying state — the
-    // post-action invariants are checked by state-validation.
-    const statusResult = await this.host.nemoclaw([instance.sandboxName, "status"], {
-      artifactName: `lifecycle-post-reboot-nemoclaw-status-${instance.sandboxName}`,
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: STATUS_TIMEOUT_MS,
-    });
-    steps.push({
-      id: `nemoclaw-status:${instance.sandboxName}`,
-      results: [statusResult],
-    });
-
-    return { profile: "post-reboot-recovery", steps };
+  private async removeStagedOpenShellGatewayUserService(
+    env = buildAvailabilityProbeEnv(),
+  ): Promise<void> {
+    const result = await this.host.command(
+      "sh",
+      ["-lc", buildOpenShellGatewayUserServiceRemovalScript()],
+      {
+        artifactName: "lifecycle-cleanup-gateway-user-service",
+        env,
+        timeoutMs: 120_000,
+      },
+    );
+    assertExitZero(result, "remove staged OpenShell gateway user service");
   }
 
-  async stopGatewayRuntime(): Promise<HostGatewayRuntime | null> {
-    const runtime = (await this.gateway?.resolveHostRuntime()) ?? null;
+  async stopGatewayRuntime(
+    options: StopGatewayRuntimeOptions = {},
+  ): Promise<HostGatewayRuntime | null> {
+    const runtimeEnv = buildAvailabilityProbeEnv(options.env);
+    const runtime = (await this.gateway?.resolveHostRuntime({ env: runtimeEnv })) ?? null;
     await this.host.command(
       "sh",
       ["-lc", "command -v openshell >/dev/null 2>&1 && openshell forward stop 18789 || true"],
       {
         artifactName: "lifecycle-gateway-forward-stop",
-        env: buildAvailabilityProbeEnv(),
+        env: runtimeEnv,
         timeoutMs: 30_000,
       },
     );
-    await this.host.command(
-      "sh",
-      ["-lc", "command -v openshell >/dev/null 2>&1 && openshell gateway stop -g nemoclaw || true"],
-      {
-        artifactName: "lifecycle-gateway-stop",
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 60_000,
-      },
-    );
+    if (
+      await this.stopOpenShellGatewayUserService({
+        env: runtimeEnv,
+        mode: options.userServiceMode ?? "lifecycle",
+      })
+    ) {
+      return runtime;
+    }
 
     const pidFileStop = await this.host.command(
       "sh",
@@ -321,7 +410,7 @@ export class LifecyclePhaseFixture {
       ],
       {
         artifactName: "lifecycle-gateway-pid-stop",
-        env: buildAvailabilityProbeEnv(),
+        env: runtimeEnv,
         timeoutMs: 30_000,
       },
     );
@@ -331,47 +420,161 @@ export class LifecyclePhaseFixture {
     // is explicitly anchored. The unanchored form can select a sandbox whose
     // name contains the gateway prefix; stopping that container remounts its
     // tmpfs and turns a gateway-restart probe into a sandbox-restart probe.
-    const containerStop = await this.host.command(
-      "sh",
-      [
-        "-lc",
-        `cid="$(docker ps --filter 'name=^/openshell-cluster-nemoclaw$' --format '{{.ID}}' 2>/dev/null)"; ` +
-          `if [ -n "$cid" ]; then docker stop "$cid" >/dev/null; fi`,
-      ],
+    const runtimeProvider = this.requireRuntimeProvider();
+    const gatewayResources = await runtimeProvider.command(
+      ["container", "ps", "--format", "{{.ID}}\t{{.Names}}"],
       {
-        artifactName: "lifecycle-gateway-container-stop",
-        env: buildAvailabilityProbeEnv(),
+        artifactName: "lifecycle-gateway-runtime-discover",
+        env: runtimeEnv,
         timeoutMs: 60_000,
       },
     );
-    assertExitZero(containerStop, "stop OpenShell gateway container");
+    assertExitZero(gatewayResources, "discover OpenShell gateway runtime resource");
+    const gatewayHandles = gatewayResources.stdout
+      .split(/\r?\n/u)
+      .map((line) => line.trim().split(/\s+/u))
+      .filter(([, name]) => name === "openshell-cluster-nemoclaw")
+      .map(([handle]) => handle)
+      .filter((handle): handle is string => Boolean(handle));
+    if (gatewayHandles.length > 1) {
+      throw new Error("OpenShell gateway runtime resource identity is ambiguous.");
+    }
+    if (gatewayHandles[0]) {
+      const containerStop = await runtimeProvider.command(
+        ["container", "stop", gatewayHandles[0]],
+        {
+          artifactName: "lifecycle-gateway-container-stop",
+          env: runtimeEnv,
+          timeoutMs: 60_000,
+        },
+      );
+      assertExitZero(containerStop, "stop OpenShell gateway runtime resource");
+    }
     return runtime;
   }
 
+  private async stopOpenShellGatewayUserService(options: {
+    env: NodeJS.ProcessEnv;
+    mode: "lifecycle" | "permanent";
+  }): Promise<boolean> {
+    const pendingSelection = this.stoppedOpenShellGatewayUserService;
+    const result = await this.host.command(
+      "bash",
+      [
+        "-c",
+        buildOpenShellGatewayUserServiceStopScript({ permanent: options.mode === "permanent" }),
+        "stop-openshell-gateway-user-service",
+        NEMOCLAW_INSTALLER,
+      ],
+      {
+        artifactName: "lifecycle-gateway-user-service-stop",
+        env: options.env,
+        timeoutMs: 120_000,
+      },
+    );
+    if (result.exitCode === 0) {
+      const match = result.stdout.match(
+        new RegExp(
+          `(?:^|\\n)${USER_SERVICE_STOP_RESULT_PREFIX}` +
+            `(homebrew:(?:homebrew\\.mxcl|sh\\.brew)\\.openshell|systemd:nemoclaw-openshell-gateway\\.service|systemd:openshell-gateway\\.service|unavailable)(?:\\n|$)`,
+          "u",
+        ),
+      );
+      if (!match) {
+        throw new Error("OpenShell gateway user service stop did not report its selection.");
+      }
+      if (match[1] === "unavailable") {
+        return options.mode === "lifecycle" && pendingSelection !== null;
+      }
+      const selection = match[1] as UserServiceSelection;
+      if (options.mode === "permanent") return true;
+      this.stoppedOpenShellGatewayUserService = selection;
+      this.cleanup.add(`lifecycle.gateway-user-service-restart:${selection}`, async () => {
+        if (this.stoppedOpenShellGatewayUserService !== selection) return;
+        await this.startOpenShellGatewayUserService({ requireAvailable: true });
+      });
+      return true;
+    }
+    if (result.exitCode === USER_SERVICE_UNAVAILABLE_EXIT) {
+      return options.mode === "lifecycle" && pendingSelection !== null;
+    }
+    const phase = options.mode === "permanent" ? "permanent cleanup" : "lifecycle qualification";
+    throw new Error(
+      `OpenShell gateway user service stop failed during ${phase}: ` +
+        `${result.stderr || result.stdout || `exit ${String(result.exitCode)}`}`,
+    );
+  }
+
   async startGatewayRuntime(
-    previousRuntime: HostGatewayRuntime | null,
-    options: { sandboxName?: string } = {},
+    options: { requireUserService?: boolean; sandboxName?: string } = {},
   ): Promise<ShellProbeResult> {
-    if (previousRuntime?.kind === "pid") {
-      const args = options.sandboxName ? [options.sandboxName, "status"] : ["status"];
-      return await this.host.nemoclaw(args, {
-        artifactName: options.sandboxName
-          ? `lifecycle-gateway-recover-through-nemoclaw-status-${options.sandboxName}`
-          : "lifecycle-gateway-recover-through-nemoclaw-status",
+    const userServiceStart = await this.startOpenShellGatewayUserService({
+      requireAvailable: options.requireUserService,
+    });
+    if (userServiceStart) return userServiceStart;
+    if (!options.sandboxName?.trim()) {
+      throw new Error("Gateway recovery requires the registered sandbox name.");
+    }
+    // The fixture knows it stopped this gateway. Observational recovery can
+    // refuse an unreachable gateway whose identity the CLI cannot report.
+    return await this.host.command(
+      process.execPath,
+      ["-e", buildGatewayRuntimeStartScript(), options.sandboxName],
+      {
+        artifactName: "lifecycle-gateway-start",
+        cwd: REPO_ROOT,
         env: buildAvailabilityProbeEnv(),
         timeoutMs: 120_000,
-      });
+      },
+    );
+  }
+
+  private async startOpenShellGatewayUserService(options: {
+    requireAvailable?: boolean;
+  }): Promise<ShellProbeResult | null> {
+    if (!this.stoppedOpenShellGatewayUserService) {
+      if (!options.requireAvailable) return null;
+      throw new Error(
+        `OpenShell gateway user service is not available for reboot lifecycle recovery.`,
+      );
     }
-    return await this.host.command("openshell", ["gateway", "start", "--name", "nemoclaw"], {
-      artifactName: "lifecycle-gateway-start",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 120_000,
-    });
+    const selection = this.stoppedOpenShellGatewayUserService;
+    const result = await this.host.command(
+      "bash",
+      [
+        "-c",
+        buildOpenShellGatewayUserServiceRestartScript(),
+        "restart-openshell-gateway-user-service",
+        NEMOCLAW_INSTALLER,
+        selection,
+      ],
+      {
+        artifactName: "lifecycle-gateway-user-service-restart",
+        env: buildAvailabilityProbeEnv(),
+        timeoutMs: 120_000,
+      },
+    );
+    if (result.exitCode === 0) {
+      this.stoppedOpenShellGatewayUserService = null;
+      return result;
+    }
+    if (result.exitCode === USER_SERVICE_UNAVAILABLE_EXIT) {
+      throw new Error(
+        `OpenShell gateway user service is not available for reboot lifecycle recovery.`,
+      );
+    }
+    throw new Error(
+      `OpenShell gateway user service restart failed during reboot lifecycle: ` +
+        `${result.stderr || result.stdout || `exit ${String(result.exitCode)}`}`,
+    );
   }
 
   async restartGatewayRuntime(
-    options: { delayMs?: number; sandboxName?: string } = {},
+    options: { delayMs?: number; requireUserService?: boolean; sandboxName?: string } = {},
   ): Promise<HostGatewayRuntime | null> {
+    if (options.requireUserService !== true && !options.sandboxName?.trim()) {
+      throw new Error("Gateway restart requires a sandbox name or a required user service.");
+    }
     const previousRuntime = await this.stopGatewayRuntime();
     if (this.gateway) {
       await this.gateway.expectHostRuntimeStopped({
@@ -382,9 +585,11 @@ export class LifecyclePhaseFixture {
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    await this.startGatewayRuntime(previousRuntime, {
+    const start = await this.startGatewayRuntime({
+      requireUserService: options.requireUserService,
       sandboxName: options.sandboxName,
     });
+    assertExitZero(start, "restart OpenShell gateway runtime");
     return previousRuntime;
   }
 
@@ -414,47 +619,19 @@ export class LifecyclePhaseFixture {
       }
       if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, intervalMs));
     }
-    throw new Error(
-      `gateway did not become healthy after restart: ${lastError instanceof Error ? lastError.message : String(lastError ?? "unknown")}`,
-    );
-  }
-
-  private async discoverLabeledContainerNames(instance: NemoClawInstance): Promise<string[]> {
-    const result = await this.host.command(
-      "docker",
-      [
-        "ps",
-        "-a",
-        "--filter",
-        `label=${OPENSHELL_SANDBOX_NAME_LABEL}=${instance.sandboxName}`,
-        "--format",
-        "{{.Names}}",
-      ],
+    const diagnostics = await this.host.command(
+      "sh",
+      ["-lc", buildOpenShellGatewayUserServiceDiagnosticsScript()],
       {
-        artifactName: `lifecycle-post-reboot-docker-discover-${instance.sandboxName}`,
+        artifactName: "lifecycle-gateway-user-service-diagnostics",
         env: buildAvailabilityProbeEnv(),
-        timeoutMs: DOCKER_PROBE_TIMEOUT_MS,
+        timeoutMs: 30_000,
       },
     );
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `lifecycle.post-reboot-recovery could not query Docker for label ` +
-          `'${OPENSHELL_SANDBOX_NAME_LABEL}=${instance.sandboxName}' (exit ${result.exitCode}).`,
-      );
-    }
-    return result.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    throw new Error(
+      `gateway did not become healthy after restart: ${
+        lastError instanceof Error ? lastError.message : String(lastError ?? "unknown")
+      }; service diagnostics: ${diagnostics.artifacts.result}`,
+    );
   }
-}
-
-// Mirror of `MAX_DOCKER_CONTAINER_NAME_LENGTH` in
-// `src/lib/onboard/docker-gpu-patch.ts`.
-const MAX_DOCKER_CONTAINER_NAME_LENGTH = 253;
-
-export function buildBackupContainerName(originalName: string, nowMs: number): string {
-  const suffix = `-nemoclaw-gpu-backup-${String(nowMs)}`;
-  const maxOriginalLength = MAX_DOCKER_CONTAINER_NAME_LENGTH - suffix.length;
-  return `${originalName.slice(0, Math.max(1, maxOriginalLength))}${suffix}`;
 }

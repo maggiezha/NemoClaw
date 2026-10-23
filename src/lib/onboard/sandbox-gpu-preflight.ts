@@ -5,7 +5,11 @@ import { dockerInfoFormat } from "../adapters/docker";
 import { failLine, warnLine } from "../cli/terminal-style";
 import type { GpuDetection } from "../inference/nim";
 import type { SandboxGpuProofResult } from "../state/registry";
-import { findReadableNvidiaCdiSpecFiles, getDockerCdiSpecDirs } from "./docker-cdi";
+import {
+  DEFAULT_DOCKER_CDI_SPEC_DIRS,
+  findReadableNvidiaCdiSpecFiles,
+  getDockerCdiSpecDirs,
+} from "./docker-cdi";
 import type { SandboxGpuConfig, SandboxGpuFlag } from "./sandbox-gpu-mode";
 import {
   detectWslDockerDesktopStatus,
@@ -18,6 +22,10 @@ export { formatSandboxGpuPassthroughNote } from "./sandbox-gpu-notes";
 
 const SANDBOX_GPU_PREFLIGHT_TIMEOUT_MS = 30_000;
 
+// Docker Engine's built-in CDI spec directories. `docker info` can report no
+// CDISpecDirs (daemon unreachable from this process, or an engine that omits
+// the field) even though CDI works, so the preflight falls back to these
+// before declaring CDI unsupported (#7330).
 export type SandboxGpuPreflightDeps = WslDockerDesktopDetectionDeps & {
   getDockerCdiSpecDirs?: () => string[];
   findReadableNvidiaCdiSpecFiles?: (dirs: string[]) => string[];
@@ -127,20 +135,22 @@ export function dockerNvidiaRuntimeAvailable(deps: SandboxGpuPreflightDeps = {})
   }
 }
 
+export function printJetsonNvidiaRuntimeUnavailableError(): void {
+  console.error("");
+  console.error(failLine("Docker NVIDIA runtime was not detected for Jetson/Tegra sandbox GPU."));
+  console.error("    Jetson sandbox GPU uses NVIDIA Container Runtime semantics, not CDI.");
+  console.error("    Install/configure NVIDIA Container Toolkit for Docker, then restart Docker:");
+  console.error("      sudo nvidia-ctk runtime configure --runtime=docker");
+  console.error("      sudo systemctl restart docker");
+  console.error("    Or force CPU sandbox behavior with NEMOCLAW_SANDBOX_GPU=0.");
+}
+
 function validateJetsonSandboxGpuPreflight(
   deps: SandboxGpuPreflightDeps,
   exitProcess: (code: number) => never,
 ): void {
   if (!dockerNvidiaRuntimeAvailable(deps)) {
-    console.error("");
-    console.error(failLine("Docker NVIDIA runtime was not detected for Jetson/Tegra sandbox GPU."));
-    console.error("    Jetson sandbox GPU uses NVIDIA Container Runtime semantics, not CDI.");
-    console.error(
-      "    Install/configure NVIDIA Container Toolkit for Docker, then restart Docker:",
-    );
-    console.error("      sudo nvidia-ctk runtime configure --runtime=docker");
-    console.error("      sudo systemctl restart docker");
-    console.error("    Or force CPU sandbox behavior with NEMOCLAW_SANDBOX_GPU=0.");
+    printJetsonNvidiaRuntimeUnavailableError();
     exitProcess(1);
   }
   console.log("  ✓ Docker NVIDIA runtime detected for Jetson/Tegra sandbox GPU");
@@ -151,7 +161,10 @@ export interface DirectSandboxGpuVerifierDeps extends WslDockerDesktopDetectionD
     args: string[],
     opts?: Record<string, unknown>,
   ): { status?: number | null; stdout?: unknown; stderr?: unknown };
-  buildDirectSandboxGpuProofCommands?: (sandboxName: string) => Array<{
+  buildDirectSandboxGpuProofCommands?: (
+    sandboxName: string,
+    gatewayName?: string,
+  ) => Array<{
     id?: string;
     args: string[];
     label: string;
@@ -159,6 +172,12 @@ export interface DirectSandboxGpuVerifierDeps extends WslDockerDesktopDetectionD
   }>;
   compactText(value: string): string;
   redact(value: unknown): string;
+  gatewayName?: string;
+  subprocessEnv?: NodeJS.ProcessEnv;
+  resolveOpenShellCommandAuthority?: () => {
+    readonly env: NodeJS.ProcessEnv;
+    readonly executablePath: string;
+  };
   // Host firmware platform resolver, used to choose Jetson-specific remediation
   // when a CUDA proof fails. Defaults to the live `nim.detectNvidiaPlatform()`
   // so onboarding does not have to thread the platform through. Injected in
@@ -226,8 +245,12 @@ export function createDirectSandboxGpuVerifier(
     // could not run at all). Records the proof that determines "failed" status.
     let cudaFailure: { label: string; detail: string } | null = null;
     let explicitNvidiaSmiFailure: { label: string; detail: string } | null = null;
-    for (const proof of buildProofCommands(sandboxName)) {
+    for (const proof of buildProofCommands(sandboxName, deps.gatewayName)) {
+      const commandAuthority = deps.resolveOpenShellCommandAuthority?.();
+      const subprocessEnv = commandAuthority?.env ?? deps.subprocessEnv;
       const result = deps.runOpenshell(proof.args, {
+        ...(subprocessEnv ? { env: subprocessEnv, replaceEnv: true } : {}),
+        ...(commandAuthority ? { openshellBinary: commandAuthority.executablePath } : {}),
         ignoreError: true,
         suppressOutput: true,
         timeout: 30_000,
@@ -368,7 +391,9 @@ export function validateSandboxGpuPreflight(
     return;
   }
 
-  const cdiSpecDirs = (deps.getDockerCdiSpecDirs ?? getDockerCdiSpecDirs)();
+  const reportedCdiSpecDirs = (deps.getDockerCdiSpecDirs ?? getDockerCdiSpecDirs)();
+  const cdiSpecDirs =
+    reportedCdiSpecDirs.length > 0 ? reportedCdiSpecDirs : [...DEFAULT_DOCKER_CDI_SPEC_DIRS];
   const cdiSpecFiles = (deps.findReadableNvidiaCdiSpecFiles ?? findReadableNvidiaCdiSpecFiles)(
     cdiSpecDirs,
   );
@@ -383,4 +408,26 @@ export function validateSandboxGpuPreflight(
     exitProcess(1);
   }
   console.log(`  ✓ Docker CDI GPU support detected (${cdiSpecFiles.join(", ")})`);
+}
+
+/** Validate native Podman GPU admission through CDI without touching Docker authority. */
+export function validatePodmanSandboxGpuPreflight(
+  config: SandboxGpuConfig,
+  deps: Pick<SandboxGpuPreflightDeps, "platform" | "findReadableNvidiaCdiSpecFiles"> = {},
+  exitProcess: (code: number) => never = (code) => process.exit(code),
+): void {
+  exitOnSandboxGpuConfigErrors(config, exitProcess);
+  if (!config.sandboxGpuEnabled || (deps.platform ?? process.platform) !== "linux") return;
+  const cdiSpecFiles = (deps.findReadableNvidiaCdiSpecFiles ?? findReadableNvidiaCdiSpecFiles)([
+    ...DEFAULT_DOCKER_CDI_SPEC_DIRS,
+  ]);
+  if (cdiSpecFiles.length === 0) {
+    console.error("");
+    console.error(failLine("Podman CDI GPU support was not detected."));
+    console.error("    Install/configure NVIDIA Container Toolkit CDI, then retry Podman:");
+    console.error("      sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml");
+    console.error("    Or force CPU sandbox behavior with NEMOCLAW_SANDBOX_GPU=0.");
+    exitProcess(1);
+  }
+  console.log(`  ✓ Podman CDI GPU support detected (${cdiSpecFiles.join(", ")})`);
 }

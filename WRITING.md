@@ -5,96 +5,138 @@
 
 # NemoClaw Writing Guide
 
-NemoClaw uses the plain-language principles in
+Write the shortest text that lets the reader act correctly.
+
+NemoClaw applies the plain-language principles from
 [ASD-STE100 Issue 9](https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf)
-for software engineering. NemoClaw does not claim full ASD-STE100 compliance.
+to software engineering. NemoClaw does not claim full ASD-STE100 compliance.
+This guide is the NemoClaw source of truth. Do not copy the ASD-STE100 dictionary or its examples into this repository.
 
-Use repository terms, software identifiers, API names, and necessary domain terms as technical
-nouns or technical verbs. Do not copy the ASD-STE100 dictionary or its examples into this
-repository. This guide is the NemoClaw source of truth.
+## 1. Apply the Guide
 
-## Scope and Review Policy
+Apply this guide to changed explanatory text in:
 
-Apply this guide when you add or modify:
-
-- Code comments.
+- Agent responses, progress updates, and final reports.
+- Tool labels and descriptions.
+- GitHub issues, PRs, reviews, and comments.
+- Code comments and user-visible messages.
 - Test titles.
-- PR descriptions and comments.
 - Changelog entries and Announcements.
 - Contributor guidance, agent guidance, and user documentation.
 
-Do not request unrelated language cleanup in a feature, fix, or release PR. Put existing language
-debt in a focused follow-up PR.
+Do not apply word or sentence rules to quoted user or external text.
+Do not apply them to code, identifiers, commands, URLs, or generated files.
+Preserve the accuracy of that content.
 
-Language findings are suggestions unless ambiguity can change behavior, security, data safety,
-test meaning, or release meaning. A blocking comment must name that effect. A suggestion should
-include a proposed rewrite.
+### Agent-Written Text
 
-## Writing Rules
+An agent must apply this guide before it:
 
-1. Use one term for one concept. Do not use synonyms to add variety.
-2. Use a term with one meaning in a given context.
-3. Use the shortest familiar term that preserves the technical meaning.
-4. Name the actor when known. Use passive voice only when the actor is unknown or does not matter.
-5. Put one instruction in each sentence. Split actions that occur at different times.
-6. Keep instructions at 20 words or fewer when possible. Keep descriptions at 25 words or fewer when possible.
-7. State a condition before the action that depends on it.
-8. Use `must` for a requirement, `may` for permission, `can` for capability, and `should` for a recommendation.
-9. Name the object of relative terms such as `current`, `latest`, `previous`, and `next`.
-10. Replace `ready`, `clean`, `safe`, `small`, and similar judgments with the condition that makes them true.
-11. Remove `just`, `simply`, `obviously`, `clearly`, `easy`, `robust`, and other words that do not change the meaning.
-12. Avoid an idiom or phrasal verb that can have more than one meaning. Use a direct technical term when one is available.
-13. Use a vertical list for three or more conditions, actions, or results.
-14. In a code comment, explain a constraint, invariant, or reason that the code does not show. Do not restate the code.
+- Sends a message.
+- Publishes text on GitHub.
+- Starts a tool call with a visible label or description.
 
-Sentence lengths are review targets, not mechanical limits. Do not make a sentence less accurate to
-meet a word count. Quoted user text, external text, code, identifiers, commands, URLs, and generated
-content are outside the word and sentence rules.
+A visible tool label or description must be a concrete verb phrase that names the object.
+If the agent cannot follow the applicable rules, it must not perform the action.
 
-## Project Word List
+### Audits of Existing Text
 
-Use these terms consistently:
+Review existing text only when the task explicitly requests it.
+During that audit:
 
-| Term | Meaning | Avoid |
-|---|---|---|
-| PR SHA | The PR-branch commit that the evidence covers. Use its short SHA in reports. Use the full SHA only when a command or API requires it. | relative revision terms without a SHA |
-| base SHA | The target-branch commit used to evaluate the PR. | current base without a SHA |
-| required check | A named GitHub check required by repository policy. | CI gate when no check is named |
-| passing | A command exited with status 0, or a check concluded with `SUCCESS`. | green when the result is not named |
-| approval-ready | All product, contributor, CI, merge-state, review, and test gates pass. | ready, good to go |
-| blocked | A named decision, dependency, access problem, or input prevents progress. | stuck, cannot proceed without a reason |
-| advisory | Information that does not change a gate, approval, or merge state. | warning when no risk requires attention |
-| changed text | Explanatory text added or modified by the diff. | the whole file when unchanged text is out of scope |
-| user-visible change | A change to a command, output, configuration, workflow, or supported behavior. | improvement without the changed behavior |
-| release entry | The dated `docs/changelog/YYYY-MM-DD.mdx` record created before the tag. | release notes when the dated entry is intended |
-| Announcement | The post-tag release communication. | release entry |
+- Review unchanged text in the assigned sources.
+- Exclude generated files unless the task assigns their source or generator.
+- Preserve accurate historical statements.
+- Report a historical statement only when it is wrong or can misdirect a current action.
+- Group repeated low-impact problems into one writing finding.
+- Cite representative evidence.
+- Do not edit the audited text unless the task also authorizes edits.
 
-Use a different term only when it identifies a different concept. Define that difference where the
-term first appears.
+## 2. Write Accurate Text
 
-## Rewrite Examples
+- Verify commands, defaults, and behavior against checked-in source, tests, or scripts.
+- Use documentation, issues, and PRs only to find claims and rationale.
+- Verify support claims against an accepted issue or accepted design decision.
+- For each credential, name its location, access, lifetime, and removal.
+- For each conditional or best-effort control, state the failure or fallback result.
 
-These examples use recurring NemoClaw concepts. They show the required level of precision.
+## 3. Write Direct Text
+
+- Name the actor when known. Name the action and its object.
+- Use passive voice only when the actor is unknown or does not matter.
+- State each condition before the action that depends on it.
+- Put one instruction in each sentence. Split actions that occur at different times.
+- Use `must` for a requirement and `may` for permission.
+- Use `can` for capability and `should` for a recommendation.
+- Keep instructions at 20 words or fewer when possible.
+- Keep descriptions at 25 words or fewer when possible.
+- Use a vertical list for three or more independent items when it helps the reader scan them.
+- In a code comment, explain a constraint, invariant, or reason that the code does not show.
+- Do not restate the code in a comment.
+- Make each test title name the behavior and the condition that triggers it.
+
+Remove text that hides the meaning:
+
+- Noun stacks that hide the actor or action.
+- Background, restatement, or implementation detail that delays the reader's task.
+- Introductions that announce the text instead of stating the result.
+- Qualifiers or contrasts that do not add a condition or technical distinction.
+- Lists whose item count or symmetry does not help the reader complete the task.
+- Adjacent cases that the reader does not need for the stated task.
+- Repeated coverage that adds no action, condition, result, or constraint.
+
+Include technical detail only when it changes the reader's action or explains a relevant constraint.
+Accuracy takes priority over a word or sentence target.
+
+## 4. Use Consistent Terms
+
+- Use one term for one concept. Do not use synonyms to add variety.
+- Use each term with one meaning in a given context.
+- Use the shortest familiar term that preserves the technical meaning.
+- Use repository terms, identifiers, API names, and necessary domain terms as technical nouns or technical verbs.
+- Replace internal workflow shorthand with terms that readers know.
+- Name the object of relative terms such as `current`, `latest`, `previous`, and `next`.
+- Replace vague judgments with the condition that makes them true.
+- Remove `just`, `simply`, `obviously`, `clearly`, `easy`, and `robust` when they add no meaning.
+- Remove `exact` when the noun or operation already defines identity or equality.
+- Keep `exact` for cardinality or a stated contrast.
+- Replace an ambiguous idiom or phrasal verb with a direct technical term.
+
+Use the [NemoClaw Controlled Word List](.agents/skills/_shared/controlled-words.md) for approved terms and their project meanings.
+Preserve literal identifiers, commands, output, API fields, quotations, URLs, and official third-party names.
+
+Use these commit terms:
+
+- `commit under review`: the commit whose diff and evidence the reviewer evaluates.
+- `latest PR commit`: the commit to which the PR source branch currently points.
+- Literal identifiers such as `headRefOid`: preserve them when the identifier matters.
+
+Do not use `head` as a general synonym for a Git commit.
+
+## 5. Report Writing Findings
+
+Review only text changed by the PR unless the task requests an audit of existing text.
+Do not report unrelated writing problems in the current review.
+Address known writing problems in a separately scoped change.
+
+For each writing finding:
+
+- State the rule that the text violates.
+- Cite representative lines within the requested scope.
+- Propose a shorter rewrite that preserves the technical meaning.
+- Group locations that share one cause and rewrite.
+
+Treat a writing finding as a suggestion unless the wording can change behavior, security, data safety, test meaning, or release meaning.
+A blocking finding must name that effect.
+
+## 6. Rewrite Examples
+
+These examples illustrate the rules. They do not add policy.
 
 | Surface | Avoid | Use |
 |---|---|---|
 | Code comment | `// Handle edge case.` | `// GitHub omits headRepository after a fork is deleted.` |
-| Code comment | `// This is needed for safety.` | `// Reject private IP targets to prevent SSRF.` |
-| Code comment | `// Keep this in sync.` | `// This list must match requiredChecks in check-gates.ts.` |
-| Code comment | `// Use the latest state.` | `// Read headRefOid again before approval.` |
-| Code comment | `// Work around a GitHub issue.` | `// GitHub can return no PR association for a deleted fork repository.` |
 | Test title | `handles invalid config correctly` | `rejects a config that has no provider` |
-| Test title | `works after retry` | `retries evidence download after child cancellation` |
-| Test title | `covers edge cases (#1234)` | `rejects an empty policy name (#1234)` |
-| Test title | `fixes issue #1234` | `preserves credentials when a sandbox rebuilds (#1234)` |
-| Test title | `does the right thing for forks` | `does not expose repository secrets to fork code` |
-| PR discussion | `This seems brittle.` | `This catch block hides EACCES. Callers then treat denied access as missing state.` |
-| PR discussion | `Can we clean this up?` | `These two parsers implement the same policy. Use parsePolicy in both call sites.` |
-| PR discussion | `Make this more robust.` | `Return a typed access error for EACCES and add a denial-path test.` |
-| PR discussion | `This is a small change.` | `This change updates one parser and does not change the policy schema.` |
-| PR discussion | `The PR is ready.` | `Required checks pass on 1a2b3c4, and GitHub reports MERGEABLE.` |
-| Announcement | `Improved onboarding.` | `Onboarding now resumes after provider selection fails.` |
-| Announcement | `Added more robust E2E handling.` | `The PR gate now retries evidence download after a child run is cancelled.` |
-| Release entry | `Fixed various issues.` | `The CLI now rejects a provider configuration that has no endpoint.` |
-| Release entry | `Better error handling.` | `The CLI now reports the provider authentication error without a stack trace.` |
-| Procedure | `Refresh and rerun as needed.` | `Fetch origin/main. Rerun the gate after the PR SHA changes.` |
+| Review comment | `Make this more robust.` | `Return a typed access error for EACCES. Add a denial-path test.` |
+| Tool label | `Inspect exact-head delta` | `Compare the latest PR commit with the commit under review` |
+| Procedure | `Refresh and rerun as needed.` | `After the refresh creates a commit, push that commit. Then rerun the PR gate.` |

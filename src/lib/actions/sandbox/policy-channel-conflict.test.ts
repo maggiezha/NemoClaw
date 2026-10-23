@@ -12,15 +12,17 @@ import * as runtime from "../../adapters/openshell/runtime";
 import * as defs from "../../agent/defs";
 import * as store from "../../credentials/store";
 import * as gatewayRuntime from "../../gateway-runtime-action";
+import { createBuiltInMessagingHookRegistry, MessagingSetupApplier } from "../../messaging";
 import * as policy from "../../policy";
 import { hashCredential } from "../../security/credential-hash";
 import * as onboardSession from "../../state/onboard-session";
 import type { SandboxEntry } from "../../state/registry";
 import * as registry from "../../state/registry";
+import * as crossPortRegistry from "../../state/registry/cross-port";
 import * as messagingHostForwardLifecycle from "./messaging-host-forward-lifecycle";
 import { addSandboxChannel, startSandboxChannel } from "./policy-channel";
 import { policyChannelDependencies } from "./policy-channel-dependencies";
-import * as processRecovery from "./process-recovery";
+import * as commandTransport from "../../adapters/sandbox/command-transport";
 
 function agentFixture(name: string): defs.AgentDefinition {
   return { name } as defs.AgentDefinition;
@@ -39,6 +41,7 @@ function successfulOpenshellResult(): ReturnType<typeof runtime.runOpenshell> {
 
 const TELEGRAM_TOKEN = "123456:AAH-secret-bot-token-value";
 const TELEGRAM_HASH = hashCredential(TELEGRAM_TOKEN) as string;
+const DISCORD_TOKEN = "discord-test-token";
 
 // Build a minimal plan-backed SandboxEntry for conflict-detection fixtures.
 // Callers supply credential bindings as { providerEnvKey, credentialHash? }.
@@ -219,12 +222,59 @@ function makeTeamsEntry(
   } as unknown as SandboxEntry;
 }
 
+function makeHermesDiscordEntry(name: string): SandboxEntry {
+  return {
+    name,
+    agent: "hermes",
+    messaging: {
+      schemaVersion: 1,
+      plan: {
+        schemaVersion: 1,
+        sandboxName: name,
+        agent: "hermes",
+        workflow: "stop-channel",
+        channels: [
+          {
+            channelId: "discord",
+            displayName: "Discord",
+            authMode: "token-paste",
+            active: false,
+            selected: true,
+            configured: true,
+            disabled: true,
+            inputs: [],
+            hooks: [],
+          },
+        ],
+        disabledChannels: ["discord"],
+        credentialBindings: [
+          {
+            channelId: "discord",
+            credentialId: "botToken",
+            sourceInput: "botToken",
+            providerName: `${name}-discord-bridge`,
+            providerEnvKey: "DISCORD_BOT_TOKEN",
+            placeholder: "openshell:resolve:env:DISCORD_BOT_TOKEN",
+            credentialAvailable: true,
+          },
+        ],
+        networkPolicy: { presets: [], entries: [] },
+        agentRender: [],
+        buildSteps: [],
+        stateUpdates: [],
+        healthChecks: [],
+      },
+    },
+  } as unknown as SandboxEntry;
+}
+
 let spies: MockInstance[];
 let logSpy: MockInstance;
 let errSpy: MockInstance;
 let exitMock: MockInstance;
 let promptMock: MockInstance;
 let getCredentialMock: MockInstance;
+let saveCredentialMock: MockInstance;
 let updateSandboxMock: MockInstance;
 let upsertMock: MockInstance;
 let runOpenshellMock: MockInstance;
@@ -260,8 +310,12 @@ function conflictPromptShown(): boolean {
   );
 }
 
+let stdinIsTty: PropertyDescriptor | undefined;
+
 beforeEach(() => {
   spies = [];
+  stdinIsTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
   delete process.env.NEMOCLAW_NON_INTERACTIVE;
   delete process.env.TELEGRAM_BOT_TOKEN;
   delete process.env.TELEGRAM_ALLOWED_IDS;
@@ -270,6 +324,7 @@ beforeEach(() => {
   delete process.env.SLACK_APP_TOKEN;
   delete process.env.SLACK_ALLOWED_USERS;
   delete process.env.SLACK_ALLOWED_CHANNELS;
+  delete process.env.DISCORD_BOT_TOKEN;
   delete process.env.NEMOCLAW_SKIP_TELEGRAM_REACHABILITY;
   delete process.env.NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION;
   delete process.env.WECHAT_BOT_TOKEN;
@@ -291,6 +346,14 @@ beforeEach(() => {
 
   // Registry seam.
   getSandboxMock = vi.spyOn(registry, "getSandbox").mockReturnValue(null);
+  vi.spyOn(crossPortRegistry, "findSandboxAcrossGatewayRoots").mockImplementation(
+    (name: string) => {
+      const entry = registry.getSandbox(name);
+      return entry
+        ? { entry, gatewayPort: entry.gatewayPort ?? null, registryFile: "/test/sandboxes.json" }
+        : null;
+    },
+  );
   getDisabledChannelsMock = vi.spyOn(registry, "getDisabledChannels").mockReturnValue([]);
   listSandboxesMock = vi
     .spyOn(registry, "listSandboxes")
@@ -299,14 +362,26 @@ beforeEach(() => {
 
   // Lazy legacy-provider seam: no onboarding graph is loaded for this suite.
   upsertMock = vi.spyOn(policyChannelDependencies, "upsertMessagingProviders").mockReturnValue([]);
+  vi.spyOn(
+    policyChannelDependencies,
+    "createMessagingHostForwardPreEnableHookRegistry",
+  ).mockReturnValue(
+    createBuiltInMessagingHookRegistry({
+      teams: { hostForwardPortConflict: { checkPortAvailable: async () => ({ ok: true }) } },
+    }),
+  );
+  vi.spyOn(policyChannelDependencies, "revalidateChannelProviderPolicy").mockImplementation(
+    async () => undefined,
+  );
 
   // openshell runtime + gateway recovery.
   runOpenshellMock = vi.spyOn(runtime, "runOpenshell").mockReturnValue(successfulOpenshellResult());
   const healthyGatewayState = {
     state: "healthy_named",
-    status: "",
-    gatewayInfo: "",
     activeGateway: "nemoclaw",
+    diagnostic: "",
+    recoveryBlocked: false,
+    unavailable: false,
   } as const;
   vi.spyOn(gatewayRuntime, "recoverNamedGatewayRuntime").mockResolvedValue({
     recovered: true,
@@ -318,7 +393,7 @@ beforeEach(() => {
   // Credentials store: staged token (no real prompt) + controllable prompt.
   getCredentialMock = vi.spyOn(store, "getCredential").mockReturnValue(null);
   promptMock = vi.spyOn(store, "prompt").mockResolvedValue("");
-  vi.spyOn(store, "saveCredential").mockImplementation(() => undefined);
+  saveCredentialMock = vi.spyOn(store, "saveCredential").mockImplementation(() => undefined);
 
   // Agent gate: OpenClaw support is derived from channel manifests.
   vi.spyOn(defs, "loadAgent").mockReturnValue(agentFixture("openclaw"));
@@ -331,12 +406,12 @@ beforeEach(() => {
   vi.spyOn(policy, "loadPreset").mockReturnValue("network_policies:\n  stub: {}\n");
   vi.spyOn(policy, "parsePresetPolicyKeys").mockReturnValue(["stub"]);
   vi.spyOn(policy, "listPresets").mockReturnValue([]);
-  vi.spyOn(policy, "getPresetContentGatewayState").mockReturnValue("absent");
+  vi.spyOn(policy, "getPresetContentGatewayState").mockResolvedValue("absent");
   scopeDisclosureMock = vi
     .spyOn(policy, "logPresetScopeForState")
     .mockImplementation(() => undefined);
-  applyPresetMock = vi.spyOn(policy, "applyPreset").mockReturnValue(true);
-  vi.spyOn(policy, "getAppliedPresets").mockReturnValue([]);
+  applyPresetMock = vi.spyOn(policy, "applyPreset").mockResolvedValue(true);
+  vi.spyOn(policy, "getAppliedPresets").mockResolvedValue([]);
 
   // Downstream rebuild is not under test.
   rebuildSandboxMock = vi
@@ -344,7 +419,7 @@ beforeEach(() => {
     .mockResolvedValue(undefined);
   ensureMessagingHostForwardAfterRebuildMock = vi
     .spyOn(messagingHostForwardLifecycle, "ensureMessagingHostForwardAfterRebuild")
-    .mockReturnValue(true);
+    .mockResolvedValue(true);
 
   // After a successful interactive add, channel health-check hooks can probe
   // the sandbox via executeSandboxExecCommand, which calls getOpenshellBinary()
@@ -352,8 +427,9 @@ beforeEach(() => {
   // unit-test runner; locally it is installed, so this only bites in CI). Stub
   // the exec path so the post-add verification never shells out and never trips
   // the exit spy unless a test explicitly overrides it.
-  vi.spyOn(processRecovery, "executeSandboxExecCommand").mockReturnValue(null);
-  vi.spyOn(processRecovery, "executeSandboxCommand").mockReturnValue(null);
+  vi.spyOn(commandTransport, "executeSandboxExecCommand").mockRejectedValue(
+    new commandTransport.SandboxCommandTransportError("unavailable"),
+  );
 
   process.env.NEMOCLAW_SKIP_TELEGRAM_REACHABILITY = "1";
   process.env.NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION = "1";
@@ -368,6 +444,9 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   for (const s of spies) s.mockRestore();
+  stdinIsTty
+    ? Object.defineProperty(process.stdin, "isTTY", stdinIsTty)
+    : Reflect.deleteProperty(process.stdin, "isTTY");
   delete process.env.NEMOCLAW_NON_INTERACTIVE;
   delete process.env.NEMOCLAW_SKIP_TELEGRAM_REACHABILITY;
   delete process.env.NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION;
@@ -392,7 +471,7 @@ afterEach(() => {
 
 describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   // Scenario 1
-  it("interactive matching-token conflict: warns, user continues, add proceeds", async () => {
+  it("aborts interactive credential conflicts without prompting (#7808)", async () => {
     arrangeRegistry({
       current: makeEmptyEntry("alpha"),
       others: [
@@ -404,52 +483,18 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "telegram" });
+    await expect(addSandboxChannel("alpha", { channel: "telegram" })).rejects.toThrow(
+      "process.exit(1)",
+    );
 
     const text = loggedText();
     expect(text).toContain("bob");
     expect(text).toContain("same telegram credential");
-    expect(upsertMock).toHaveBeenCalledTimes(1);
-    expect(updateSandboxMock).toHaveBeenCalledWith("alpha", expect.any(Object));
-  });
-
-  // Scenario 2
-  it("interactive matching-token conflict: user aborts, nothing is mutated", async () => {
-    arrangeRegistry({
-      current: makeEmptyEntry("alpha"),
-      others: [
-        makePlanEntry("bob", "telegram", [
-          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
-        ]),
-      ],
-    });
-    getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
-    promptMock.mockResolvedValue("n");
-
-    await addSandboxChannel("alpha", { channel: "telegram" });
-
-    expect(loggedText()).toContain("same telegram credential");
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).toHaveBeenCalledWith(1);
     expect(upsertMock).not.toHaveBeenCalled();
     expect(updateSandboxMock).not.toHaveBeenCalledWith("alpha", expect.any(Object));
     expect(applyPresetMock).not.toHaveBeenCalled();
-  });
-
-  it("interactive matching-token conflict: empty answer (default N) aborts", async () => {
-    arrangeRegistry({
-      current: makeEmptyEntry("alpha"),
-      others: [
-        makePlanEntry("bob", "telegram", [
-          { providerEnvKey: "TELEGRAM_BOT_TOKEN", credentialHash: TELEGRAM_HASH },
-        ]),
-      ],
-    });
-    getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
-    promptMock.mockResolvedValue(""); // bare Enter -> default No
-
-    await addSandboxChannel("alpha", { channel: "telegram" });
-
-    expect(upsertMock).not.toHaveBeenCalled();
-    expect(updateSandboxMock).not.toHaveBeenCalledWith("alpha", expect.any(Object));
   });
 
   // Scenario 3
@@ -505,7 +550,7 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   });
 
   // Scenario 5a
-  it("unknown-token wording when the other sandbox has the channel but no hash", async () => {
+  it("aborts when the other sandbox has the channel but no credential hash", async () => {
     arrangeRegistry({
       current: makeEmptyEntry("alpha"),
       others: [makePlanEntry("bob", "telegram", [{ providerEnvKey: "TELEGRAM_BOT_TOKEN" }])],
@@ -513,12 +558,63 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "telegram" });
+    await expect(addSandboxChannel("alpha", { channel: "telegram" })).rejects.toThrow(
+      "process.exit(1)",
+    );
 
     const text = loggedText();
     expect(text).toContain("credential hash is unavailable");
     expect(text).not.toContain("same telegram credential");
+    expect(conflictPromptShown()).toBe(false);
+    expect(upsertMock).not.toHaveBeenCalled();
   });
+
+  it("does not create or attach a provider when credential-free policy fails", async () => {
+    arrangeRegistry({ current: makeEmptyEntry("alpha") });
+    getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
+    applyPresetMock.mockReturnValueOnce(false);
+
+    await expect(addSandboxChannel("alpha", { channel: "telegram" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(applyPresetMock).toHaveBeenCalledWith(
+      "alpha",
+      "telegram",
+      expect.objectContaining({ includeMessagingCredentialBindings: false }),
+    );
+    expect(upsertMock).not.toHaveBeenCalled();
+    expect(runOpenshellMock).not.toHaveBeenCalledWith(
+      expect.arrayContaining(["provider", "attach"]),
+      expect.anything(),
+    );
+  });
+
+  // Coverage shards exercise this rollback path under aggregate process load;
+  // keep its behavior deadline bounded above the default 5 seconds.
+  it("removes credential-free policy when provider attachment fails", async () => {
+    arrangeRegistry({ current: makeEmptyEntry("alpha") });
+    getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
+    upsertMock.mockRejectedValue(
+      Object.assign(new Error("provider attachment failed"), {
+        code: "NEMOCLAW_MESSAGING_PROVIDER_MUTATION_FAILURE",
+        mutatedProviderNames: ["alpha-telegram-bridge"],
+        createdProviderNames: ["alpha-telegram-bridge"],
+      }),
+    );
+    vi.mocked(policy.listPresets).mockReturnValue([
+      { file: "telegram.yaml", name: "telegram", description: "Telegram" },
+    ]);
+    vi.mocked(policy.getAppliedPresets).mockResolvedValue(["telegram"]);
+    const removePresetMock = vi.spyOn(policy, "removePreset").mockResolvedValue(true);
+    runOpenshellMock.mockReturnValue(successfulOpenshellResult());
+
+    await expect(addSandboxChannel("alpha", { channel: "telegram" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(removePresetMock).toHaveBeenCalledWith("alpha", "telegram");
+  }, 60_000);
 
   // Scenario 5b
   it("different hash on the other sandbox is NOT a conflict (no warning, add proceeds)", async () => {
@@ -544,6 +640,104 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     expect(conflictPromptShown()).toBe(false);
     expect(upsertMock).toHaveBeenCalledTimes(1);
     expect(updateSandboxMock).toHaveBeenCalledWith("alpha", expect.any(Object));
+  });
+
+  it("registers Hermes Discord with the exact static provider binding", async () => {
+    arrangeRegistry({
+      current: { ...makeEmptyEntry("alpha"), agent: "hermes" } as SandboxEntry,
+    });
+    vi.mocked(defs.loadAgent).mockReturnValue(agentFixture("hermes"));
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "DISCORD_BOT_TOKEN" ? DISCORD_TOKEN : null,
+    );
+
+    await addSandboxChannel("alpha", { channel: "discord" });
+
+    expect(upsertMock).toHaveBeenCalledWith(
+      [
+        {
+          name: "alpha-discord-bridge",
+          envKey: "DISCORD_BOT_TOKEN",
+          token: DISCORD_TOKEN,
+          providerType: "discord-hermes-static-v1",
+        },
+      ],
+      "nemoclaw",
+      { replaceExisting: true },
+      expect.objectContaining({
+        channelName: "discord",
+        sandboxAgent: "hermes",
+        sandboxName: "alpha",
+      }),
+    );
+  });
+
+  it("does not remove a pre-existing provider after a Hermes Discord identity conflict", async () => {
+    const originalEntry = { ...makeEmptyEntry("alpha"), agent: "hermes" } as SandboxEntry;
+    arrangeRegistry({ current: originalEntry });
+    vi.mocked(defs.loadAgent).mockReturnValue(agentFixture("hermes"));
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "DISCORD_BOT_TOKEN" ? DISCORD_TOKEN : null,
+    );
+    upsertMock.mockImplementationOnce(() => {
+      throw Object.assign(new Error("alpha-discord-bridge does not match the required binding"), {
+        code: "NEMOCLAW_MESSAGING_PROVIDER_BINDING_CONFLICT",
+        mutatedProviderNames: [],
+      });
+    });
+
+    await expect(addSandboxChannel("alpha", { channel: "discord" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(updateSandboxMock).not.toHaveBeenCalled();
+    expect(registry.getSandbox("alpha")).toBe(originalEntry);
+    expect(
+      runOpenshellMock.mock.calls
+        .map(([args]) => (args as string[]).join(" "))
+        .filter((command) => command.includes("provider detach") || command.includes("delete")),
+    ).toEqual([]);
+  });
+
+  it("does not persist a multi-provider add when identity preflight fails", async () => {
+    const originalEntry = makeEmptyEntry("alpha");
+    arrangeRegistry({ current: originalEntry });
+    const slackBot = "xoxb-alpha-slack-bot-token";
+    const slackApp = "xapp-alpha-slack-app-token";
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
+    );
+    upsertMock.mockImplementationOnce(() => {
+      throw Object.assign(new Error("alpha-slack-app does not match the required binding"), {
+        code: "NEMOCLAW_MESSAGING_PROVIDER_BINDING_CONFLICT",
+        mutatedProviderNames: [],
+      });
+    });
+
+    await expect(addSandboxChannel("alpha", { channel: "slack" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(upsertMock.mock.calls[0]?.[0]).toHaveLength(2);
+    expect(saveCredentialMock).not.toHaveBeenCalled();
+    expect(applyPresetMock).toHaveBeenCalledWith(
+      "alpha",
+      "slack",
+      expect.objectContaining({ includeMessagingCredentialBindings: false }),
+    );
+    expect(applyPresetMock).not.toHaveBeenCalledWith(
+      "alpha",
+      "slack",
+      expect.objectContaining({ includeMessagingCredentialBindings: true }),
+    );
+    expect(updateSandboxMock).not.toHaveBeenCalled();
+    expect(rebuildSandboxMock).not.toHaveBeenCalled();
+    expect(registry.getSandbox("alpha")).toBe(originalEntry);
+    expect(
+      runOpenshellMock.mock.calls
+        .map(([args]) => (args as string[]).join(" "))
+        .filter((command) => command.includes("provider detach") || command.includes("delete")),
+    ).toEqual([]);
   });
 
   // Scenario 6
@@ -655,7 +849,7 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   });
 
   // Scenario 9
-  it("entries without messaging plans are ignored while plan-backed conflicts still warn", async () => {
+  it("entries without messaging plans are ignored while plan-backed conflicts still abort", async () => {
     arrangeRegistry({
       current: makeEmptyEntry("alpha"),
       others: [
@@ -689,13 +883,13 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     expect(updateSandboxMock).toHaveBeenCalledWith("alpha", expect.any(Object));
   });
 
-  it("non-interactive add aborts when the conflict check throws", async () => {
+  it("aborts without prompting when the conflict check throws", async () => {
     arrangeRegistry({ current: makeEmptyEntry("alpha"), others: [] });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
     listSandboxesMock.mockImplementation(() => {
       throw new Error("malformed messaging plan");
     });
-    process.env.NEMOCLAW_NON_INTERACTIVE = "1";
+    promptMock.mockResolvedValue("y");
 
     await expect(addSandboxChannel("alpha", { channel: "telegram" })).rejects.toThrow(
       "process.exit(1)",
@@ -703,7 +897,8 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
 
     const text = loggedText();
     expect(text).toContain("Could not verify messaging channel conflicts");
-    expect(text).toContain("rerun with --force");
+    expect(text).toContain("re-run with --force");
+    expect(conflictPromptShown()).toBe(false);
     expect(upsertMock).not.toHaveBeenCalled();
   });
 
@@ -713,8 +908,6 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     listSandboxesMock.mockImplementation(() => {
       throw new Error("malformed messaging plan");
     });
-    process.env.NEMOCLAW_NON_INTERACTIVE = "1";
-
     await addSandboxChannel("alpha", { channel: "telegram", force: true });
 
     const text = loggedText();
@@ -724,7 +917,7 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   });
 
   // Scenario 10
-  it("never prints the raw token value in any conflict output (proceed path)", async () => {
+  it("never prints raw credential material in the --force conflict path", async () => {
     arrangeRegistry({
       current: makeEmptyEntry("alpha"),
       others: [
@@ -734,14 +927,12 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
       ],
     });
     getCredentialMock.mockReturnValue(TELEGRAM_TOKEN);
-    promptMock.mockResolvedValue("y");
-
-    await addSandboxChannel("alpha", { channel: "telegram" });
+    await addSandboxChannel("alpha", { channel: "telegram", force: true });
 
     const text = loggedText();
     expect(text).toContain("same telegram credential"); // sanity
     expect(text).not.toContain(TELEGRAM_TOKEN); // no raw secret
-    expect(text).not.toContain(TELEGRAM_HASH); // hash not in conflict warning text
+    expect(text).not.toContain(TELEGRAM_HASH); // hash not in conflict output
   });
 
   it("non-interactive abort path also keeps the raw token out of output", async () => {
@@ -764,38 +955,80 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
   });
 
   // Scenario 11
-  it("slack two-token channel: matching SLACK_BOT_TOKEN hash is detected", async () => {
-    const slackBot = "xoxb-test-slack-bot-token";
-    const slackApp = "xapp-test-slack-app-token";
-    const slackBotHash = hashCredential(slackBot) as string;
+  it("rejects a reused Slack app token across gateways without prompting (#7808)", async () => {
+    const slackBot = "xoxb-alpha-slack-bot-token";
+    const slackApp = "xapp-shared-slack-app-token";
+    const bob = makePlanEntry("bob", "slack", [
+      {
+        providerEnvKey: "SLACK_BOT_TOKEN",
+        credentialHash: hashCredential("xoxb-bob-slack-bot-token") as string,
+      },
+      {
+        providerEnvKey: "SLACK_APP_TOKEN",
+        credentialHash: hashCredential(slackApp) as string,
+      },
+    ]);
+    (bob as { gatewayName?: string }).gatewayName = "nemoclaw-9090";
     arrangeRegistry({
       current: makeEmptyEntry("alpha"),
-      // only bot token stored — app token unknown → conservative unknown-token OR
-      // matching-token if bot token matches; test verifies the conflict is surfaced.
-      others: [
-        makePlanEntry("bob", "slack", [
-          { providerEnvKey: "SLACK_BOT_TOKEN", credentialHash: slackBotHash },
-        ]),
-      ],
+      others: [bob],
     });
-    getCredentialMock.mockImplementation((key: string) => {
-      if (key === "SLACK_BOT_TOKEN") return slackBot;
-      if (key === "SLACK_APP_TOKEN") return slackApp;
-      return null;
-    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
+    );
     promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "slack" });
+    await expect(addSandboxChannel("alpha", { channel: "slack" })).rejects.toThrow(
+      "process.exit(1)",
+    );
 
     const text = loggedText();
     expect(text).toContain("bob");
-    expect(text).toContain("same slack credential"); // matching-token wording
+    expect(text).toContain("same slack credential");
     expect(text).not.toContain(slackBot);
     expect(text).not.toContain(slackApp);
+    expect(text).not.toContain("proceeding despite");
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).toHaveBeenCalledWith(1);
+    expect(upsertMock).not.toHaveBeenCalled();
+  });
+
+  it("allows --force for a reused Slack app token across gateways (#7808)", async () => {
+    const slackBot = "xoxb-alpha-slack-bot-token";
+    const slackApp = "xapp-shared-slack-app-token";
+    const bob = makePlanEntry("bob", "slack", [
+      {
+        providerEnvKey: "SLACK_BOT_TOKEN",
+        credentialHash: hashCredential("xoxb-bob-slack-bot-token") as string,
+      },
+      {
+        providerEnvKey: "SLACK_APP_TOKEN",
+        credentialHash: hashCredential(slackApp) as string,
+      },
+    ]);
+    (bob as { gatewayName?: string }).gatewayName = "nemoclaw-9090";
+    arrangeRegistry({
+      current: makeEmptyEntry("alpha"),
+      others: [bob],
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
+    );
+    promptMock.mockResolvedValue("y");
+
+    await addSandboxChannel("alpha", { channel: "slack", force: true });
+
+    const text = loggedText();
+    expect(text).toContain("same slack credential");
+    expect(text).toContain("--force: proceeding despite");
+    expect(text).not.toContain(slackBot);
+    expect(text).not.toContain(slackApp);
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).not.toHaveBeenCalled();
     expect(upsertMock).toHaveBeenCalledTimes(1);
   });
 
-  it("slack: a second sandbox on the SAME gateway is blocked even with a different token (#4953)", async () => {
+  it("allows --force for a second Slack sandbox on the same gateway (#7808)", async () => {
     const slackBot = "xoxb-alpha-bot-token";
     const slackApp = "xapp-alpha-app-token";
     arrangeRegistry({
@@ -818,17 +1051,19 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     getCredentialMock.mockImplementation((key: string) =>
       key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
     );
-    promptMock.mockResolvedValue("n"); // decline the conflict prompt
+    promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "slack" });
+    await addSandboxChannel("alpha", { channel: "slack", force: true });
 
     const text = loggedText();
     expect(text).toContain("Slack Socket Mode is already enabled for sandbox 'bob'");
     expect(text).not.toContain("same slack credential"); // gateway axis, not a token match
     expect(text).not.toContain(slackBot);
     expect(text).not.toContain(slackApp);
-    expect(conflictPromptShown()).toBe(true);
-    expect(upsertMock).not.toHaveBeenCalled(); // aborted before registering
+    expect(text).toContain("--force: proceeding despite");
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).not.toHaveBeenCalled();
+    expect(upsertMock).toHaveBeenCalledTimes(1);
   });
 
   it("slack: a second sandbox on the SAME non-default gateway is blocked", async () => {
@@ -854,21 +1089,24 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     getCredentialMock.mockImplementation((key: string) =>
       key === "SLACK_BOT_TOKEN" ? slackBot : key === "SLACK_APP_TOKEN" ? slackApp : null,
     );
-    promptMock.mockResolvedValue("n");
+    promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "slack" });
+    await expect(addSandboxChannel("alpha", { channel: "slack" })).rejects.toThrow(
+      "process.exit(1)",
+    );
 
     const text = loggedText();
     expect(text).toContain("Slack Socket Mode is already enabled for sandbox 'bob'");
     expect(text).not.toContain(slackBot);
     expect(text).not.toContain(slackApp);
-    expect(conflictPromptShown()).toBe(true);
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).toHaveBeenCalledWith(1);
     expect(upsertMock).not.toHaveBeenCalled();
   });
 
   it("slack: shared token on the same gateway reports the credential conflict first (#4953)", async () => {
     // The credential axis runs before the gateway axis, so a shared Slack token
-    // surfaces the gateway-independent "same slack credential" warning (more
+    // surfaces the gateway-independent "same slack credential" conflict (more
     // actionable: it conflicts even after moving to another gateway) instead of
     // only the same-gateway remediation.
     const slackBot = "xoxb-shared-bot-token";
@@ -932,11 +1170,8 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     expect(upsertMock).toHaveBeenCalledTimes(1);
   });
 
-  it("slack: a gateway conflict-detection failure is fail-soft, not a crash (#4953)", async () => {
+  it("rejects Slack setup when the conflict check cannot read the registry (#7808)", async () => {
     arrangeRegistry({ current: { name: "alpha" } as SandboxEntry });
-    // Simulate a malformed registry read: listSandboxes throws. The Slack
-    // gateway lookup must swallow it (best-effort warning) rather than crash
-    // the add or bypass the downstream guarded credential check.
     listSandboxesMock.mockImplementation(() => {
       throw new Error("registry boom");
     });
@@ -947,11 +1182,38 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
           ? "xapp-alpha-app"
           : null,
     );
-    promptMock.mockResolvedValue("y"); // proceed through any "could not verify" prompt
+    promptMock.mockResolvedValue("y");
 
-    await addSandboxChannel("alpha", { channel: "slack" });
+    await expect(addSandboxChannel("alpha", { channel: "slack" })).rejects.toThrow(
+      "process.exit(1)",
+    );
 
-    expect(loggedText()).toContain("Could not verify messaging pre-enable checks");
+    expect(loggedText()).toContain("Could not verify messaging channel conflicts for slack");
+    expect(loggedText()).toContain("re-run with --force");
+    expect(conflictPromptShown()).toBe(false);
+    expect(exitMock).toHaveBeenCalledWith(1);
+    expect(upsertMock).not.toHaveBeenCalled();
+  });
+
+  it("allows --force when the Slack conflict check cannot read the registry (#7808)", async () => {
+    arrangeRegistry({ current: { name: "alpha" } as SandboxEntry });
+    listSandboxesMock.mockImplementation(() => {
+      throw new Error("registry boom");
+    });
+    getCredentialMock.mockImplementation((key: string) =>
+      key === "SLACK_BOT_TOKEN"
+        ? "xoxb-alpha-bot"
+        : key === "SLACK_APP_TOKEN"
+          ? "xapp-alpha-app"
+          : null,
+    );
+
+    await addSandboxChannel("alpha", { channel: "slack", force: true });
+
+    expect(loggedText()).toContain(
+      "--force: proceeding without a completed messaging channel conflict check",
+    );
+    expect(conflictPromptShown()).toBe(false);
     expect(exitMock).not.toHaveBeenCalled();
     expect(upsertMock).toHaveBeenCalledTimes(1);
   });
@@ -984,8 +1246,13 @@ describe("addSandboxChannel cross-sandbox conflict check (#4305)", () => {
     expect(text).toContain("'telegram' bridge startup detected");
     expect(text).toContain("Telegram direct-message allowlist is empty");
     const execCommands = vi
-      .mocked(processRecovery.executeSandboxExecCommand)
+      .mocked(commandTransport.executeSandboxExecCommand)
       .mock.calls.map((call: unknown[]) => String(call[1]));
+    expect(
+      vi
+        .mocked(commandTransport.executeSandboxExecCommand)
+        .mock.calls.every((call) => call[3] === undefined || Object.keys(call[3]).length === 0),
+    ).toBe(true);
     expect(execCommands.some((cmd: string) => cmd.includes("grep"))).toBe(false);
     expect(
       execCommands.some(
@@ -1039,11 +1306,73 @@ describe("Teams host-forward lifecycle (PRA-2)", () => {
     return plan?.channels?.find((channel) => channel.channelId === "teams")?.hostForward;
   }
 
+  it("rejects an occupied host port before persisting any channel state", async () => {
+    setTeamsEnv();
+    arrangeRegistry({ current: makeEmptyEntry("alpha") });
+    const preEnableHookRegistry = createBuiltInMessagingHookRegistry({
+      teams: {
+        hostForwardPortConflict: {
+          checkPortAvailable: async () => ({ ok: false, process: "nc", pid: 4321 }),
+          isCurrentSandboxForward: () => false,
+        },
+      },
+    });
+
+    vi.mocked(
+      policyChannelDependencies.createMessagingHostForwardPreEnableHookRegistry,
+    ).mockReturnValue(preEnableHookRegistry);
+    await expect(addSandboxChannel("alpha", { channel: "teams" })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(
+      policyChannelDependencies.createMessagingHostForwardPreEnableHookRegistry,
+    ).toHaveBeenCalledOnce();
+    expect(loggedText()).toContain(
+      "Microsoft Teams webhook port 3978 is already in use by nc (PID 4321)",
+    );
+    expect(loggedText()).toContain("MSTEAMS_PORT");
+    expect(upsertMock).not.toHaveBeenCalled();
+    expect(saveCredentialMock).not.toHaveBeenCalled();
+    expect(applyPresetMock).not.toHaveBeenCalled();
+    expect(updateSandboxMock).not.toHaveBeenCalled();
+    expect(rebuildSandboxMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["add", "start", "add QR"])(
+    "reports incomplete channel %s when the host forward fails (#11648)",
+    async (operation) => {
+      setTeamsEnv();
+      arrangeRegistry({
+        current:
+          operation === "start"
+            ? makeTeamsEntry("alpha", { disabled: true, port: "3978" })
+            : makeEmptyEntry("alpha"),
+      });
+      getDisabledChannelsMock.mockReturnValue(operation === "start" ? ["teams"] : []);
+      ensureMessagingHostForwardAfterRebuildMock.mockResolvedValue(false);
+      const healthChecks = vi.spyOn(MessagingSetupApplier, "applyHealthChecks");
+      const action = operation === "start" ? startSandboxChannel : addSandboxChannel;
+      await expect(
+        action("alpha", { channel: operation === "add QR" ? "whatsapp" : "teams" }),
+      ).rejects.toThrow(/host forward.*incomplete/i);
+      expect(ensureMessagingHostForwardAfterRebuildMock).toHaveBeenCalledOnce();
+      expect(healthChecks).not.toHaveBeenCalled();
+    },
+  );
+
   it("channels add teams starts the MSTEAMS_PORT host forward after rebuild-now completes", async () => {
     setTeamsEnv();
     arrangeRegistry({ current: makeEmptyEntry("alpha") });
+    const preEnableHookRegistry = createBuiltInMessagingHookRegistry({
+      teams: {
+        hostForwardPortConflict: {
+          checkPortAvailable: async () => ({ ok: true }),
+        },
+      },
+    });
 
-    await addSandboxChannel("alpha", { channel: "teams" });
+    await addSandboxChannel("alpha", { channel: "teams" }, { preEnableHookRegistry });
 
     expect(rebuildSandboxMock).toHaveBeenCalledWith("alpha", ["--yes"]);
     expect(ensureMessagingHostForwardAfterRebuildMock).toHaveBeenCalledWith(
@@ -1066,13 +1395,8 @@ describe("Teams host-forward lifecycle (PRA-2)", () => {
 
     await startSandboxChannel("alpha", { channel: "teams" });
 
-    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "teams", {
-      disclosedPresetState: "absent",
-    });
+    expect(applyPresetMock).not.toHaveBeenCalled();
     expect(rebuildSandboxMock).toHaveBeenCalledWith("alpha", ["--yes"]);
-    expect(applyPresetMock.mock.invocationCallOrder[0]).toBeLessThan(
-      rebuildSandboxMock.mock.invocationCallOrder[0],
-    );
     expect(ensureMessagingHostForwardAfterRebuildMock).toHaveBeenCalledWith(
       "alpha",
       expect.any(Object),
@@ -1087,16 +1411,50 @@ describe("Teams host-forward lifecycle (PRA-2)", () => {
     });
   });
 
-  it("channels start reapplies its policy before a non-interactive rebuild is queued", async () => {
+  it("rebuilds before a credential-bound Hermes Discord policy reaches the replacement sandbox", async () => {
+    const current = makeHermesDiscordEntry("alpha");
+    arrangeRegistry({ current });
+    vi.mocked(defs.loadAgent).mockReturnValue(agentFixture("hermes"));
+    getDisabledChannelsMock.mockImplementation(
+      () => current.messaging?.plan.disabledChannels ?? [],
+    );
+    updateSandboxMock.mockImplementation((_name: string, updates: Partial<SandboxEntry>) => {
+      Object.assign(current, updates);
+      return true;
+    });
+    applyPresetMock.mockImplementation(() => {
+      throw new Error(
+        "credential_binding references provider 'alpha-discord-bridge', but that provider is not attached to the sandbox",
+      );
+    });
+    rebuildSandboxMock.mockImplementation(async () => {
+      expect(current.messaging?.plan.disabledChannels).toEqual([]);
+      expect(current.messaging?.plan.networkPolicy.presets).toEqual(["discord"]);
+      expect(current.messaging?.plan.credentialBindings).toContainEqual(
+        expect.objectContaining({
+          providerName: "alpha-discord-bridge",
+          providerEnvKey: "DISCORD_BOT_TOKEN",
+        }),
+      );
+    });
+
+    await startSandboxChannel("alpha", { channel: "discord" });
+
+    expect(applyPresetMock).not.toHaveBeenCalled();
+    expect(rebuildSandboxMock).toHaveBeenCalledWith("alpha", ["--yes"]);
+    expect(updateSandboxMock.mock.invocationCallOrder[0]).toBeLessThan(
+      rebuildSandboxMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("channels start defers policy application when a non-interactive rebuild is queued", async () => {
     process.env.NEMOCLAW_NON_INTERACTIVE = "1";
     arrangeRegistry({ current: makeTeamsEntry("alpha", { disabled: true }) });
     getDisabledChannelsMock.mockReturnValue(["teams"]);
 
     await startSandboxChannel("alpha", { channel: "teams" });
 
-    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "teams", {
-      disclosedPresetState: "absent",
-    });
+    expect(applyPresetMock).not.toHaveBeenCalled();
     expect(rebuildSandboxMock).not.toHaveBeenCalled();
     expect(loggedText()).toContain("Change queued");
   });
@@ -1119,61 +1477,20 @@ describe("Teams host-forward lifecycle (PRA-2)", () => {
     expect(scopeDisclosureMock.mock.invocationCallOrder[0]).toBeLessThan(
       updateSandboxMock.mock.invocationCallOrder[0],
     );
-    expect(scopeDisclosureMock.mock.invocationCallOrder[0]).toBeLessThan(
-      applyPresetMock.mock.invocationCallOrder[0],
-    );
-  });
-
-  it("channels start restores the disabled plan and skips rebuild when its policy preset fails", async () => {
-    const current = makeTeamsEntry("alpha", { disabled: true });
-    arrangeRegistry({ current });
-    getDisabledChannelsMock.mockImplementation(
-      () => current.messaging?.plan.disabledChannels ?? [],
-    );
-    updateSandboxMock.mockImplementation((_name: string, updates: Partial<SandboxEntry>) => {
-      Object.assign(current, updates);
-      return true;
-    });
-    applyPresetMock.mockReturnValue(false);
-
-    await expect(startSandboxChannel("alpha", { channel: "teams" })).rejects.toThrow(
-      "process.exit(1)",
-    );
-
-    expect(applyPresetMock).toHaveBeenCalledWith("alpha", "teams", {
-      disclosedPresetState: "absent",
-    });
-    expect(registry.getDisabledChannels("alpha")).toContain("teams");
-    expect(rebuildSandboxMock).not.toHaveBeenCalled();
-    expect(loggedText()).toContain("channels start teams");
-  });
-
-  it("channels start prints recovery guidance when policy and disabled-plan rollback both fail", async () => {
-    arrangeRegistry({ current: makeTeamsEntry("alpha", { disabled: true }) });
-    getDisabledChannelsMock.mockReturnValue(["teams"]);
-    applyPresetMock.mockReturnValue(false);
-    updateSandboxMock.mockReturnValueOnce(true).mockReturnValueOnce(false);
-
-    await expect(startSandboxChannel("alpha", { channel: "teams" })).rejects.toThrow(
-      "process.exit(1)",
-    );
-
-    expect(rebuildSandboxMock).not.toHaveBeenCalled();
-    expect(loggedText()).toContain("Could not restore 'teams' to disabled state");
-    expect(loggedText()).toContain("nemoclaw alpha channels stop teams");
+    expect(applyPresetMock).not.toHaveBeenCalled();
   });
 });
 
 function mockBridgeHealthExec(options: { config: unknown; log: string }): void {
-  vi.mocked(processRecovery.executeSandboxExecCommand).mockImplementation(
-    (_sandboxName: string, command: string) => {
+  vi.mocked(commandTransport.executeSandboxExecCommand).mockImplementation(
+    async (_sandboxName: string, command: string) => {
       if (command.includes("cat") && command.includes("openclaw.json")) {
         return { status: 0, stdout: JSON.stringify(options.config), stderr: "" };
       }
       if (command.includes("tail -n 400") && command.includes("gateway.log")) {
         return { status: 0, stdout: options.log, stderr: "" };
       }
-      return null;
+      throw new commandTransport.SandboxCommandTransportError("unavailable");
     },
   );
 }

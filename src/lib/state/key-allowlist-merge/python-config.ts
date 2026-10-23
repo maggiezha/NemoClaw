@@ -11,7 +11,6 @@ import secrets
 import stat
 import sys
 import tomllib
-import tomli_w
 
 MAX_CONFIG_BYTES = 16 * 1024 * 1024
 
@@ -32,7 +31,7 @@ def parse_config_payload(payload, label):
     except tomllib.TOMLDecodeError:
         fail(f"{label} config is not valid TOML")
     if not isinstance(parsed, dict):
-        fail(f"{label} config must be a TOML document")
+        fail(f"{label} config must be a TOML object")
     return text, parsed
 
 
@@ -69,6 +68,8 @@ def read_regular_file_at(parent_fd, name, label):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        fail(f"{label} config is missing or unsafe")
     except OSError:
         fail(f"{label} config is missing or unsafe")
     try:

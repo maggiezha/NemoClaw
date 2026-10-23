@@ -17,6 +17,7 @@ import {
 import { ensureDockerDriverGatewayJwtBundle } from "./docker-driver-gateway-jwt-bundle";
 
 const CONCURRENT_CALLER_COUNT = 12;
+const TSX_LOADER_DEPRECATION = "DEP0205";
 
 function spawnConcurrentJwtBundleCaller(
   stateDir: string,
@@ -49,7 +50,14 @@ process.stdout.write("RESULT " + JSON.stringify({ kid, signingKeyHash }) + "\n")
 `;
   const child = spawn(
     process.execPath,
-    ["--import", "tsx", "--input-type=module", "--eval", script],
+    [
+      `--disable-warning=${TSX_LOADER_DEPRECATION}`,
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "--eval",
+      script,
+    ],
     {
       cwd: path.resolve(import.meta.dirname, "../../.."),
       env: {
@@ -153,7 +161,7 @@ describe("docker-driver-gateway JWT bundle", () => {
     }
   });
 
-  it("regenerates an incomplete gateway JWT bundle before writing config", () => {
+  it("does not replace an incomplete JWT identity when its gateway config is missing", () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-gateway-config-"));
     try {
       const jwtDir = path.join(stateDir, "jwt");
@@ -163,19 +171,16 @@ describe("docker-driver-gateway JWT bundle", () => {
       const kidPath = path.join(jwtDir, "kid");
       fs.writeFileSync(signingKeyPath, "stale partial key\n", { mode: 0o600 });
 
-      writeGatewayConfig(stateDir);
+      expect(() => writeGatewayConfig(stateDir)).toThrow(
+        /durable gateway state exists without a config/,
+      );
 
-      const toml = fs.readFileSync(path.join(stateDir, "openshell-gateway.toml"), "utf-8");
-      expect(fs.readFileSync(signingKeyPath, "utf-8")).not.toBe("stale partial key\n");
-      expect(fs.existsSync(publicKeyPath)).toBe(true);
-      expect(fs.existsSync(kidPath)).toBe(true);
+      expect(fs.existsSync(path.join(stateDir, "openshell-gateway.toml"))).toBe(false);
+      expect(fs.readFileSync(signingKeyPath, "utf-8")).toBe("stale partial key\n");
+      expect(fs.existsSync(publicKeyPath)).toBe(false);
+      expect(fs.existsSync(kidPath)).toBe(false);
       expect(fs.statSync(jwtDir).mode & 0o777).toBe(0o700);
       expect(fs.statSync(signingKeyPath).mode & 0o777).toBe(0o600);
-      expect(fs.statSync(publicKeyPath).mode & 0o777).toBe(0o600);
-      expect(fs.statSync(kidPath).mode & 0o777).toBe(0o600);
-      expect(toml).toContain(`signing_key_path = "${signingKeyPath}"`);
-      expect(toml).toContain(`public_key_path = "${publicKeyPath}"`);
-      expect(toml).toContain(`kid_path = "${kidPath}"`);
     } finally {
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
@@ -218,40 +223,50 @@ describe("docker-driver-gateway JWT bundle", () => {
     }
   });
 
-  it("serializes 12 concurrent callers onto one valid gateway JWT bundle", {
-    timeout: 30_000,
-  }, async () => {
-    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-gateway-config-"));
-    const startPath = path.join(stateDir, ".start-concurrent-callers");
-    try {
-      const callers = Array.from({ length: CONCURRENT_CALLER_COUNT }, () =>
-        spawnConcurrentJwtBundleCaller(stateDir, startPath),
-      );
-      await Promise.all(callers.map((caller) => caller.ready));
-      fs.writeFileSync(startPath, "start\n", { mode: 0o600 });
+  it(
+    "serializes 12 concurrent callers onto one valid gateway JWT bundle",
+    {
+      timeout: 30_000,
+    },
+    async () => {
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-gateway-config-"));
+      const startPath = path.join(stateDir, ".start-concurrent-callers");
+      try {
+        const callers = Array.from({ length: CONCURRENT_CALLER_COUNT }, () =>
+          spawnConcurrentJwtBundleCaller(stateDir, startPath),
+        );
+        await Promise.all(callers.map((caller) => caller.ready));
+        fs.writeFileSync(startPath, "start\n", { mode: 0o600 });
 
-      const results = await Promise.all(callers.map((caller) => caller.done));
-      expect(results.map((result) => result.code)).toEqual(Array(CONCURRENT_CALLER_COUNT).fill(0));
-      expect(results.map((result) => result.stderr)).toEqual(
-        Array(CONCURRENT_CALLER_COUNT).fill(""),
-      );
-      const published = results.map((result) => {
-        const line = result.stdout.split("\n").find((candidate) => candidate.startsWith("RESULT "));
-        expect(line, result.stdout).toBeDefined();
-        return JSON.parse(line?.slice("RESULT ".length) ?? "{}") as {
-          kid: string;
-          signingKeyHash: string;
-        };
-      });
-      expect(new Set(published.map((entry) => entry.kid)).size).toBe(1);
-      expect(new Set(published.map((entry) => entry.signingKeyHash)).size).toBe(1);
-      expectEd25519BundleSignsAndVerifies(jwtBundlePaths(stateDir));
-      expect(fs.existsSync(path.join(stateDir, ".jwt-generating"))).toBe(false);
-      expect(fs.readdirSync(stateDir).filter((entry) => entry.startsWith(".jwt-tmp-"))).toEqual([]);
-    } finally {
-      fs.rmSync(stateDir, { recursive: true, force: true });
-    }
-  });
+        const results = await Promise.all(callers.map((caller) => caller.done));
+        expect(results.map((result) => result.code)).toEqual(
+          Array(CONCURRENT_CALLER_COUNT).fill(0),
+        );
+        expect(results.map((result) => result.stderr)).toEqual(
+          Array(CONCURRENT_CALLER_COUNT).fill(""),
+        );
+        const published = results.map((result) => {
+          const line = result.stdout
+            .split("\n")
+            .find((candidate) => candidate.startsWith("RESULT "));
+          expect(line, result.stdout).toBeDefined();
+          return JSON.parse(line?.slice("RESULT ".length) ?? "{}") as {
+            kid: string;
+            signingKeyHash: string;
+          };
+        });
+        expect(new Set(published.map((entry) => entry.kid)).size).toBe(1);
+        expect(new Set(published.map((entry) => entry.signingKeyHash)).size).toBe(1);
+        expectEd25519BundleSignsAndVerifies(jwtBundlePaths(stateDir));
+        expect(fs.existsSync(path.join(stateDir, ".jwt-generating"))).toBe(false);
+        expect(fs.readdirSync(stateDir).filter((entry) => entry.startsWith(".jwt-tmp-"))).toEqual(
+          [],
+        );
+      } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("recovers a gateway JWT generation lock left by a crashed process", () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-gateway-config-"));

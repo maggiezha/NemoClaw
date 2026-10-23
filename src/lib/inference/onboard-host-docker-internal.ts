@@ -2,8 +2,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+const { createContainerCurlProbeSpawn } = require("../adapters/http/container-curl-probe");
+const { OLLAMA_PROXY_PORT } = require("../core/ollama-proxy-port");
+
 const HOST_DOCKER_INTERNAL = "host.docker.internal";
-const OLLAMA_PROXY_URL = "http://host.openshell.internal:11435/v1";
+const OLLAMA_PROXY_URL = `http://host.openshell.internal:${OLLAMA_PROXY_PORT}/v1`;
 
 function isHijackedDockerInternalUrl(url) {
   try {
@@ -40,6 +43,7 @@ function getHostDockerInternalProbeFailure() {
 module.exports = {
   HOST_DOCKER_INTERNAL,
   OLLAMA_PROXY_URL,
+  createContainerCurlProbeSpawn,
   isHijackedDockerInternalUrl,
   getHostDockerInternalProbeFailure,
 };

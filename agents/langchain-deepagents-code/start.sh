@@ -6,13 +6,45 @@
 
 set -euo pipefail
 unset BASH_ENV ENV
+
+export HOME=/sandbox
+export PATH="/usr/local/bin:/opt/venv/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# managed-entrypoint-env-wrapper begin
+_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER="/usr/local/lib/nemoclaw/entrypoint-env-wrapper.sh"
+if [ ! -f "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER" ]; then
+  _DCODE_ENTRYPOINT_SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _NEMOCLAW_ENTRYPOINT_ENV_WRAPPER="${_DCODE_ENTRYPOINT_SOURCE_DIR}/../../scripts/lib/entrypoint-env-wrapper.sh"
+  unset _DCODE_ENTRYPOINT_SOURCE_DIR
+fi
+if [ ! -f "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER" ]; then
+  printf '%s\n' '[SECURITY] Required entrypoint env-wrapper normalizer is missing.' >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/entrypoint-env-wrapper.sh
+source "$_NEMOCLAW_ENTRYPOINT_ENV_WRAPPER"
+nemoclaw_normalize_entrypoint_env_wrapper "$@"
+if [ "$NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGC" -eq 0 ]; then
+  set --
+else
+  set -- "${NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGV[@]}"
+fi
+unset NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGC NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGV \
+  _NEMOCLAW_ENTRYPOINT_ENV_WRAPPER
+unset -f nemoclaw_normalize_entrypoint_env_wrapper
+# managed-entrypoint-env-wrapper end
+
+# Root entrypoints hand off agent work without reading personal shell files.
+if [ "$(id -u)" -eq 0 ]; then
+  exec /usr/bin/setpriv --reuid=sandbox --regid=sandbox --init-groups -- \
+    /usr/local/bin/nemoclaw-start "$@"
+fi
+
 while IFS= read -r _nemoclaw_auto_approval_env; do
   unset "$_nemoclaw_auto_approval_env"
 done < <(compgen -A variable NEMOCLAW_DCODE_AUTO_APPROVAL || true)
 unset _nemoclaw_auto_approval_env
 
-export HOME=/sandbox
-export PATH="/usr/local/bin:/opt/venv/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export DEEPAGENTS_CODE_NO_UPDATE_CHECK=1
 export LANGGRAPH_NO_VERSION_CHECK=true
 export LANGGRAPH_CLI_NO_ANALYTICS=1
@@ -29,6 +61,7 @@ export LANGCHAIN_TRACING_V2=false
 export DEEPAGENTS_CODE_OFFLINE=1
 export DEEPAGENTS_CODE_RIPGREP_INSTALLER=system
 export DEEPAGENTS_CODE_OPENAI_API_KEY="${DEEPAGENTS_CODE_OPENAI_API_KEY:-nemoclaw-managed-inference}"
+unset NEMOCLAW_ATTACHED_PROVIDER_API_KEY
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://inference.local/v1}"
 
 # Harden RLIMITs (nproc + nofile) for the long-running Deep Agents Code process
@@ -71,7 +104,12 @@ unset _NEMOCLAW_SANDBOX_RLIMITS
 # or when dcode no longer uses inference.local.
 readonly MANAGED_PROXY_HOST_FILE="/usr/local/share/nemoclaw/dcode-proxy-host"
 readonly MANAGED_PROXY_PORT_FILE="/usr/local/share/nemoclaw/dcode-proxy-port"
-readonly MANAGED_FETCH_CA_BUNDLE_FILE="/etc/openshell-tls/ca-bundle.pem"
+if [ -e /etc/openshell-tls/ca-bundle.pem ] \
+  || [ -L /etc/openshell-tls/ca-bundle.pem ]; then
+  readonly MANAGED_FETCH_CA_BUNDLE_FILE="/etc/openshell-tls/ca-bundle.pem"
+else
+  readonly MANAGED_FETCH_CA_BUNDLE_FILE="/tmp/nemoclaw-managed-startup-ca-bundle.pem"
+fi
 readonly MANAGED_PROXY_OWNER_UID=0
 
 managed_proxy_file_metadata() {
@@ -149,6 +187,12 @@ validate_managed_fetch_ca_bundle() {
 PROXY_HOST="$(read_managed_proxy_value "$MANAGED_PROXY_HOST_FILE" "host")"
 PROXY_PORT="$(read_managed_proxy_value "$MANAGED_PROXY_PORT_FILE" "port")"
 validate_managed_fetch_ca_bundle
+if [ -e "$MANAGED_FETCH_CA_BUNDLE_FILE" ]; then
+  : "${SSL_CERT_FILE:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  : "${REQUESTS_CA_BUNDLE:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  : "${NODE_EXTRA_CA_CERTS:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  export SSL_CERT_FILE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS
+fi
 unset NEMOCLAW_PROXY_HOST NEMOCLAW_PROXY_PORT
 # Generic proxy fallbacks are outside the managed dcode contract and may carry
 # host credentials even after the scheme-specific proxy values are normalized.
@@ -183,7 +227,7 @@ fi
 
 _PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 _NO_PROXY_VAL="localhost,127.0.0.1,::1,${PROXY_HOST}"
-# Deep Agents Code 0.1.34 intentionally ignores environment proxies in
+# Deep Agents Code 0.1.71 intentionally ignores environment proxies in
 # fetch_url so it can pin direct DNS results against rebinding. OpenShell's
 # sandbox instead requires all ordinary egress, including DNS resolution for a
 # destination, to stay behind its policy proxy. This explicit variable opts the
@@ -234,6 +278,7 @@ prepare_runtime_env() {
     write_export_if_set DEEPAGENTS_CODE_FETCH_URL_TRUSTED_PROXY_URL
     # shellcheck disable=SC2016
     printf '%s\n' 'export DEEPAGENTS_CODE_OPENAI_API_KEY="${DEEPAGENTS_CODE_OPENAI_API_KEY:-nemoclaw-managed-inference}"'
+    printf '%s\n' 'unset NEMOCLAW_ATTACHED_PROVIDER_API_KEY'
     # shellcheck disable=SC2016
     printf '%s\n' 'export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://inference.local/v1}"'
     printf '%s\n' 'unset ALL_PROXY all_proxy OPENAI_PROXY'

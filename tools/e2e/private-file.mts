@@ -19,6 +19,26 @@ function openPrivateFileForWrite(file: string): number {
   }
 }
 
+/** Create a private regular file without replacing any existing path. */
+export function createPrivateRegularFile(file: string, contents: string): void {
+  const descriptor = fs.openSync(
+    file,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NO_FOLLOW | NON_BLOCK,
+    0o600,
+  );
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`${file} must be a private regular file`);
+    }
+    fs.fchmodSync(descriptor, 0o600);
+    fs.writeFileSync(descriptor, contents, "utf8");
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 export function readPrivateRegularFile(
   file: string,
   options: { allowMissing?: boolean; maxBytes: number },
@@ -56,7 +76,7 @@ export function readPrivateRegularFile(
   }
 }
 
-export function writePrivateRegularFile(file: string, contents: string): void {
+export function writePrivateRegularFile(file: string, contents: string | Uint8Array): void {
   const descriptor = openPrivateFileForWrite(file);
   try {
     const stat = fs.fstatSync(descriptor);
@@ -65,7 +85,10 @@ export function writePrivateRegularFile(file: string, contents: string): void {
     }
     fs.fchmodSync(descriptor, 0o600);
     fs.ftruncateSync(descriptor, 0);
-    fs.writeFileSync(descriptor, contents, "utf8");
+    fs.writeFileSync(
+      descriptor,
+      typeof contents === "string" ? Buffer.from(contents, "utf8") : contents,
+    );
     fs.fsyncSync(descriptor);
   } finally {
     fs.closeSync(descriptor);

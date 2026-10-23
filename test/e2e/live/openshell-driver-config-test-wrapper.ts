@@ -6,12 +6,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { shellQuote } from "../fixtures/clients/command.ts";
+import {
+  type OpenShellComponents,
+  resolveOpenShellSiblingComponents,
+} from "../../helpers/openshell-components.ts";
 
-export type OpenShellComponents = {
-  cli: string;
-  gateway: string;
-  sandbox: string;
-};
+export { type OpenShellComponents, resolveOpenShellSiblingComponents };
 
 export type OpenShellDriverConfigTestWrapper = {
   directory: string;
@@ -19,25 +19,9 @@ export type OpenShellDriverConfigTestWrapper = {
   remove(): void;
 };
 
-export function resolveOpenShellSiblingComponents(openshellPath: string): OpenShellComponents {
-  const cli = fs.realpathSync(openshellPath);
-  fs.accessSync(cli, fs.constants.X_OK);
-  const installDirectory = path.dirname(cli);
-  const canonicalSibling = (name: string): string => {
-    const sibling = fs.realpathSync(path.join(installDirectory, name));
-    fs.accessSync(sibling, fs.constants.X_OK);
-    return sibling;
-  };
-  return {
-    cli,
-    gateway: canonicalSibling("openshell-gateway"),
-    sandbox: canonicalSibling("openshell-sandbox"),
-  };
-}
-
 export function createOpenShellDriverConfigTestWrapper(options: {
   delegatedCapabilityMarkers?: readonly string[];
-  driverConfigJson: string;
+  driverConfigJson?: string;
   label: string;
   realOpenshellPath: string;
 }): OpenShellDriverConfigTestWrapper {
@@ -48,13 +32,15 @@ export function createOpenShellDriverConfigTestWrapper(options: {
     throw new Error("OpenShell driver-config test wrapper label must be shell-safe");
   }
   fs.accessSync(options.realOpenshellPath, fs.constants.X_OK);
-  const parsedDriverConfig: unknown = JSON.parse(options.driverConfigJson);
-  if (
-    parsedDriverConfig === null ||
-    typeof parsedDriverConfig !== "object" ||
-    Array.isArray(parsedDriverConfig)
-  ) {
-    throw new Error("OpenShell driver-config test wrapper requires a JSON object");
+  if (options.driverConfigJson !== undefined) {
+    const parsedDriverConfig: unknown = JSON.parse(options.driverConfigJson);
+    if (
+      parsedDriverConfig === null ||
+      typeof parsedDriverConfig !== "object" ||
+      Array.isArray(parsedDriverConfig)
+    ) {
+      throw new Error("OpenShell driver-config test wrapper requires a JSON object");
+    }
   }
 
   const capabilityComments = (options.delegatedCapabilityMarkers ?? [])
@@ -69,11 +55,8 @@ export function createOpenShellDriverConfigTestWrapper(options: {
     path.join(os.tmpdir(), `nemoclaw-${options.label}-openshell-wrapper-`),
   );
   const executable = path.join(directory, "openshell");
-  const script = `#!/bin/sh
-${capabilityComments}
-set -eu
-if [ "$#" -ge 2 ] && [ "$1" = sandbox ] && [ "$2" = create ]; then
-  shift 2
+  const sandboxCreate = options.driverConfigJson
+    ? `shift 2
   for argument in "$@"; do
     case "$argument" in
       --driver-config-json|--driver-config-json=*)
@@ -82,7 +65,13 @@ if [ "$#" -ge 2 ] && [ "$1" = sandbox ] && [ "$2" = create ]; then
         ;;
     esac
   done
-  exec ${shellQuote(options.realOpenshellPath)} sandbox create --driver-config-json ${shellQuote(options.driverConfigJson)} "$@"
+  exec ${shellQuote(options.realOpenshellPath)} sandbox create --driver-config-json ${shellQuote(options.driverConfigJson)} "$@"`
+    : `exec ${shellQuote(options.realOpenshellPath)} "$@"`;
+  const script = `#!/bin/sh
+${capabilityComments}
+set -eu
+if [ "$#" -ge 2 ] && [ "$1" = sandbox ] && [ "$2" = create ]; then
+  ${sandboxCreate}
 fi
 exec ${shellQuote(options.realOpenshellPath)} "$@"
 `;
@@ -103,7 +92,7 @@ export function withOpenShellDriverConfigWrapperEnv(
   return {
     ...env,
     PATH: `${wrapper.directory}${path.delimiter}${env.PATH ?? ""}`,
-    NEMOCLAW_OPENSHELL_BIN: wrapper.executable,
+    NEMOCLAW_OPENSHELL_BIN: components.cli,
     NEMOCLAW_OPENSHELL_GATEWAY_BIN: components.gateway,
     NEMOCLAW_OPENSHELL_SANDBOX_BIN: components.sandbox,
   };

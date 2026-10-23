@@ -2,7 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { isObjectRecord } from "../core/json-types";
-import type { SandboxEntry } from "./registry";
+import type { SandboxEntry } from "./registry/types";
+import { normalizePendingSandboxCreateIdentity } from "./registry/pending-create-identity";
+
+export { normalizePendingSandboxCreateIdentity };
+
+const POLICY_SHADOW_FIELDS = [
+  "baselineExclusions",
+  "baselineExclusionTransition",
+  "customPolicies",
+  "policies",
+  "policyAuthority",
+  "policyCreationReceipt",
+  "pendingPolicyVerification",
+  "policyHash",
+  "policyPresetsFinalized",
+  "policyTier",
+  "policyVersion",
+  "observedPolicyAuthority",
+] as const;
+
+/** Remove legacy policy shadow state without interpreting or replaying it. */
+export function normalizeSandboxPolicyAttribution(entry: SandboxEntry): SandboxEntry {
+  const result = { ...entry } as SandboxEntry & Record<string, unknown>;
+  for (const field of POLICY_SHADOW_FIELDS) delete result[field];
+  if (result.pendingCreateIdentity !== undefined) {
+    result.pendingCreateIdentity = normalizePendingSandboxCreateIdentity(
+      result.pendingCreateIdentity,
+    );
+  }
+  return result;
+}
 
 export function parseSandboxRegistryEntries(value: unknown): Array<[string, SandboxEntry]> {
   const sandboxes = isObjectRecord(value) ? value : {};

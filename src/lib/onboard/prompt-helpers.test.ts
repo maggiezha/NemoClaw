@@ -3,7 +3,11 @@
 
 import { describe, expect, it, vi } from "vitest";
 // Import source directly so tests cannot pass against a stale build.
-import { promptOrDefault, selectFromNumberedMenuOrExit } from "./prompt-helpers";
+import {
+  promptOnboardConfigurationReview,
+  promptOrDefault,
+  selectFromNumberedMenuOrExit,
+} from "./prompt-helpers";
 
 function makeDeps(promptReply: string) {
   return {
@@ -30,6 +34,41 @@ describe("promptOrDefault interactive default fallback (#4387)", () => {
   });
 });
 
+describe("onboarding configuration review actions (#6005)", () => {
+  function createReviewDeps(...answers: string[]) {
+    return {
+      prompt: vi.fn(async () => answers.shift() ?? ""),
+      log: vi.fn(),
+    };
+  }
+
+  it.each([
+    ["", "apply"],
+    ["apply", "apply"],
+    ["2", "edit-inference"],
+    ["model", "edit-inference"],
+    ["3", "edit-sandbox"],
+    ["name", "edit-sandbox"],
+    ["4", "exit"],
+    ["quit", "exit"],
+  ] as const)("returns action %s as %s (#6005)", async (answer, expected) => {
+    await expect(promptOnboardConfigurationReview(createReviewDeps(answer))).resolves.toBe(
+      expected,
+    );
+  });
+
+  it("re-prompts after an unknown action", async () => {
+    const deps = createReviewDeps("unknown", "1");
+
+    await expect(promptOnboardConfigurationReview(deps)).resolves.toBe("apply");
+
+    expect(deps.prompt).toHaveBeenCalledTimes(2);
+    expect(deps.log).toHaveBeenCalledWith(
+      "  Choose Apply, Edit inference, Edit sandbox name, or Exit onboarding.",
+    );
+  });
+});
+
 describe("selectFromNumberedMenuOrExit (#4514)", () => {
   const options = [
     { key: "build", label: "NVIDIA Endpoints" },
@@ -49,25 +88,22 @@ describe("selectFromNumberedMenuOrExit (#4514)", () => {
     expect(selectFromNumberedMenuOrExit("99", 1, options)).toBe(options[0]);
   });
 
-  it.each([
-    "exit",
-    "EXIT",
-    "quit",
-    "Quit",
-    "  exit  ",
-  ])("cancels onboarding when the reply is %j", (reply) => {
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`process.exit(${code})`);
-    }) as never);
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    try {
-      expect(() => selectFromNumberedMenuOrExit(reply, 1, options)).toThrow("process.exit(1)");
-      expect(logSpy).toHaveBeenCalledWith("  Exiting onboarding.");
-    } finally {
-      exitSpy.mockRestore();
-      logSpy.mockRestore();
-    }
-  });
+  it.each(["exit", "EXIT", "quit", "Quit", "  exit  "])(
+    "cancels onboarding when the reply is %j",
+    (reply) => {
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        expect(() => selectFromNumberedMenuOrExit(reply, 1, options)).toThrow("process.exit(1)");
+        expect(logSpy).toHaveBeenCalledWith("  Exiting onboarding.");
+      } finally {
+        exitSpy.mockRestore();
+        logSpy.mockRestore();
+      }
+    },
+  );
 
   it("does not treat non-navigation words as exit", () => {
     expect(selectFromNumberedMenuOrExit("3", 1, options)).toBe(options[2]);

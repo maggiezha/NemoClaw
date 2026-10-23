@@ -71,8 +71,9 @@ describe("terminal step failure helper", () => {
     expect(loaded.machine.state).toBe("failed");
   });
 
-  it("simulates the onboard exit listener and ignores successful or complete exits", () => {
+  it("keeps the portable profile captured by the onboard exit listener (#8873)", () => {
     const listeners: Array<(code: number) => void> = [];
+    const errors: string[] = [];
     let complete = false;
     const processLike = {
       once: (event: "exit", listener: (code: number) => void) => {
@@ -82,13 +83,16 @@ describe("terminal step failure helper", () => {
     };
     session.saveSession(session.createSession({ lastStepStarted: "inference" }));
     // The incomplete exit also prints the #6003 resume hint; capture it.
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation((message = "") => errors.push(String(message)));
 
     registerIncompleteOnboardExitFailureHandler(
       session,
       () => complete,
       "Onboarding exited before the step completed.",
       processLike,
+      true,
     );
     listeners[0](0);
     expect(requireLoadedSession().status).toBe("in_progress");
@@ -100,6 +104,8 @@ describe("terminal step failure helper", () => {
     complete = false;
     listeners[0](1);
     errorSpy.mockRestore();
+    expect(errors.join("\n")).toContain("onboard --resume --name <sandbox>");
+    expect(errors.join("\n")).toContain("onboard --experimental-profile portable --fresh");
 
     const loaded = requireLoadedSession();
     expect(loaded.steps.inference.status).toBe("failed");
@@ -107,6 +113,43 @@ describe("terminal step failure helper", () => {
     expect(loaded.failure?.step).toBe("inference");
     expect(loaded.failure?.message).toBe("Onboarding exited before the step completed.");
     expect(loaded.machine.state).toBe("failed");
+  });
+
+  it("records the in-flight step as interrupted when the exit backstop fires (#7982)", () => {
+    session.saveSession(session.createSession({ lastStepStarted: "sandbox" }));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const listeners: Array<(code: number) => void> = [];
+      const processLike = {
+        once: (_event: "exit", listener: (code: number) => void) => {
+          listeners.push(listener);
+        },
+      };
+
+      registerIncompleteOnboardExitFailureHandler(
+        session,
+        () => false,
+        "Onboarding exited before the step completed.",
+        processLike,
+      );
+      listeners[0](1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    const loaded = requireLoadedSession();
+    expect(loaded.machine.state).toBe("failed");
+    expect(loaded.failure).toMatchObject({ step: "sandbox", interrupted: true });
+  });
+
+  it("records rebuild recreate cleanup as a failure without an onboard interrupt (#7982)", () => {
+    session.saveSession(session.createSession({ lastStepStarted: "sandbox" }));
+
+    markLastStartedStepFailed(session, "Rebuild recreate failed");
+
+    const loaded = requireLoadedSession();
+    expect(loaded.machine.state).toBe("failed");
+    expect(loaded.failure).toMatchObject({ step: "sandbox", interrupted: false });
   });
 
   it("marks rebuild recreate cleanup failures as terminal machine failures", () => {
@@ -179,7 +222,16 @@ describe("incomplete-onboard --resume backstop (#6003)", () => {
 
   it("prints the resume hint when a step was in progress at exit", () => {
     session.saveSession(session.createSession({ lastStepStarted: "inference" }));
-    expect(runExitHandler(1)).toContain("onboard --resume");
+    expect(runExitHandler(1)).toContain("onboard --resume --name <sandbox>");
+  });
+
+  it("keeps the short resume hint when the sandbox name was recorded", () => {
+    session.saveSession(
+      session.createSession({ lastStepStarted: "inference", sandboxName: "alpha" }),
+    );
+    const output = runExitHandler(1);
+    expect(output).toContain("onboard --resume");
+    expect(output).not.toContain("--name <sandbox>");
   });
 
   it("stays silent when no step had started", () => {
@@ -196,6 +248,29 @@ describe("incomplete-onboard --resume backstop (#6003)", () => {
     session.saveSession(session.createSession({ lastStepStarted: "sandbox" }));
     noteOnboardResumeHintShown();
     expect(runExitHandler(1)).not.toContain("--resume");
+  });
+
+  it("preserves recovery-only cancellation through the later exit backstop (#9833)", () => {
+    const fingerprint = "a".repeat(64);
+    session.saveSession(
+      session.createSession({ lastStepStarted: "sandbox", sandboxName: "retained-sb" }),
+    );
+    session.markCancellationRecovery("retained-sb", fingerprint, {
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      lifecycleGeneration: "generation-1",
+      createAttemptNonce: "c".repeat(62),
+    });
+    const beforeExit = requireLoadedSession();
+    expect(beforeExit.failure?.message).toContain(
+      "retained recovery blocks this sandbox name until destroy confirms absence",
+    );
+    expect(beforeExit.failure?.message).not.toContain("administrator");
+
+    const output = runExitHandler(1);
+
+    expect(output).not.toContain("--resume");
+    expect(requireLoadedSession()).toEqual(beforeExit);
   });
 
   it("stays silent when cancel cleanup clears the session before a signal is re-raised", async () => {
@@ -234,32 +309,76 @@ describe("incomplete-onboard --resume backstop (#6003)", () => {
     errorSpy.mockRestore();
   });
 
+  it("records signals as terminal after validation preservation is latched (#9732)", async () => {
+    const signalListeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+    const kill = vi.fn();
+    const processLike = {
+      once: vi.fn(),
+      on: (signal: "SIGINT" | "SIGTERM", listener: () => void) => {
+        signalListeners.set(signal, listener);
+      },
+      removeListener: (signal: "SIGINT" | "SIGTERM", listener: () => void) => {
+        expect(signalListeners.get(signal)).toBe(listener);
+        signalListeners.delete(signal);
+      },
+      kill,
+      pid: 4242,
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    session.saveSession(session.createSession({ lastStepStarted: "preflight" }));
+
+    try {
+      registerIncompleteOnboardExitFailureHandler(
+        session,
+        () => true,
+        "Onboarding exited before the step completed.",
+        processLike,
+      );
+      signalListeners.get("SIGTERM")?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const loaded = requireLoadedSession();
+      expect(loaded.status).toBe("failed");
+      expect(loaded.failure).toMatchObject({ step: "preflight", interrupted: true });
+      expect(loaded.machine.state).toBe("failed");
+      expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
-    "prints the resume hint before re-raising SIGINT in a real subprocess",
+    "releases the owned lock before re-raising SIGINT in a real subprocess",
     async () => {
       const childDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-resume-signal-"));
       const childScript = path.join(childDir, "signal-resume-hint.cjs");
       const helperPath = path.resolve("src/lib/onboard/exit-step-failure.ts");
+      const onboardSessionPath = path.resolve("src/lib/state/onboard-session.ts");
       fs.writeFileSync(
         childScript,
         `
 const { registerIncompleteOnboardExitFailureHandler } = require(${JSON.stringify(helperPath)});
+const onboardSession = require(${JSON.stringify(onboardSessionPath)});
+
+if (!onboardSession.acquireOnboardLock("signal cleanup test").acquired) process.exit(2);
 
 const resumableSession = { lastStepStarted: "inference" };
 registerIncompleteOnboardExitFailureHandler(
   {
     loadSession: () => resumableSession,
     finalizeIncompleteOnboardStep: () => resumableSession,
+    releaseOnboardLock: onboardSession.releaseOnboardLock,
   },
   () => false,
   "Onboarding exited before the step completed.",
 );
-process.stdout.write("ready\\n");
+process.stdout.write(JSON.stringify({ lockFile: onboardSession.LOCK_FILE }) + "\\n");
 setInterval(() => {}, 1_000);
 `,
       );
 
       const child = spawn(process.execPath, ["--require", "tsx/cjs", childScript], {
+        env: { ...process.env, HOME: childDir },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stderr = "";
@@ -270,13 +389,15 @@ setInterval(() => {}, 1_000);
 
       try {
         const [ready] = await once(child.stdout, "data");
-        expect(String(ready)).toContain("ready");
+        const { lockFile } = JSON.parse(String(ready)) as { lockFile: string };
+        expect(fs.existsSync(lockFile)).toBe(true);
         const exited = once(child, "exit");
         child.kill("SIGINT");
         const [code, signal] = await exited;
         expect(code).toBeNull();
         expect(signal).toBe("SIGINT");
         expect(stderr).toContain("onboard --resume");
+        expect(fs.existsSync(lockFile)).toBe(false);
       } finally {
         child.kill("SIGKILL");
         fs.rmSync(childDir, { recursive: true, force: true });

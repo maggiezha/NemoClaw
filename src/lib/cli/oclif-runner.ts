@@ -9,11 +9,13 @@ import {
 } from "@oclif/core";
 
 import { CLI_NAME } from "./branding";
+import { PUBLIC_HELP_SANDBOX_NAME_PROPERTY } from "./public-help";
 
 export interface OclifCommandRunOptions {
   rootDir: string;
   error?: (message?: string) => void;
   exit?: (code: number) => never;
+  publicSandboxName?: string;
 }
 
 function getOclifExitCode(error: unknown): number | null {
@@ -25,6 +27,14 @@ function getOclifExitCode(error: unknown): number | null {
   return typeof oclif?.exit === "number" ? oclif.exit : null;
 }
 
+function hasOclifParseErrorShape(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  if (typeof getOclifExitCode(error) !== "number") return false;
+  return (
+    Object.hasOwn(error, "parse") && typeof (error as { showHelp?: unknown }).showHelp === "boolean"
+  );
+}
+
 function isOclifParseError(error: unknown): boolean {
   const name =
     error && typeof error === "object"
@@ -32,6 +42,7 @@ function isOclifParseError(error: unknown): boolean {
       : "";
   const message = error instanceof Error ? error.message : "";
   return (
+    hasOclifParseErrorShape(error) ||
     name === "NonExistentFlagsError" ||
     name === "RequiredArgsError" ||
     name === "UnexpectedArgsError" ||
@@ -57,12 +68,13 @@ function formatOclifError(error: unknown): string {
   return String(error).trim();
 }
 
-function applyBrandedBin(config: OclifConfig): void {
+function applyBrandedBin(config: OclifConfig, publicSandboxName?: string): void {
   const pjson = {
     ...config.pjson,
     oclif: {
       ...config.pjson.oclif,
       bin: CLI_NAME,
+      [PUBLIC_HELP_SANDBOX_NAME_PROPERTY]: publicSandboxName,
     },
   };
   // config.runCommand() calls Command.run(), which reloads from the root
@@ -88,7 +100,7 @@ export async function runOclifCommandById(
   opts: OclifCommandRunOptions,
 ): Promise<void> {
   const config = await OclifConfig.load(opts.rootDir);
-  applyBrandedBin(config);
+  applyBrandedBin(config, opts.publicSandboxName);
   const errorLine = opts.error ?? console.error;
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const originalArgv = process.argv;
@@ -142,7 +154,7 @@ export async function runOclifCommandById(
 
 export async function runOclifArgv(args: string[], opts: OclifCommandRunOptions): Promise<void> {
   const config = await OclifConfig.load(opts.rootDir);
-  applyBrandedBin(config);
+  applyBrandedBin(config, opts.publicSandboxName);
   const errorLine = opts.error ?? console.error;
   const originalArgv = process.argv;
   // oclif's parse-error help renderer consults process.argv, not just the

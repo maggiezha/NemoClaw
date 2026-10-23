@@ -133,7 +133,7 @@ Anti-examples:
 
 Evidence:
 
-- The title includes `openclaw-tui-chat-correlation-e2e`.
+- The title includes `openclaw-inference-switch`.
 - The report is a nightly/e2e failure involving OpenClaw.
 
 Dry run:
@@ -194,6 +194,41 @@ Dry run:
     "platform: windows": "The title identifies Windows as the host platform.",
     "platform: arm64": "The title identifies Windows ARM.",
     "platform: wsl": "The body identifies WSL2 as part of the failing setup."
+  },
+  "questions_for_author": [],
+  "human_review_required": false
+}
+```
+
+### N1X Linux Install Failure
+
+Evidence:
+
+- The title identifies an N1x Linux Laptop and an OpenShell install failure.
+- Ubuntu and ARM64 appear only in the environment and are not independently routing-relevant.
+- The report contrasts the N1X failure with successful driver detection on DGX Spark.
+
+Dry run:
+
+```json
+{
+  "item_number": 8095,
+  "item_kind": "issue",
+  "issue_type_to_set": "Bug",
+  "labels_to_add": ["area: install", "platform: n1x"],
+  "labels_to_remove": [],
+  "labels_to_create": [],
+  "labels_to_delete": [],
+  "issue_fields_to_set": {},
+  "project_fields_to_set": {
+    "Status": "Backlog"
+  },
+  "recommended_action": "triage",
+  "confidence": "high",
+  "rationale": {
+    "issue_type_to_set": "The report describes broken install behavior.",
+    "area: install": "The failure occurs during OpenShell installation.",
+    "platform: n1x": "The report identifies N1X as the affected platform and contrasts its behavior with DGX Spark."
   },
   "questions_for_author": [],
   "human_review_required": false

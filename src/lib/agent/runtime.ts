@@ -11,17 +11,14 @@ import { DASHBOARD_PORT } from "../core/ports";
 import * as onboardSession from "../state/onboard-session";
 import * as registry from "../state/registry";
 import { type AgentDefinition, isTerminalAgent, listAgents, loadAgent } from "./defs";
-import { getTerminalCommand } from "./gateway-restart-scripts";
+import {
+  getInteractiveAgentCommand as getManifestInteractiveAgentCommand,
+  getTerminalCommand,
+} from "./gateway-restart-scripts";
 
 type RegisteredAgentSource = { agent?: string | null } | null | undefined;
 
-export {
-  type AgentRecoveryScript,
-  buildRecoveryScript,
-  getTerminalCommand,
-  isTerminalAgentRecoveryScript,
-  TERMINAL_AGENT_RECOVERY_SCRIPT,
-} from "./gateway-restart-scripts";
+export { getTerminalCommand } from "./gateway-restart-scripts";
 
 /**
  * Resolve the agent for a sandbox. Checks the per-sandbox registry first
@@ -44,6 +41,45 @@ export function getSessionAgent(sandboxName?: string): AgentDefinition | null {
   }
 }
 
+export type SessionAgentDefinitionResolution =
+  | { agent: AgentDefinition; requestedName: string; resolved: true }
+  | { agent: null; requestedName: string; resolved: false };
+
+/** Resolve a registry-recorded name against the trusted agent manifest inventory. */
+export function resolveRegisteredAgentDefinition(
+  source: RegisteredAgentSource,
+): AgentDefinition | null {
+  const name = source?.agent;
+  if (!name) return null;
+  try {
+    if (!listAgents().includes(name)) return null;
+    return loadAgent(name);
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve OpenClaw's legacy null without hiding an invalid registered agent. */
+export function resolveSessionAgentDefinition(
+  sandboxName: string | undefined,
+  agent: AgentDefinition | null,
+): SessionAgentDefinitionResolution {
+  if (agent) return { agent, requestedName: agent.name, resolved: true };
+  let requestedName = "openclaw";
+  try {
+    const registered = sandboxName ? registry.getSandbox(sandboxName) : null;
+    requestedName = registered
+      ? (registered.agent ?? "openclaw")
+      : onboardSession.loadSession()?.agent || "openclaw";
+    if (requestedName !== "openclaw") {
+      return { agent: null, requestedName, resolved: false };
+    }
+    return { agent: loadAgent("openclaw"), requestedName, resolved: true };
+  } catch {
+    return { agent: null, requestedName, resolved: false };
+  }
+}
+
 /**
  * Resolve only the canonical agent persisted on the supplied sandbox registry row.
  * Registry state is user-writable, so validate against the trusted manifest inventory
@@ -52,12 +88,52 @@ export function getSessionAgent(sandboxName?: string): AgentDefinition | null {
 export function getRegisteredAgent(source: RegisteredAgentSource): AgentDefinition | null {
   const name = source?.agent;
   if (!name || name === "openclaw") return null;
-  try {
-    if (!listAgents().includes(name)) return null;
-    return loadAgent(name);
-  } catch {
-    return null;
+  return resolveRegisteredAgentDefinition(source);
+}
+
+/**
+ * Resolve the agent persisted by the registry root that owns a sandbox.
+ * The selected onboarding session remains the fast path, but it cannot
+ * override a different agent recorded in a sibling gateway registry.
+ */
+export function resolveRegisteredSandboxAgent(
+  sandboxName: string,
+  selectedAgent: AgentDefinition | null,
+): AgentDefinition | null {
+  const sandbox =
+    registry.getSandboxAcrossGatewayRoots(sandboxName) ?? registry.getSandbox(sandboxName);
+  if (!sandbox) return selectedAgent;
+  const persistedAgent = sandbox.agent ?? "openclaw";
+  if (
+    selectedAgent?.name === persistedAgent ||
+    (selectedAgent === null && persistedAgent === "openclaw")
+  ) {
+    return selectedAgent;
   }
+  return getRegisteredAgent(sandbox);
+}
+
+/**
+ * Resolve the trusted manifest command used for an interactive agent handoff.
+ * OpenClaw remains `null` in getSessionAgent because its recovery behavior uses
+ * legacy defaults, but launch and connect hints still load its repository-owned
+ * manifest here. The historical OpenClaw fallback is used only when that
+ * manifest is genuinely unavailable.
+ */
+export function getInteractiveAgentCommand(
+  agent: AgentDefinition | null,
+  agentName: string | null | undefined,
+): string {
+  const name = agentName || agent?.name || "openclaw";
+  let trustedAgent = agent;
+  if (!trustedAgent) {
+    try {
+      if (listAgents().includes(name)) trustedAgent = loadAgent(name);
+    } catch {
+      trustedAgent = null;
+    }
+  }
+  return getManifestInteractiveAgentCommand(trustedAgent, name);
 }
 
 /**

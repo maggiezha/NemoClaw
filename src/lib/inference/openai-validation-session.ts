@@ -7,12 +7,23 @@ import {
   createValidationSession,
   type ValidationSessionOptions,
 } from "../adapters/http/validation-session";
+import { retryUntilAsync } from "../core/retry";
 import { addTraceEvent, withTraceSpan } from "../trace";
 import type { TrustedPrivateEndpointCapability } from "./endpoint-ssrf-preflight";
-import { resolveMaxTokensField } from "./max-tokens-field";
-import { isDeepSeekV4ProModel } from "./openai-probe-models";
+import {
+  getChatCompletionsToolProbePayload,
+  isDeepSeekV4ProModel,
+  isReasoningOnlyLengthResponse,
+  STRICT_TOOL_PROBE_INITIAL_TOKENS,
+  STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER,
+  strictToolProbeReasoningRetryMessage,
+} from "./openai-probe-models";
+import {
+  MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS,
+  STREAMING_EVENT_PROBE_MAX_SECONDS,
+} from "./probe-http-helpers";
+import { RETRIABLE_HTTP_PROBE_STATUSES } from "./probe/transient-http-policy";
 
-const RETRIABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 
 export interface OpenAiValidationOptions {
@@ -20,6 +31,9 @@ export interface OpenAiValidationOptions {
   extraHeaders?: readonly string[];
   requireResponsesToolCalling?: boolean;
   requireChatCompletionsToolCalling?: boolean;
+  retryChatCompletionsToolReadiness?: boolean;
+  useNvidiaEndpointProbePayload?: boolean;
+
   skipResponsesProbe?: boolean;
   probeStreaming?: boolean;
   isWsl?: boolean;
@@ -46,7 +60,7 @@ export interface OpenAiValidationSessionDeps {
   hasResponsesToolCall(body: string): boolean;
   hasChatCompletionsToolCall(body: string): boolean;
   hasChatCompletionsToolCallLeak(body: string): boolean;
-  getChatPayload(model: string): Record<string, unknown>;
+  getChatPayload(model: string, options: OpenAiValidationOptions): Record<string, unknown>;
   getResponsesTimeoutMs(options: OpenAiValidationOptions): number;
   getChatTimeoutMs(model: string, options: OpenAiValidationOptions): number;
   sessionOptions?: ValidationSessionOptions;
@@ -81,70 +95,61 @@ function responsesPayload(model: string, requireToolCall: boolean, stream = fals
   });
 }
 
-function chatToolPayload(model: string): string {
-  const maxTokensField = resolveMaxTokensField(model);
-  return JSON.stringify({
-    model,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a tool-calling assistant. When tools are available and the user asks for an action, call a tool.",
-      },
-      {
-        role: "user",
-        content:
-          "Send hello to the current session. Use the sessions_send tool and do not answer in plain text.",
-      },
-    ],
-    tools: [
-      {
-        type: "function",
-        function: {
-          name: "sessions_send",
-          description: "Send a message to the active chat session.",
-          parameters: {
-            type: "object",
-            properties: { message: { type: "string" } },
-            required: ["message"],
-            additionalProperties: false,
-          },
-        },
-      },
-      {
-        type: "function",
-        function: {
-          name: "memory_search",
-          description: "Search memory for relevant prior context.",
-          parameters: {
-            type: "object",
-            properties: { query: { type: "string" } },
-            required: ["query"],
-            additionalProperties: false,
-          },
-        },
-      },
-      {
-        type: "function",
-        function: {
-          name: "web_fetch",
-          description: "Fetch a URL and summarize the result.",
-          parameters: {
-            type: "object",
-            properties: { url: { type: "string" } },
-            required: ["url"],
-            additionalProperties: false,
-          },
-        },
-      },
-    ],
-    tool_choice: "required",
-    // GPT-5/o-series models reject custom sampling temperatures. Keep the
-    // deterministic setting for models that still use the legacy field.
-    ...(maxTokensField === "max_tokens" ? { temperature: 0 } : {}),
-    [maxTokensField]: 256,
-    stream: false,
-  });
+function chatToolPayload(model: string, maxTokens = STRICT_TOOL_PROBE_INITIAL_TOKENS): string {
+  return JSON.stringify(getChatCompletionsToolProbePayload(model, maxTokens));
+}
+
+function failedChatValidation(
+  result: CurlProbeResult,
+  failureMessage: string,
+  diagnosticCodes?: string[],
+): OpenAiValidationResult {
+  const failure = {
+    name: "Chat Completions API with tool calling",
+    httpStatus: result.httpStatus,
+    curlStatus: result.curlStatus,
+    message: failureMessage,
+    body: result.body,
+    ...(diagnosticCodes ? { diagnosticCodes } : {}),
+  };
+  return {
+    ok: false,
+    message: `${failure.name}: ${failure.message}`,
+    failures: [failure],
+  };
+}
+
+function failedChatToolCall(result: CurlProbeResult, leaked: boolean): OpenAiValidationResult {
+  const failureMessage = leaked
+    ? `HTTP ${result.httpStatus}: Chat Completions leaked tool calls into plain text content. ` +
+      "Use an endpoint/runtime that returns structured tool_calls (for Hermes on local inference, " +
+      "prefer vLLM with --tool-call-parser hermes)."
+    : `HTTP ${result.httpStatus}: Chat Completions did not return a tool call`;
+  return failedChatValidation(
+    result,
+    failureMessage,
+    leaked
+      ? ["openai-chat-tool-call-leak"]
+      : isReasoningOnlyLengthResponse(result.body)
+        ? ["openai-chat-missing-structured-tool-call", "openai-chat-reasoning-budget-exhausted"]
+        : ["openai-chat-missing-structured-tool-call"],
+  );
+}
+
+function failedChatValidationAfterReasoningRetry(): OpenAiValidationResult {
+  const failureMessage = "Chat Completions validation failed after the reasoning retry";
+  const failure = {
+    name: "Chat Completions API with tool calling",
+    httpStatus: 0,
+    curlStatus: 0,
+    message: failureMessage,
+    body: "",
+  };
+  return {
+    ok: false,
+    message: `${failure.name}: ${failure.message}`,
+    failures: [failure],
+  };
 }
 
 function requestAuth(
@@ -190,31 +195,33 @@ function safeErrorDetails(error: unknown): { error_code: string; error_message: 
 async function requestWithHttpRetry(
   name: string,
   request: () => Promise<CurlProbeResult>,
+  retryTransientHttp = true,
 ): Promise<CurlProbeResult> {
-  let result = await request();
-  let attempt = 1;
-  addTraceEvent("probe_result", {
-    attempt,
-    ok: result.ok,
-    http_status: result.httpStatus,
-    curl_status: result.curlStatus,
-  });
-  for (const delayMs of RETRY_DELAYS_MS) {
-    if (result.curlStatus !== 0 || !RETRIABLE_HTTP_STATUSES.has(result.httpStatus)) break;
-    console.log(
-      `  ${name} validation returned HTTP ${result.httpStatus}; retrying in ${Math.round(delayMs / 1000)}s...`,
-    );
-    await waitForRetry(delayMs);
-    attempt += 1;
-    result = await request();
-    addTraceEvent("probe_result", {
-      attempt,
-      ok: result.ok,
-      http_status: result.httpStatus,
-      curl_status: result.curlStatus,
-    });
-  }
-  return result;
+  return retryUntilAsync(
+    async (attempt) => {
+      const result = await request();
+      addTraceEvent("probe_result", {
+        attempt,
+        ok: result.ok,
+        http_status: result.httpStatus,
+        curl_status: result.curlStatus,
+      });
+      return result;
+    },
+    {
+      accept: (result) =>
+        !retryTransientHttp ||
+        result.curlStatus !== 0 ||
+        !RETRIABLE_HTTP_PROBE_STATUSES.has(result.httpStatus),
+      retryDelaysMs: RETRY_DELAYS_MS,
+      onRetry: (result, delayMs) => {
+        console.log(
+          `  ${name} validation returned HTTP ${result.httpStatus}; retrying in ${Math.round(delayMs / 1000)}s...`,
+        );
+      },
+      sleep: waitForRetry,
+    },
+  );
 }
 
 function shouldUseLegacyForModel(model: string): boolean {
@@ -243,8 +250,10 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
     return deps.legacyProbe(endpointUrl, model, apiKey, options);
   }
   // Custom-endpoint SSRF preflight pins approved addresses through curl's
-  // reviewed --resolve boundary. Keep that security path authoritative until
-  // native address pinning has equivalent end-to-end rebinding coverage.
+  // reviewed --resolve boundary. This #6661 migration fallback is bounded to
+  // the native-session rollout: remove it once the native transport can enforce
+  // the exact preflight address set and the caller-level rebinding test passes
+  // with legacyProbe unavailable.
   if (
     (options.pinnedAddresses && options.pinnedAddresses.length > 0) ||
     options.trustedPrivateCapability
@@ -260,11 +269,16 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
   if (!session) return deps.legacyProbe(endpointUrl, model, apiKey, options);
 
   const baseUrl = endpointUrl.replace(/\/+$/, "");
+  // Preserve curl diagnostics during the #6661 migration only. Remove this
+  // replay once native proxy, CA, streaming, and terminal-failure parity is
+  // complete and the public-helper migration tests pass without legacyProbe.
   const nativeFailureFallback = async (reason: string): Promise<OpenAiValidationResult> => {
     addTraceEvent("validation_transport_fallback", { reason });
     session.close();
     return deps.legacyProbe(endpointUrl, model, apiKey, options);
   };
+  let retriedReasoningTruncation = false;
+  let retriedToolReadiness = false;
 
   try {
     if (!options.skipResponsesProbe) {
@@ -290,7 +304,11 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
           const streamResult = await session.request({
             ...auth,
             body: responsesPayload(model, false, true),
-            timeoutMs: deps.getResponsesTimeoutMs(options),
+            // Cap the streaming probe deadline, mirroring the curl path. See #7792.
+            timeoutMs: Math.min(
+              deps.getResponsesTimeoutMs(options),
+              STREAMING_EVENT_PROBE_MAX_SECONDS * 1000,
+            ),
           });
           const events = streamingEventTypes(streamResult.body);
           if (streamResult.curlStatus !== 0 && streamResult.curlStatus !== 28) {
@@ -313,30 +331,102 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
     }
 
     const auth = requestAuth(`${baseUrl}/chat/completions`, apiKey, options);
-    const chatBody =
-      options.requireChatCompletionsToolCalling === true
-        ? chatToolPayload(model)
-        : JSON.stringify(deps.getChatPayload(model));
+    const requireToolCall = options.requireChatCompletionsToolCalling === true;
     const chat = await withTraceSpan(
       "nemoclaw.inference.validation_probe",
       { probe_name: "Chat Completions API", api: "openai-completions" },
-      () =>
-        requestWithHttpRetry("Chat Completions API", () =>
-          session.request({
-            ...auth,
-            body: chatBody,
-            timeoutMs: deps.getChatTimeoutMs(model, options),
-          }),
-        ),
+      async () => {
+        const requestChat = (
+          maxTokens = STRICT_TOOL_PROBE_INITIAL_TOKENS,
+          retryTransientHttp = true,
+          timeoutMultiplier = 1,
+        ) =>
+          requestWithHttpRetry(
+            "Chat Completions API",
+            () =>
+              session.request({
+                ...auth,
+                body: requireToolCall
+                  ? chatToolPayload(model, maxTokens)
+                  : JSON.stringify(deps.getChatPayload(model, options)),
+                timeoutMs: Math.min(
+                  deps.getChatTimeoutMs(model, options) * timeoutMultiplier,
+                  MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS * 1000,
+                ),
+              }),
+            retryTransientHttp,
+          );
+        const retryReasoningOnly = async (
+          candidate: CurlProbeResult,
+        ): Promise<CurlProbeResult | null> => {
+          if (!isReasoningOnlyLengthResponse(candidate.body)) return null;
+          let laddered = candidate;
+          let exhaustedTokens = STRICT_TOOL_PROBE_INITIAL_TOKENS;
+          for (const retryTokens of STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER) {
+            if (!laddered.ok || !isReasoningOnlyLengthResponse(laddered.body)) break;
+            retriedReasoningTruncation = true;
+            console.log(strictToolProbeReasoningRetryMessage(exhaustedTokens, retryTokens));
+            addTraceEvent("tool_call_reasoning_retry", {
+              initial_max_tokens: exhaustedTokens,
+              retry_max_tokens: retryTokens,
+            });
+            // The final rung generates up to 4096 tokens; give it the doubled
+            // deadline so a slow reasoning model does not time out instead of
+            // finishing the larger response.
+            laddered = await requestChat(
+              retryTokens,
+              false,
+              retryTokens === STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER.at(-1) ? 2 : 1,
+            );
+            exhaustedTokens = retryTokens;
+          }
+          return laddered;
+        };
+        let result = await requestChat();
+        if (!requireToolCall || !result.ok) return result;
+        const initialReasoningRetry = await retryReasoningOnly(result);
+        if (initialReasoningRetry) return initialReasoningRetry;
+        for (const delayMs of RETRY_DELAYS_MS) {
+          if (
+            options.retryChatCompletionsToolReadiness !== true ||
+            result.httpStatus !== 200 ||
+            deps.hasChatCompletionsToolCall(result.body) ||
+            deps.hasChatCompletionsToolCallLeak(result.body)
+          ) {
+            break;
+          }
+          retriedToolReadiness = true;
+          console.log(
+            `  Chat Completions API validation did not return a structured tool call; retrying in ${Math.round(delayMs / 1000)}s...`,
+          );
+          addTraceEvent("tool_call_readiness_retry", { delay_ms: delayMs });
+          await waitForRetry(delayMs);
+          result = await requestChat(STRICT_TOOL_PROBE_INITIAL_TOKENS, false);
+          if (!result.ok) break;
+          const reasoningRetry = await retryReasoningOnly(result);
+          if (reasoningRetry) return reasoningRetry;
+        }
+        return result;
+      },
     );
-    if (chat.curlStatus !== 0) return nativeFailureFallback("native_chat_failure");
-    if (!chat.ok) return nativeFailureFallback("native_terminal_http_failure");
-    if (options.requireChatCompletionsToolCalling === true) {
+    if (chat.curlStatus !== 0) {
+      return retriedReasoningTruncation
+        ? failedChatValidation(chat, chat.message)
+        : nativeFailureFallback("native_chat_failure");
+    }
+    if (!chat.ok) {
+      return retriedReasoningTruncation
+        ? failedChatValidation(chat, chat.message)
+        : nativeFailureFallback("native_terminal_http_failure");
+    }
+    if (requireToolCall) {
       if (!deps.hasChatCompletionsToolCall(chat.body)) {
+        const leaked = deps.hasChatCompletionsToolCallLeak(chat.body);
+        if (retriedReasoningTruncation || retriedToolReadiness) {
+          return failedChatToolCall(chat, leaked);
+        }
         return nativeFailureFallback(
-          deps.hasChatCompletionsToolCallLeak(chat.body)
-            ? "native_chat_tool_call_leak"
-            : "native_chat_tool_call_missing",
+          leaked ? "native_chat_tool_call_leak" : "native_chat_tool_call_missing",
         );
       }
     }
@@ -346,7 +436,9 @@ export async function probeOpenAiLikeEndpointWithValidationSession(
       reason: "native_unexpected_failure",
       ...safeErrorDetails(error),
     });
-    return nativeFailureFallback("native_unexpected_failure");
+    return retriedReasoningTruncation
+      ? failedChatValidationAfterReasoningRetry()
+      : nativeFailureFallback("native_unexpected_failure");
   } finally {
     session.close();
   }

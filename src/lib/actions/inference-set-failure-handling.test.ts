@@ -1,11 +1,53 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { InferenceSetError, runInferenceSet } from "./inference-set";
-import { createDeps } from "./inference-set.test-support";
+import { createDeps } from "../../../test/helpers/inference-set";
 
 describe("runInferenceSet failure handling", () => {
+  it("fails before OpenShell or config mutation for an unknown durable runtime provider", async () => {
+    const deps = createDeps({
+      config: {},
+      entry: { name: "alpha", agent: "openclaw", openshellDriver: "unknown-runtime" },
+    });
+
+    await expect(
+      runInferenceSet({ provider: "nvidia-prod", model: "nvidia/model-a", noVerify: true }, deps),
+    ).rejects.toThrow(/unknown-runtime.*not registered/u);
+    expect(deps.calls.prepareRunOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+  });
+
+  it("rechecks live runtime authority inside the sandbox mutation lock", async () => {
+    const initial = { name: "alpha", agent: "openclaw", openshellDriver: "docker" } as const;
+    const changed = {
+      name: "alpha",
+      agent: "openclaw",
+      openshellDriver: "unknown-runtime",
+    } as const;
+    const deps = createDeps({ config: {}, entry: initial });
+    deps.getSandbox = vi.fn().mockReturnValueOnce(initial).mockReturnValue(changed);
+
+    await expect(
+      runInferenceSet(
+        {
+          provider: "nvidia-prod",
+          model: "nvidia/model-a",
+          sandboxName: "alpha",
+        },
+        deps,
+      ),
+    ).rejects.toThrow(/unknown-runtime.*not registered/u);
+
+    expect(deps.calls.prepareRunOpenshell).toHaveBeenCalledOnce();
+    expect(deps.calls.withGatewayRouteMutationLock).not.toHaveBeenCalled();
+    expect(deps.calls.captureOpenshell).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
   it("resolves the OpenShell runner before entering the async mutation lock", async () => {
     const deps = createDeps({
       config: { agents: { defaults: { model: { primary: "inference/nvidia/model-a" } } } },
@@ -55,14 +97,125 @@ describe("runInferenceSet failure handling", () => {
     const deps = createDeps({ config: {}, openshellStatus: 17 });
 
     await expect(
-      runInferenceSet({ provider: "nvidia-prod", model: "nvidia/model-a" }, deps),
-    ).rejects.toThrow(/OpenShell inference route update failed/);
+      runInferenceSet({ provider: "nvidia-router", model: "openai/model-a" }, deps),
+    ).rejects.toThrow(/OpenShell inference route update with verification failed/);
 
     expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
     expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
   });
 
+  it("gives same-gateway recovery guidance for an ambiguous production mutation", async () => {
+    const deps = createDeps({ config: {}, openshellStatus: 17 });
+
+    await expect(
+      runInferenceSet({ provider: "nvidia-router", model: "openai/model-a" }, deps),
+    ).rejects.toThrow(
+      /route state is unknown.*Inspect gateway 'nemoclaw', then rerun the same `nemoclaw inference set` command\./su,
+    );
+
+    expect(deps.calls.captureOpenshell).toHaveBeenCalledOnce();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it("stops before provider, route, config, or registry effects when pre-mutation observation fails", async () => {
+    const setInferenceRoute = vi.fn();
+    const createProvider = vi.fn();
+    const base = createDeps({
+      config: {},
+      entries: [
+        { name: "alpha", agent: "openclaw", provider: "nvidia-router", model: "old-model" },
+      ],
+      inferenceRouteMutator: { setInferenceRoute },
+      inferenceRouteObserver: {
+        observeInferenceRoute: vi.fn(async () => ({
+          ok: false as const,
+          error: {
+            kind: "transport" as const,
+            reason: "unreachable" as const,
+            message: "gateway unavailable",
+          },
+        })),
+      },
+    });
+    const deps = {
+      ...base,
+      providerAdapter: { ...base.providerAdapter, createProvider },
+    };
+
+    await expect(
+      runInferenceSet({ provider: "nvidia-router", model: "new-model" }, deps),
+    ).rejects.toThrow(/Cannot reconcile.*gateway 'nemoclaw'.*gateway unavailable/su);
+
+    expect(createProvider).not.toHaveBeenCalled();
+    expect(setInferenceRoute).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.setOpenClawConfigValues).not.toHaveBeenCalled();
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+  });
+
+  it("observes the same named gateway before a retry can write after an ambiguous mutation", async () => {
+    const events: string[] = [];
+    const observeInferenceRoute = vi.fn(async (request) => {
+      events.push(
+        `observe:${request.target.kind === "named" ? request.target.gatewayName : "selected"}`,
+      );
+      return {
+        ok: true as const,
+        value: {
+          state: "configured" as const,
+          route: { provider: "nvidia-router", model: "old-model" },
+        },
+      };
+    });
+    const setInferenceRoute = vi
+      .fn()
+      .mockImplementationOnce(async (request) => {
+        events.push(`write:${request.target.gatewayName}`);
+        return {
+          ok: false as const,
+          ambiguous: true,
+          error: {
+            kind: "schema" as const,
+            message: "gateway schema mismatch",
+          },
+        };
+      })
+      .mockImplementationOnce(async (request) => {
+        events.push(`write:${request.target.gatewayName}`);
+        return { ok: true as const };
+      });
+    const deps = createDeps({
+      config: {},
+      entries: [
+        { name: "alpha", agent: "openclaw", provider: "nvidia-router", model: "old-model" },
+      ],
+      inferenceRouteObserver: { observeInferenceRoute },
+      inferenceRouteMutator: { setInferenceRoute },
+    });
+
+    await expect(
+      runInferenceSet({ provider: "nvidia-router", model: "new-model" }, deps),
+    ).rejects.toThrow(
+      /gateway schema mismatch.*Inspect gateway 'nemoclaw', then rerun the same `nemoclaw inference set` command\./su,
+    );
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+
+    await expect(
+      runInferenceSet({ provider: "nvidia-router", model: "new-model" }, deps),
+    ).resolves.toMatchObject({ provider: "nvidia-router", model: "new-model" });
+
+    expect(events).toEqual([
+      "observe:nemoclaw",
+      "write:nemoclaw",
+      "observe:nemoclaw",
+      "write:nemoclaw",
+    ]);
+  });
+
   it("keeps ENOBUFS failures bounded and redacted without writing sandbox state (#5924)", async () => {
+    const username = "overflow-user-secret";
     const password = "overflow-password-secret";
     const querySecret = "overflow-query-secret";
     const deps = createDeps({
@@ -76,7 +229,7 @@ describe("runInferenceSet failure handling", () => {
         status: null,
         output: "",
         stdout: "",
-        stderr: `error: provider 'openai-api' not found at https://user:${password}@gateway.example.test/v1?token=${querySecret} ${"x".repeat(3_000)}`,
+        stderr: `error: provider 'nvidia-router' not found at https://${username}:${password}@gateway.example.test/v1?token=${querySecret} ${"x".repeat(3_000)}`,
         error: Object.assign(new Error("spawnSync openshell ENOBUFS"), { code: "ENOBUFS" }),
         signal: "SIGTERM",
       })
@@ -88,7 +241,7 @@ describe("runInferenceSet failure handling", () => {
       });
 
     const err = await runInferenceSet(
-      { provider: "openai-api", model: "openai/gpt-5.4-mini" },
+      { provider: "nvidia-router", model: "openai/gpt-5.4-mini" },
       deps,
     ).catch((error: Error) => error);
 
@@ -97,57 +250,64 @@ describe("runInferenceSet failure handling", () => {
     const message = (err as Error).message;
     const detail = message.match(/^OpenShell detail: (.*)$/mu)?.[1];
     expect(detail).toHaveLength(2_000);
-    expect(message).not.toContain(password);
+    expect(message).not.toContain(username.slice(0, 4));
+    expect(message).not.toContain(password.slice(0, 4));
     expect(message).not.toContain(querySecret);
-    expect(message).toContain("Registered providers: nvidia-prod");
-    expect(message).toContain("Tip: register a new provider with `nemoclaw onboard`");
+    expect(message).not.toContain("Registered providers:");
+    expect(message).not.toContain("Tip: register a new provider");
     expect(deps.calls.captureOpenshell).toHaveBeenNthCalledWith(1, expect.any(Array), {
       ignoreError: true,
       includeStreams: true,
-      maxBuffer: 64 * 1024,
+      includeStderr: true,
+      maxBuffer: 1024 * 1024,
+      timeout: expect.any(Number),
     });
     expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
     expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
   });
 
-  it("uses gateway providers instead of stale sandbox providers for the diagnostic (#5924)", async () => {
-    const deps = createDeps({
+  it("uses the route gateway instead of stale sandbox providers for the diagnostic (#5924)", async () => {
+    const baseDeps = createDeps({
       config: {},
       entries: [
         { name: "alpha", agent: "openclaw", provider: "stale-local", model: "stale-model" },
       ],
       openshellStatus: 1,
     });
-    deps.calls.captureOpenshell
-      .mockReturnValueOnce({
-        status: 1,
-        output: "",
-        stdout: "",
-        stderr: "error: provider 'openai-api' not found in gateway",
-      })
-      .mockReturnValueOnce({
-        status: 0,
-        output: "alpha-telegram-bridge\nnvidia-prod",
-        stdout: "alpha-telegram-bridge\nnvidia-prod\n",
-        stderr: "",
-      });
+    const listProviders = vi.fn().mockResolvedValue({
+      ok: true,
+      value: { names: ["alpha-telegram-bridge", "nvidia-prod"] },
+    });
+    const deps = {
+      ...baseDeps,
+      providerAdapter: { ...baseDeps.providerAdapter, listProviders },
+    };
+    deps.calls.captureOpenshell.mockReturnValueOnce({
+      status: 1,
+      output: "",
+      stdout: "",
+      stderr: "error: provider 'nvidia-router' not found in gateway",
+    });
 
     const err = await runInferenceSet(
-      { provider: "openai-api", model: "openai/gpt-5.4-mini" },
+      { provider: "nvidia-router", model: "openai/gpt-5.4-mini" },
       deps,
     ).catch((e: Error) => e);
 
     expect(err).toBeInstanceOf(Error);
     const message = (err as Error).message;
-    expect(message).toMatch(/provider 'openai-api' not found/);
+    expect(message).toMatch(/provider 'nvidia-router' not found/);
     expect(message).toMatch(/Registered providers: nvidia-prod/);
     expect(message).not.toMatch(/stale-local|telegram-bridge/);
     expect(message).toMatch(/Tip: register a new provider with `nemoclaw onboard`/);
-    expect(deps.calls.captureOpenshell).toHaveBeenNthCalledWith(
-      2,
-      ["provider", "list", "--names"],
-      { ignoreError: true, maxBuffer: 64 * 1024, timeout: 5_000 },
-    );
+    expect(listProviders).toHaveBeenCalledExactlyOnceWith({
+      target: {
+        kind: "named",
+        gatewayName: "nemoclaw",
+      },
+      timeoutMs: 5_000,
+    });
+    expect(deps.calls.captureOpenshell).toHaveBeenCalledOnce();
     expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
     expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
   });
@@ -161,13 +321,15 @@ describe("runInferenceSet failure handling", () => {
     });
 
     const err = await runInferenceSet(
-      { provider: "nvidia-prod", model: "nvidia/model-a" },
+      { provider: "nvidia-router", model: "openai/model-a" },
       deps,
     ).catch((e: Error) => e);
 
     expect(err).toBeInstanceOf(Error);
     const message = (err as Error).message;
-    expect(message).toMatch(/OpenShell inference route update failed with exit 42/);
+    expect(message).toMatch(
+      /OpenShell inference route update with verification failed with exit 42/,
+    );
     expect(message).toMatch(/network timeout connecting to gateway/);
     expect(message).not.toContain("nvapi-secret-value");
     expect(message).not.toMatch(/Registered providers/);
@@ -184,8 +346,8 @@ describe("runInferenceSet failure handling", () => {
     deps.calls.captureOpenshell
       .mockReturnValueOnce({
         status: 1,
-        output: "error: provider 'openai-api' not found in gateway",
-        stdout: "error: provider 'openai-api' not found in gateway",
+        output: "error: provider 'nvidia-router' not found in gateway",
+        stdout: "error: provider 'nvidia-router' not found in gateway",
         stderr: "",
       })
       .mockReturnValueOnce({
@@ -196,7 +358,7 @@ describe("runInferenceSet failure handling", () => {
       });
 
     const err = await runInferenceSet(
-      { provider: "openai-api", model: "openai/gpt-5.4-mini" },
+      { provider: "nvidia-router", model: "openai/gpt-5.4-mini" },
       deps,
     ).catch((e: Error) => e);
 
@@ -214,14 +376,14 @@ describe("runInferenceSet failure handling", () => {
         status: 1,
         output: "",
         stdout: "",
-        stderr: "error: provider 'openai-api' not found in gateway",
+        stderr: "error: provider 'nvidia-router' not found in gateway",
       })
       .mockImplementationOnce(() => {
         throw new Error(`gateway provider query failed token=${querySecret}`);
       });
 
     const err = await runInferenceSet(
-      { provider: "openai-api", model: "openai/gpt-5.4-mini" },
+      { provider: "nvidia-router", model: "openai/gpt-5.4-mini" },
       deps,
     ).catch((e: Error) => e);
 
@@ -244,7 +406,7 @@ describe("runInferenceSet failure handling", () => {
         status: 1,
         output: "",
         stdout: "",
-        stderr: "error: provider 'openai-api' not found in gateway",
+        stderr: "error: provider 'nvidia-router' not found in gateway",
       })
       .mockReturnValueOnce({
         status: null,
@@ -256,7 +418,7 @@ describe("runInferenceSet failure handling", () => {
       });
 
     const err = await runInferenceSet(
-      { provider: "openai-api", model: "openai/gpt-5.4-mini" },
+      { provider: "nvidia-router", model: "openai/gpt-5.4-mini" },
       deps,
     ).catch((error: Error) => error);
 

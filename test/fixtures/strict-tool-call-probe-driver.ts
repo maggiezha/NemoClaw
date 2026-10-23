@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Process-level driver for the Local Ollama strict Chat Completions
-// tool-call probe. Loaded by test/strict-tool-call-probe.test.ts via
+// tool-call probe. Loaded by test/security/strict-tool-call-probe.test.ts via
 // `node --import tsx <driver>`; not picked up by Vitest's discovery (lives under
 // test/fixtures/, which is excluded from the test glob).
 //
@@ -28,7 +28,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-process.env.NEMOCLAW_TEST_NO_SLEEP = "1";
 process.env.NO_PROXY = [process.env.NO_PROXY, "127.0.0.1", "localhost"].filter(Boolean).join(",");
 process.env.no_proxy = [process.env.no_proxy, "127.0.0.1", "localhost"].filter(Boolean).join(",");
 
@@ -38,6 +37,9 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const requireFromHere = createRequire(import.meta.url);
 const { createInferenceSelectionValidationHelpers } = requireFromHere(
   path.join(REPO_ROOT, "src", "lib", "onboard", "inference-selection-validation.ts"),
+);
+const { MIN_OLLAMA_VERSION } = requireFromHere(
+  path.join(REPO_ROOT, "src", "lib", "inference", "ollama-version.ts"),
 );
 const localInference = requireFromHere(path.join(REPO_ROOT, "src", "lib", "inference", "local.ts"));
 
@@ -122,8 +124,32 @@ function plainTextResponse() {
   return { choices: [{ message: { role: "assistant", content: "OK" } }] };
 }
 
-function responseForChatRequest() {
+function reasoningOnlyLengthResponse() {
+  return {
+    choices: [
+      {
+        finish_reason: "length",
+        message: {
+          role: "assistant",
+          content: "",
+          reasoning_content: "Planning the tool call.",
+          tool_calls: null,
+        },
+      },
+    ],
+  };
+}
+
+function responseForChatRequest(requestBody) {
   if (mode === "success") return { status: 200, body: toolCallResponse() };
+  if (mode === "reasoning-length") {
+    const maxTokens = requestBody && typeof requestBody.max_tokens === "number"
+      ? requestBody.max_tokens
+      : 0;
+    return maxTokens >= 4096
+      ? { status: 200, body: toolCallResponse() }
+      : { status: 200, body: reasoningOnlyLengthResponse() };
+  }
   if (mode === "transient-502") {
     return chatCount === 1
       ? { status: 502, body: { error: { message: "transient upstream failure" } } }
@@ -155,7 +181,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     chatCount += 1;
-    const response = responseForChatRequest();
+    const response = responseForChatRequest(parsedBody);
     res.writeHead(response.status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(response.body));
   });
@@ -241,7 +267,6 @@ const assert = require("node:assert/strict");
 process.env.NEMOCLAW_NON_INTERACTIVE = "1";
 process.env.NEMOCLAW_PROVIDER = "ollama";
 process.env.NEMOCLAW_MODEL = "mock-tool-model";
-process.env.NEMOCLAW_TEST_NO_SLEEP = "1";
 
 const runner = require("./src/lib/runner.ts");
 runner.run = () => ({ status: 0 });
@@ -249,6 +274,9 @@ runner.runShell = () => ({ status: 0 });
 runner.runCapture = (command) => {
   const cmd = Array.isArray(command) ? command.join(" ") : String(command);
   if (cmd.includes("command -v") && cmd.includes("ollama")) return "";
+  if (cmd.includes("/api/version")) {
+    return JSON.stringify({ version: "${MIN_OLLAMA_VERSION}" });
+  }
   if (cmd.includes("/api/tags")) {
     return JSON.stringify({ models: [{ name: "mock-tool-model" }] });
   }
@@ -270,7 +298,7 @@ runner.runCaptureEx = (command) => {
 };
 
 require("./src/lib/onboard/ollama-systemd.ts").ensureOllamaLoopbackSystemdOverride = () => "ready";
-require("./src/lib/onboard/local-inference-topology.ts").shouldFrontOllamaWithProxy = () => false;
+require("./src/lib/inference/local.ts").shouldFrontOllamaWithProxy = () => false;
 
 const credentials = require("./src/lib/credentials/store.ts");
 credentials.prompt = async (message) => {
@@ -361,15 +389,36 @@ function assertChatCompletionRequests(requests, expectedCount) {
     console.log("[PASS] strict validation retries a transient 502 and keeps bounded payloads");
   });
 
+  await withMockEndpoint("reasoning-length", async (endpoint, readRequests) => {
+    const result = await validate(endpoint);
+    assert.deepEqual(result, { ok: true, api: "openai-completions" });
+    const requests = readRequests();
+    assert.equal(requests.length, 4);
+    assertCalibrationRequest(requests[0]);
+    const chatRequests = requests.filter((request) => request.url === "/v1/chat/completions");
+    assert.deepEqual(
+      chatRequests.map((request) => request.body.max_tokens),
+      [256, 1024, 4096],
+    );
+    for (const request of chatRequests) {
+      assert.equal(request.body.tool_choice, "required");
+    }
+    console.log(
+      "[PASS] strict validation escalates the reasoning-only budget ladder to 4096 tokens",
+    );
+  });
+
   await withMockEndpoint("plain-text", async (endpoint, readRequests) => {
     const recoveryCalls = [];
     const result = await validate(endpoint, recoveryCalls);
     assert.deepEqual(result, { ok: false, retry: "retry" });
     const requests = readRequests();
-    assert.equal(requests.length, 2);
-    assertChatCompletionRequests(requests, 1);
+    assert.equal(requests.length, 5);
+    assertChatCompletionRequests(requests, 4);
     assert.equal(recoveryCalls.length, 1);
-    console.log("[PASS] strict validation fails closed when no structured tool_call is returned");
+    console.log(
+      "[PASS] strict validation retries three times and stops after four responses omit structured tool calls",
+    );
   });
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);

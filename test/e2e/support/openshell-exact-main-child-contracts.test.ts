@@ -18,7 +18,10 @@ import {
 } from "../live/openshell-exact-main-exec.ts";
 
 const SANDBOX_NAME = "e2e-mcp-dcode";
+const SANDBOX_ID = "sandbox-uuid-1";
+const SANDBOX_WORKSPACE = "default";
 const CONTAINER_ID = "a".repeat(64);
+const CONTAINER_NAME = `openshell-${SANDBOX_WORKSPACE}--${SANDBOX_NAME}-${SANDBOX_ID}`;
 const EMPTY_ARTIFACTS = { result: "", stderr: "", stdout: "" };
 
 function probeResult(stdout: string, exitCode = 0, stderr = ""): ShellProbeResult {
@@ -31,6 +34,21 @@ function probeResult(stdout: string, exitCode = 0, stderr = ""): ShellProbeResul
     stdout,
     timedOut: false,
   };
+}
+
+function containerRow(
+  overrides: { containerId?: string; name?: string; sandboxId?: string; workspace?: string } = {},
+): string {
+  return [
+    overrides.containerId ?? CONTAINER_ID,
+    overrides.name ?? CONTAINER_NAME,
+    overrides.sandboxId ?? SANDBOX_ID,
+    overrides.workspace ?? SANDBOX_WORKSPACE,
+  ].join("\t");
+}
+
+function containerDiscovery(overrides: Parameters<typeof containerRow>[0] = {}): ShellProbeResult {
+  return probeResult(`${containerRow(overrides)}\n`);
 }
 
 function childReport(
@@ -49,15 +67,16 @@ function fakeHost() {
     host: {
       command,
       nemoclaw,
-      openshellCommandPath: "/reviewed/openshell",
+      commandPath: "/reviewed/nemoclaw",
     } as unknown as HostCliClient,
     nemoclaw,
   };
 }
 
 describe("OpenShell exact-main child contracts", () => {
-  it("keeps every embedded child probe syntactically executable", () => {
-    for (const source of [ENTRYPOINT_CHILD_PROBE, EXEC_CHILD_PROBE]) {
+  it.each([ENTRYPOINT_CHILD_PROBE, EXEC_CHILD_PROBE])(
+    "keeps every embedded child probe syntactically executable [case %#]",
+    (source) => {
       const compiled = spawnSync(
         "python3",
         ["-c", "import sys; compile(sys.argv[1], '<exact-main-child-proof>', 'exec')", source],
@@ -65,13 +84,14 @@ describe("OpenShell exact-main child contracts", () => {
       );
       expect(compiled.status, compiled.stderr).toBe(0);
       expect(source).not.toContain("value.strip().split()[0]");
-    }
-    const parsed = spawnSync("bash", ["-n"], {
-      encoding: "utf8",
-      input: CONNECT_CHILD_PROBE,
-    });
-    expect(parsed.status, parsed.stderr).toBe(0);
-  });
+
+      const parsed = spawnSync("bash", ["-n"], {
+        encoding: "utf8",
+        input: CONNECT_CHILD_PROBE,
+      });
+      expect(parsed.status, parsed.stderr).toBe(0);
+    },
+  );
 
   it("parses proc status entries with an empty value", () => {
     const directory = mkdtempSync(path.join(tmpdir(), "nemoclaw-proc-status-"));
@@ -95,10 +115,10 @@ describe("OpenShell exact-main child contracts", () => {
     }
   });
 
-  it("proves entrypoint, exec, and forced-TTY connect children independently", async () => {
+  it("proves entrypoint, exec, and NemoClaw connect children", async () => {
     const { command, host, nemoclaw } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}-reviewed\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint"))
       .mockResolvedValueOnce(
         probeResult("NEMOCLAW_EXACT_MAIN_CONNECT_CHILD_OK CapBnd=0000000000000000\r\n"),
@@ -117,7 +137,7 @@ describe("OpenShell exact-main child contracts", () => {
       "--filter",
       `label=openshell.ai/sandbox-name=${SANDBOX_NAME}`,
       "--format",
-      "{{.ID}}\t{{.Names}}",
+      '{{.ID}}\t{{.Names}}\t{{.Label "openshell.ai/sandbox-id"}}\t{{.Label "openshell.ai/sandbox-workspace"}}',
     ]);
     expect(command.mock.calls[1]?.[1]).toEqual(
       expect.arrayContaining(["exec", "--user", "0", CONTAINER_ID, "python3", "-c"]),
@@ -128,10 +148,10 @@ describe("OpenShell exact-main child contracts", () => {
     expect(command.mock.calls[2]?.[0]).toBe("bash");
     expect(command.mock.calls[2]?.[1]).toEqual([
       "-lc",
-      'printf \'%s\\n\' "$1" | "$2" sandbox connect "$3"',
+      'printf \'%s\\n\' "$1" | "$2" "$3" connect',
       "exact-main-connect-child",
       CONNECT_CHILD_PROBE,
-      "/reviewed/openshell",
+      "/reviewed/nemoclaw",
       SANDBOX_NAME,
     ]);
     expect(CONNECT_CHILD_PROBE).toContain('"/proc/$$/status"');
@@ -141,7 +161,7 @@ describe("OpenShell exact-main child contracts", () => {
   it("rejects a successful-looking entrypoint report with any bounding capability", async () => {
     const { command, host } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint", "0000000000000001"));
 
     await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
@@ -152,7 +172,7 @@ describe("OpenShell exact-main child contracts", () => {
   it("rejects a successful-looking entrypoint report naming supervisor TLS identity", async () => {
     const { command, host } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint", "0000000000000000", ["OPENSHELL_TLS_KEY"]));
 
     await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
@@ -171,7 +191,7 @@ describe("OpenShell exact-main child contracts", () => {
   ])("rejects an exec report exposing %s", async (_case, capBnd, tlsNames, message) => {
     const { command, host, nemoclaw } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint"));
     nemoclaw.mockResolvedValueOnce(childReport("exec", capBnd, tlsNames as string[]));
 
@@ -180,7 +200,9 @@ describe("OpenShell exact-main child contracts", () => {
 
   it("rejects a mislabeled container before inspecting any process", async () => {
     const { command, host } = fakeHost();
-    command.mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-unrelated-sandbox\n`));
+    command.mockResolvedValueOnce(
+      containerDiscovery({ name: "openshell-default--unrelated-sandbox-sandbox-uuid-1" }),
+    );
 
     await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
       "unexpected OpenShell Docker container identity",
@@ -188,10 +210,61 @@ describe("OpenShell exact-main child contracts", () => {
     expect(command).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects a container qualified by a non-default workspace", async () => {
+    const { command, host } = fakeHost();
+    command.mockResolvedValueOnce(
+      containerDiscovery({
+        name: `openshell-review--${SANDBOX_NAME}-${SANDBOX_ID}`,
+        workspace: "review",
+      }),
+    );
+
+    await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
+      "unexpected OpenShell Docker container identity",
+    );
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a container whose name does not carry its exact sandbox-id label", async () => {
+    const { command, host } = fakeHost();
+    command.mockResolvedValueOnce(
+      containerDiscovery({
+        name: `openshell-default--${SANDBOX_NAME}-different-sandbox-id`,
+      }),
+    );
+
+    await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
+      "unexpected OpenShell Docker container identity",
+    );
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an abbreviated mutable Docker container ID", async () => {
+    const { command, host } = fakeHost();
+    command.mockResolvedValueOnce(containerDiscovery({ containerId: "a".repeat(12) }));
+
+    await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
+      "unexpected OpenShell Docker container identity",
+    );
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects multiple label-matching containers before inspecting a process", async () => {
+    const { command, host } = fakeHost();
+    command.mockResolvedValueOnce(
+      probeResult(`${containerRow()}\n${containerRow({ containerId: "b".repeat(64) })}\n`),
+    );
+
+    await expect(assertExactMainChildProcessContracts(host, SANDBOX_NAME)).rejects.toThrow(
+      "expected exactly one running Docker container",
+    );
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects connect success without one executed zero-bound marker", async () => {
     const { command, host, nemoclaw } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint"))
       .mockResolvedValueOnce(probeResult("remote shell closed without proof\n"));
     nemoclaw.mockResolvedValueOnce(childReport("exec"));
@@ -204,7 +277,7 @@ describe("OpenShell exact-main child contracts", () => {
   it("rejects a connect marker reporting any bounding capability", async () => {
     const { command, host, nemoclaw } = fakeHost();
     command
-      .mockResolvedValueOnce(probeResult(`${CONTAINER_ID}\topenshell-${SANDBOX_NAME}\n`))
+      .mockResolvedValueOnce(containerDiscovery())
       .mockResolvedValueOnce(childReport("entrypoint"))
       .mockResolvedValueOnce(probeResult("NEMOCLAW_EXACT_MAIN_CONNECT_CHILD_OK CapBnd=1\n"));
     nemoclaw.mockResolvedValueOnce(childReport("exec"));

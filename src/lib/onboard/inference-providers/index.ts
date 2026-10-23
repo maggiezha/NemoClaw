@@ -14,10 +14,7 @@ export { setupOllamaLocalInference } from "./ollama-local";
 export { setupRemoteProviderInference } from "./remote";
 export { setupRoutedInference } from "./routed";
 export { setupVllmLocalInference } from "./vllm-local";
-export {
-  isRemoteProviderName,
-  REMOTE_PROVIDER_NAMES,
-} from "./types";
+export { isRemoteProviderName, REMOTE_PROVIDER_NAMES } from "./types";
 export type {
   CommonDeps,
   HermesDeps,
@@ -28,3 +25,16 @@ export type {
   SetupInferenceResult,
   VllmDeps,
 } from "./types";
+
+export { requireNativeProviderPolicy } from "../../adapters/openshell/provider-policy";
+export {
+  isPersistedPiSharedLocalInferenceRoute,
+  normalizeNativeLocalProviderAttachment,
+  usesNativeLocalInference,
+  usesNativeLocalInferenceForAgent,
+} from "../../inference/native-local/contract";
+export {
+  prepareNativeLocalSelection,
+  retireUnreservedNativeLocalProvider,
+} from "../../inference/native-local/selection";
+export { gatewayReachableCompatibleEndpointUrl } from "./compatible-endpoint-gateway-route";

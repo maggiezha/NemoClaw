@@ -7,6 +7,14 @@ description: Resolve the Hermes sandbox base image from GHCR, falling back to a 
 runs:
   using: composite
   steps:
+    - name: Set up security inventory tooling
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.18.1
+
+    - name: Install reviewed npm
+      uses: NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@98669f24d35f18e49b6b2769cd68709509ea24f2
+
     - name: Resolve Hermes sandbox base image
       shell: bash
       run: |
@@ -17,12 +25,32 @@ runs:
         source "${GITHUB_ACTION_PATH}/../base-image-resolver.sh"
 
         # Build-time package/import guard only. Authenticated HTTPS execution is
-        # validated by test/e2e/live/mcp-bridge.test.ts against a
-        # final Hermes sandbox image and OpenShell policy.
-        mcp_client_imports_ok() {
+        # validated by test/e2e/live/mcp-bridge.test.ts against a final Hermes
+        # sandbox image and OpenShell policy. Managed-image validation exercises
+        # the ACP adapter entrypoint separately.
+        expected_semvers=()
+        while IFS= read -r semver; do
+          expected_semvers+=("$semver")
+        done < <(
+          sed -nE 's|^ARG HERMES_SEMVER=([0-9]+([.][0-9]+){2})$|\1|p' \
+            agents/hermes/Dockerfile.base
+        )
+        if (( ${#expected_semvers[@]} != 1 )); then
+          echo "::error::Expected exactly one Hermes release semver in agents/hermes/Dockerfile.base"
+          exit 1
+        fi
+        expected_semver="${expected_semvers[0]}"
+
+        runtime_identity_ok() {
           local ref="$1"
-          docker run --rm --entrypoint /opt/hermes/.venv/bin/python "$ref" -c \
-            'import mcp; from tools import mcp_tool; assert getattr(mcp_tool, "_MCP_AVAILABLE", False); assert getattr(mcp_tool, "_MCP_HTTP_AVAILABLE", False)' \
+          docker run --rm \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --read-only \
+            --user sandbox \
+            --entrypoint /opt/hermes/.venv/bin/python "$ref" -I -c \
+            "import importlib.metadata as metadata; import sys; import acp; import mcp; from acp_adapter.server import HermesACPAgent; from tools import mcp_tool; metadata.version('hermes-agent') == '${expected_semver}' or sys.exit(1); metadata.version('agent-client-protocol') == '0.9.0' or sys.exit(1); mcp_tool._ensure_mcp_sdk() or sys.exit(1); getattr(mcp_tool, '_MCP_AVAILABLE', False) or sys.exit(1); getattr(mcp_tool, '_MCP_HTTP_AVAILABLE', False) or sys.exit(1)" \
             >/dev/null 2>&1
         }
 
@@ -40,7 +68,7 @@ runs:
         }
 
         try_image() {
-          local ref="$1" version digest_ref
+          local ref="$1" version digest_ref inventory_profile
           if ! resolver_pull "$ref"; then
             return 1
           fi
@@ -58,8 +86,16 @@ runs:
             echo "::warning::Hermes sandbox base image ${ref} contains retired sandbox state; trying another candidate"
             return 1
           fi
-          if ! mcp_client_imports_ok "$digest_ref"; then
-            echo "::warning::Hermes sandbox base image ${ref} lacks the packaged MCP Streamable HTTP client imports"
+          inventory_profile=shared
+          if [[ "$digest_ref" == "$tracked_ref" ]]; then
+            inventory_profile=hermes-compatible
+          fi
+          if ! resolver_security_inventory_ok "$digest_ref" "$inventory_profile"; then
+            echo "::warning::Hermes sandbox base image ${ref} does not match the reviewed security package inventory; trying another candidate"
+            return 1
+          fi
+          if ! runtime_identity_ok "$digest_ref"; then
+            echo "::warning::Hermes sandbox base image ${ref} does not match Hermes ${expected_semver} with the required MCP Streamable HTTP and ACP 0.9.0 runtimes"
             return 1
           fi
           resolver_write_env HERMES_BASE_IMAGE "$digest_ref" || return 1
@@ -104,8 +140,12 @@ runs:
           echo "::error::Local Hermes sandbox base image contains retired sandbox state"
           exit 1
         fi
-        if ! mcp_client_imports_ok nemoclaw-hermes-base-local; then
-          echo "::error::Local Hermes sandbox base image lacks the packaged MCP Streamable HTTP client imports"
+        if ! resolver_security_inventory_ok nemoclaw-hermes-base-local shared; then
+          echo "::error::Local Hermes sandbox base image does not match the reviewed security package inventory"
+          exit 1
+        fi
+        if ! runtime_identity_ok nemoclaw-hermes-base-local; then
+          echo "::error::Local Hermes sandbox base image does not match Hermes ${expected_semver} with the required MCP Streamable HTTP and ACP 0.9.0 runtimes"
           exit 1
         fi
         resolver_write_env HERMES_BASE_IMAGE nemoclaw-hermes-base-local

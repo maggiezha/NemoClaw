@@ -8,22 +8,31 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 
+const logPresetScopeMock = vi.hoisted(() => vi.fn());
 vi.mock("../policy", () => ({
-  mergePresetNamesIntoPolicy: (policy: string, presetNames: string[]) => ({
-    policy: `${policy.trimEnd()}\n${presetNames
-      .map((preset) => `  ${preset === "wechat" ? "wechat_bridge" : preset}: {}`)
-      .join("\n")}\n`,
-    appliedPresets: presetNames,
-    missingPresets: [],
-  }),
+  mergePresetNamesIntoPolicy: (policy: string, presetNames: string[]) => {
+    const additions = presetNames.flatMap((preset) => {
+      const policyKey = preset === "wechat" ? "wechat_bridge" : preset;
+      return new RegExp(`^  ${policyKey}:`, "mu").test(policy) ? [] : [`  ${policyKey}: {}`];
+    });
+    return {
+      policy: additions.length === 0 ? policy : `${policy.trimEnd()}\n${additions.join("\n")}\n`,
+      appliedPresets: presetNames,
+      missingPresets: [],
+    };
+  },
+  logPresetScope: logPresetScopeMock,
 }));
 
 import {
   buildDirectGpuPolicyYaml,
   buildDirectSandboxGpuProofCommands,
+  discloseInitialSandboxPolicy,
+  discoverHostStationGb300SysfsReadOnlyPaths,
   discoverStationGb300SysfsReadOnlyPaths,
   getNetworkPolicyNames,
   isStationGb300ProductName,
+  planHermesPortableInitialSandboxPolicy,
   prepareInitialSandboxCreatePolicy,
 } from "./initial-policy";
 
@@ -64,6 +73,7 @@ const originalOtelEnv = {
 };
 
 beforeEach(() => {
+  logPresetScopeMock.mockReset();
   delete process.env.NEMOCLAW_OPENCLAW_OTEL;
   delete process.env.NEMOCLAW_OPENCLAW_OTEL_ENDPOINT;
   delete process.env.NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME;
@@ -78,6 +88,23 @@ function tmpPolicy(content: string): string {
   return file;
 }
 
+function tmpHostedInstallerPolicy(content: string): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hosted-policy-test-"));
+  tmpRoots.push(root);
+  const policies = path.join(root, "nemoclaw-blueprint", "policies");
+  const presets = path.join(policies, "presets");
+  fs.mkdirSync(presets, { recursive: true });
+  fs.chmodSync(policies, 0o775);
+  fs.chmodSync(presets, 0o775);
+  const basePolicyPath = path.join(policies, "base.yaml");
+  fs.writeFileSync(basePolicyPath, content, { mode: 0o664 });
+  fs.chmodSync(basePolicyPath, 0o664);
+  const presetPath = path.join(presets, "personal-open-internet.yaml");
+  fs.writeFileSync(presetPath, "version: 1\nnetwork_policies: {}\n", { mode: 0o664 });
+  fs.chmodSync(presetPath, 0o664);
+  return basePolicyPath;
+}
+
 function tmpSysfsRoot(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-station-sysfs-test-"));
   tmpRoots.push(dir);
@@ -90,12 +117,20 @@ function writeSysfsFile(root: string, relativePath: string, content: string): vo
   fs.writeFileSync(file, content, "utf-8");
 }
 
-function addPciDevice(root: string, bdf: string, vendor: string, pciClass: string): void {
+function addPciDevice(
+  root: string,
+  bdf: string,
+  vendor: string,
+  pciClass: string,
+  device = "0x31c2\n",
+): void {
   writeSysfsFile(root, path.join("bus", "pci", "devices", bdf, "vendor"), vendor);
+  writeSysfsFile(root, path.join("bus", "pci", "devices", bdf, "device"), device);
   writeSysfsFile(root, path.join("bus", "pci", "devices", bdf, "class"), pciClass);
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tmpRoots.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -112,6 +147,129 @@ afterEach(() => {
 });
 
 describe("initial sandbox policy helpers", () => {
+  it("discloses the effective in-memory policy when exact source bytes are available (#9203)", () => {
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  base: {}\n");
+    const effectivePolicy = Buffer.from(
+      "version: 1\nnetwork_policies:\n  personal-open-internet: {}\n",
+    );
+
+    discloseInitialSandboxPolicy({
+      policyPath: basePolicyPath,
+      appliedPresets: ["personal-open-internet"],
+      sourceBytes: effectivePolicy,
+    });
+
+    expect(logPresetScopeMock).toHaveBeenCalledWith(effectivePolicy.toString("utf8"));
+  });
+
+  it("plans schema-5 Personal policy bytes without creating a temporary file (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  base: {}\n");
+    const mkdtemp = vi.spyOn(fs, "mkdtempSync");
+    const writeFile = vi.spyOn(fs, "writeFileSync");
+
+    const planned = planHermesPortableInitialSandboxPolicy(basePolicyPath, [], {
+      agentName: "hermes",
+      additionalPresets: ["personal-open-internet", "slack"],
+    });
+
+    expect(planned.policyPath).toBe(basePolicyPath);
+    expect(planned.appliedPresets).toEqual(["personal-open-internet", "slack"]);
+    expect(planned.sourceBytes?.toString("utf8")).toContain("personal-open-internet");
+    expect(planned.cleanup).toBeUndefined();
+    expect(planned.cleanupExact).toBeUndefined();
+    expect(mkdtemp).not.toHaveBeenCalled();
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  it("accepts the hosted installer policy source owned by the current user and group (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const basePolicyPath = tmpHostedInstallerPolicy("version: 1\nnetwork_policies:\n  base: {}\n");
+
+    const planned = planHermesPortableInitialSandboxPolicy(basePolicyPath, [], {
+      agentName: "hermes",
+      additionalPresets: ["personal-open-internet"],
+    });
+
+    const policies = path.dirname(basePolicyPath);
+    const presets = path.join(policies, "presets");
+    const presetPath = path.join(presets, "personal-open-internet.yaml");
+    const baseStat = fs.statSync(basePolicyPath);
+    const presetStat = fs.statSync(presetPath);
+    expect(fs.statSync(policies).mode & 0o777).toBe(0o775);
+    expect(fs.statSync(presets).mode & 0o777).toBe(0o775);
+    expect(baseStat.mode & 0o777).toBe(0o664);
+    expect(baseStat.uid).toBe(process.getuid?.());
+    expect(baseStat.gid).toBe(process.getgid?.());
+    expect(presetStat.mode & 0o777).toBe(0o664);
+    expect(presetStat.uid).toBe(process.getuid?.());
+    expect(presetStat.gid).toBe(process.getgid?.());
+    expect(planned.sourceBytes?.toString("utf8")).toContain("personal-open-internet");
+  });
+
+  it("rejects malformed schema-5 base policy bytes before planning effects (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies: {}\n");
+    fs.writeFileSync(basePolicyPath, Buffer.from([0xff, 0xfe]));
+
+    expect(() =>
+      planHermesPortableInitialSandboxPolicy(basePolicyPath, [], {
+        agentName: "hermes",
+        additionalPresets: ["personal-open-internet"],
+      }),
+    ).toThrow("not strict UTF-8");
+  });
+
+  it("rejects a UTF-8 byte-order mark before schema-5 policy planning (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies: {}\n");
+    fs.writeFileSync(
+      basePolicyPath,
+      Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from("version: 1\nnetwork_policies: {}\n"),
+      ]),
+    );
+
+    expect(() =>
+      planHermesPortableInitialSandboxPolicy(basePolicyPath, [], {
+        agentName: "hermes",
+        additionalPresets: ["personal-open-internet"],
+      }),
+    ).toThrow("must not include a UTF-8 byte-order mark");
+  });
+
+  it("rejects replaced, linked, or writable schema-5 policy requirements (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const original = tmpPolicy("version: 1\nnetwork_policies: {}\n");
+    const replacement = path.join(path.dirname(original), "replacement.yaml");
+    const plan = (policyPath: string) =>
+      planHermesPortableInitialSandboxPolicy(policyPath, [], {
+        agentName: "hermes",
+        additionalPresets: ["personal-open-internet"],
+      });
+
+    fs.writeFileSync(replacement, "version: 1\nnetwork_policies: {}\n", { mode: 0o600 });
+    fs.unlinkSync(original);
+    fs.symlinkSync(replacement, original);
+    expect(() => plan(original)).toThrow("source authority is unsafe");
+
+    fs.unlinkSync(original);
+    fs.linkSync(replacement, original);
+    expect(() => plan(original)).toThrow("source authority is unsafe");
+
+    fs.unlinkSync(original);
+    fs.writeFileSync(original, "version: 1\nnetwork_policies: {}\n", { mode: 0o666 });
+    fs.chmodSync(original, 0o666);
+    expect(() => plan(original)).toThrow("source authority is unsafe");
+
+    fs.chmodSync(original, 0o620);
+    expect(() => plan(original)).toThrow("source authority is unsafe");
+
+    fs.chmodSync(original, 0o602);
+    expect(() => plan(original)).toThrow("source authority is unsafe");
+  });
+
   it.each([
     ["Dell Pro Max with Station GB300", true],
     ["NVIDIA DGX Station GB300", true],
@@ -124,13 +282,15 @@ describe("initial sandbox policy helpers", () => {
     expect(isStationGb300ProductName(productName)).toBe(expected);
   });
 
-  it("discovers exact NVIDIA display-class PCI BDFs and fails closed without one (#7103)", () => {
+  it("discovers exact NVIDIA GB300 PCI BDFs and fails closed without one (#7103)", () => {
     const sysfsRoot = tmpSysfsRoot();
     addPciDevice(sysfsRoot, "0009:06:00.0", "0x10de\n", "0x030200\n");
     addPciDevice(sysfsRoot, "0008:05:00.0", "0X10DE\n", "0x030000\n");
     addPciDevice(sysfsRoot, "0000:01:00.0", "0x10de\n", "0x020000\n");
     addPciDevice(sysfsRoot, "0000:02:00.0", "0x1002\n", "0x030000\n");
     addPciDevice(sysfsRoot, "0000:03:00.8", "0x10de\n", "0x030000\n");
+    addPciDevice(sysfsRoot, "0000:04:00.0", "0x10de\n", "0x030000\n", "0xffff\n");
+
     for (const relativePath of [
       "devices/system/cpu",
       "devices/system/memory",
@@ -152,37 +312,130 @@ describe("initial sandbox policy helpers", () => {
     addPciDevice(noGpuSysfsRoot, "0000:01:00.0", "0x10de\n", "0x020000\n");
     expect(() =>
       discoverStationGb300SysfsReadOnlyPaths("NVIDIA DGX Station GB300", noGpuSysfsRoot),
-    ).toThrow("no NVIDIA display-class PCI device was found");
+    ).toThrow("no exact NVIDIA GB300 PCI device was found");
   });
 
-  it("scopes sysfs read access and lets OpenShell own /proc GPU enrichment (#7103)", () => {
-    const gpuPolicy = buildDirectGpuPolicyYaml(BASE_POLICY_FIXTURE, {
-      sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS,
+  it("rejects a Station-classified non-GB300 product before GPU policy creation", () => {
+    expect(() =>
+      discoverHostStationGb300SysfsReadOnlyPaths({
+        platform: "linux",
+        architecture: "arm64",
+        identity: {
+          nvidiaPlatform: "station",
+          productName: "NVIDIA DGX Station A100",
+          stationProfile: "supported-dgx-os",
+          stationGb300PciGpu: true,
+          osId: "ubuntu",
+          osVersionId: "24.04",
+        },
+      }),
+    ).toThrow("the detected Station product is not a qualified GB300 system");
+  });
+
+  it("uses a Station firmware-family identity for direct-GPU policy preparation (#10928)", () => {
+    const sysfsRoot = tmpSysfsRoot();
+    addPciDevice(sysfsRoot, "0009:06:00.0", "0x10de\n", "0x030200\n");
+    const discoveredPaths = discoverHostStationGb300SysfsReadOnlyPaths({
+      platform: "linux",
+      architecture: "arm64",
+      hasNvidiaGpu: true,
+      identity: {
+        nvidiaPlatform: "station",
+        productName: "Generic ARM workstation",
+        stationFirmwareProduct: "NVIDIA DGX Station GB300",
+        stationProfile: "supported-dgx-os",
+        stationGb300PciGpu: true,
+        osId: "ubuntu",
+        osVersionId: "24.04",
+      },
+      sysfsRoot,
     });
-    const baseDoc = YAML.parse(BASE_POLICY_FIXTURE);
-    const gpuDoc = YAML.parse(gpuPolicy);
+    const prepared = prepareInitialSandboxCreatePolicy(tmpPolicy(BASE_POLICY_FIXTURE), [], {
+      directGpu: true,
+      stationGb300SysfsReadOnlyPaths: discoveredPaths,
+    });
+    const preparedDoc = YAML.parse(fs.readFileSync(prepared.policyPath, "utf-8"));
 
-    // /proc is added at runtime by OpenShell's GPU enrichment;
-    // create-time must not pre-declare it.
-    expect(baseDoc.filesystem_policy.read_only).toContain("/proc");
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc");
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
-    expect(gpuDoc.filesystem_policy.read_only).toEqual(
-      expect.arrayContaining(STATION_GB300_SYSFS_READ_ONLY_PATHS),
+    expect(discoveredPaths).toEqual(["/sys/bus/pci/devices/0009:06:00.0"]);
+    expectSingleOccurrence(
+      preparedDoc.filesystem_policy.read_only,
+      "/sys/bus/pci/devices/0009:06:00.0",
     );
-    for (const unrelatedPath of [
-      "/sys/class",
-      "/sys/class/net",
-      "/sys/bus/pci/devices",
-      "/sys/firmware",
-      "/sys/fs",
-      "/sys/kernel",
-    ]) {
-      expect(gpuDoc.filesystem_policy.read_only).not.toContain(unrelatedPath);
-    }
-    expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc");
-    expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc/self/task/*/comm");
+    expect(prepared.cleanup?.()).toBe(true);
   });
+
+  it("rejects family-only Station hardware with an unsupported software profile (#10928)", () => {
+    const sysfsRoot = tmpSysfsRoot();
+    addPciDevice(sysfsRoot, "0009:06:00.0", "0x10de\n", "0x030200\n");
+
+    expect(() =>
+      discoverHostStationGb300SysfsReadOnlyPaths({
+        platform: "linux",
+        architecture: "arm64",
+        hasNvidiaGpu: true,
+        identity: {
+          nvidiaPlatform: "station",
+          productName: "Generic ARM workstation",
+          stationFirmwareProduct: "NVIDIA DGX Station GB300",
+          stationProfile: "unsupported-dgx-os",
+          stationGb300PciGpu: true,
+          osId: "ubuntu",
+          osVersionId: "24.04",
+        },
+        sysfsRoot,
+      }),
+    ).toThrow("the Station software profile is unsupported or unknown");
+  });
+
+  it("rejects Station GPU policy when host GPU availability fails", () => {
+    expect(() =>
+      discoverHostStationGb300SysfsReadOnlyPaths({
+        platform: "linux",
+        architecture: "arm64",
+        hasNvidiaGpu: false,
+        identity: {
+          nvidiaPlatform: "station",
+          productName: "NVIDIA DGX Station GB300",
+          stationProfile: "supported-dgx-os",
+          stationGb300PciGpu: true,
+          osId: "ubuntu",
+          osVersionId: "24.04",
+        },
+      }),
+    ).toThrow("an available GB300 GPU");
+  });
+
+  it.each([
+    "/sys/class",
+    "/sys/class/net",
+    "/sys/bus/pci/devices",
+    "/sys/firmware",
+    "/sys/fs",
+    "/sys/kernel",
+  ])(
+    "scopes sysfs read access and lets OpenShell own /proc GPU enrichment [%s] (#7103)",
+    (unrelatedPath) => {
+      const gpuPolicy = buildDirectGpuPolicyYaml(BASE_POLICY_FIXTURE, {
+        sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS,
+      });
+      const baseDoc = YAML.parse(BASE_POLICY_FIXTURE);
+      const gpuDoc = YAML.parse(gpuPolicy);
+
+      // /proc is added at runtime by OpenShell's GPU enrichment;
+      // create-time must not pre-declare it.
+      expect(baseDoc.filesystem_policy.read_only).toContain("/proc");
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc");
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
+      expect(gpuDoc.filesystem_policy.read_only).toEqual(
+        expect.arrayContaining(STATION_GB300_SYSFS_READ_ONLY_PATHS),
+      );
+
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain(unrelatedPath);
+
+      expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc");
+      expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc/self/task/*/comm");
+    },
+  );
 
   it("adds /proc read-write when Docker GPU patch must own GPU enrichment (#7103)", () => {
     const gpuPolicy = buildDirectGpuPolicyYaml(BASE_POLICY_FIXTURE, {
@@ -200,9 +453,11 @@ describe("initial sandbox policy helpers", () => {
     expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc/self/task/*/comm");
   });
 
-  it("removes stale proc entries from GPU policy input (#7103)", () => {
-    const gpuPolicy = buildDirectGpuPolicyYaml(
-      `
+  it.each(STATION_GB300_SYSFS_READ_ONLY_PATHS)(
+    "removes stale proc entries from GPU policy input [case %#] (#7103)",
+    (sysfsPath) => {
+      const gpuPolicy = buildDirectGpuPolicyYaml(
+        `
 version: 1
 filesystem_policy:
   include_workdir: true
@@ -221,25 +476,28 @@ network_policies:
       - host: integrate.api.nvidia.com
         port: 443
 `,
-      { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
-    );
-    const gpuDoc = YAML.parse(gpuPolicy);
+        { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
+      );
+      const gpuDoc = YAML.parse(gpuPolicy);
 
-    expect(gpuDoc.filesystem_policy.read_only).toContain("/usr");
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc");
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc/self/task/*/comm");
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
-    for (const sysfsPath of STATION_GB300_SYSFS_READ_ONLY_PATHS) {
+      expect(gpuDoc.filesystem_policy.read_only).toContain("/usr");
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc");
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/proc/self/task/*/comm");
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
+
       expectSingleOccurrence(gpuDoc.filesystem_policy.read_only, sysfsPath);
-    }
-    expect(gpuDoc.filesystem_policy.read_write).toContain("/tmp");
-    expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc");
-    expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc/self/task/*/comm");
-  });
 
-  it("preserves an existing broad read-only sysfs policy without expansion (#7103)", () => {
-    const gpuPolicy = buildDirectGpuPolicyYaml(
-      `
+      expect(gpuDoc.filesystem_policy.read_write).toContain("/tmp");
+      expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc");
+      expect(gpuDoc.filesystem_policy.read_write).not.toContain("/proc/self/task/*/comm");
+    },
+  );
+
+  it.each(Array.from(STATION_GB300_SYSFS_READ_ONLY_PATHS, (value) => [value]))(
+    "preserves an existing broad read-only sysfs policy without expanding %s (#7103)",
+    (sysfsPath) => {
+      const gpuPolicy = buildDirectGpuPolicyYaml(
+        `
 version: 1
 filesystem_policy:
   read_only:
@@ -249,20 +507,22 @@ filesystem_policy:
     - /tmp
 network_policies: {}
 `,
-      { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
-    );
-    const gpuDoc = YAML.parse(gpuPolicy);
+        { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
+      );
+      const gpuDoc = YAML.parse(gpuPolicy);
 
-    expect(gpuDoc.filesystem_policy.read_only).toContain("/usr");
-    expectSingleOccurrence(gpuDoc.filesystem_policy.read_only, "/sys");
-    for (const sysfsPath of STATION_GB300_SYSFS_READ_ONLY_PATHS) {
+      expect(gpuDoc.filesystem_policy.read_only).toContain("/usr");
+      expectSingleOccurrence(gpuDoc.filesystem_policy.read_only, "/sys");
+
       expect(gpuDoc.filesystem_policy.read_only).not.toContain(sysfsPath);
-    }
-  });
+    },
+  );
 
-  it("preserves an existing broad writable sysfs policy without expansion (#7103)", () => {
-    const gpuPolicy = buildDirectGpuPolicyYaml(
-      `
+  it.each(Array.from(STATION_GB300_SYSFS_READ_ONLY_PATHS, (value) => [value]))(
+    "preserves an existing broad writable sysfs policy without expanding %s (#7103)",
+    (sysfsPath) => {
+      const gpuPolicy = buildDirectGpuPolicyYaml(
+        `
 version: 1
 filesystem_policy:
   read_only:
@@ -272,17 +532,17 @@ filesystem_policy:
     - /sys
 network_policies: {}
 `,
-      { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
-    );
-    const gpuDoc = YAML.parse(gpuPolicy);
+        { sysfsReadOnlyPaths: STATION_GB300_SYSFS_READ_ONLY_PATHS },
+      );
+      const gpuDoc = YAML.parse(gpuPolicy);
 
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
-    expect(gpuDoc.filesystem_policy.read_write).toContain("/tmp");
-    expectSingleOccurrence(gpuDoc.filesystem_policy.read_write, "/sys");
-    for (const sysfsPath of STATION_GB300_SYSFS_READ_ONLY_PATHS) {
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
+      expect(gpuDoc.filesystem_policy.read_write).toContain("/tmp");
+      expectSingleOccurrence(gpuDoc.filesystem_policy.read_write, "/sys");
+
       expect(gpuDoc.filesystem_policy.read_only).not.toContain(sysfsPath);
-    }
-  });
+    },
+  );
 
   it("deduplicates scoped sysfs paths and lets exact read-write entries win (#7103)", () => {
     const writablePath = "/sys/bus/pci/devices/0009:06:00.0";
@@ -308,22 +568,24 @@ network_policies: {}
 
     expect(gpuDoc.filesystem_policy.read_only).not.toContain(writablePath);
     expectSingleOccurrence(gpuDoc.filesystem_policy.read_write, writablePath);
-    for (const sysfsPath of STATION_GB300_SYSFS_READ_ONLY_PATHS.filter(
-      (candidate) => candidate !== writablePath,
-    )) {
-      expectSingleOccurrence(gpuDoc.filesystem_policy.read_only, sysfsPath);
-    }
+    STATION_GB300_SYSFS_READ_ONLY_PATHS.filter((candidate) => candidate !== writablePath).forEach(
+      (sysfsPath) => {
+        expectSingleOccurrence(gpuDoc.filesystem_policy.read_only, sysfsPath);
+      },
+    );
   });
 
-  it("keeps non-Station direct GPU policies at the pre-issue sysfs boundary (#7103)", () => {
-    const gpuPolicy = buildDirectGpuPolicyYaml(BASE_POLICY_FIXTURE);
-    const gpuDoc = YAML.parse(gpuPolicy);
+  it.each(Array.from(STATION_GB300_SYSFS_READ_ONLY_PATHS, (value) => [value]))(
+    "keeps %s outside the non-Station direct GPU policy (#7103)",
+    (sysfsPath) => {
+      const gpuPolicy = buildDirectGpuPolicyYaml(BASE_POLICY_FIXTURE);
+      const gpuDoc = YAML.parse(gpuPolicy);
 
-    expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
-    for (const sysfsPath of STATION_GB300_SYSFS_READ_ONLY_PATHS) {
+      expect(gpuDoc.filesystem_policy.read_only).not.toContain("/sys");
+
       expect(gpuDoc.filesystem_policy.read_only).not.toContain(sysfsPath);
-    }
-  });
+    },
+  );
 
   it("preserves best-effort Landlock for missing Station sysfs paths (#7103)", () => {
     const sysfsRoot = tmpSysfsRoot();
@@ -366,9 +628,9 @@ network_policies: {}
       "/sys/devices/system/cpu",
       "/sys/module/nvidia/initstate",
     ]);
-    for (const discoveredPath of discoveredPaths) {
+    discoveredPaths.forEach((discoveredPath) => {
       expectSingleOccurrence(preparedDoc.filesystem_policy.read_only, discoveredPath);
-    }
+    });
     expect(preparedDoc.filesystem_policy.read_only).not.toContain("/sys");
     expect(prepared.cleanup?.()).toBe(true);
     expect(fs.existsSync(prepared.policyPath)).toBe(false);
@@ -401,11 +663,21 @@ network_policies: {}
     expect(commands[1].args.join(" ")).toContain("/proc/self/comm");
     expect(commands[1].args.join(" ")).not.toContain("ls /proc/self/task");
     expect(commands[2].args.join(" ")).toContain("cuInit(0)");
-    for (const command of commands) {
-      for (const arg of command.args) {
-        expect(arg).not.toMatch(/[\r\n]/);
-      }
-    }
+    commands.forEach((command) => {
+      expect(command.args.every((arg) => !/[\r\n]/.test(arg))).toBe(true);
+    });
+    expect(buildDirectSandboxGpuProofCommands("alpha", "nemoclaw")[0]?.args).toEqual([
+      "sandbox",
+      "exec",
+      "-g",
+      "nemoclaw",
+      "-n",
+      "alpha",
+      "--",
+      "sh",
+      "-lc",
+      expect.stringContaining("command -v nvidia-smi"),
+    ]);
   });
 
   it("returns network policy names from a policy document", () => {
@@ -421,28 +693,46 @@ network_policies: {}
   it("keeps the base policy when no channel needs a create-time preset", () => {
     const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  base: {}\n");
 
-    expect(prepareInitialSandboxCreatePolicy(basePolicyPath, ["telegram"])).toEqual({
+    expect(prepareInitialSandboxCreatePolicy(basePolicyPath, ["whatsapp"])).toEqual({
       policyPath: basePolicyPath,
       appliedPresets: [],
     });
   });
 
-  it("records an existing create-time preset without writing a temp policy", () => {
-    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  slack: {}\n");
+  it("applies the WeChat bridge policy at sandbox creation", () => {
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  base: {}\n");
 
-    expect(prepareInitialSandboxCreatePolicy(basePolicyPath, ["slack"])).toEqual({
-      policyPath: basePolicyPath,
-      appliedPresets: ["slack"],
-    });
+    const prepared = prepareInitialSandboxCreatePolicy(basePolicyPath, ["wechat"]);
+
+    expect(prepared.policyPath).not.toBe(basePolicyPath);
+    expect(prepared.appliedPresets).toEqual(["wechat"]);
+    expect(getNetworkPolicyNames(fs.readFileSync(prepared.policyPath, "utf-8"))).toEqual(
+      new Set(["base", "wechat_bridge"]),
+    );
+    expect(prepared.cleanup?.()).toBe(true);
+    expect(fs.existsSync(prepared.policyPath)).toBe(false);
   });
 
-  it("records active channel policies already provided by an agent base policy", () => {
+  it("replaces an existing messaging key with its active channel preset", () => {
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  slack: {}\n");
+
+    const prepared = prepareInitialSandboxCreatePolicy(basePolicyPath, ["slack"], {
+      sandboxName: "active-slack",
+    });
+
+    expect(prepared.policyPath).not.toBe(basePolicyPath);
+    expect(prepared.appliedPresets).toEqual(["slack"]);
+    expect(prepared.cleanup?.()).toBe(true);
+  });
+
+  it("materializes active channel policy authority over an agent base entry", () => {
     const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  discord: {}\n");
 
-    expect(prepareInitialSandboxCreatePolicy(basePolicyPath, ["discord"])).toEqual({
-      policyPath: basePolicyPath,
-      appliedPresets: ["discord"],
-    });
+    const prepared = prepareInitialSandboxCreatePolicy(basePolicyPath, ["discord"]);
+
+    expect(prepared.policyPath).not.toBe(basePolicyPath);
+    expect(prepared.appliedPresets).toEqual(["discord"]);
+    expect(prepared.cleanup?.()).toBe(true);
   });
 
   it("filters inactive Hermes messaging policies from the create-time policy", () => {
@@ -471,6 +761,29 @@ network_policies: {}
     );
     expect(prepared.cleanup?.()).toBe(true);
     expect(fs.existsSync(prepared.policyPath)).toBe(false);
+  });
+
+  it("gives only portable Hermes an exact replacement-safe policy cleanup (#9203)", () => {
+    vi.stubEnv("NEMOCLAW_EXPERIMENTAL_PROFILE", "portable");
+    const basePolicyPath = tmpPolicy("version: 1\nnetwork_policies:\n  discord: {}\n  slack: {}\n");
+    const prepared = prepareInitialSandboxCreatePolicy(basePolicyPath, ["discord"], {
+      agentName: "hermes",
+    });
+    const parent = path.dirname(prepared.policyPath);
+    const original = path.join(parent, "original.yaml");
+    tmpRoots.push(parent);
+
+    expect(prepared.cleanupExact).toEqual(expect.any(Function));
+    fs.renameSync(prepared.policyPath, original);
+    fs.writeFileSync(prepared.policyPath, "replacement\n", { mode: 0o600 });
+    expect(prepared.cleanupExact?.()).toBe(false);
+    expect(fs.readFileSync(prepared.policyPath, "utf8")).toBe("replacement\n");
+    expect(fs.existsSync(original)).toBe(true);
+
+    const ordinary = prepareInitialSandboxCreatePolicy(basePolicyPath, ["discord"], {
+      agentName: "openclaw",
+    });
+    expect(ordinary).not.toHaveProperty("cleanupExact");
   });
 
   it("filters inactive Hermes messaging policies from the relative Hermes policy path", () => {
@@ -540,7 +853,7 @@ network_policies: {}
     }
 
     expect(createdDirs).toHaveLength(2);
-    for (const dir of createdDirs) expect(fs.existsSync(dir)).toBe(false);
+    expect(createdDirs.every((dir) => Object.is(fs.existsSync(dir), false))).toBe(true);
   });
 
   it("merges openclaw-diagnostics-otel-local at create time when OTEL is enabled and the tier is known non-restricted", () => {

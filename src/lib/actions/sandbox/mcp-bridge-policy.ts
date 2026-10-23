@@ -1,17 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import * as policies from "../../policy";
-import type { McpBridgeEntry } from "../../state/registry";
-import * as registry from "../../state/registry";
-import {
-  isAgentMcpAdapter,
-  MCP_BRIDGE_POLICY_SOURCE,
-  McpBridgeError,
-} from "./mcp-bridge-contracts";
-import { buildMcpBridgePolicyKey, buildMcpBridgePolicyYaml } from "./mcp-bridge-policy-render";
+import { isDeepStrictEqual } from "node:util";
+import YAML from "yaml";
 
+import * as policies from "../../policy";
+import { assertTrustedPrivateEndpointCapability } from "../../security/trusted-private-endpoint";
+import type { McpSourceEntry } from "./mcp-bridge-contracts";
+import { isAgentMcpAdapter, McpBridgeError } from "./mcp-bridge-contracts";
+import {
+  buildMcpBridgeCapabilityPolicyYaml,
+  buildMcpBridgePolicyKey,
+  buildMcpBridgePolicyName,
+  buildMcpBridgePolicyYaml,
+} from "./mcp-bridge-policy-render";
+import type { McpProviderInspectionRuntimeSelection } from "./mcp-bridge-provider-inspection";
+import {
+  parseMcpUrlWithValidatedTarget,
+  type McpBridgeTargetValidation,
+} from "./mcp-bridge-url-validation";
+
+export { MCP_BRIDGE_POLICY_SOURCE } from "./mcp-bridge-contracts";
 export {
+  buildMcpBridgeCapabilityPolicyYaml,
   buildMcpBridgePolicyKey,
   buildMcpBridgePolicyName,
   buildMcpBridgePolicyYaml,
@@ -19,305 +30,223 @@ export {
   MCP_BRIDGE_POLICY_MAX_BODY_BYTES,
 } from "./mcp-bridge-policy-render";
 
-type GeneratedPolicyRegistrationState = {
-  policy: registry.CustomPolicyEntry;
-  state: "match" | "absent" | "drift" | null;
-  confirmed: boolean;
-};
-
-function withoutPendingContent(
-  policy: registry.CustomPolicyEntry,
-  content = policy.content,
-): registry.CustomPolicyEntry {
-  const { pendingContent: _pendingContent, ...confirmed } = policy;
-  return { ...confirmed, content };
+export async function applyGeneratedPolicy(
+  sandboxName: string,
+  entry: McpSourceEntry,
+  target: McpBridgeTargetValidation,
+  options: {
+    bindCredential?: boolean;
+    runtimeSelection: McpProviderInspectionRuntimeSelection;
+  },
+): Promise<void> {
+  const addresses = assertMcpBridgePolicyTarget(entry, target);
+  if (addresses.length === 0) {
+    throw new McpBridgeError(
+      `Refusing to apply generated MCP policy '${entry.policyName}' without address pins.`,
+    );
+  }
+  const adapter = isAgentMcpAdapter(entry.adapter) ? entry.adapter : "openclaw-config";
+  const content =
+    options.bindCredential === false
+      ? buildMcpBridgeCapabilityPolicyYaml(
+          entry.server,
+          entry.url,
+          adapter,
+          target,
+          entry.denyTools,
+        )
+      : buildMcpBridgePolicyYaml(
+          entry.server,
+          entry.url,
+          adapter,
+          target,
+          entry.providerName ?? "",
+          entry.denyTools,
+        );
+  await applyGeneratedPolicyContent(sandboxName, entry, content, options.runtimeSelection);
 }
 
-function persistGeneratedPolicyRegistration(
+/** Change only an existing public endpoint's pins in the observed OpenShell policy. */
+export async function refreshMcpPublicPolicyPins(
   sandboxName: string,
-  policy: registry.CustomPolicyEntry,
-): void {
-  if (!registry.addCustomPolicy(sandboxName, policy)) {
-    throw new McpBridgeError(
-      `Could not persist ownership for generated MCP policy '${policy.name}'.`,
-    );
+  entry: McpSourceEntry,
+  target: McpBridgeTargetValidation,
+  runtimeSelection: McpProviderInspectionRuntimeSelection,
+): Promise<void> {
+  assertGeneratedPolicyMutationSafe(sandboxName, entry);
+  if (entry.trustedPrivateHost) {
+    throw new McpBridgeError("Trusted-private pins require explicit remove-and-add approval.", 2);
   }
-}
-
-/**
- * Resolve a crash-interrupted generated-policy transition against the effective
- * gateway policy. `content` remains the last confirmed value while
- * `pendingContent` reserves the desired value, so either side of the mutation
- * can be recognized safely after process death.
- */
-function reconcileGeneratedPolicyRegistration(
-  sandboxName: string,
-  policy: registry.CustomPolicyEntry,
-): GeneratedPolicyRegistrationState {
-  const pendingContent = policy.pendingContent;
-  if (pendingContent === undefined) {
-    return {
-      policy,
-      state: policies.getPresetContentGatewayState(sandboxName, policy.content),
-      confirmed: true,
-    };
-  }
-  if (!pendingContent) {
-    return { policy, state: "drift", confirmed: false };
-  }
-
-  const pendingState = policies.getPresetContentGatewayState(sandboxName, pendingContent);
-  if (pendingState === "match") {
-    const confirmedPolicy = withoutPendingContent(policy, pendingContent);
-    persistGeneratedPolicyRegistration(sandboxName, confirmedPolicy);
-    return { policy: confirmedPolicy, state: "match", confirmed: true };
-  }
-
-  // A new add has no older confirmed value; content equals the reservation.
-  // Only an absent key is safe to retry.
-  if (pendingContent === policy.content) {
-    return { policy, state: pendingState, confirmed: false };
-  }
-
-  const confirmedState = policies.getPresetContentGatewayState(sandboxName, policy.content);
-  if (confirmedState === "match" || (confirmedState === "absent" && pendingState === "absent")) {
-    const confirmedPolicy = withoutPendingContent(policy);
-    persistGeneratedPolicyRegistration(sandboxName, confirmedPolicy);
-    return { policy: confirmedPolicy, state: confirmedState, confirmed: true };
-  }
-  return { policy, state: confirmedState === null ? null : "drift", confirmed: false };
-}
-
-export function applyGeneratedPolicy(
-  sandboxName: string,
-  entry: McpBridgeEntry,
-  resolvedAddresses: readonly string[],
-): void {
-  if (resolvedAddresses.length === 0) {
-    throw new McpBridgeError(
-      `Refusing to apply generated MCP policy '${entry.policyName}' without exact public address pins.`,
-    );
-  }
-  const adapter = isAgentMcpAdapter(entry.adapter) ? entry.adapter : "mcporter";
-  const content = buildMcpBridgePolicyYaml(entry.server, entry.url, adapter, resolvedAddresses);
-  const policyKey = buildMcpBridgePolicyKey(entry.server);
-  const sameNamePolicy = registry
-    .getCustomPolicies(sandboxName)
-    .find((policy) => policy.name === entry.policyName);
-  if (sameNamePolicy && sameNamePolicy.sourcePath !== MCP_BRIDGE_POLICY_SOURCE) {
-    throw new McpBridgeError(
-      `Generated MCP policy '${entry.policyName}' conflicts with an unowned same-name registry record. Refusing to replace operator-owned policy state.`,
-    );
-  }
-  const registeredPolicy = sameNamePolicy;
-  let previousPolicy: registry.CustomPolicyEntry | undefined;
-  let previousPolicyConfirmed = false;
-  let ownsExistingPolicyKey = false;
-  if (registeredPolicy) {
-    const reconciled = reconcileGeneratedPolicyRegistration(sandboxName, registeredPolicy);
-    previousPolicy = reconciled.policy;
-    previousPolicyConfirmed = reconciled.confirmed;
-    const previousState = reconciled.state;
-    if (previousState !== "absent" && previousState !== "match") {
-      throw new McpBridgeError(
-        `Generated MCP policy '${entry.policyName}' has drifted or could not be inspected against its recorded content. Refusing to replace the live key.`,
-      );
-    }
-    // A prior ownership record may have been reserved immediately before a
-    // process died, so an absent key is safe to create. A present key is safe
-    // to replace only after its full content matches that ownership record.
-    ownsExistingPolicyKey = previousState === "match";
-  } else {
-    const unownedState = policies.getPresetContentGatewayState(sandboxName, content);
-    if (unownedState !== "absent") {
-      throw new McpBridgeError(
-        `Generated MCP policy key '${policyKey}' is already present or could not be inspected without a NemoClaw ownership record.`,
-      );
-    }
-  }
-
-  // Preserve the last confirmed content while reserving a changed desired
-  // value. For a brand-new key, content and pendingContent are intentionally
-  // equal so an absent live key remains recognizable as an uncommitted add.
-  let reservation: registry.CustomPolicyEntry;
-  if (
-    previousPolicy &&
-    previousPolicy.content === content &&
-    (previousPolicy.pendingContent === undefined || previousPolicy.pendingContent === content)
-  ) {
-    reservation = previousPolicy;
-  } else if (previousPolicy) {
-    reservation = { ...withoutPendingContent(previousPolicy), pendingContent: content };
-    persistGeneratedPolicyRegistration(sandboxName, reservation);
-  } else {
-    reservation = {
-      name: entry.policyName,
-      content,
-      pendingContent: content,
-      sourcePath: MCP_BRIDGE_POLICY_SOURCE,
-    };
-    persistGeneratedPolicyRegistration(sandboxName, reservation);
-  }
-  // `custom` denotes user-supplied preset content and intentionally rejects
-  // `allowed_ips`. This content is generated from validated MCP inputs and the
-  // ownership reservation above; `skipRegistryUpdate` avoids a second write.
-  const ok = policies.applyPresetContent(sandboxName, entry.policyName, content, {
-    expectedExistingNetworkPolicyContent:
-      ownsExistingPolicyKey && previousPolicy ? previousPolicy.content : null,
-    nonFatal: true,
-    skipRegistryUpdate: true,
-  });
-  // `policy set --wait` proves that a submitted revision loaded, but OpenShell
-  // also returns success for unchanged and concurrently superseded revisions.
-  // Confirm that the effective policy still contains our exact generated entry.
-  const activeState = policies.getPresetContentGatewayState(sandboxName, content);
-  if (ok !== false && activeState === "match") {
-    persistGeneratedPolicyRegistration(sandboxName, withoutPendingContent(reservation, content));
-    return;
-  }
-
-  if (previousPolicyConfirmed && previousPolicy) {
-    const previousState = policies.getPresetContentGatewayState(
-      sandboxName,
-      previousPolicy.content,
-    );
-    if (previousState === "match" || (previousState === "absent" && activeState === "absent")) {
-      persistGeneratedPolicyRegistration(sandboxName, withoutPendingContent(previousPolicy));
-    }
-  } else if (activeState === "absent") {
-    registry.removeCustomPolicyByName(sandboxName, entry.policyName);
-  }
-  const detail =
-    activeState === "match" ? "the update command failed" : `effective state: ${activeState}`;
-  throw new McpBridgeError(
-    `Failed to activate generated MCP policy '${entry.policyName}' (${detail}).`,
+  const policyPins = [
+    ...new Set((entry.allowedIps ?? []).map((address) => address.toLowerCase())),
+  ].sort();
+  const url = parseMcpUrlWithValidatedTarget(entry.url, { addresses: policyPins });
+  assertMcpBridgePolicyTarget(entry, target);
+  parseMcpUrlWithValidatedTarget(entry.url, target);
+  const operation = `refresh public address pins for MCP server '${entry.server}'`;
+  const context = await policies.inspectPolicyMutationContext(
+    sandboxName,
+    operation,
+    runtimeSelection.gatewayName,
+    runtimeSelection,
   );
+  const document = YAML.parseDocument(context.basePolicyDocument);
+  const endpoints = document.getIn(
+    ["network_policies", buildMcpBridgePolicyKey(entry.server), "endpoints"],
+    true,
+  );
+  const mcpEndpoints = YAML.isSeq(endpoints)
+    ? endpoints.items.filter((node) => YAML.isMap(node) && node.get("protocol") === "mcp")
+    : [];
+  const endpoint = mcpEndpoints[0];
+  if (document.errors.length > 0 || mcpEndpoints.length !== 1 || !YAML.isMap(endpoint)) {
+    throw new McpBridgeError(
+      "Public-pin refresh requires one unambiguous live MCP policy endpoint. No policy was changed.",
+    );
+  }
+  const binding = endpoint.get("credential_binding", true);
+  const pins = endpoint.get("allowed_ips", true);
+  if (
+    String(endpoint.get("host")).toLowerCase() !== url.hostname ||
+    endpoint.get("port") !== Number(url.port || 443) ||
+    endpoint.get("path") !== (url.pathname || "/") ||
+    !YAML.isMap(binding) ||
+    binding.get("provider") !== entry.providerName ||
+    !YAML.isSeq(pins) ||
+    !isDeepStrictEqual(pins.toJSON(), entry.allowedIps)
+  ) {
+    throw new McpBridgeError(
+      "The live MCP endpoint or pins changed during public-pin refresh. No policy was changed; rerun against the current sources.",
+    );
+  }
+  if (isDeepStrictEqual(policyPins, target.addresses)) return;
+  endpoint.set("allowed_ips", target.addresses);
+  if (
+    !(await policies.setPolicyDocument(sandboxName, document.toString(), {
+      nonFatal: true,
+      operation,
+      context,
+    }))
+  ) {
+    throw new McpBridgeError(
+      "Public-pin policy update was not confirmed. Inspect mcp status before retrying; no agent or credential state was changed.",
+    );
+  }
 }
 
-function generatedPolicyContent(entry: McpBridgeEntry): string {
-  const adapter = isAgentMcpAdapter(entry.adapter) ? entry.adapter : "mcporter";
-  return buildMcpBridgePolicyYaml(entry.server, entry.url, adapter);
+async function applyGeneratedPolicyContent(
+  sandboxName: string,
+  entry: McpSourceEntry,
+  content: string,
+  runtimeSelection: McpProviderInspectionRuntimeSelection,
+): Promise<void> {
+  if (
+    !(await policies.applyPresetContent(sandboxName, entry.policyName, content, {
+      nonFatal: true,
+      runtimeSelection,
+    })) ||
+    (await policies.getPresetContentGatewayState(
+      sandboxName,
+      content,
+      undefined,
+      runtimeSelection,
+    )) !== "match"
+  ) {
+    throw new McpBridgeError(`Failed to activate generated MCP policy '${entry.policyName}'.`);
+  }
+}
+
+export function assertMcpBridgePolicyTarget(
+  entry: McpSourceEntry,
+  target: McpBridgeTargetValidation,
+): readonly string[] {
+  if (target.addresses.length === 0) {
+    throw new McpBridgeError(
+      `Refusing to apply generated MCP policy '${entry.policyName}' without exact ${entry.trustedPrivateHost ? "trusted-private" : "public"} address pins.`,
+    );
+  }
+  if (!entry.trustedPrivateHost) {
+    if (target.trustedPrivateCapability || target.trustedPrivateHost) {
+      throw new McpBridgeError(
+        `MCP server '${entry.server}' has no durable trusted-private intent. Refusing private policy mutation.`,
+      );
+    }
+    return target.addresses;
+  }
+  let authority;
+  try {
+    authority = assertTrustedPrivateEndpointCapability(
+      entry.trustedPrivateHost,
+      target.addresses,
+      target.trustedPrivateCapability,
+      { requireAllPrivate: true },
+    );
+  } catch {
+    throw new McpBridgeError(
+      `MCP server '${entry.server}' has no provenance-checked capability for trusted private host '${entry.trustedPrivateHost}'.`,
+    );
+  }
+  const recordedPins = entry.allowedIps ?? [];
+  if (
+    target.trustedPrivateHost !== authority.host ||
+    !isDeepStrictEqual(authority.addresses, recordedPins)
+  ) {
+    throw new McpBridgeError(
+      `MCP server '${entry.server}' no longer resolves to its recorded trusted-private address pins. Remove and re-add the server to approve changed pins.`,
+      2,
+    );
+  }
+  return recordedPins;
 }
 
 export function assertGeneratedPolicyMutationSafe(
-  sandboxName: string,
-  entry: McpBridgeEntry,
+  _sandboxName: string,
+  entry: McpSourceEntry,
 ): void {
-  const registeredPolicy = assertGeneratedPolicyRegistrationMutationSafe(sandboxName, entry);
-  const owned = registeredPolicy !== undefined;
-  const reconciled = registeredPolicy
-    ? reconcileGeneratedPolicyRegistration(sandboxName, registeredPolicy)
-    : undefined;
-  const content = reconciled?.policy.content ?? generatedPolicyContent(entry);
-  const state = reconciled?.state ?? policies.getPresetContentGatewayState(sandboxName, content);
-  if (state === "absent") return;
-  if (!owned || state !== "match") {
-    throw new McpBridgeError(
-      `Generated MCP policy '${entry.policyName}' is unowned, unreachable, or drifted. Refusing to mutate the adapter, provider, or same-key live policy until ownership is resolved.`,
-    );
+  if (entry.policyName !== buildMcpBridgePolicyName(entry.server)) {
+    throw new McpBridgeError("Generated MCP policy name does not match its bridge definition.");
   }
 }
 
-/** Check registry ownership without consulting a sandbox already proven absent. */
-export function assertGeneratedPolicyRegistrationMutationSafe(
+export async function removeGeneratedPolicy(
   sandboxName: string,
-  entry: McpBridgeEntry,
-): registry.CustomPolicyEntry | undefined {
-  const registeredPolicy = registry
-    .getCustomPolicies(sandboxName)
-    .find((policy) => policy.name === entry.policyName);
-  const owned = registeredPolicy?.sourcePath === MCP_BRIDGE_POLICY_SOURCE;
-  if (registeredPolicy && !owned) {
-    throw new McpBridgeError(
-      `Generated MCP policy '${entry.policyName}' conflicts with an unowned same-name registry record. Refusing to mutate the adapter, provider, or live policy.`,
-    );
-  }
-  return owned ? registeredPolicy : undefined;
-}
-
-export function removeGeneratedPolicy(
-  sandboxName: string,
-  entry: McpBridgeEntry,
-  options: { bestEffort?: boolean } = {},
-): void {
-  const policyName = entry.policyName;
-  const registeredPolicy = registry
-    .getCustomPolicies(sandboxName)
-    .find((policy) => policy.name === policyName);
-  const ownsRegistration = registeredPolicy?.sourcePath === MCP_BRIDGE_POLICY_SOURCE;
-  const reconciled =
-    registeredPolicy && ownsRegistration
-      ? reconcileGeneratedPolicyRegistration(sandboxName, registeredPolicy)
-      : undefined;
-  const effectiveRegistration = reconciled?.policy ?? registeredPolicy;
-  const content = effectiveRegistration?.content ?? generatedPolicyContent(entry);
-  const gatewayState =
-    reconciled?.state ?? policies.getPresetContentGatewayState(sandboxName, content);
-  if (gatewayState === "absent") {
-    if (ownsRegistration) {
-      registry.removeCustomPolicyByName(sandboxName, policyName);
-    }
-    return;
-  }
-  if (!ownsRegistration || gatewayState !== "match") {
-    if (options.bestEffort) return;
-    throw new McpBridgeError(
-      `Generated MCP policy '${policyName}' is unowned, unreachable, or no longer matches its registered content. Refusing to delete same-key policy state.`,
-    );
-  }
-  const ok = policies.removePreset(sandboxName, policyName, {
+  entry: McpSourceEntry,
+  options: {
+    bestEffort?: boolean;
+    runtimeSelection: McpProviderInspectionRuntimeSelection;
+  },
+): Promise<void> {
+  const policyKey = buildMcpBridgePolicyKey(entry.server);
+  const content = `network_policies:\n  ${policyKey}: {}\n`;
+  const removed = await policies.removePreset(sandboxName, entry.policyName, {
     nonFatal: true,
-    // Keep ownership durable across a crash or superseded OpenShell revision.
-    // It is cleared only after the exact live key is proven absent below.
-    skipRegistryUpdate: true,
+    presetContent: content,
+    runtimeSelection: options.runtimeSelection,
   });
-  // OpenShell can acknowledge a superseded policy revision as success. Confirm
-  // the exact generated key is absent before discarding its ownership record.
-  const activeState = policies.getPresetContentGatewayState(sandboxName, content);
-  if (activeState === "absent") {
-    registry.removeCustomPolicyByName(sandboxName, policyName);
-    return;
-  }
-  // Keep (or defensively restore) the last reconciled ownership record when
-  // exact post-state is not proven.
-  if (ownsRegistration && effectiveRegistration) {
-    persistGeneratedPolicyRegistration(sandboxName, effectiveRegistration);
-  }
+  if (removed) return;
   if (options.bestEffort) return;
-  const detail = ok ? `effective state: ${activeState}` : "the removal command failed";
-  throw new McpBridgeError(`Failed to remove generated MCP policy '${policyName}' (${detail}).`);
+  throw new McpBridgeError(`Failed to remove generated MCP policy '${entry.policyName}'.`);
 }
 
-export function getRegisteredGeneratedPolicy(
+export async function getPolicyPresence(
   sandboxName: string,
-  entry: McpBridgeEntry | undefined,
-): ReturnType<typeof registry.getCustomPolicies>[number] | undefined {
-  if (!entry?.policyName) return undefined;
-  return registry
-    .getCustomPolicies(sandboxName)
-    .find(
-      (policy) =>
-        policy.name === entry.policyName && policy.sourcePath === MCP_BRIDGE_POLICY_SOURCE,
+  entry: McpSourceEntry | undefined,
+  runtimeSelection: McpProviderInspectionRuntimeSelection,
+): Promise<boolean | null> {
+  if (!entry) return false;
+  try {
+    const document = YAML.parse(
+      await policies.captureRecordedSandboxBasePolicy(
+        sandboxName,
+        "inspect current MCP policy",
+        runtimeSelection,
+      ),
+    ) as { network_policies?: Record<string, unknown> } | null;
+    return Boolean(
+      document?.network_policies &&
+      Object.hasOwn(document.network_policies, buildMcpBridgePolicyKey(entry.server)),
     );
-}
-
-export function getPolicyPresence(
-  sandboxName: string,
-  entry: McpBridgeEntry | undefined,
-): boolean | null {
-  if (!entry?.policyName) return false;
-  const registeredPolicy = getRegisteredGeneratedPolicy(sandboxName, entry);
-  if (!registeredPolicy) return null;
-  const confirmedState = policies.getPresetContentGatewayState(
-    sandboxName,
-    registeredPolicy.content,
-  );
-  if (confirmedState === "match") return true;
-  const pendingContent = registeredPolicy.pendingContent;
-  if (typeof pendingContent !== "string" || pendingContent.length === 0) {
-    return confirmedState === null ? null : false;
+  } catch {
+    return null;
   }
-  const pendingState = policies.getPresetContentGatewayState(sandboxName, pendingContent);
-  if (pendingState === "match") return true;
-  return confirmedState === null || pendingState === null ? null : false;
 }

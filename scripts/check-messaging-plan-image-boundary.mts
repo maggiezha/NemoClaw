@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export type MessagingBoundaryAgent = "hermes" | "openclaw";
@@ -26,15 +27,38 @@ export const TEAMS_APP_ID = "nemoclaw-ci-teams-app-id";
 export const TEAMS_TENANT_ID = "00000000-0000-0000-0000-000000000042";
 export const TEAMS_SECRET_PLACEHOLDER = "openshell:resolve:env:MSTEAMS_APP_PASSWORD";
 export const OPENCLAW_TEAMS_PACKAGE_SPEC = "npm:@openclaw/msteams@{{openclaw.version}}";
-export const OPENCLAW_TEAMS_PACKAGE_VERSION = "2026.7.1";
+const reviewedMessagingLock = parseJson(
+  readFileSync(
+    new URL(
+      "../agents/openclaw/managed-image-messaging-runtime/package-lock.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+  "reviewed messaging lock",
+);
+const reviewedPackages =
+  isObject(reviewedMessagingLock) && isObject(reviewedMessagingLock.packages)
+    ? reviewedMessagingLock.packages
+    : {};
+const reviewedTeams = reviewedPackages["node_modules/@openclaw/msteams"];
+if (
+  !isObject(reviewedTeams) ||
+  typeof reviewedTeams.version !== "string" ||
+  !reviewedTeams.version ||
+  typeof reviewedTeams.integrity !== "string" ||
+  !reviewedTeams.integrity
+) {
+  throw new Error("The reviewed messaging lock must identify the Teams package and integrity.");
+}
+export const OPENCLAW_TEAMS_PACKAGE_VERSION = reviewedTeams.version;
+export const OPENCLAW_TEAMS_PACKAGE_INTEGRITY = reviewedTeams.integrity;
 export const HERMES_TEAMS_PACKAGE_SPEC = "microsoft-teams-apps==2.0.13.4";
-export const HERMES_AIOHTTP_PACKAGE_SPEC = "aiohttp==3.14.1";
+export const HERMES_AIOHTTP_PACKAGE_SPEC = "aiohttp==3.14.3";
 
 const PLAN_ENV_KEY = "NEMOCLAW_MESSAGING_PLAN_B64";
 const RUNTIME_PLAN_PATH = "/usr/local/share/nemoclaw/messaging-runtime-plan.json";
 const OPENCLAW_CONFIG_PATH = "/sandbox/.openclaw/openclaw.json";
-const OPENCLAW_TEAMS_MANAGED_ROOT =
-  /^\/sandbox\/\.openclaw\/npm\/projects\/openclaw-msteams-[a-f0-9]{10}\/node_modules\/@openclaw\/msteams$/;
 const OPENCLAW_TEAMS_PRELOAD_PATH = "/usr/local/lib/nemoclaw/preloads/msteams-message-hints.js";
 const HERMES_ENV_PATH = "/sandbox/.hermes/.env";
 const HERMES_CONFIG_PATH = "/sandbox/.hermes/config.yaml";
@@ -93,7 +117,6 @@ export function createMessagingBoundaryPlan(agent: unknown) {
           value: {
             enabled: true,
             appId: TEAMS_APP_ID,
-            appPassword: TEAMS_SECRET_PLACEHOLDER,
             tenantId: TEAMS_TENANT_ID,
             webhook: { port: 3978, path: "/api/messages" },
             healthMonitor: { enabled: false },
@@ -144,7 +167,6 @@ export function createMessagingBoundaryPlan(agent: unknown) {
         target: "~/.hermes/.env",
         lines: [
           `TEAMS_CLIENT_ID=${TEAMS_APP_ID}`,
-          `TEAMS_CLIENT_SECRET=${TEAMS_SECRET_PLACEHOLDER}`,
           `TEAMS_TENANT_ID=${TEAMS_TENANT_ID}`,
           "TEAMS_PORT=3978",
         ],
@@ -167,15 +189,20 @@ export function createMessagingBoundaryPlan(agent: unknown) {
         required: true,
         value: { manager: "hermes-uv-pip", spec: HERMES_TEAMS_PACKAGE_SPEC },
       },
-      {
-        channelId: "teams",
-        kind: "package-install",
-        outputId: "hermesAiohttpPackage",
-        required: true,
-        value: { manager: "hermes-uv-pip", spec: HERMES_AIOHTTP_PACKAGE_SPEC },
-      },
     ],
-    runtimeSetup: { nodePreloads: [], envAliases: [], secretScans: [] },
+    runtimeSetup: {
+      nodePreloads: [],
+      envAliases: [
+        {
+          channelId: "teams",
+          envKey: "MSTEAMS_APP_PASSWORD",
+          targetEnvKey: "TEAMS_CLIENT_SECRET",
+          match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_MSTEAMS_APP_PASSWORD$",
+          value: TEAMS_SECRET_PLACEHOLDER,
+        },
+      ],
+      secretScans: [],
+    },
   };
 }
 
@@ -238,7 +265,9 @@ export function verifyMessagingPlanImageBoundary(
 }
 
 function assertReducedRuntimeArtifact(text: string, agent: MessagingBoundaryAgent): void {
-  assertDoesNotContainFullPlanData("reduced runtime plan", text);
+  assertDoesNotContainFullPlanData("reduced runtime plan", text, {
+    allowPlaceholder: agent === "hermes",
+  });
   const artifact = parseJson(text, "reduced runtime plan");
   if (
     !isObject(artifact) ||
@@ -338,7 +367,7 @@ function assertReducedRuntimeArtifact(text: string, agent: MessagingBoundaryAgen
   );
   assertRuntimeSetupEntryAllowlist(
     runtimeSetup.envAliases,
-    ["channelId", "envKey", "match", "value", "message"],
+    ["channelId", "envKey", "targetEnvKey", "match", "value", "message"],
     "envAliases",
   );
   assertRuntimeSetupEntryAllowlist(
@@ -346,8 +375,8 @@ function assertReducedRuntimeArtifact(text: string, agent: MessagingBoundaryAgen
     ["channelId", "path", "pattern", "message", "exitCode"],
     "secretScans",
   );
-  if (runtimeSetup.envAliases.length !== 0 || runtimeSetup.secretScans.length !== 0) {
-    throw new Error("reduced runtime plan contains unexpected Teams runtime setup entries");
+  if (runtimeSetup.secretScans.length !== 0) {
+    throw new Error("reduced runtime plan contains unexpected Teams secret scans");
   }
   if (agent === "openclaw") {
     const [preload] = runtimeSetup.nodePreloads;
@@ -363,8 +392,24 @@ function assertReducedRuntimeArtifact(text: string, agent: MessagingBoundaryAgen
     ) {
       throw new Error("reduced runtime plan does not contain the sanitized Teams node preload");
     }
-  } else if (runtimeSetup.nodePreloads.length !== 0) {
-    throw new Error("Hermes reduced runtime plan unexpectedly contains node preloads");
+    if (runtimeSetup.envAliases.length !== 0) {
+      throw new Error("OpenClaw reduced runtime plan unexpectedly contains environment aliases");
+    }
+  } else {
+    const [alias] = runtimeSetup.envAliases;
+    if (
+      runtimeSetup.nodePreloads.length !== 0 ||
+      runtimeSetup.envAliases.length !== 1 ||
+      !isObject(alias) ||
+      alias.channelId !== "teams" ||
+      alias.envKey !== "MSTEAMS_APP_PASSWORD" ||
+      alias.targetEnvKey !== "TEAMS_CLIENT_SECRET" ||
+      alias.match !==
+        "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_MSTEAMS_APP_PASSWORD$" ||
+      alias.value !== TEAMS_SECRET_PLACEHOLDER
+    ) {
+      throw new Error("Hermes reduced runtime plan is missing the Teams credential alias");
+    }
   }
 }
 
@@ -380,11 +425,13 @@ function assertOpenClawEvidence(runner: DockerRunner, image: string): void {
   const plugins = isObject(config) && isObject(config.plugins) ? config.plugins : {};
   const pluginEntries = isObject(plugins.entries) ? plugins.entries : {};
   const teamsPlugin = pluginEntries.msteams;
+  if (isObject(teams) && Object.hasOwn(teams, "appPassword")) {
+    throw new Error("OpenClaw image Teams render must omit appPassword");
+  }
   if (
     !isObject(teams) ||
     teams.enabled !== true ||
     teams.appId !== TEAMS_APP_ID ||
-    teams.appPassword !== TEAMS_SECRET_PLACEHOLDER ||
     teams.tenantId !== TEAMS_TENANT_ID ||
     !isObject(teamsPlugin) ||
     teamsPlugin.enabled !== true
@@ -416,6 +463,7 @@ function assertOpenClawEvidence(runner: DockerRunner, image: string): void {
   );
   const inspect = parseJsonAfterLogPreamble(inspectText, "OpenClaw Teams plugin inspection");
   const plugin = isObject(inspect) && isObject(inspect.plugin) ? inspect.plugin : {};
+  const install = isObject(inspect) && isObject(inspect.install) ? inspect.install : {};
   const hasTeamsChannel =
     isObject(inspect) &&
     Array.isArray(inspect.capabilities) &&
@@ -431,12 +479,16 @@ function assertOpenClawEvidence(runner: DockerRunner, image: string): void {
     plugin.packageName !== "@openclaw/msteams" ||
     plugin.version !== OPENCLAW_TEAMS_PACKAGE_VERSION ||
     plugin.status !== "loaded" ||
-    typeof plugin.rootDir !== "string" ||
-    !OPENCLAW_TEAMS_MANAGED_ROOT.test(plugin.rootDir) ||
+    plugin.trustedOfficialInstall !== true ||
+    install.source !== "npm" ||
+    install.sourcePath !== undefined ||
+    install.artifactKind !== undefined ||
+    install.resolvedSpec !== `@openclaw/msteams@${OPENCLAW_TEAMS_PACKAGE_VERSION}` ||
+    install.integrity !== OPENCLAW_TEAMS_PACKAGE_INTEGRITY ||
     !hasTeamsChannel
   ) {
     throw new Error(
-      `OpenClaw Teams plugin evidence must be loaded from the managed npm project as @openclaw/msteams@${OPENCLAW_TEAMS_PACKAGE_VERSION} with the msteams channel registered`,
+      `OpenClaw Teams plugin evidence must retain reviewed npm provenance for @openclaw/msteams@${OPENCLAW_TEAMS_PACKAGE_VERSION} and load the msteams channel`,
     );
   }
 
@@ -449,16 +501,16 @@ function assertOpenClawEvidence(runner: DockerRunner, image: string): void {
 function assertHermesEvidence(runner: DockerRunner, image: string): void {
   const envText = readImageFile(runner, image, HERMES_ENV_PATH);
   assertDoesNotContainFullPlanData("Hermes rendered .env", envText, {
-    allowPlaceholder: true,
     allowRenderedConfig: true,
   });
   const renderedEnv = parseEnvFile(envText);
   if (
     renderedEnv.TEAMS_CLIENT_ID !== TEAMS_APP_ID ||
-    renderedEnv.TEAMS_CLIENT_SECRET !== TEAMS_SECRET_PLACEHOLDER ||
-    renderedEnv.TEAMS_TENANT_ID !== TEAMS_TENANT_ID
+    renderedEnv.TEAMS_TENANT_ID !== TEAMS_TENANT_ID ||
+    renderedEnv.TEAMS_PORT !== "3978" ||
+    Object.hasOwn(renderedEnv, "TEAMS_CLIENT_SECRET")
   ) {
-    throw new Error("Hermes image is missing the expected Teams .env render output");
+    throw new Error("Hermes image has unexpected Teams .env render output");
   }
 
   const yaml = readImageFile(runner, image, HERMES_CONFIG_PATH);
@@ -488,7 +540,7 @@ function assertHermesEvidence(runner: DockerRunner, image: string): void {
   if (
     !isObject(packageVersions) ||
     packageVersions["microsoft-teams-apps"] !== "2.0.13.4" ||
-    packageVersions.aiohttp !== "3.14.1"
+    packageVersions.aiohttp !== "3.14.3"
   ) {
     throw new Error(
       `Hermes package evidence must include ${HERMES_TEAMS_PACKAGE_SPEC} and ${HERMES_AIOHTTP_PACKAGE_SPEC}`,
@@ -678,8 +730,8 @@ function formatError(error: unknown): string {
 function usage(): string {
   return [
     "Usage:",
-    "  node --experimental-strip-types scripts/check-messaging-plan-image-boundary.mts plan <openclaw|hermes>",
-    "  node --experimental-strip-types scripts/check-messaging-plan-image-boundary.mts verify <image> <openclaw|hermes>",
+    "  node scripts/check-messaging-plan-image-boundary.mts plan <openclaw|hermes>",
+    "  node scripts/check-messaging-plan-image-boundary.mts verify <image> <openclaw|hermes>",
   ].join("\n");
 }
 

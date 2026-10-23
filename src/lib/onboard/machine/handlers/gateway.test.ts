@@ -2,20 +2,95 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import http from "node:http";
+import { generateKeyPairSync } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { gatewayAdaptersForTest } from "../../../../../test/helpers/openshell-gateway-adapters";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayReuseState } from "../../../state/gateway";
 import { createSession, type Session } from "../../../state/onboard-session";
 import { flushTrace, resetTraceForTests, TRACE_FILE_ENV, type TraceArtifact } from "../../../trace";
 import type { GatewayContainerState } from "../../gateway-container-running";
+import type { PreparedExternalComponent } from "../../external-component";
+import * as componentActivation from "../../external-component/activation";
+import {
+  type GatewayAttachmentProbe,
+  type GatewayOwner,
+  GatewayOwnershipError,
+  resolveGatewayOwner,
+} from "../../gateway-ownership";
+import { createGatewayReuseHelpers } from "../../gateway-reuse";
 import { ONBOARD_TRACE_PHASE_NAMES } from "../../tracing";
 import { type GatewayStateOptions, handleGatewayState } from "./gateway";
 
+const EXTERNAL_OWNER: GatewayOwner = resolveGatewayOwner({
+  gatewayName: "nemoclaw",
+  gatewayPort: 8080,
+  declaration: {
+    version: 1,
+    mode: "externally-supervised",
+    endpoint: "http://127.0.0.1:8080",
+    stateDir: "/var/lib/openshell/gateway",
+    supervisor: {
+      kind: "systemd-system",
+      serviceName: "openshell-gateway.service",
+      execPath: "/usr/local/bin/openshell-gateway",
+    },
+    requiredCapabilities: [],
+  },
+  hasPackagedService: false,
+});
+
 type Gpu = { type: string } | null;
+
+function preparedExternalComponent(revalidateBeforeGateway = vi.fn()): PreparedExternalComponent {
+  return {
+    declaration: {
+      schemaVersion: 1,
+      componentId: "policy-governance",
+      interceptorSocketPath: "/run/user/1000/component/interceptor.sock",
+      activationSocketPath: "/run/user/1000/component/activation.sock",
+    },
+    revalidateBeforeGateway,
+    revalidateBeforeActivation: vi.fn(),
+  };
+}
+
+function preparedConnectionComponent(
+  activationSocketPath = "/run/component/activate.sock",
+): PreparedExternalComponent {
+  let revalidateGateway = () => {};
+  return {
+    ...preparedExternalComponent(),
+    setGatewayRevalidation: vi.fn((revalidate: () => void) => {
+      revalidateGateway = revalidate;
+    }),
+    revalidateBeforeGateway: vi.fn(() => revalidateGateway()),
+    revalidateBeforeActivation: vi.fn(() => revalidateGateway()),
+    declaration: {
+      schemaVersion: 2,
+      componentId: "generic-policy",
+      activationSocketPath,
+      interceptor: {
+        endpoint: "https://127.0.0.1:9443",
+        caCertificatePath: "/run/component/ca.pem",
+        audience: "urn:generic:admission",
+      },
+      middleware: {
+        name: "generic-middleware",
+        endpoint: "https://host.openshell.internal:9444",
+        caCertificatePath: "/run/component/ca.pem",
+        audience: "urn:generic:middleware",
+      },
+    },
+  };
+}
 
 function createDeps(overrides: Partial<GatewayStateOptions<Gpu>["deps"]> = {}) {
   const calls = {
+    assertExternalComponentFreshSandbox: vi.fn(),
+    configureExternalComponentGateway: vi.fn(),
     refresh: vi.fn(async (state: GatewayReuseState) => state),
     lifecycle: vi.fn(() => false),
     verifyContainer: vi.fn((_gatewayName: string): GatewayContainerState => "running"),
@@ -28,6 +103,7 @@ function createDeps(overrides: Partial<GatewayStateOptions<Gpu>["deps"]> = {}) {
     stopForwards: vi.fn(),
     reconcileGpu: vi.fn((opts: { gatewayReuseState: GatewayReuseState }) => opts.gatewayReuseState),
     dockerDriver: vi.fn(() => false),
+    verifyReusableGatewayReachability: vi.fn(async () => undefined),
     retireLegacy: vi.fn(),
     destroyGpuRuntime: vi.fn(() => true),
     skipped: vi.fn(),
@@ -39,10 +115,35 @@ function createDeps(overrides: Partial<GatewayStateOptions<Gpu>["deps"]> = {}) {
     exit: vi.fn((code: number): never => {
       throw new Error(`exit ${code}`);
     }),
+    resolveOwner: vi.fn((): GatewayOwner =>
+      resolveGatewayOwner({
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        declaration: null,
+        hasPackagedService: false,
+      }),
+    ),
+    attachGateway: vi.fn(async () => undefined),
+    probeAttachment: vi.fn(async (): Promise<GatewayAttachmentProbe> => ({
+      gatewayPort: 8080,
+      httpReady: true,
+      portOccupied: true,
+      listenerPids: [4242],
+      listenerScanComplete: true,
+      listenerStartTime: "710024",
+      supervisorActive: true,
+      listenerExecPath: "/usr/local/bin/openshell-gateway",
+      listenerSupervisorMatch: true,
+    })),
   };
   return {
     calls,
     deps: {
+      resolveGatewayOwner: calls.resolveOwner,
+      attachGateway: calls.attachGateway,
+      probeGatewayAttachment: calls.probeAttachment,
+      assertExternalComponentFreshSandbox: calls.assertExternalComponentFreshSandbox,
+      configureExternalComponentGateway: calls.configureExternalComponentGateway,
       refreshDockerDriverGatewayReuseState: calls.refresh,
       gatewayCliSupportsLifecycleCommands: calls.lifecycle,
       verifyGatewayContainerRunning: calls.verifyContainer,
@@ -56,6 +157,7 @@ function createDeps(overrides: Partial<GatewayStateOptions<Gpu>["deps"]> = {}) {
       stopAllDashboardForwards: calls.stopForwards,
       reconcileGatewayGpuReuseForGpuIntent: calls.reconcileGpu,
       isLinuxDockerDriverGatewayEnabled: calls.dockerDriver,
+      verifyReusableDockerDriverGatewaySandboxReachability: calls.verifyReusableGatewayReachability,
       retireLegacyGatewayForDockerDriverUpgrade: calls.retireLegacy,
       destroyGatewayRuntimeForGpuReuse: calls.destroyGpuRuntime,
       skippedStepMessage: calls.skipped,
@@ -116,6 +218,234 @@ function gatewaySpans(artifact: TraceArtifact) {
 }
 
 describe("handleGatewayState", () => {
+  it("rejects an existing sandbox before gateway mutation (#11340)", async () => {
+    const component = preparedExternalComponent();
+    const { deps, calls } = createDeps({
+      assertExternalComponentFreshSandbox: vi.fn(() => {
+        throw new Error("sandbox exists");
+      }),
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+    });
+
+    await expect(
+      handleGatewayState({
+        ...baseOptions(deps, "missing"),
+        externalComponent: component,
+      }),
+    ).rejects.toThrow("sandbox exists");
+
+    expect(deps.assertExternalComponentFreshSandbox).toHaveBeenCalledWith("my-assistant");
+    expect(component.revalidateBeforeGateway).not.toHaveBeenCalled();
+    expect(calls.configureExternalComponentGateway).not.toHaveBeenCalled();
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startStep).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("validates the component before gateway configuration or lifecycle effects (#11340)", async () => {
+    const revalidateBeforeGateway = vi.fn(() => {
+      throw new Error("declaration changed");
+    });
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+    });
+
+    await expect(
+      handleGatewayState({
+        ...baseOptions(deps, "missing"),
+        externalComponent: preparedExternalComponent(revalidateBeforeGateway),
+      }),
+    ).rejects.toThrow("declaration changed");
+
+    expect(revalidateBeforeGateway).toHaveBeenCalledOnce();
+    expect(calls.configureExternalComponentGateway).not.toHaveBeenCalled();
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startStep).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("passes only the validated component projection to the managed gateway (#11340)", async () => {
+    const revalidateBeforeGateway = vi.fn();
+    const component = preparedExternalComponent(revalidateBeforeGateway);
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+    });
+
+    await handleGatewayState({
+      ...baseOptions(deps, "missing"),
+      externalComponent: component,
+    });
+
+    const projection = {
+      componentId: "policy-governance",
+      interceptorSocketPath: "/run/user/1000/component/interceptor.sock",
+    };
+    expect(component.revalidateBeforeGateway).toHaveBeenCalledOnce();
+    expect(calls.configureExternalComponentGateway).toHaveBeenCalledWith(projection);
+    expect(calls.refresh).toHaveBeenCalledWith("missing");
+    expect(calls.startGateway).toHaveBeenCalledWith({ type: "nvidia" }, { gpuPassthrough: true });
+    expect(revalidateBeforeGateway.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.configureExternalComponentGateway.mock.invocationCallOrder[0],
+    );
+    expect(calls.configureExternalComponentGateway.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.refresh.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("starts the gateway after component preparation succeeds (#11507)", async () => {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync(os.homedir()), "nc-prepare-"));
+    const socketPath = path.join(directory, "activate.sock");
+    const component = preparedConnectionComponent(socketPath);
+    const preparation: componentActivation.ExternalComponentGatewayPreparation = {
+      gateway: {
+        id: "generic-gateway",
+        issuer: "openshell-gateway:generic-gateway",
+        publicKeyPem: generateKeyPairSync("ed25519")
+          .publicKey.export({ type: "spki", format: "pem" })
+          .toString(),
+        kid: "generic-key",
+        extensionTokenTtlSecs: 900,
+      },
+      network: { gatewayIp: "172.30.115.1", subnet: "172.30.115.0/24" },
+      revalidate: vi.fn(),
+    };
+    const { deps, calls } = createDeps({ isLinuxDockerDriverGatewayEnabled: vi.fn(() => true) });
+    calls.configureExternalComponentGateway.mockResolvedValue(preparation);
+    const acknowledge = vi.fn((request: { preparationId: string; componentId: string }) => ({
+      schemaVersion: 2,
+      preparationId: request.preparationId,
+      componentId: request.componentId,
+      result: "prepared",
+    }));
+    const received: unknown[] = [];
+    const server = http.createServer((request, reply) => {
+      let body = "";
+      request.on("data", (chunk) => {
+        body += String(chunk);
+      });
+      request.on("end", () => {
+        const payload = JSON.parse(body);
+        received.push({ method: request.method, url: request.url, body: payload });
+        const response = JSON.stringify(acknowledge(payload));
+        reply.writeHead(200, {
+          "content-length": Buffer.byteLength(response),
+          connection: "close",
+        });
+        reply.end(response);
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath, resolve);
+      });
+      await handleGatewayState({ ...baseOptions(deps, "missing"), externalComponent: component });
+      expect(received).toEqual([
+        {
+          method: "POST",
+          url: "/v2/prepare",
+          body: expect.objectContaining({
+            schemaVersion: 2,
+            componentId: component.declaration.componentId,
+            gateway: { name: "nemoclaw", ...preparation.gateway },
+            network: preparation.network,
+          }),
+        },
+      ]);
+      expect(component.setGatewayRevalidation).toHaveBeenCalledOnce();
+      expect(preparation.revalidate).toHaveBeenCalled();
+      expect(calls.configureExternalComponentGateway).toHaveBeenCalledWith(
+        expect.objectContaining({ schemaVersion: 2 }),
+      );
+      expect(calls.configureExternalComponentGateway.mock.invocationCallOrder[0]).toBeLessThan(
+        acknowledge.mock.invocationCallOrder[0]!,
+      );
+      expect(acknowledge.mock.invocationCallOrder[0]).toBeLessThan(
+        calls.startGateway.mock.invocationCallOrder[0]!,
+      );
+      expect(calls.startGateway).toHaveBeenCalledOnce();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("waits for network preparation and preserves gateway state on failure", async () => {
+    const prepare = vi.spyOn(componentActivation, "prepareExternalComponentGateway");
+    const { deps, calls } = createDeps({ isLinuxDockerDriverGatewayEnabled: vi.fn(() => true) });
+    let rejectPreparation!: (reason: Error) => void;
+    calls.configureExternalComponentGateway.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectPreparation = reject;
+      }),
+    );
+    const pending = handleGatewayState({
+      ...baseOptions(deps, "missing"),
+      externalComponent: preparedConnectionComponent(),
+    });
+    await vi.waitFor(() => expect(calls.configureExternalComponentGateway).toHaveBeenCalledOnce());
+    expect(prepare).not.toHaveBeenCalled();
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    rejectPreparation(new Error("preparation_failed"));
+    await expect(pending).rejects.toThrow("preparation_failed");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("preserves gateway state when component preparation fails (#11507)", async () => {
+    vi.spyOn(componentActivation, "prepareExternalComponentGateway").mockRejectedValue(
+      new Error("preparation_failed"),
+    );
+    const { deps, calls } = createDeps({ isLinuxDockerDriverGatewayEnabled: vi.fn(() => true) });
+    await expect(
+      handleGatewayState({
+        ...baseOptions(deps, "missing"),
+        externalComponent: preparedConnectionComponent(),
+      }),
+    ).rejects.toThrow("preparation_failed");
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("removes a prior component before evaluating managed gateway reuse (#11340)", async () => {
+    const refresh = vi.fn(async () => "stale" as GatewayReuseState);
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+      refreshDockerDriverGatewayReuseState: refresh,
+    });
+
+    await handleGatewayState(baseOptions(deps, "healthy"));
+
+    expect(calls.configureExternalComponentGateway).toHaveBeenCalledWith(null);
+    expect(calls.configureExternalComponentGateway.mock.invocationCallOrder[0]).toBeLessThan(
+      refresh.mock.invocationCallOrder[0],
+    );
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.startGateway).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a registered component outside the supported Linux gateway path (#11340)", async () => {
+    const component = preparedExternalComponent();
+    const { deps, calls } = createDeps();
+
+    await expect(
+      handleGatewayState({
+        ...baseOptions(deps, "missing"),
+        externalComponent: component,
+      }),
+    ).rejects.toMatchObject({ code: "capability_unsupported" });
+
+    expect(component.revalidateBeforeGateway).not.toHaveBeenCalled();
+    expect(calls.configureExternalComponentGateway).not.toHaveBeenCalled();
+    expect(calls.refresh).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
   it("starts the gateway when no reusable gateway exists", async () => {
     const { deps, calls } = createDeps();
 
@@ -123,6 +453,7 @@ describe("handleGatewayState", () => {
 
     expect(calls.startStep).toHaveBeenCalledWith("gateway");
     expect(calls.startGateway).toHaveBeenCalledWith({ type: "nvidia" }, { gpuPassthrough: true });
+    expect(calls.configureExternalComponentGateway).not.toHaveBeenCalled();
     expect(calls.complete).toHaveBeenCalledWith("gateway");
     expect(result.gatewayReuseState).toBe("missing");
     expect(result.stateResult).toEqual({
@@ -130,8 +461,83 @@ describe("handleGatewayState", () => {
       next: "provider_selection",
       transitionKind: "advance",
       updates: undefined,
-      metadata: { state: "gateway", gatewayReuseState: "missing" },
+      metadata: {
+        state: "gateway",
+        gatewayReuseState: "missing",
+        gatewayOwner: {
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          mode: "nemoclaw-managed",
+          source: "standalone",
+          endpoint: null,
+          supervisor: null,
+          requiredCapabilities: [],
+        },
+      },
     });
+  });
+
+  it("starts a verified stale gateway with named metadata (#7087)", async () => {
+    const gatewayReuseSnapshot = await createGatewayReuseHelpers({
+      ...gatewayAdaptersForTest({
+        healthy: false,
+        namedMetadata: true,
+        gatewayReuseState: "stale",
+      }),
+      gatewayName: "nemoclaw",
+      cliDisplayName: () => "NemoClaw",
+    }).getGatewayReuseSnapshot();
+    const { deps, calls } = createDeps();
+
+    const result = await handleGatewayState(
+      baseOptions(deps, gatewayReuseSnapshot.gatewayReuseState),
+    );
+
+    expect(gatewayReuseSnapshot.gatewayReuseState).toBe("stale");
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.startStep).toHaveBeenCalledWith("gateway");
+    expect(calls.startGateway).toHaveBeenCalledWith({ type: "nvidia" }, { gpuPassthrough: true });
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(result.gatewayReuseState).toBe("stale");
+  });
+
+  it("completes one gateway step when a refused-status start succeeds on retry (#7087)", async () => {
+    const startGateway = vi
+      .fn<GatewayStateOptions<Gpu>["deps"]["startGateway"]>()
+      .mockRejectedValueOnce(new Error("gateway start failed"))
+      .mockResolvedValueOnce(undefined);
+    const { deps, calls } = createDeps({ startGateway });
+
+    await expect(handleGatewayState(baseOptions(deps, "stale"))).rejects.toThrow(
+      "gateway start failed",
+    );
+
+    expect(calls.startStep).toHaveBeenCalledOnce();
+    expect(calls.complete).not.toHaveBeenCalled();
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+
+    const result = await handleGatewayState(baseOptions(deps, "stale"));
+
+    expect(startGateway).toHaveBeenCalledTimes(2);
+    expect(calls.startStep).toHaveBeenCalledTimes(2);
+    expect(calls.complete).toHaveBeenCalledOnce();
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(result.gatewayReuseState).toBe("stale");
+    expect(result.stateResult).toEqual(
+      expect.objectContaining({
+        type: "transition",
+        next: "provider_selection",
+        metadata: expect.objectContaining({
+          state: "gateway",
+          gatewayReuseState: "stale",
+        }),
+      }),
+    );
   });
 
   it("reuses healthy gateways on fresh runs", async () => {
@@ -147,6 +553,130 @@ describe("handleGatewayState", () => {
     expect(calls.note).toHaveBeenCalledWith("  Reusing healthy NemoClaw gateway.");
     expect(calls.startGateway).not.toHaveBeenCalled();
     expect(calls.complete).toHaveBeenCalledWith("gateway");
+  });
+
+  it("proves sandbox bridge reachability before reusing a Docker-driver gateway", async () => {
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+    });
+
+    await handleGatewayState(baseOptions(deps, "healthy"));
+
+    expect(calls.verifyReusableGatewayReachability).toHaveBeenCalledWith(
+      { type: "nvidia" },
+      { gpuPassthrough: true },
+    );
+    expect(calls.verifyReusableGatewayReachability).toHaveBeenCalledBefore(calls.recordSkip);
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("stops before recording reuse when sandbox bridge reachability fails", async () => {
+    const verifyReusableDockerDriverGatewaySandboxReachability = vi.fn(async () => {
+      throw new Error("sandbox bridge cannot reach gateway");
+    });
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+      verifyReusableDockerDriverGatewaySandboxReachability,
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toThrow(
+      "sandbox bridge cannot reach gateway",
+    );
+
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("stops before gateway or sandbox state mutation when reuse verification fails (#9594)", async () => {
+    const { deps, calls } = createDeps({
+      refreshDockerDriverGatewayReuseState: vi.fn(async () => {
+        throw new Error("Docker network inspection was inconclusive");
+      }),
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toThrow(
+      "Docker network inspection was inconclusive",
+    );
+
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.startStep).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("does not retire a gateway with unproven lifecycle authority when its Docker network is absent (#9594)", async () => {
+    const { deps, calls } = createDeps({
+      refreshDockerDriverGatewayReuseState: vi.fn(async () => {
+        throw new Error(
+          "Docker network is absent, but NemoClaw could not verify the running gateway's lifecycle authority.",
+        );
+      }),
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toThrow(
+      "Docker network is absent, but NemoClaw could not verify the running gateway's lifecycle authority.",
+    );
+
+    expect(calls.startStep).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("recreates the NemoClaw-managed OpenShell gateway before completion when its Docker network is absent (#9594)", async () => {
+    const order: string[] = [];
+    const { deps, calls } = createDeps({
+      refreshDockerDriverGatewayReuseState: vi.fn(async () => {
+        order.push("verify-network");
+        return "stale" as GatewayReuseState;
+      }),
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+      startRecordedStep: vi.fn(async () => {
+        order.push("start-step");
+      }),
+      retireLegacyGatewayForDockerDriverUpgrade: vi.fn(() => {
+        order.push("retire-gateway");
+      }),
+      startGateway: vi.fn(async () => {
+        order.push("start-gateway");
+      }),
+      recordStepComplete: vi.fn(async () => {
+        order.push("complete-gateway");
+        return createSession();
+      }),
+    });
+
+    await handleGatewayState(baseOptions(deps, "healthy"));
+
+    expect(order).toEqual([
+      "verify-network",
+      "start-step",
+      "retire-gateway",
+      "start-gateway",
+      "complete-gateway",
+    ]);
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+  });
+
+  it("keeps the gateway step incomplete when missing-network recreation fails (#9594)", async () => {
+    const { deps, calls } = createDeps({
+      refreshDockerDriverGatewayReuseState: vi.fn(async () => "stale" as GatewayReuseState),
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+      startGateway: vi.fn(async () => {
+        throw new Error("gateway restart failed");
+      }),
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toThrow(
+      "gateway restart failed",
+    );
+
+    expect(calls.retireLegacy).toHaveBeenCalledOnce();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
   });
 
   it("emits one successful gateway phase when reusing a healthy gateway", async () => {
@@ -344,7 +874,7 @@ describe("handleGatewayState", () => {
     );
   });
 
-  it("replaces legacy metadata before starting the Docker-driver gateway", async () => {
+  it("replaces legacy metadata before starting the managed gateway", async () => {
     const { deps, calls } = createDeps({
       isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
       reconcileGatewayGpuReuseForGpuIntent: vi.fn(() => "stale" as GatewayReuseState),
@@ -352,15 +882,13 @@ describe("handleGatewayState", () => {
 
     const result = await handleGatewayState(baseOptions(deps, "healthy"));
 
-    expect(calls.note).toHaveBeenCalledWith(
-      "  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.",
-    );
+    expect(calls.note).toHaveBeenCalledWith("  Replacing legacy OpenShell gateway metadata.");
     expect(calls.retireLegacy).toHaveBeenCalledOnce();
     expect(calls.startGateway).toHaveBeenCalledOnce();
     expect(result.gatewayReuseState).toBe("missing");
   });
 
-  it("emits the step [2/8] header before retiring the legacy Docker-driver gateway", async () => {
+  it("emits the step [2/8] header before retiring the legacy gateway", async () => {
     const order: string[] = [];
     const { deps, calls } = createDeps({
       isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
@@ -379,9 +907,7 @@ describe("handleGatewayState", () => {
     await handleGatewayState(baseOptions(deps, "healthy"));
 
     expect(order).toEqual(["startRecordedStep:gateway", "retireLegacy", "startGateway"]);
-    expect(calls.note).toHaveBeenCalledWith(
-      "  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.",
-    );
+    expect(calls.note).toHaveBeenCalledWith("  Replacing legacy OpenShell gateway metadata.");
   });
 
   it("does not retire a foreign-active Docker-driver gateway (concurrent instances)", async () => {
@@ -393,10 +919,148 @@ describe("handleGatewayState", () => {
     const result = await handleGatewayState(baseOptions(deps, "foreign-active"));
 
     expect(calls.retireLegacy).not.toHaveBeenCalled();
-    expect(calls.note).not.toHaveBeenCalledWith(
-      "  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.",
-    );
+    expect(calls.note).not.toHaveBeenCalled();
     expect(calls.startGateway).toHaveBeenCalledOnce();
     expect(result.gatewayReuseState).toBe("missing");
+  });
+});
+
+describe("externally supervised gateway lifecycle authority", () => {
+  function externalDeps(probe: Partial<GatewayAttachmentProbe> = {}) {
+    const { calls, deps } = createDeps();
+    calls.resolveOwner.mockReturnValue(EXTERNAL_OWNER);
+    calls.probeAttachment.mockResolvedValue({
+      gatewayPort: 8080,
+      httpReady: true,
+      portOccupied: true,
+      listenerPids: [4242],
+      listenerScanComplete: true,
+      listenerStartTime: "710024",
+      supervisorActive: true,
+      listenerExecPath: "/usr/local/bin/openshell-gateway",
+      listenerSupervisorMatch: true,
+      ...probe,
+    });
+    return { calls, deps };
+  }
+
+  it("attaches to the supervised gateway without running any lifecycle effect (#6576)", async () => {
+    const order: string[] = [];
+    const { calls, deps } = externalDeps();
+    calls.attachGateway.mockImplementation(async () => {
+      order.push("attach");
+    });
+    calls.complete.mockImplementation(async () => {
+      order.push("complete");
+      return createSession();
+    });
+
+    const result = await handleGatewayState(baseOptions(deps, "missing"));
+
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.attachGateway).toHaveBeenCalledWith(
+      EXTERNAL_OWNER,
+      expect.objectContaining({ listenerPids: [4242], listenerSupervisorMatch: true }),
+    );
+    expect(calls.destroy).not.toHaveBeenCalled();
+    expect(calls.destroyForReuse).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.complete).toHaveBeenCalledWith("gateway");
+    expect(order).toEqual(["attach", "complete"]);
+    expect(result.stateResult).toMatchObject({
+      metadata: { gatewayOwner: { mode: "externally-supervised", source: "declared" } },
+    });
+  });
+
+  it("rejects a registered component before any supervised gateway effect (#11340)", async () => {
+    const { calls, deps } = externalDeps();
+
+    await expect(
+      handleGatewayState({
+        ...baseOptions(deps, "missing"),
+        externalComponent: preparedExternalComponent(),
+      }),
+    ).rejects.toMatchObject({ code: "capability_unsupported" });
+
+    expect(calls.probeAttachment).not.toHaveBeenCalled();
+    expect(calls.attachGateway).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("rejects host mounts before any externally supervised gateway effect", async () => {
+    const { calls, deps } = externalDeps();
+
+    await expect(
+      handleGatewayState({ ...baseOptions(deps, "missing"), requiresBindMounts: true }),
+    ).rejects.toMatchObject({ code: "capability_unsupported" });
+
+    expect(calls.attachGateway).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroy).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("does not cross the provider-mutation boundary when exact registration fails (#6576)", async () => {
+    const { calls, deps } = externalDeps();
+    calls.attachGateway.mockImplementation(async () => {
+      throw new GatewayOwnershipError(
+        "gateway_registration_failed",
+        "registration failed",
+        EXTERNAL_OWNER,
+      );
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "missing"))).rejects.toMatchObject({
+      code: "gateway_registration_failed",
+    });
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("never falls back to a standalone gateway when the supervisor is inactive (#6576)", async () => {
+    const { calls, deps } = externalDeps({ supervisorActive: false });
+
+    await expect(handleGatewayState(baseOptions(deps, "missing"))).rejects.toThrow(
+      GatewayOwnershipError,
+    );
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroy).not.toHaveBeenCalled();
+  });
+
+  it("fails before any effect when a competing listener holds the port (#6576)", async () => {
+    const { calls, deps } = externalDeps({ listenerPids: [4242, 4243] });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toMatchObject({
+      code: "multiple_owners",
+    });
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroyForReuse).not.toHaveBeenCalled();
+  });
+
+  it("fails before any effect when the running gateway is not the declared one (#6576)", async () => {
+    const { calls, deps } = externalDeps({ listenerExecPath: "/opt/other/openshell-gateway" });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toMatchObject({
+      code: "identity_mismatch",
+    });
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the declared owner on resume rather than trusting the recorded step (#6576)", async () => {
+    const { calls, deps } = externalDeps({
+      portOccupied: false,
+      listenerPids: [],
+      httpReady: false,
+    });
+    const session = createSession();
+    session.steps = {
+      gateway: { status: "complete", startedAt: null, completedAt: null, error: null },
+    };
+
+    await expect(
+      handleGatewayState({ ...baseOptions(deps, "healthy", session), resume: true }),
+    ).rejects.toMatchObject({ code: "gateway_unreachable" });
+    expect(calls.probeAttachment).toHaveBeenCalledOnce();
+    expect(calls.startGateway).not.toHaveBeenCalled();
   });
 });

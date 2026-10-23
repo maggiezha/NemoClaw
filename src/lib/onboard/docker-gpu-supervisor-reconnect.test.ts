@@ -3,11 +3,222 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import type { OpenShellSandboxBufferedCommandExecutor } from "../adapters/openshell/sandbox-command";
 import {
   getDockerGpuSupervisorReconnectErrorDebouncePolls,
   getDockerGpuSupervisorReconnectTimeoutSecs,
+  waitForOpenShellFinalHandoff,
   waitForOpenShellSupervisorReconnect,
 } from "./docker-gpu-supervisor-reconnect";
+
+type LegacyExecResult = { status: number | null; stdout?: string; stderr?: string };
+
+function commandExecutorThrough(
+  run: () => LegacyExecResult,
+): OpenShellSandboxBufferedCommandExecutor {
+  return {
+    runBuffered: vi.fn(async () => {
+      const result = run();
+      return {
+        outcome:
+          result.status === null
+            ? { kind: "failed" as const, error: { kind: "invocation" as const, message: "failed" } }
+            : { kind: "completed" as const, exitCode: result.status },
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      };
+    }),
+  };
+}
+
+describe("Docker GPU supervisor reconnect", () => {
+  it("does not report reconnect when the OpenShell execution boundary fails (#9531)", async () => {
+    await expect(
+      waitForOpenShellSupervisorReconnect("alpha", 1, {
+        commandExecutor: commandExecutorThrough(() => ({ status: 1 })),
+        sleep: vi.fn(),
+      }),
+    ).resolves.toBe(false);
+  });
+});
+
+describe("Docker GPU final handoff acknowledgement", () => {
+  it("accepts a running replacement when OpenShell reports Running", async () => {
+    const runCaptureOpenshell = vi.fn(() => "alpha   Running   1s ago");
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const replacementIsExactAndRunning = vi.fn(() => true);
+    const sleep = vi.fn();
+
+    const acknowledgement = await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+      runCaptureOpenshell,
+      commandExecutor: commandExecutorThrough(runOpenshell),
+      replacementIsExactAndRunning,
+      sleep,
+    });
+
+    expect(acknowledgement).toEqual({ acknowledged: true, lastSandboxPhase: "Running" });
+    expect(runCaptureOpenshell).toHaveBeenCalledOnce();
+    expect(runOpenshell).toHaveBeenCalledOnce();
+    expect(replacementIsExactAndRunning).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("expires a subsecond final handoff budget in milliseconds (#11096)", async () => {
+    vi.useFakeTimers();
+    try {
+      const startedAtMs = new Date("2026-09-04T07:42:01Z").getTime();
+      vi.setSystemTime(startedAtMs);
+      const runCaptureOpenshell = vi.fn(() => "alpha  2026-09-04 07:42:01  Provisioning\n");
+      const sleep = vi.fn((seconds: number) => {
+        vi.advanceTimersByTime(seconds * 1000);
+      });
+
+      const acknowledgement = await waitForOpenShellFinalHandoff("alpha", startedAtMs + 500, {
+        runCaptureOpenshell,
+        commandExecutor: commandExecutorThrough(() => ({ status: 1 })),
+        replacementIsExactAndRunning: vi.fn(() => true),
+        sleep,
+      });
+
+      expect(acknowledgement).toEqual({
+        acknowledged: false,
+        lastSandboxPhase: "Provisioning",
+      });
+      expect(Date.now() - startedAtMs).toBe(500);
+      expect(runCaptureOpenshell).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts the exact running replacement only after OpenShell reports Ready (#9531)", async () => {
+    const events: string[] = [];
+    const runCaptureOpenshell = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        events.push("observe provisioning");
+        return "alpha  2026-08-23 10:00:00  Provisioning\n";
+      })
+      .mockImplementationOnce(() => {
+        events.push("observe ready");
+        return "alpha  2026-08-23 10:00:02  Ready\n";
+      });
+    const runOpenshell = vi.fn(() => {
+      events.push("exec ready");
+      return { status: 0 };
+    });
+    const commandExecutor = commandExecutorThrough(runOpenshell);
+    const replacementIsExactAndRunning = vi.fn(() => {
+      events.push("confirm exact replacement");
+      return true;
+    });
+
+    const acknowledgement = await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+      runCaptureOpenshell,
+      commandExecutor,
+      replacementIsExactAndRunning,
+      sleep: vi.fn(),
+    });
+
+    expect(acknowledgement).toEqual({ acknowledged: true, lastSandboxPhase: "Ready" });
+    expect(events).toEqual([
+      "observe provisioning",
+      "confirm exact replacement",
+      "observe ready",
+      "exec ready",
+      "confirm exact replacement",
+    ]);
+    expect(runCaptureOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "list"],
+      expect.objectContaining({
+        killProcessTreeOnTimeout: true,
+        killSignal: "SIGKILL",
+        timeout: expect.any(Number),
+      }),
+    );
+    expect(commandExecutor.runBuffered).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sandboxName: "alpha",
+        command: ["true"],
+        timeoutMilliseconds: expect.any(Number),
+      }),
+    );
+  });
+
+  it("treats Deleting after the replacement start as terminal (#9531)", async () => {
+    const runCaptureOpenshell = vi.fn(() => "alpha  2026-08-23 10:00:00  Deleting\n");
+    const runOpenshell = vi.fn(() => ({ status: 1 }));
+    const replacementIsExactAndRunning = vi.fn(() => true);
+    const sleep = vi.fn();
+
+    expect(
+      await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+        runCaptureOpenshell,
+        commandExecutor: commandExecutorThrough(runOpenshell),
+        replacementIsExactAndRunning,
+        sleep,
+      }),
+    ).toEqual({ acknowledged: false, lastSandboxPhase: "Deleting" });
+    expect(runCaptureOpenshell).toHaveBeenCalledOnce();
+    expect(runOpenshell).not.toHaveBeenCalled();
+    expect(replacementIsExactAndRunning).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("continues through Error only while the exact replacement is running (#9531)", async () => {
+    const runCaptureOpenshell = vi.fn(() => "alpha  2026-08-23 10:00:00  Error\n");
+    const replacementIsExactAndRunning = vi.fn(() => false);
+
+    expect(
+      await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+        runCaptureOpenshell,
+        commandExecutor: commandExecutorThrough(() => ({ status: 1 })),
+        replacementIsExactAndRunning,
+        sleep: vi.fn(),
+      }),
+    ).toEqual({ acknowledged: false, lastSandboxPhase: "Error" });
+    expect(replacementIsExactAndRunning).toHaveBeenCalledOnce();
+  });
+
+  it("allows a running replacement to progress from Error to Ready (#9531)", async () => {
+    const runCaptureOpenshell = vi
+      .fn()
+      .mockReturnValueOnce("alpha  2026-08-23 10:00:00  Error\n")
+      .mockReturnValueOnce("alpha  2026-08-23 10:00:02  Ready\n");
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const replacementIsExactAndRunning = vi.fn(() => true);
+
+    expect(
+      await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+        runCaptureOpenshell,
+        commandExecutor: commandExecutorThrough(runOpenshell),
+        replacementIsExactAndRunning,
+        sleep: vi.fn(),
+      }),
+    ).toEqual({ acknowledged: true, lastSandboxPhase: "Ready" });
+    expect(replacementIsExactAndRunning).toHaveBeenCalledTimes(2);
+    expect(runOpenshell).toHaveBeenCalledOnce();
+  });
+
+  it("does not reuse a stale Ready phase after the sandbox row disappears (#9531)", async () => {
+    const runCaptureOpenshell = vi
+      .fn()
+      .mockReturnValueOnce("alpha  2026-08-23 10:00:00  Ready\n")
+      .mockReturnValue("");
+    const runOpenshell = vi.fn(() => ({ status: 1 }));
+    const replacementIsExactAndRunning = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+
+    expect(
+      await waitForOpenShellFinalHandoff("alpha", Date.now() + 60_000, {
+        runCaptureOpenshell,
+        commandExecutor: commandExecutorThrough(runOpenshell),
+        replacementIsExactAndRunning,
+        sleep: vi.fn(),
+      }),
+    ).toEqual({ acknowledged: false, lastSandboxPhase: "Ready" });
+    expect(runOpenshell).toHaveBeenCalledOnce();
+  });
+});
 
 // The Docker GPU patch supervisor-reconnect wait must absorb a transient
 // Error phase reported while OpenShell's sandbox-list cache catches up to
@@ -17,6 +228,98 @@ import {
 // GPU sandbox whose container is running and whose supervisor has already
 // logged `LIFECYCLE:INSTALL OpenShell Sandbox Supervisor success`.
 describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
+  it("keeps sandbox-list inside the reconnect deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
+      const commandExecutor: OpenShellSandboxBufferedCommandExecutor = {
+        runBuffered: vi.fn(async () => {
+          vi.advanceTimersByTime(600);
+          return {
+            outcome: { kind: "completed" as const, exitCode: 0 },
+            stdout: "",
+            stderr: "",
+          };
+        }),
+      };
+      const runCaptureOpenshell = vi.fn((_args: string[], opts?: Record<string, unknown>) => {
+        vi.advanceTimersByTime(Number(opts?.timeout));
+        return "alpha   Ready   1s ago";
+      });
+      const sleep = vi.fn();
+
+      const ok = await waitForOpenShellSupervisorReconnect("alpha", 1, {
+        commandExecutor,
+        runCaptureOpenshell,
+        sleep,
+      });
+
+      expect(ok).toBe(false);
+      expect(commandExecutor.runBuffered).toHaveBeenCalledOnce();
+      expect(runCaptureOpenshell).toHaveBeenCalledWith(
+        ["sandbox", "list"],
+        expect.objectContaining({ timeout: 400 }),
+      );
+      expect(runCaptureOpenshell).toHaveBeenCalledOnce();
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not accept a working exec while OpenShell still reports Error", async () => {
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const runCaptureOpenshell = vi.fn(() => "alpha   Error   1s ago");
+    const sleep = vi.fn();
+
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
+      runCaptureOpenshell,
+      sleep,
+      errorPhaseDebouncePolls: 2,
+    });
+
+    expect(ok).toBe(false);
+    expect(runOpenshell).toHaveBeenCalledTimes(2);
+    expect(runCaptureOpenshell).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a working exec after the Error row settles to Ready", async () => {
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const runCaptureOpenshell = vi
+      .fn()
+      .mockReturnValueOnce("alpha   Error   1s ago")
+      .mockReturnValueOnce("alpha   Ready   3s ago");
+
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
+      runCaptureOpenshell,
+      sleep: vi.fn(),
+      errorPhaseDebouncePolls: 2,
+    });
+
+    expect(ok).toBe(true);
+    expect(runOpenshell).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts a working exec when OpenShell reports Running", async () => {
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const runCaptureOpenshell = vi.fn(() => "alpha   Running   1s ago");
+    const sleep = vi.fn();
+
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 1, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
+      runCaptureOpenshell,
+      sleep,
+    });
+
+    expect(ok).toBe(true);
+    expect(runOpenshell).toHaveBeenCalledOnce();
+    expect(runCaptureOpenshell).toHaveBeenCalledOnce();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
   it("uses a Docker-GPU-specific supervisor reconnect wait with an override", () => {
     expect(getDockerGpuSupervisorReconnectTimeoutSecs(180, {})).toBe(900);
     expect(getDockerGpuSupervisorReconnectTimeoutSecs(600, {})).toBe(900);
@@ -28,15 +331,18 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     ).toBe(30);
   });
 
-  it("short-circuits the supervisor-reconnect wait when the sandbox enters Error phase", () => {
+  it("short-circuits the supervisor-reconnect wait when the sandbox enters Error phase", async () => {
     const runOpenshell = vi.fn(() => ({ status: 1, stderr: "sandbox not ready" }));
-    const listOutputs = ["alpha   Provisioning   1s ago", "alpha   Error          3s ago"];
+    const listOutputs = [
+      "alpha   Provisioning   1s ago",
+      "alpha   \u001b[31mError\u001b[0m          3s ago",
+    ];
     let index = 0;
     const runCaptureOpenshell = vi.fn(() => listOutputs[Math.min(index++, listOutputs.length - 1)]);
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
       errorPhaseDebouncePolls: 1,
@@ -47,7 +353,7 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(sleep).toHaveBeenCalledTimes(1);
   });
 
-  it("absorbs a transient Error phase shorter than the debounce window", () => {
+  it("absorbs a transient Error phase shorter than the debounce window", async () => {
     const execOutputs = [
       { status: 1, stderr: "sandbox not ready" },
       { status: 1, stderr: "sandbox not ready" },
@@ -68,8 +374,8 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     );
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
       errorPhaseDebouncePolls: 5,
@@ -79,13 +385,13 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(runOpenshell).toHaveBeenCalledTimes(4);
   });
 
-  it("still fast-fails when Error phase persists for the full debounce window", () => {
+  it("still fast-fails when Error phase persists for the full debounce window", async () => {
     const runOpenshell = vi.fn(() => ({ status: 1, stderr: "sandbox not ready" }));
     const runCaptureOpenshell = vi.fn(() => "alpha   Error   1s ago");
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
       errorPhaseDebouncePolls: 3,
@@ -98,12 +404,12 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(sleep).toHaveBeenCalledTimes(2);
   });
 
-  it("does not accept a supervisor exec with no exit status", () => {
+  it("does not accept a supervisor exec with no exit status", async () => {
     const runOpenshell = vi.fn(() => ({ status: null, stderr: "timed out" }));
     const runCaptureOpenshell = vi.fn(() => "alpha   Error   1s ago");
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep: vi.fn(),
       errorPhaseDebouncePolls: 1,
@@ -113,7 +419,7 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(runOpenshell).toHaveBeenCalledOnce();
   });
 
-  it("resets the consecutive-Error counter when the phase recovers", () => {
+  it("resets the consecutive-Error counter when the phase recovers", async () => {
     // Error, Error, Provisioning (counter resets), Error, Error, Error
     // -> bails out on the 3rd post-recovery Error, not earlier.
     const runOpenshell = vi.fn(() => ({ status: 1, stderr: "sandbox not ready" }));
@@ -131,8 +437,8 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     );
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
       errorPhaseDebouncePolls: 3,
@@ -142,7 +448,7 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(runOpenshell).toHaveBeenCalledTimes(6);
   });
 
-  it("absorbs a Docker-CDI Error phase longer than the old 30s window", () => {
+  it("absorbs a Docker-CDI Error phase longer than the old 30s window", async () => {
     // #4948 runtime validation on the Docker-CDI GPU runner showed the
     // sandbox-list row can remain Error for roughly a minute after the CDI
     // recreate (`--device nvidia.com/gpu=all`) while the supervisor is still
@@ -158,8 +464,8 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     );
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
     });
@@ -183,15 +489,15 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     ).toBe(1);
   });
 
-  it("clamps an injected debounce override to the same minimum as the env path", () => {
+  it("clamps an injected debounce override to the same minimum as the env path", async () => {
     // 0 / negative / fractional overrides must not bypass the ≥1 contract that
     // the env-backed helper enforces.
     const runOpenshell = vi.fn(() => ({ status: 1, stderr: "sandbox not ready" }));
     const runCaptureOpenshell = vi.fn(() => "alpha   Error   1s ago");
     const sleep = vi.fn();
 
-    const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-      runOpenshell,
+    const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+      commandExecutor: commandExecutorThrough(runOpenshell),
       runCaptureOpenshell,
       sleep,
       errorPhaseDebouncePolls: 0,
@@ -203,18 +509,15 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 
-  it("falls back to the env-backed default when an injected override is non-finite", () => {
-    // NaN / +Infinity / -Infinity overrides must not silently neutralise the
-    // fast-fail loop. A NaN comparison would always be false and `Infinity`
-    // would never satisfy `>= debouncePolls`, leaving the wait to burn the
-    // full timeout window.
-    for (const bogus of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "falls back to the env-backed default when an injected override is non-finite [case %#]",
+    async (bogus) => {
       const runOpenshell = vi.fn(() => ({ status: 1, stderr: "sandbox not ready" }));
       const runCaptureOpenshell = vi.fn(() => "alpha   Error   1s ago");
       const sleep = vi.fn();
 
-      const ok = waitForOpenShellSupervisorReconnect("alpha", 600, {
-        runOpenshell,
+      const ok = await waitForOpenShellSupervisorReconnect("alpha", 600, {
+        commandExecutor: commandExecutorThrough(runOpenshell),
         runCaptureOpenshell,
         sleep,
         errorPhaseDebouncePolls: bogus,
@@ -224,6 +527,6 @@ describe("docker-gpu-supervisor-reconnect Error-phase debounce", () => {
       // Default K=60 from the env-backed helper: 60 polls + 59 sleeps before fast-fail.
       expect(runOpenshell).toHaveBeenCalledTimes(60);
       expect(sleep).toHaveBeenCalledTimes(59);
-    }
-  });
+    },
+  );
 });

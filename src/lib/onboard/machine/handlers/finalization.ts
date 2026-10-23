@@ -1,12 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Session } from "../../../state/onboard-session";
+import { CLI_NAME } from "../../../cli/branding";
+import { OPENROUTER_PROVIDER_NAME } from "../../../inference/openrouter";
+import type { ExternalComponentActivationIncomplete } from "../../../state/onboard-session";
+import { DCODE_AGENT_NAME } from "../../observability-policy-presets";
 import { type DashboardRuntimeAgent, shouldManageDashboardForAgent } from "../../dashboard-runtime";
+import type { PreparedExternalComponent } from "../../external-component";
+import type {
+  ExternalComponentActivationProof,
+  ExternalComponentActivationResult,
+} from "../../external-component/activation";
+import type { WebSearchVerifyProvider } from "../../web-search-verify";
+import type { PortableOpenClawPairingSettlementResult } from "../../../actions/sandbox/launch-readiness";
+import type {
+  OrdinaryOpenClawPairingSettlementResult,
+  SandboxProcessReadinessResult,
+} from "../finalization-deps";
 import {
+  advanceTo,
   completeOnboardMachine,
   type OnboardStateCompleteResult,
   type OnboardStatePauseResult,
+  type OnboardStateTransitionResult,
   pauseOnboardMachine,
 } from "../result";
 
@@ -21,54 +37,88 @@ export interface FinalizationStateOptions<Agent, VerifyChain, VerificationResult
   stagedLegacyKeys: readonly string[];
   migratedLegacyKeys: ReadonlySet<string>;
   webSearchEnabled: boolean;
+  webSearchProvider: WebSearchVerifyProvider | null;
+  preferredInferenceApi?: string | null;
+  portableProfileSelected?: boolean;
+  externalComponent?: PreparedExternalComponent | null;
+  providerless?: boolean;
+  deferRuntimeVerification?: boolean;
   deps: {
-    ensureAgentDashboardForward(sandboxName: string, agent: NonNullable<Agent>): number;
     /**
      * Mark this sandbox as the default. Called here (not at sandbox creation) so
      * a cancel at the policy-preset step never leaves an unconfigured sandbox
      * registered as default (#4614).
      */
     setDefaultSandbox(sandboxName: string): void;
-    recordPostVerifyStarted(): Promise<Session>;
+    createExternalComponentActivationProof?(
+      sandboxName: string,
+    ): ExternalComponentActivationProof | Promise<ExternalComponentActivationProof>;
+    createExternalComponentActivationId?(): string;
+    activateExternalComponent?(
+      component: PreparedExternalComponent,
+      proof: ExternalComponentActivationProof,
+      activationId: string,
+    ): Promise<ExternalComponentActivationResult>;
+    setExternalComponentActivationEvidence?(
+      evidence: ExternalComponentActivationIncomplete | null,
+    ): void;
     toSessionUpdates(
       updates: Record<string, unknown>,
     ): NonNullable<OnboardStateCompleteResult["updates"]>;
     removeLegacyCredentialsFile(): void;
     cleanupStaleHostFiles(): void;
-    checkAndRecoverSandboxProcesses(sandboxName: string, options: { quiet: boolean }): void;
-    /**
-     * Best-effort device-approval sweep that clears pending allowlisted
-     * CLI/webchat scope upgrades before handoff. Never throws; swallows its own
-     * failures (timeout, sandbox-exec errors). Run after process recovery
-     * because that can restart the gateway (#3573), so the sweep targets the
-     * freshly-recovered gateway (ref #4504 / #4263).
-     */
-    autoPairScopeApproval(sandboxName: string): void;
-    /**
-     * Best-effort warm-up that provokes the `operator.write` scope upgrade with
-     * a throwaway in-sandbox `openclaw agent` run, making the request PENDING so
-     * the `autoPairScopeApproval` pass (which must run immediately after) can
-     * clear it before handoff. Without this, the upgrade is only requested by
-     * the user's first real run — after finalization's approval pass already
-     * found nothing pending — causing one silent embedded fallback (#4504-v2).
-     * Order is load-bearing: warm-up (provoke) must run BEFORE
-     * `autoPairScopeApproval` (approve), and after process recovery so the
-     * gateway is live. Never throws; idempotent once operator.write is paired.
-     */
-    warmupScopeUpgrade(sandboxName: string): void;
+    /** False when process recovery refuses the required secret-boundary check. */
+    checkAndRecoverSandboxProcesses(
+      sandboxName: string,
+      options: { quiet: boolean },
+    ): Promise<SandboxProcessReadinessResult>;
+    settleOrdinaryOpenClawPairing(
+      sandboxName: string,
+    ): Promise<OrdinaryOpenClawPairingSettlementResult>;
+    ordinaryOpenClawPairingIncompleteMessage(
+      sandboxName: string,
+      reason: Extract<OrdinaryOpenClawPairingSettlementResult, { kind: "incomplete" }>["reason"],
+    ): string;
+    readRegistryAgent(sandboxName: string): string | null;
+    settlePortablePairing(
+      sandboxName: string,
+      options: {
+        readonly portableRequired: true;
+      },
+    ): Promise<PortableOpenClawPairingSettlementResult>;
+    portablePairingIncompleteMessage(
+      sandboxName: string,
+      reason: Extract<PortableOpenClawPairingSettlementResult, { kind: "incomplete" }>["reason"],
+    ): string;
     getChatUiUrl(): string;
-    buildVerifyChain(chatUiUrl: string): VerifyChain;
+    /**
+     * `sandboxName` lets the chain target the API port this sandbox actually
+     * owns: Hermes allocates a per-sandbox port from the 8642-8652 range, so
+     * the manifest default would probe a sibling sandbox's port (#9290).
+     */
+    buildVerifyChain(chatUiUrl: string, sandboxName: string): VerifyChain;
     verifyDeployment(sandboxName: string, chain: VerifyChain): Promise<VerificationResult>;
+    probeTerminalInference?(input: {
+      sandboxName: string;
+      agentName: string;
+      provider: string;
+      model: string;
+      preferredInferenceApi: string | null;
+    }): Promise<{ ok: boolean; detail?: string }>;
     formatVerificationDiagnostics(result: VerificationResult): string[];
     isDeploymentHealthy(result: VerificationResult): boolean;
     reportDeploymentReadiness(healthy: boolean): void;
     /**
-     * Best-effort probe that confirms the agent runtime actually accepted the
-     * web-search config and (for Brave) that the L7 proxy rewrites the
-     * `X-Subscription-Token` header at egress. Called after the post-policy
-     * sandbox-process recovery so the final policy/gateway state is live.
+     * Confirms the live sandbox does not expose a raw web-search credential.
+     * Other web-search diagnostics remain best-effort. Returns false for a
+     * confirmed exposure or an unverifiable isolation result so finalization
+     * cannot report the sandbox as ready.
      */
-    verifyWebSearchInsideSandbox(sandboxName: string, agent: Agent): void;
+    verifyWebSearchInsideSandbox(
+      sandboxName: string,
+      agent: Agent,
+      provider: WebSearchVerifyProvider,
+    ): Promise<boolean>;
     printDashboard(
       sandboxName: string,
       model: string,
@@ -76,15 +126,19 @@ export interface FinalizationStateOptions<Agent, VerifyChain, VerificationResult
       nimContainer: string | null,
       agent: Agent,
       ready: boolean,
-    ): void;
+    ): Promise<void>;
     error(message?: string): void;
     log(message?: string): void;
   };
 }
 
 export interface FinalizationStateResult {
-  stateResult: OnboardStateCompleteResult | OnboardStatePauseResult;
+  stateResult: OnboardStateTransitionResult | OnboardStatePauseResult;
   unmigratedLegacyKeys: string[];
+}
+
+export interface PostVerifyStateResult {
+  stateResult: OnboardStateCompleteResult | OnboardStatePauseResult;
   verificationDiagnostics: string[];
   deploymentHealthy: boolean;
 }
@@ -97,6 +151,49 @@ type TerminalReadyAgent = {
     headless_command?: unknown;
   } | null;
 };
+
+type PortableAgentDisposition = "invalid" | "ordinary" | "strict-openclaw";
+
+function portableAgentDisposition(
+  sandboxName: string,
+  agent: unknown,
+  portableProfileSelected: boolean | undefined,
+  readRegistryAgent: (sandboxName: string) => string | null,
+): PortableAgentDisposition {
+  if (portableProfileSelected !== true) return "ordinary";
+  // The onboarding model represents the default OpenClaw selection as null.
+  // Keep malformed/unknown objects invalid; only the canonical null sentinel
+  // receives default-OpenClaw semantics.
+  const selectedAgent = agent === null ? "openclaw" : (agent as { readonly name?: unknown })?.name;
+  if (selectedAgent === "openclaw") return "strict-openclaw";
+  if (
+    typeof selectedAgent === "string" &&
+    selectedAgent.length > 0 &&
+    selectedAgent === selectedAgent.trim() &&
+    readRegistryAgent(sandboxName) === selectedAgent
+  ) {
+    return "ordinary";
+  }
+  return "invalid";
+}
+
+function selectedAgentName(agent: unknown): string | null {
+  if (agent === null) return "openclaw";
+  const name = (agent as { readonly name?: unknown })?.name;
+  return typeof name === "string" && name.trim() === name && name ? name : null;
+}
+
+function requiresTerminalInferenceVerification(agent: unknown, provider: string): boolean {
+  return selectedAgentName(agent) === DCODE_AGENT_NAME && provider === OPENROUTER_PROVIDER_NAME;
+}
+
+function terminalInferenceIncompleteMessage(sandboxName: string, detail: string): string {
+  return (
+    `Deep Code inference for '${sandboxName}' is not ready: ${detail}. The sandbox was preserved. ` +
+    `Resolve the provider, model, or runtime adapter problem, then resume onboarding with ` +
+    `${CLI_NAME} onboard --resume.`
+  );
+}
 
 function logTerminalReadyBlock(
   sandboxName: string,
@@ -111,7 +208,11 @@ function logTerminalReadyBlock(
         ? terminalAgent.name
         : "Terminal agent";
   log(`  ✓ ${displayName} terminal runtime is ready`);
-  log(`  Connect: nemoclaw ${sandboxName} connect`);
+  // Lead with the one-step path (#6006); `connect` still opens a sandbox shell.
+  // Only terminal agents reach this block, so the variant binary (for example
+  // `nemo-deepagents`) is the common case — use the resolved name, not a literal.
+  log(`  Launch: ${CLI_NAME} launch ${sandboxName}`);
+  log(`  Connect: ${CLI_NAME} ${sandboxName} connect`);
   if (typeof terminalAgent.runtime?.interactive_command === "string") {
     log(`  Interactive: ${terminalAgent.runtime.interactive_command}`);
   }
@@ -120,17 +221,31 @@ function logTerminalReadyBlock(
   }
 }
 
+function recoveryIncompleteMessage(
+  sandboxName: string,
+  readiness: Exclude<SandboxProcessReadinessResult, true> = false,
+): string {
+  if (typeof readiness === "object") {
+    switch (readiness.reason) {
+      case "portable-hermes-registry-authority-unavailable":
+        return `Portable Hermes onboarding for '${sandboxName}' is incomplete because its lifecycle receipt and registered gateway authority could not be matched. Run ${CLI_NAME} ${sandboxName} doctor. Preserve the registry and lifecycle receipt files unchanged. Stop; do not resume onboarding or edit either file.`;
+      case "portable-hermes-native-gateway-unavailable":
+        return `Portable Hermes onboarding for '${sandboxName}' is incomplete because its receipt-owned native gateway is not qualified and healthy. Run ${CLI_NAME} ${sandboxName} recover, then resume onboarding with ${CLI_NAME} onboard --resume.`;
+      case "portable-hermes-lifecycle-lock-unavailable":
+        return `Portable Hermes onboarding for '${sandboxName}' is incomplete because its lifecycle lock is unavailable. Wait for the active sandbox operation to finish, then resume onboarding with ${CLI_NAME} onboard --resume.`;
+    }
+  }
+  return `Onboarding for '${sandboxName}' is incomplete because a required process or secret-boundary check did not pass. Inspect with ${CLI_NAME} ${sandboxName} doctor, resolve the reported problem, then resume onboarding with ${CLI_NAME} onboard --resume.`;
+}
+
 export async function handleFinalizationState<Agent, VerifyChain, VerificationResult>({
   sandboxName,
-  model,
-  provider,
-  nimContainer,
   agent,
-  hermesAuthMethod,
-  hermesToolGateways,
   stagedLegacyKeys,
   migratedLegacyKeys,
-  webSearchEnabled,
+  externalComponent = null,
+  providerless = false,
+  deferRuntimeVerification = false,
   deps,
 }: FinalizationStateOptions<
   Agent,
@@ -138,14 +253,58 @@ export async function handleFinalizationState<Agent, VerifyChain, VerificationRe
   VerificationResult
 >): Promise<FinalizationStateResult> {
   const manageDashboard = shouldManageDashboardForAgent(agent as DashboardRuntimeAgent);
-
+  if (providerless && !externalComponent) {
+    throw new Error("Providerless finalization requires a registered external component.");
+  }
+  if (externalComponent) {
+    if (
+      !deps.createExternalComponentActivationProof ||
+      !deps.createExternalComponentActivationId ||
+      !deps.activateExternalComponent ||
+      !deps.setExternalComponentActivationEvidence
+    ) {
+      throw new Error("External component activation is unavailable.");
+    }
+    const proof = await deps.createExternalComponentActivationProof(sandboxName);
+    const activationId = deps.createExternalComponentActivationId();
+    const evidence = (resultClass: "failed" | "ambiguous") => ({
+      schemaVersion: 1 as const,
+      activationId,
+      componentId: externalComponent.declaration.componentId,
+      lifecycleGeneration: proof.lifecycleGeneration,
+      sandboxIdentityFingerprint: proof.sandboxIdentityFingerprint,
+      resultClass,
+    });
+    deps.setExternalComponentActivationEvidence(evidence("ambiguous"));
+    const activation = await deps.activateExternalComponent(externalComponent, proof, activationId);
+    if (activation.kind !== "activated") {
+      const resultClass = activation.kind === "rejected" ? "failed" : "ambiguous";
+      const incompleteEvidence = evidence(resultClass);
+      deps.setExternalComponentActivationEvidence(incompleteEvidence);
+      deps.error(
+        `  External component activation is incomplete. Reason class: ${resultClass}. The sandbox was preserved.`,
+      );
+      return {
+        stateResult: pauseOnboardMachine(
+          deps.toSessionUpdates({
+            externalComponentActivation: incompleteEvidence,
+          }),
+          { state: "finalizing", reason: "external_component_activation_incomplete" },
+        ),
+        unmigratedLegacyKeys: stagedLegacyKeys.filter((key) => !migratedLegacyKeys.has(key)),
+      };
+    }
+    deps.setExternalComponentActivationEvidence(null);
+  }
+  if (providerless) {
+    return {
+      stateResult: advanceTo("post_verify", { metadata: { state: "finalizing" } }),
+      unmigratedLegacyKeys: stagedLegacyKeys.filter((key) => !migratedLegacyKeys.has(key)),
+    };
+  }
   // Reaching finalization means the policy-preset step was confirmed, so it is
   // now safe to register this sandbox as the default (#4614).
   deps.setDefaultSandbox(sandboxName);
-
-  if (agent && manageDashboard) {
-    deps.ensureAgentDashboardForward(sandboxName, agent as NonNullable<Agent>);
-  }
 
   const allStagedMigrated =
     stagedLegacyKeys.length > 0 && stagedLegacyKeys.every((key) => migratedLegacyKeys.has(key));
@@ -163,39 +322,192 @@ export async function handleFinalizationState<Agent, VerifyChain, VerificationRe
 
   // Sweep stale host files left by older credential migration paths (#3105).
   deps.cleanupStaleHostFiles();
+  if (deferRuntimeVerification) {
+    return {
+      stateResult: advanceTo("post_verify", { metadata: { state: "finalizing" } }),
+      unmigratedLegacyKeys,
+    };
+  }
   if (manageDashboard) {
-    // Policy application can restart the sandbox; recover OpenClaw before verification (#3573).
-    deps.checkAndRecoverSandboxProcesses(sandboxName, { quiet: true });
-    // #4504-v2: provoke the operator.write scope upgrade now (throwaway agent
-    // run) so the request is PENDING when the approval pass below clears it, and
-    // the user's first real run connects without an embedded fallback.
-    // Best-effort; never blocks. No-op/idempotent once operator.write is paired.
-    deps.warmupScopeUpgrade(sandboxName);
-    // Clear any pending allowlisted scope upgrade against the freshly-recovered
-    // gateway before verification, so onboard hands off without a stuck pairing
-    // request (#4504 / #4263). Best-effort; never blocks.
-    deps.autoPairScopeApproval(sandboxName);
+    // Policy application can restart the sandbox; recover before verification (#3573).
+    const readiness = await deps.checkAndRecoverSandboxProcesses(sandboxName, { quiet: true });
+    if (readiness !== true) {
+      deps.error(`  ${recoveryIncompleteMessage(sandboxName, readiness)}`);
+      deps.reportDeploymentReadiness(false);
+      return {
+        stateResult: pauseOnboardMachine(
+          {},
+          {
+            state: "finalizing",
+            reason: "recovery_check_incomplete",
+          },
+        ),
+        unmigratedLegacyKeys,
+      };
+    }
   }
 
-  // Probe Brave Search egress through the L7 proxy now that the final
-  // policy and provider state are live — earlier probes would race the
-  // not-yet-applied `brave` preset (#3626). Best-effort; never blocks.
-  if (webSearchEnabled && manageDashboard) {
-    deps.verifyWebSearchInsideSandbox(sandboxName, agent);
+  return {
+    stateResult: advanceTo("post_verify", { metadata: { state: "finalizing" } }),
+    unmigratedLegacyKeys,
+  };
+}
+
+export async function handlePostVerifyState<Agent, VerifyChain, VerificationResult>({
+  sandboxName,
+  model,
+  provider,
+  nimContainer,
+  agent,
+  hermesAuthMethod,
+  hermesToolGateways,
+  webSearchEnabled,
+  webSearchProvider,
+  preferredInferenceApi = null,
+  portableProfileSelected,
+  deferRuntimeVerification = false,
+  deps,
+}: FinalizationStateOptions<
+  Agent,
+  VerifyChain,
+  VerificationResult
+>): Promise<PostVerifyStateResult> {
+  const terminalInferenceVerificationRequired = requiresTerminalInferenceVerification(
+    agent,
+    provider,
+  );
+  if (deferRuntimeVerification && !terminalInferenceVerificationRequired) {
+    return {
+      stateResult: completeOnboardMachine({}, { state: "post_verify" }),
+      verificationDiagnostics: [],
+      deploymentHealthy: true,
+    };
   }
-
-  await deps.recordPostVerifyStarted();
-
+  const manageDashboard = shouldManageDashboardForAgent(agent as DashboardRuntimeAgent);
+  const portableAgent = portableAgentDisposition(
+    sandboxName,
+    agent,
+    portableProfileSelected,
+    deps.readRegistryAgent,
+  );
+  const ordinaryOpenClawPairingRequired =
+    portableAgent === "ordinary" && selectedAgentName(agent) === "openclaw";
   let verificationDiagnostics: string[] = [];
   let deploymentHealthy = true;
+  if (portableAgent !== "ordinary") {
+    const pairing =
+      portableAgent === "strict-openclaw"
+        ? await deps.settlePortablePairing(sandboxName, { portableRequired: true })
+        : ({
+            kind: "incomplete",
+            reason: "portable-runtime-identity-invalid",
+          } as const);
+    if (pairing.kind !== "settled") {
+      const reason =
+        pairing.kind === "incomplete" ? pairing.reason : "portable-runtime-identity-invalid";
+      const message = deps.portablePairingIncompleteMessage(sandboxName, reason);
+      deps.error(`  ${message}`);
+      deps.reportDeploymentReadiness(false);
+      const sessionUpdates = deps.toSessionUpdates({
+        sandboxName,
+        provider,
+        model,
+        hermesAuthMethod,
+        hermesToolGateways,
+      });
+      return {
+        stateResult: pauseOnboardMachine(sessionUpdates, {
+          state: "post_verify",
+          reason: "portable_pairing_incomplete",
+        }),
+        verificationDiagnostics: [message],
+        deploymentHealthy: false,
+      };
+    }
+  }
+  if (ordinaryOpenClawPairingRequired) {
+    const pairing = await deps.settleOrdinaryOpenClawPairing(sandboxName);
+    if (pairing.kind !== "settled") {
+      const message = deps.ordinaryOpenClawPairingIncompleteMessage(sandboxName, pairing.reason);
+      deps.error(`  ${message}`);
+      deps.reportDeploymentReadiness(false);
+      const sessionUpdates = deps.toSessionUpdates({
+        sandboxName,
+        provider,
+        model,
+        hermesAuthMethod,
+        hermesToolGateways,
+      });
+      return {
+        stateResult: pauseOnboardMachine(sessionUpdates, {
+          state: "post_verify",
+          reason: "deployment_not_ready",
+        }),
+        verificationDiagnostics: [message],
+        deploymentHealthy: false,
+      };
+    }
+  }
   if (manageDashboard) {
+    // Recheck after pairing and on resume, including Hermes secret-boundary enforcement.
+    const readiness = await deps.checkAndRecoverSandboxProcesses(sandboxName, { quiet: true });
+    if (readiness !== true) {
+      const message = recoveryIncompleteMessage(sandboxName, readiness);
+      deps.error(`  ${message}`);
+      deps.reportDeploymentReadiness(false);
+      return {
+        stateResult: pauseOnboardMachine(
+          deps.toSessionUpdates({
+            sandboxName,
+            provider,
+            model,
+            hermesAuthMethod,
+            hermesToolGateways,
+          }),
+          { state: "post_verify", reason: "recovery_check_incomplete" },
+        ),
+        verificationDiagnostics: [message],
+        deploymentHealthy: false,
+      };
+    }
+    // Probe web-search credential isolation and egress now that the final
+    // policy, provider, process, and forwarding state are live. Egress
+    // diagnostics remain best-effort, but a confirmed raw credential must
+    // prevent a successful handoff (#7425).
+    const webSearchCredentialBoundarySafe =
+      !webSearchEnabled ||
+      (webSearchProvider !== null &&
+        (await deps.verifyWebSearchInsideSandbox(sandboxName, agent, webSearchProvider)));
     // Confirm the delivered sandbox is reachable before printing the live dashboard (#2342).
-    const verifyChain = deps.buildVerifyChain(deps.getChatUiUrl());
+    const verifyChain = deps.buildVerifyChain(deps.getChatUiUrl(), sandboxName);
     const verificationResult = await deps.verifyDeployment(sandboxName, verifyChain);
-    deploymentHealthy = deps.isDeploymentHealthy(verificationResult);
+    deploymentHealthy =
+      webSearchCredentialBoundarySafe && deps.isDeploymentHealthy(verificationResult);
     verificationDiagnostics = deps.formatVerificationDiagnostics(verificationResult);
     for (const line of verificationDiagnostics) deps.log(line);
-    deps.printDashboard(sandboxName, model, provider, nimContainer, agent, deploymentHealthy);
+    await deps.printDashboard(sandboxName, model, provider, nimContainer, agent, deploymentHealthy);
+    deps.reportDeploymentReadiness(deploymentHealthy);
+  } else if (terminalInferenceVerificationRequired) {
+    const agentName = selectedAgentName(agent);
+    if (!agentName) throw new Error("Terminal inference verification requires an agent name.");
+    const inference = (await deps.probeTerminalInference?.({
+      sandboxName,
+      agentName,
+      provider,
+      model,
+      preferredInferenceApi,
+    })) ?? { ok: false, detail: "bounded sandbox inference verification is unavailable" };
+    deploymentHealthy = inference.ok;
+    if (deploymentHealthy) {
+      logTerminalReadyBlock(sandboxName, agent, deps.log);
+    } else {
+      const message = terminalInferenceIncompleteMessage(
+        sandboxName,
+        inference.detail ?? "bounded sandbox inference verification failed",
+      );
+      verificationDiagnostics = [message];
+      deps.error(`  ${message}`);
+    }
     deps.reportDeploymentReadiness(deploymentHealthy);
   } else {
     logTerminalReadyBlock(sandboxName, agent, deps.log);
@@ -209,11 +521,11 @@ export async function handleFinalizationState<Agent, VerifyChain, VerificationRe
     hermesToolGateways,
   });
   const stateResult = deploymentHealthy
-    ? completeOnboardMachine(sessionUpdates, { state: "finalizing" })
+    ? completeOnboardMachine(sessionUpdates, { state: "post_verify" })
     : pauseOnboardMachine(sessionUpdates, {
-        state: "finalizing",
+        state: "post_verify",
         reason: "deployment_not_ready",
       });
 
-  return { stateResult, unmigratedLegacyKeys, verificationDiagnostics, deploymentHealthy };
+  return { stateResult, verificationDiagnostics, deploymentHealthy };
 }

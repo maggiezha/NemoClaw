@@ -8,6 +8,7 @@ description-agent: "Lists OpenClaw security controls that operate independently 
 keywords: ["openclaw security controls", "nemoclaw security boundary", "prompt injection", "tool access control"]
 content:
   type: "concept"
+agent-variants: ["openclaw"]
 ---
 NemoClaw provides infrastructure-layer security through sandbox isolation, network policy, filesystem restrictions, SSRF validation, and credential handling.
 It delegates all application-layer security to OpenClaw.
@@ -78,7 +79,7 @@ The following checks run as part of the audit:
 - Weak-model susceptibility assessment.
 - Multi-user exposure matrix.
 - Node command policy validation.
-- Dangerous config flag scanning (`allowInsecureAuth`, `dangerouslyDisableDeviceAuth`, and similar flags).
+- Dangerous config flag scanning (including Host-header origin fallback and similar flags).
 
 ## Skill and Extension Supply Chain Scanning
 

@@ -15,18 +15,32 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function restoreCachedModule(modulePath: string, prior: unknown): void {
+  if (prior) requireCache[modulePath] = prior;
+  else delete requireCache[modulePath];
+}
+
 describe("config set CLI dispatch", () => {
   it("awaits configSet before completing the dispatcher", async () => {
     const cliPath = require.resolve("../../../dist/nemoclaw.js");
+    const publicDispatchPath = require.resolve("../../../dist/lib/cli/public-dispatch.js");
+    const crossPortPath = require.resolve("../../../dist/lib/state/registry/cross-port.js");
+    const configSetCommandPath = require.resolve("../../../dist/commands/sandbox/config/set.js");
     const registryPath = require.resolve("../../../dist/lib/state/registry.js");
     const sandboxConfigPath = require.resolve("../../../dist/lib/sandbox/config.js");
     const runnerPath = require.resolve("../../../dist/lib/runner.js");
 
     const priorCli = require.cache[cliPath];
+    const priorPublicDispatch = require.cache[publicDispatchPath];
+    const priorCrossPort = require.cache[crossPortPath];
+    const priorConfigSetCommand = require.cache[configSetCommandPath];
     const priorRegistry = require.cache[registryPath];
     const priorSandboxConfig = require.cache[sandboxConfigPath];
     const priorRunner = require.cache[runnerPath];
     const priorDisableAutoDispatch = process.env.NEMOCLAW_DISABLE_AUTO_DISPATCH;
+
+    require(publicDispatchPath);
+    require(configSetCommandPath);
 
     const configSetDeferred = deferred<void>();
     const validateName = vi.fn();
@@ -62,6 +76,21 @@ describe("config set CLI dispatch", () => {
       },
     } as any;
 
+    requireCache[crossPortPath] = {
+      id: crossPortPath,
+      filename: crossPortPath,
+      loaded: true,
+      exports: {
+        findSandboxAcrossGatewayRoots: vi.fn((name: string) =>
+          name === "test-sandbox"
+            ? { entry: { name }, gatewayPort: null, registryFile: "test-registry" }
+            : null,
+        ),
+        listPublishedSandboxNamesAcrossGatewayRoots: vi.fn(() => ["test-sandbox"]),
+        listPendingSandboxNamesAcrossGatewayRoots: vi.fn(() => []),
+      },
+    } as any;
+
     requireCache[sandboxConfigPath] = {
       id: sandboxConfigPath,
       filename: sandboxConfigPath,
@@ -74,6 +103,8 @@ describe("config set CLI dispatch", () => {
     } as any;
 
     try {
+      delete require.cache[configSetCommandPath];
+      delete require.cache[publicDispatchPath];
       delete require.cache[cliPath];
       const { dispatchCli } = require(cliPath);
 
@@ -113,17 +144,13 @@ describe("config set CLI dispatch", () => {
         process.env.NEMOCLAW_DISABLE_AUTO_DISPATCH = priorDisableAutoDispatch;
       }
 
-      if (priorCli) requireCache[cliPath] = priorCli;
-      else delete requireCache[cliPath];
-
-      if (priorRegistry) requireCache[registryPath] = priorRegistry;
-      else delete requireCache[registryPath];
-
-      if (priorSandboxConfig) requireCache[sandboxConfigPath] = priorSandboxConfig;
-      else delete requireCache[sandboxConfigPath];
-
-      if (priorRunner) requireCache[runnerPath] = priorRunner;
-      else delete requireCache[runnerPath];
+      restoreCachedModule(cliPath, priorCli);
+      restoreCachedModule(publicDispatchPath, priorPublicDispatch);
+      restoreCachedModule(crossPortPath, priorCrossPort);
+      restoreCachedModule(configSetCommandPath, priorConfigSetCommand);
+      restoreCachedModule(registryPath, priorRegistry);
+      restoreCachedModule(sandboxConfigPath, priorSandboxConfig);
+      restoreCachedModule(runnerPath, priorRunner);
     }
   });
 });

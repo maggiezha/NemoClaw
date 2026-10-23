@@ -1,12 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
-
+import type { OpenShellSandboxBufferedCommandExecutor } from "../../../adapters/openshell/sandbox-command";
+import type { TelemetryOutcome, TelemetryState } from "../../../domain/telemetry/event";
+import {
+  configuredAgentIds,
+  persistVerifiedAgentModelSelections,
+  readAgentSelectionEntry,
+} from "./model-selections";
 import { loadAgentsManifest } from "../../../onboard/agents-manifest";
 import { isOpenclawAgent } from "../../../onboard/openclaw-otel-policy-presets";
 import * as registry from "../../../state/registry";
-import { buildOpenshellExecArgs } from "../exec";
+import { isTelemetryOperationActive, recordTelemetryTarget } from "../../telemetry/operation";
+
+import {
+  createCliOpenShellSandboxCommandExecutor,
+  type OpenShellGatewayTarget,
+  selectedOpenShellGateway,
+  readTelemetryAgentCommand,
+  readTelemetryAgentConfiguration,
+} from "./telemetry-verification";
+export { readTelemetryAgentConfiguration } from "./telemetry-verification";
 
 // Lazy-require `ensureLiveSandboxOrExit` because its import chain pulls in
 // `runner`/`./platform`, which the Vitest TS loader cannot resolve at module
@@ -218,9 +232,10 @@ export interface RunAgentsApplyOptions {
 export interface RunAgentsApplyDeps {
   ensureLive?: EnsureLive;
   getSandboxAgent?: (sandboxName: string) => string | null;
-  listAgents?: (sandboxName: string) => OpenClawAgentEntry[];
-  addAgent?: (sandboxName: string, id: string, workspace: string | undefined) => void;
-  deleteAgent?: (sandboxName: string, id: string) => void;
+  commandExecutor?: OpenShellSandboxBufferedCommandExecutor;
+  listAgents?: (sandboxName: string) => Promise<OpenClawAgentEntry[]>;
+  addAgent?: (sandboxName: string, id: string, workspace: string | undefined) => Promise<void>;
+  deleteAgent?: (sandboxName: string, id: string) => Promise<void>;
   log?: (message: string) => void;
   exit?: (code: number) => never;
 }
@@ -249,7 +264,8 @@ function parseJsonFromOutput(output: string): unknown {
   return JSON.parse(text || "[]");
 }
 
-export function parseOpenClawAgentsList(output: string): OpenClawAgentEntry[] {
+export function parseOpenClawAgentsList(output: string, strict = false): OpenClawAgentEntry[] {
+  if (strict && !output.trim()) throw new Error("Agent roster output is empty");
   const parsed = parseJsonFromOutput(output || "[]");
   let entries: unknown[] | null = null;
   if (Array.isArray(parsed)) {
@@ -263,6 +279,18 @@ export function parseOpenClawAgentsList(output: string): OpenClawAgentEntry[] {
   if (!entries) {
     throw new Error("openclaw agents list --json did not return a JSON array");
   }
+  if (strict) {
+    const ids = new Set<string>();
+    for (const entry of entries) {
+      const id =
+        entry && typeof entry === "object" && !Array.isArray(entry)
+          ? (entry as { id?: unknown }).id
+          : undefined;
+      if (typeof id !== "string" || !id || ids.has(id))
+        throw new Error("Agent roster output contains invalid or duplicated entries");
+      ids.add(id);
+    }
+  }
   return entries.filter((entry): entry is OpenClawAgentEntry => {
     return (
       entry !== null &&
@@ -272,21 +300,61 @@ export function parseOpenClawAgentsList(output: string): OpenClawAgentEntry[] {
   });
 }
 
-function defaultListAgents(sandboxName: string): OpenClawAgentEntry[] {
-  const { getOpenshellBinary } =
-    require("../../../adapters/openshell/runtime") as typeof import("../../../adapters/openshell/runtime");
-  const result = spawnSync(
-    getOpenshellBinary(),
-    buildOpenshellExecArgs(sandboxName, ["openclaw", "agents", "list", "--json"]),
-    { stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+export async function readTelemetryAgentRoster(
+  sandboxName: string,
+  target: OpenShellGatewayTarget = selectedOpenShellGateway(),
+  configuration?: unknown,
+): Promise<string[] | null> {
+  const configured = configuredAgentIds(
+    configuration === undefined
+      ? await readTelemetryAgentConfiguration(sandboxName, target)
+      : configuration,
   );
-  if (result.status !== 0) {
-    const stderr = String(result.stderr || "").trim();
+  if (configured !== undefined) return configured;
+  return readTelemetryAgentCommand(
+    sandboxName,
+    target,
+    ["openclaw", "agents", "list", "--json"],
+    (raw) =>
+      parseOpenClawAgentsList(raw, true)
+        .map((entry) => entry.id)
+        .sort(),
+    5_000,
+  );
+}
+
+async function executeAgentCommand(
+  executor: OpenShellSandboxBufferedCommandExecutor,
+  sandboxName: string,
+  command: readonly string[],
+) {
+  return executor.runBuffered({
+    sandboxName,
+    target: selectedOpenShellGateway(),
+    command,
+  });
+}
+
+async function defaultListAgents(
+  executor: OpenShellSandboxBufferedCommandExecutor,
+  sandboxName: string,
+): Promise<OpenClawAgentEntry[]> {
+  const result = await executeAgentCommand(executor, sandboxName, [
+    "openclaw",
+    "agents",
+    "list",
+    "--json",
+  ]);
+  if (result.outcome.kind === "failed") {
+    throw new Error(`openclaw agents list --json failed: ${result.outcome.error.message}`);
+  }
+  if (result.outcome.exitCode !== 0) {
+    const stderr = result.stderr.trim();
     throw new Error(
-      `openclaw agents list --json failed (exit ${result.status ?? "?"})${stderr ? `: ${stderr}` : ""}`,
+      `openclaw agents list --json failed (exit ${result.outcome.exitCode})${stderr ? `: ${stderr}` : ""}`,
     );
   }
-  return parseOpenClawAgentsList(String(result.stdout || "[]"));
+  return parseOpenClawAgentsList(result.stdout || "[]");
 }
 
 // OpenClaw flag contract differs by agents verb:
@@ -307,29 +375,40 @@ export function buildOpenclawAgentDeleteArgs(id: string): string[] {
   return ["openclaw", "agents", "delete", id, "--force"];
 }
 
-function defaultAddAgent(sandboxName: string, id: string, workspace: string | undefined): void {
-  const { getOpenshellBinary } =
-    require("../../../adapters/openshell/runtime") as typeof import("../../../adapters/openshell/runtime");
-  const result = spawnSync(
-    getOpenshellBinary(),
-    buildOpenshellExecArgs(sandboxName, buildOpenclawAgentAddArgs(id, workspace)),
-    { stdio: "inherit" },
+async function defaultAddAgent(
+  executor: OpenShellSandboxBufferedCommandExecutor,
+  sandboxName: string,
+  id: string,
+  workspace: string | undefined,
+): Promise<void> {
+  const result = await executeAgentCommand(
+    executor,
+    sandboxName,
+    buildOpenclawAgentAddArgs(id, workspace),
   );
-  if (result.status !== 0) {
-    throw new Error(`openclaw agents add ${id} failed (exit ${result.status ?? "?"})`);
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  if (result.outcome.kind === "failed") {
+    throw new Error(`openclaw agents add ${id} failed: ${result.outcome.error.message}`);
+  }
+  if (result.outcome.exitCode !== 0) {
+    throw new Error(`openclaw agents add ${id} failed (exit ${result.outcome.exitCode})`);
   }
 }
 
-function defaultDeleteAgent(sandboxName: string, id: string): void {
-  const { getOpenshellBinary } =
-    require("../../../adapters/openshell/runtime") as typeof import("../../../adapters/openshell/runtime");
-  const result = spawnSync(
-    getOpenshellBinary(),
-    buildOpenshellExecArgs(sandboxName, buildOpenclawAgentDeleteArgs(id)),
-    { stdio: "inherit" },
-  );
-  if (result.status !== 0) {
-    throw new Error(`openclaw agents delete ${id} failed (exit ${result.status ?? "?"})`);
+async function defaultDeleteAgent(
+  executor: OpenShellSandboxBufferedCommandExecutor,
+  sandboxName: string,
+  id: string,
+): Promise<void> {
+  const result = await executeAgentCommand(executor, sandboxName, buildOpenclawAgentDeleteArgs(id));
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  if (result.outcome.kind === "failed") {
+    throw new Error(`openclaw agents delete ${id} failed: ${result.outcome.error.message}`);
+  }
+  if (result.outcome.exitCode !== 0) {
+    throw new Error(`openclaw agents delete ${id} failed (exit ${result.outcome.exitCode})`);
   }
 }
 
@@ -337,13 +416,26 @@ export async function runAgentsApply(
   options: RunAgentsApplyOptions,
   deps: RunAgentsApplyDeps = {},
 ): Promise<void> {
+  const telemetryActive = isTelemetryOperationActive();
+  const record = (outcome: TelemetryOutcome, state: TelemetryState, collectionError = false) =>
+    recordTelemetryTarget({
+      scope: "configuration",
+      sandboxName: options.sandboxName,
+      outcome,
+      state,
+      ...(collectionError ? { verificationStatus: "collection_error" as const } : {}),
+    });
   const log = deps.log ?? ((message: string) => console.log(message));
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const ensureLive = deps.ensureLive ?? lazyEnsureLive();
   const getSandboxAgent = deps.getSandboxAgent ?? defaultGetSandboxAgent;
-  const listAgents = deps.listAgents ?? defaultListAgents;
-  const addAgent = deps.addAgent ?? defaultAddAgent;
-  const deleteAgent = deps.deleteAgent ?? defaultDeleteAgent;
+  const commandExecutor = deps.commandExecutor ?? createCliOpenShellSandboxCommandExecutor();
+  const listAgents = deps.listAgents ?? ((name) => defaultListAgents(commandExecutor, name));
+  const addAgent =
+    deps.addAgent ??
+    ((name, id, workspace) => defaultAddAgent(commandExecutor, name, id, workspace));
+  const deleteAgent =
+    deps.deleteAgent ?? ((name, id) => defaultDeleteAgent(commandExecutor, name, id));
 
   await ensureLive(options.sandboxName, { allowNonReadyPhase: false });
 
@@ -352,6 +444,7 @@ export async function runAgentsApply(
     log(
       `  agents apply is OpenClaw-specific; sandbox "${options.sandboxName}" runs ${sandboxAgent}. Manage agents through the in-sandbox CLI for that runtime.`,
     );
+    record("failed", "unchanged");
     exit(1);
   }
 
@@ -361,9 +454,12 @@ export async function runAgentsApply(
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log(`  Manifest rejected before mutation: ${reason}`);
+    record("failed", "unchanged");
     exit(1);
   }
-  const currentList = listAgents(options.sandboxName);
+  const currentList = await listAgents(options.sandboxName);
+  const selectionEntry = telemetryActive ? readAgentSelectionEntry(options.sandboxName) : null;
+  const beforeRoster = telemetryActive ? await readTelemetryAgentRoster(options.sandboxName) : null;
   const diff = buildAgentsApplyDiff(currentList, manifest);
 
   log(`  Sandbox: ${options.sandboxName}`);
@@ -387,30 +483,86 @@ export async function runAgentsApply(
   }
   if (diff.toAdd.length === 0 && diff.toDelete.length === 0) {
     log("  No roster changes to apply.");
+    const verified =
+      beforeRoster &&
+      JSON.stringify(beforeRoster) === JSON.stringify(currentList.map((entry) => entry.id).sort());
+    record(
+      telemetryActive && !verified ? "unverified" : "no_change",
+      telemetryActive && !verified
+        ? "unavailable"
+        : diff.rebuildOnlyFields.length > 0
+          ? "pending"
+          : "unchanged",
+      telemetryActive && !verified,
+    );
     return;
   }
   if (!options.yes && options.nonInteractive) {
     log("  Pass --yes to apply roster changes in non-interactive mode.");
+    record("skipped", "unchanged");
     exit(1);
   }
   if (!options.yes && !options.nonInteractive) {
     log("  Pass --yes to confirm the roster changes above.");
+    record("skipped", "unchanged");
     exit(2);
   }
 
   const toolsAgentIds = findManifestToolsByAgentId(manifest.agents);
-  for (const id of diff.toDelete) {
-    log(`  Deleting agent: ${id}`);
-    deleteAgent(options.sandboxName, id);
+  try {
+    for (const id of diff.toDelete) {
+      log(`  Deleting agent: ${id}`);
+      await deleteAgent(options.sandboxName, id);
+    }
+    for (const entry of diff.toAdd) {
+      if (toolsAgentIds.has(entry.id)) {
+        log(
+          `  ⚠  Manifest declares tools for "${entry.id}"; the live add cannot bake a tool policy. Rerun \`nemoclaw onboard --agents <file> --recreate-sandbox\` to apply it.`,
+        );
+      }
+      log(`  Adding agent: ${entry.id}`);
+      await addAgent(options.sandboxName, entry.id, entry.workspace);
+    }
+  } catch (error) {
+    const after = telemetryActive ? await readTelemetryAgentRoster(options.sandboxName) : null;
+    const changed = beforeRoster && after && JSON.stringify(after) !== JSON.stringify(beforeRoster);
+    const deleted = beforeRoster?.filter((id) => after && !after.includes(id)) ?? [];
+    const sourceVerified =
+      deleted.length === 0 ||
+      persistVerifiedAgentModelSelections(
+        selectionEntry,
+        await readTelemetryAgentConfiguration(options.sandboxName),
+        [],
+        deleted,
+      );
+    record(
+      "failed",
+      beforeRoster && after ? (changed ? "partial" : "unchanged") : "unavailable",
+      ((!beforeRoster || !after) && telemetryActive) || !sourceVerified,
+    );
+    throw error;
   }
-  for (const entry of diff.toAdd) {
-    if (toolsAgentIds.has(entry.id)) {
-      log(
-        `  ⚠  Manifest declares tools for "${entry.id}"; the live add cannot bake a tool policy. Rerun \`nemoclaw onboard --agents <file> --recreate-sandbox\` to apply it.`,
+  if (telemetryActive) {
+    const after = await readTelemetryAgentRoster(options.sandboxName);
+    const expected = new Set(currentList.map((entry) => entry.id));
+    for (const id of diff.toDelete) expected.delete(id);
+    for (const entry of diff.toAdd) expected.add(entry.id);
+    if (!beforeRoster || !after || JSON.stringify(after) !== JSON.stringify([...expected].sort())) {
+      record("unverified", "unavailable", true);
+    } else {
+      const config = await readTelemetryAgentConfiguration(options.sandboxName);
+      const sourceVerified = persistVerifiedAgentModelSelections(
+        selectionEntry,
+        config,
+        [],
+        diff.toDelete,
+      );
+      record(
+        "completed",
+        diff.rebuildOnlyFields.length > 0 ? "partial" : "applied",
+        !sourceVerified,
       );
     }
-    log(`  Adding agent: ${entry.id}`);
-    addAgent(options.sandboxName, entry.id, entry.workspace);
   }
   log("  Apply complete.");
 }

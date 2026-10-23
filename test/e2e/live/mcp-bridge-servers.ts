@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import type { AddressInfo } from "node:net";
 import os from "node:os";
 
 import type { CleanupRegistry } from "../fixtures/cleanup.ts";
@@ -15,23 +15,60 @@ import {
   listenServer as listenOnRandomPort,
   readRequestBody,
 } from "../fixtures/http-protocol.ts";
+import { spawnObservedChild } from "../fixtures/observed-child-process.ts";
+import type { TestProgress, TestProgressCapability } from "../fixtures/progress.ts";
 
-type TestServer = http.Server | https.Server;
+export const HERMES_DEFERRED_TOOL_SEARCH_MISS =
+  "Hermes tool_search did not return the deferred target";
 
 export interface StartedHttpServer {
   port: number;
   close(): Promise<void>;
 }
 
+export const FAKE_MCP_STATUS_RESULT_TOKEN = "MCP_STATUS_OK";
+const MCP_DIAGNOSTIC_PERSIST_TIMEOUT_MS = 10_000;
+
+export interface FakeMcpRequest {
+  method: string;
+  path: string;
+  auth: string;
+  body: string;
+  sessionId: string;
+  protocolVersion: string;
+  rpcMethod?: string;
+  rpcToolName?: string;
+  responseStatus?: number;
+  responseHasResult?: boolean;
+  negotiatedSessionId?: string;
+  negotiatedProtocolVersion?: string;
+  legacySessionId?: string;
+  negotiatedLegacySessionId?: string;
+  legacyPhase?: LegacyMcpSessionPhase;
+  legacyResponseSequence?: number;
+  rpcId?: string | number | null;
+}
+
+export interface FakeMcpHttpsDiagnostics {
+  secureConnections: number;
+  requestHeaders: number;
+  requestBodiesComplete: number;
+  tlsClientErrors: {
+    ERR_SSL_HTTP_REQUEST: number;
+    ERR_SSL_WRONG_VERSION_NUMBER: number;
+    ERR_SSL_UNEXPECTED_EOF_WHILE_READING: number;
+    ECONNRESET: number;
+    OTHER: number;
+  };
+}
+
 export interface FakeMcpHttpsServer extends StartedHttpServer {
+  diagnostics(): FakeMcpHttpsDiagnostics;
   setSecret(secret: string): void;
-  requests: Array<{
-    method: string;
-    path: string;
-    auth: string;
-    body: string;
-    rpcMethod?: string;
-  }>;
+  observations: FakeMcpRequest[];
+  requests: FakeMcpRequest[];
+  tlsFailures: string[];
+  activeLegacySessionCount(): number;
 }
 
 export interface StartedPublicMcpTunnel {
@@ -45,8 +82,25 @@ type TunnelCleanupRegistry = Pick<CleanupRegistry, "add">;
 interface McpRequestPayload {
   id?: unknown;
   method?: unknown;
-  params?: { name?: unknown; arguments?: { challenge?: unknown } };
+  params?: { name?: unknown; arguments?: { challenge?: unknown }; cursor?: unknown };
 }
+
+export type LegacyMcpSessionPhase = "opened" | "awaiting-initialized" | "ready" | "closed";
+
+interface LegacyMcpSession {
+  id: string;
+  response: http.ServerResponse;
+  phase: LegacyMcpSessionPhase;
+  protocolVersion?: string;
+  pendingRequestIds: Set<string>;
+  queuedBytes: number;
+  responseSequence: number;
+  writeChain: Promise<void>;
+}
+
+type LegacyQueueResult =
+  | { ok: true; sequence: number }
+  | { ok: false; status: number; message: string };
 
 const MCP_NOTIFICATION_METHODS = new Set([
   "notifications/initialized",
@@ -55,6 +109,9 @@ const MCP_NOTIFICATION_METHODS = new Set([
   "notifications/roots/list_changed",
   "notifications/elicitation/complete",
 ]);
+
+const LEGACY_MCP_SESSION_BYTES = 32;
+const LEGACY_MCP_MAX_QUEUED_BYTES = 64 * 1024;
 
 const TRYCLOUDFLARE_ORIGIN_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com(?=$|[\s"'\\/])/i;
 const QUICK_TUNNEL_ATTEMPTS = 3;
@@ -70,12 +127,15 @@ const CLOUDFLARED_ENV_NAMES = new Set([
   "LANG",
   "HTTP_PROXY",
   "HTTPS_PROXY",
+  "ALL_PROXY",
   "NO_PROXY",
   "http_proxy",
   "https_proxy",
+  "all_proxy",
   "no_proxy",
   "SSL_CERT_FILE",
   "SSL_CERT_DIR",
+  "CURL_CA_BUNDLE",
 ]);
 
 const EMPTY_TASK = {
@@ -110,19 +170,90 @@ const MCP_EMPTY_RESULT_BY_METHOD: Record<string, unknown> = {
   "messages/listen": {},
 };
 
-function requireTcpPort(server: TestServer, label: string): number {
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error(`${label} did not bind to a TCP port`);
-  }
-  return (address as AddressInfo).port;
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function buildCloudflaredSubprocessEnv(): Record<string, string> {
+function jsonRpcId(value: unknown): string | number | null | undefined {
+  if (value === null || typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return undefined;
+}
+
+function jsonRpcIdKey(value: string | number | null): string {
+  return `${value === null ? "null" : typeof value}:${String(value)}`;
+}
+
+function waitForLegacyMcpDrain(response: http.ServerResponse): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      response.off("error", onError);
+    };
+    const onDrain = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onClose = (): void => {
+      cleanup();
+      reject(new Error("legacy MCP event stream closed during backpressure"));
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+    response.once("error", onError);
+  });
+}
+
+function queueLegacyMcpResponse(
+  session: LegacyMcpSession,
+  requestId: string | number | null,
+  payload: unknown,
+): LegacyQueueResult {
+  if (session.phase === "closed" || session.response.destroyed || session.response.writableEnded) {
+    return { ok: false, status: 410, message: "legacy MCP event stream is closed" };
+  }
+  const requestIdKey = jsonRpcIdKey(requestId);
+  if (session.pendingRequestIds.has(requestIdKey)) {
+    return { ok: false, status: 409, message: "legacy MCP request ID is already pending" };
+  }
+  const event = `data: ${JSON.stringify(payload)}\n\n`;
+  const eventBytes = Buffer.byteLength(event);
+  if (session.queuedBytes + eventBytes > LEGACY_MCP_MAX_QUEUED_BYTES) {
+    return { ok: false, status: 429, message: "legacy MCP response queue is full" };
+  }
+
+  session.pendingRequestIds.add(requestIdKey);
+  session.queuedBytes += eventBytes;
+  session.responseSequence += 1;
+  const sequence = session.responseSequence;
+  session.writeChain = session.writeChain
+    .then(async () => {
+      if (
+        session.phase === "closed" ||
+        session.response.destroyed ||
+        session.response.writableEnded
+      ) {
+        throw new Error("legacy MCP event stream closed before response delivery");
+      }
+      if (!session.response.write(event)) await waitForLegacyMcpDrain(session.response);
+    })
+    .catch(() => {
+      session.phase = "closed";
+      session.response.destroy();
+    })
+    .finally(() => {
+      session.pendingRequestIds.delete(requestIdKey);
+      session.queuedBytes -= eventBytes;
+    });
+  return { ok: true, sequence };
+}
+
+function buildPublicTunnelSubprocessEnv(): Record<string, string> {
   const env: Record<string, string> = {
     // Do not let quick-tunnel discovery consume a developer's named-tunnel
     // credentials or config. The CI runner temp directory is job-isolated.
@@ -134,6 +265,27 @@ function buildCloudflaredSubprocessEnv(): Record<string, string> {
     if (CLOUDFLARED_ENV_NAMES.has(name) || name.startsWith("LC_")) env[name] = value;
   }
   return env;
+}
+
+function buildPublicTunnelProbeArgs(url: string): string[] {
+  return [
+    "--disable",
+    "--silent",
+    "--show-error",
+    "--head",
+    "--proto",
+    "=https",
+    "--tlsv1.2",
+    "--connect-timeout",
+    "5",
+    "--max-time",
+    "5",
+    "--output",
+    "/dev/null",
+    "--write-out",
+    "%{http_code}",
+    url,
+  ];
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
@@ -190,41 +342,36 @@ export function buildCloudflaredQuickTunnelArgs(port: number): string[] {
   ];
 }
 
-async function probePublicTunnel(origin: string): Promise<{
-  ready: boolean;
-  diagnostic: string;
-}> {
-  try {
-    const response = await fetch(`${origin}/mcp`, {
-      method: "HEAD",
-      redirect: "manual",
-      signal: AbortSignal.timeout(5_000),
-    });
-    await response.body?.cancel();
-    return {
-      ready: response.status === 405,
-      diagnostic: `public HEAD /mcp returned HTTP ${response.status}`,
-    };
-  } catch (error) {
-    return {
-      ready: false,
-      // Avoid reflecting request URLs or child output here. The error class is
-      // enough to distinguish DNS/transport failure without risking headers.
-      diagnostic: `public HEAD /mcp failed (${error instanceof Error ? error.name : "unknown error"})`,
-    };
-  }
-}
-
+/**
+ * Publishes a local HTTPS origin behind a real `trycloudflare.com` quick
+ * tunnel: a genuinely public, DNS-resolvable, publicly-trusted-certificate
+ * endpoint. Named for its original MCP-bridge fixture caller; reused as-is
+ * (via the optional readiness override below) for the HTTPS-pin runtime
+ * adapter's live coverage, since both need the identical real-tunnel proof
+ * and only differ in which local path/status means "ready".
+ */
 export async function startPublicMcpHttpsTunnel(options: {
   cleanup: TunnelCleanupRegistry;
   label: string;
+  progress: Pick<TestProgress, "activity" | "event" | "onOutput"> & TestProgressCapability;
   server: StartedHttpServer;
   cloudflaredBin?: string;
+  curlBin?: string;
+  readinessPath?: string;
+  readinessStatus?: number;
 }): Promise<StartedPublicMcpTunnel> {
+  const readinessPath = options.readinessPath ?? "/mcp";
+  const readinessStatus = options.readinessStatus ?? 405;
   const args = buildCloudflaredQuickTunnelArgs(options.server.port);
   let lastFailure = "cloudflared did not publish a quick-tunnel URL";
 
   for (let attempt = 1; attempt <= QUICK_TUNNEL_ATTEMPTS; attempt += 1) {
+    const progressName = `cloudflared quick tunnel attempt ${attempt}`;
+    try {
+      options.progress.event(`${progressName} started`);
+    } catch {
+      // Progress diagnostics must never change tunnel setup.
+    }
     let origin: string | null = null;
     let consecutiveReadyProbes = 0;
     let childOutputSeen = false;
@@ -238,10 +385,14 @@ export async function startPublicMcpHttpsTunnel(options: {
         carry = candidate.slice(-QUICK_TUNNEL_DISCOVERY_CARRY_LIMIT);
       };
     };
-    const child = spawn(options.cloudflaredBin ?? "cloudflared", args, {
-      detached: true,
-      env: buildCloudflaredSubprocessEnv(),
-      stdio: ["ignore", "pipe", "pipe"],
+    const child = spawnObservedChild(options.cloudflaredBin ?? "cloudflared", args, {
+      activityLabel: `command: ${progressName}`,
+      progress: options.progress,
+      spawn: {
+        detached: true,
+        env: buildPublicTunnelSubprocessEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
     });
     const exited = waitForExit(child);
     child.stdout?.setEncoding("utf8");
@@ -250,6 +401,13 @@ export async function startPublicMcpHttpsTunnel(options: {
     child.stderr?.on("data", inspectOutputForOrigin());
     child.once("error", (error) => {
       spawnError = error;
+    });
+    child.once("close", () => {
+      try {
+        options.progress.event(`${progressName} stopped`);
+      } catch {
+        // Progress diagnostics must never change tunnel cleanup.
+      }
     });
 
     let closePromise: Promise<void> | undefined;
@@ -269,7 +427,61 @@ export async function startPublicMcpHttpsTunnel(options: {
         break;
       }
       if (origin) {
-        const probe = await probePublicTunnel(origin);
+        let probeOutput = "";
+        let probeOutputExceededLimit = false;
+        let probeSpawnError = false;
+        const probeChild = spawnObservedChild(
+          options.curlBin ?? "curl",
+          buildPublicTunnelProbeArgs(`${origin}${readinessPath}`),
+          {
+            activityLabel: "command: public tunnel readiness probe",
+            progress: options.progress,
+            spawn: {
+              env: buildPublicTunnelSubprocessEnv(),
+              stdio: ["ignore", "pipe", "pipe"],
+            },
+          },
+        );
+        probeChild.stdout?.setEncoding("utf8");
+        probeChild.stdout?.on("data", (chunk: string) => {
+          if (probeOutputExceededLimit) return;
+          probeOutput += chunk;
+          if (probeOutput.length > 16) {
+            probeOutput = "";
+            probeOutputExceededLimit = true;
+          }
+        });
+        probeChild.once("error", () => {
+          probeSpawnError = true;
+        });
+        const probeExited = waitForExit(probeChild);
+        const probeCompleted = await Promise.race([
+          probeExited.then(() => true),
+          delay(6_000).then(() => false),
+        ]);
+        if (!probeCompleted) {
+          probeChild.kill("SIGKILL");
+          await probeExited;
+        }
+        const probeStatus = Number.parseInt(probeOutput, 10);
+        const probe =
+          !probeCompleted || probeSpawnError || probeChild.exitCode !== 0
+            ? {
+                ready: false,
+                // Retain process status only; curl stderr can contain proxy details.
+                diagnostic: `public HEAD ${readinessPath} failed (curl exit=${String(probeChild.exitCode)}, deadline=${!probeCompleted}, spawnError=${probeSpawnError})`,
+              }
+            : probeOutputExceededLimit ||
+                !/^\d{3}$/u.test(probeOutput) ||
+                !Number.isInteger(probeStatus)
+              ? {
+                  ready: false,
+                  diagnostic: `public HEAD ${readinessPath} returned an invalid status`,
+                }
+              : {
+                  ready: probeStatus === readinessStatus,
+                  diagnostic: `public HEAD ${readinessPath} returned HTTP ${probeStatus}`,
+                };
         if (probe.ready) {
           consecutiveReadyProbes += 1;
           if (consecutiveReadyProbes >= QUICK_TUNNEL_CONSECUTIVE_READY_PROBES) {
@@ -317,7 +529,18 @@ export async function startCompatibleMock(options: {
   toolNames?: string[];
   deferredToolName?: string;
   progressiveToolSearch?: { toolName: string; query: string };
+  openClawToolSearch?: { toolNames: string[]; query: string };
+  deniedToolProbe?:
+    | { mode: "bridge"; promptMarker: string; resultToken: string; toolName: string }
+    | {
+        mode: "progressive";
+        promptMarker: string;
+        query: string;
+        resultToken: string;
+        toolName: string;
+      };
 }): Promise<StartedHttpServer> {
+  let selectedOpenClawToolName: string | undefined;
   const server = http.createServer(async (req, res) => {
     const requestPath = new URL(req.url ?? "/", "http://compatible.mock").pathname;
     const auth = req.headers.authorization === `Bearer ${options.apiKey}`;
@@ -350,6 +573,10 @@ export async function startCompatibleMock(options: {
       );
       const toolResults = (body.messages ?? []).filter((message) => message.role === "tool");
       const toolResultCount = toolResults.length;
+      const deniedToolProbe = options.deniedToolProbe;
+      const deniedToolProbeRequested =
+        deniedToolProbe !== undefined &&
+        JSON.stringify(body.messages ?? []).includes(deniedToolProbe.promptMarker);
       const sawAuthenticatedToolResult = toolResults.some((message) =>
         JSON.stringify(message.content).includes(options.toolResultToken ?? "__never__"),
       );
@@ -365,12 +592,282 @@ export async function startCompatibleMock(options: {
           requiredContent.every((value) => content.includes(value))
         );
       };
+      const parseToolResultRecord = (
+        value: unknown,
+        depth = 0,
+      ): Record<string, unknown> | undefined => {
+        if (depth > 4) return undefined;
+        if (typeof value === "string") {
+          try {
+            return parseToolResultRecord(JSON.parse(value), depth + 1);
+          } catch {
+            return undefined;
+          }
+        }
+        if (Array.isArray(value)) {
+          for (const entry of value) {
+            const parsed = parseToolResultRecord(entry, depth + 1);
+            if (parsed) return parsed;
+          }
+          return undefined;
+        }
+        if (!value || typeof value !== "object") return undefined;
+        const record = value as Record<string, unknown>;
+        for (const key of ["details", "payload", "text", "content"] as const) {
+          if (!Object.hasOwn(record, key)) continue;
+          const parsed = parseToolResultRecord(record[key], depth + 1);
+          if (parsed) return parsed;
+        }
+        return record;
+      };
+      const parsedToolResult = (index: number, toolCallId: string) => {
+        const message = toolResults[index];
+        if (message?.tool_call_id !== toolCallId) {
+          return undefined;
+        }
+        return parseToolResultRecord(message.content);
+      };
+      const isDeniedBridgeToolResult = (index: number, toolCallId: string) => {
+        const message = toolResults[index];
+        if (message?.tool_call_id !== toolCallId) return false;
+        return /policy_denied|blocked by deny rule/iu.test(JSON.stringify(message.content));
+      };
+      const classifyHermesSearchResult = (
+        index: number,
+        toolName: string,
+      ): "target" | "miss" | "invalid" => {
+        const parsed = parsedToolResult(index, "call_hermes_tool_search");
+        if (!parsed) return "invalid";
+        if (
+          !Array.isArray(parsed.queries) ||
+          parsed.queries.length !== 1 ||
+          parsed.queries[0] !== toolName ||
+          !Number.isInteger(parsed.total_available) ||
+          (parsed.total_available as number) < 0 ||
+          !Array.isArray(parsed.results) ||
+          parsed.results.length !== 1 ||
+          !parsed.tools ||
+          typeof parsed.tools !== "object" ||
+          Array.isArray(parsed.tools)
+        ) {
+          return "invalid";
+        }
+        const result = parsed.results[0];
+        if (!result || typeof result !== "object" || Array.isArray(result)) return "invalid";
+        const resultRecord = result as Record<string, unknown>;
+        if (resultRecord.query !== toolName || !Array.isArray(resultRecord.matches)) {
+          return "invalid";
+        }
+        const names = resultRecord.matches.map((match) =>
+          typeof match === "string" ? match : undefined,
+        );
+        if (names.some((name) => name === undefined)) return "invalid";
+        const tools = parsed.tools as Record<string, unknown>;
+        if (
+          names.some(
+            (name) =>
+              !name ||
+              !Object.hasOwn(tools, name) ||
+              !tools[name] ||
+              typeof tools[name] !== "object" ||
+              Array.isArray(tools[name]),
+          )
+        ) {
+          return "invalid";
+        }
+        return names.includes(toolName) ? "target" : "miss";
+      };
+      const hasExpectedHermesDescription = (index: number, toolName: string) => {
+        const parsed = parsedToolResult(index, "call_hermes_tool_describe");
+        const tools = parsed?.tools;
+        const describedTool =
+          tools && typeof tools === "object" && !Array.isArray(tools)
+            ? (tools as Record<string, unknown>)[toolName]
+            : undefined;
+        const parameters =
+          describedTool && typeof describedTool === "object" && !Array.isArray(describedTool)
+            ? (describedTool as Record<string, unknown>).parameters
+            : undefined;
+        const description =
+          describedTool && typeof describedTool === "object" && !Array.isArray(describedTool)
+            ? (describedTool as Record<string, unknown>).description
+            : undefined;
+        const properties =
+          parameters && typeof parameters === "object" && !Array.isArray(parameters)
+            ? (parameters as Record<string, unknown>).properties
+            : undefined;
+        return (
+          typeof description === "string" &&
+          properties !== null &&
+          typeof properties === "object" &&
+          !Array.isArray(properties) &&
+          Object.hasOwn(properties, "challenge")
+        );
+      };
+      const classifyOpenClawSearchResult = (index: number): "target" | "miss" | "invalid" => {
+        const search = options.openClawToolSearch;
+        const message = toolResults[index];
+        if (!search || !message) return "invalid";
+        const content = JSON.stringify(message.content);
+        selectedOpenClawToolName = search.toolNames.find((name) => content.includes(name));
+        return selectedOpenClawToolName ? "target" : "miss";
+      };
+      const hasExpectedOpenClawDescription = (index: number): boolean => {
+        const message = toolResults[index];
+        if (!message || !selectedOpenClawToolName) {
+          return false;
+        }
+        const content = JSON.stringify(message.content);
+        return content.includes(selectedOpenClawToolName) && content.includes("challenge");
+      };
+      const collectOpenClawSearchIdentifiers = (
+        value: unknown,
+        identifiers: string[] = [],
+        depth = 0,
+      ): string[] => {
+        if (depth > 6) return identifiers;
+        if (typeof value === "string") {
+          try {
+            return collectOpenClawSearchIdentifiers(JSON.parse(value), identifiers, depth + 1);
+          } catch {
+            return identifiers;
+          }
+        }
+        if (Array.isArray(value)) {
+          for (const entry of value) {
+            collectOpenClawSearchIdentifiers(entry, identifiers, depth + 1);
+          }
+          return identifiers;
+        }
+        if (!value || typeof value !== "object") return identifiers;
+        const record = value as Record<string, unknown>;
+        for (const key of ["name", "id"] as const) {
+          if (typeof record[key] === "string" && !identifiers.includes(record[key])) {
+            identifiers.push(record[key]);
+          }
+        }
+        for (const nested of Object.values(record)) {
+          collectOpenClawSearchIdentifiers(nested, identifiers, depth + 1);
+        }
+        return identifiers;
+      };
       let plannedToolCall:
         | { id: string; name: string; arguments: Record<string, unknown> }
         | undefined;
       let protocolError: string | undefined;
+      let openClawSearchDiagnostic = "";
+      let deniedToolProbeComplete = false;
 
-      if (!sawAuthenticatedToolResult && options.progressiveToolSearch) {
+      if (deniedToolProbeRequested && deniedToolProbe) {
+        if (deniedToolProbe.mode === "bridge") {
+          if (toolResultCount === 0 && !visibleToolNames.has("tool_call")) {
+            protocolError = "denied-tool probe requires the tool_call bridge";
+          } else if (toolResultCount === 0) {
+            plannedToolCall = {
+              id: "call_denied_tool_bridge",
+              name: "tool_call",
+              arguments: { name: deniedToolProbe.toolName, arguments: {} },
+            };
+          } else if (toolResultCount === 1) {
+            deniedToolProbeComplete = isDeniedBridgeToolResult(0, "call_denied_tool_bridge");
+            if (!deniedToolProbeComplete) {
+              protocolError = "denied-tool bridge call did not report a policy denial";
+            }
+          } else {
+            protocolError = "denied-tool bridge returned an unexpected result sequence";
+          }
+        } else if (toolResultCount === 0 && visibleToolNames.has(deniedToolProbe.toolName)) {
+          protocolError = `denied progressive target ${deniedToolProbe.toolName} was visible before search_tools`;
+        } else if (toolResultCount === 0 && !visibleToolNames.has("search_tools")) {
+          protocolError = "denied-tool probe requires search_tools";
+        } else if (toolResultCount === 0) {
+          plannedToolCall = {
+            id: "call_denied_tool_search",
+            name: "search_tools",
+            arguments: { query: deniedToolProbe.query },
+          };
+        } else if (
+          toolResultCount === 1 &&
+          !hasExpectedToolResult(0, "call_denied_tool_search", [`- ${deniedToolProbe.toolName}:`])
+        ) {
+          protocolError = "search_tools did not return the denied progressive target";
+        } else if (toolResultCount === 1 && !visibleToolNames.has(deniedToolProbe.toolName)) {
+          protocolError = "denied progressive target was not visible after search_tools";
+        } else if (toolResultCount === 1) {
+          plannedToolCall = {
+            id: "call_denied_progressive_tool",
+            name: deniedToolProbe.toolName,
+            arguments: {},
+          };
+        } else if (toolResultCount === 2) {
+          deniedToolProbeComplete =
+            toolResults[1]?.tool_call_id === "call_denied_progressive_tool" &&
+            /policy_denied|blocked by deny rule/iu.test(JSON.stringify(toolResults[1]?.content));
+          if (!deniedToolProbeComplete) {
+            protocolError = "denied progressive tool call did not report a policy denial";
+          }
+        } else {
+          protocolError = "denied progressive tool returned an unexpected result sequence";
+        }
+      } else if (!sawAuthenticatedToolResult && options.openClawToolSearch) {
+        const bridgeNames = ["tool_search", "tool_describe", "tool_call"];
+        const missingBridges = bridgeNames.filter((name) => !visibleToolNames.has(name));
+        if (options.openClawToolSearch.toolNames.some((name) => visibleToolNames.has(name))) {
+          protocolError = "OpenClaw deferred MCP target leaked into model tools";
+        } else if (missingBridges.length > 0) {
+          protocolError = `OpenClaw tool catalog bridges missing: ${missingBridges.join(", ")}`;
+        } else if (toolResultCount === 0) {
+          plannedToolCall = {
+            id: "call_openclaw_tool_search",
+            name: "tool_search",
+            arguments: { query: options.openClawToolSearch.query, limit: 8 },
+          };
+        } else if (toolResultCount === 1) {
+          const searchResult = classifyOpenClawSearchResult(0);
+          if (searchResult === "miss") {
+            const identifiers = collectOpenClawSearchIdentifiers(toolResults[0]?.content);
+            const terms = options.openClawToolSearch.query
+              .toLowerCase()
+              .split(/[^a-z0-9]+/u)
+              .filter(Boolean);
+            selectedOpenClawToolName = identifiers.find((identifier) => {
+              const normalized = identifier.toLowerCase().replace(/[^a-z0-9]+/gu, " ");
+              return terms.every((term) => normalized.includes(term));
+            });
+            openClawSearchDiagnostic =
+              identifiers.length > 0
+                ? identifiers.join(", ").slice(0, 512)
+                : JSON.stringify(toolResults[0]?.content).replace(/\s+/gu, " ").slice(0, 512);
+          }
+          if (searchResult === "target" || selectedOpenClawToolName) {
+            plannedToolCall = {
+              id: "call_openclaw_tool_describe",
+              name: "tool_describe",
+              arguments: { id: selectedOpenClawToolName },
+            };
+          } else {
+            protocolError =
+              searchResult === "miss"
+                ? `OpenClaw tool_search did not find the deferred MCP target; observed ${openClawSearchDiagnostic || "no identifiers"}`
+                : "OpenClaw returned an invalid tool_search result";
+          }
+        } else if (toolResultCount === 2) {
+          if (hasExpectedOpenClawDescription(1) && selectedOpenClawToolName) {
+            plannedToolCall = {
+              id: "call_openclaw_tool_call",
+              name: "tool_call",
+              arguments: {
+                id: selectedOpenClawToolName,
+                args: { challenge: options.toolChallenge },
+              },
+            };
+          } else {
+            protocolError = "OpenClaw tool_describe did not return the deferred MCP schema";
+          }
+        } else {
+          protocolError = "OpenClaw returned an unexpected tool catalog result sequence";
+        }
+      } else if (!sawAuthenticatedToolResult && options.progressiveToolSearch) {
         const { query, toolName } = options.progressiveToolSearch;
         if (toolResultCount === 0 && visibleToolNames.has(toolName)) {
           protocolError = `progressive target ${toolName} was visible before search_tools`;
@@ -382,19 +879,18 @@ export async function startCompatibleMock(options: {
             name: "search_tools",
             arguments: { query },
           };
-        } else if (
-          toolResultCount !== 1 ||
-          !hasExpectedToolResult(0, "call_progressive_tool_search", [`- ${toolName}:`])
-        ) {
+        } else if (!hasExpectedToolResult(0, "call_progressive_tool_search", [`- ${toolName}:`])) {
           protocolError = "search_tools did not return the expected progressive target";
         } else if (!visibleToolNames.has(toolName)) {
           protocolError = `progressive target ${toolName} was not visible after search_tools`;
-        } else {
+        } else if (toolResultCount === 1) {
           plannedToolCall = {
             id: "call_progressive_mcp_proof",
             name: toolName,
             arguments: { challenge: options.toolChallenge },
           };
+        } else {
+          protocolError = `progressive target ${toolName} did not return the expected authenticated result`;
         }
       } else if (!sawAuthenticatedToolResult && options.deferredToolName) {
         const bridgeNames = ["tool_search", "tool_describe", "tool_call"];
@@ -407,31 +903,26 @@ export async function startCompatibleMock(options: {
           plannedToolCall = {
             id: "call_hermes_tool_search",
             name: "tool_search",
-            arguments: { query: options.deferredToolName },
+            arguments: { queries: [options.deferredToolName] },
           };
         } else if (toolResultCount === 1) {
-          if (
-            hasExpectedToolResult(0, "call_hermes_tool_search", [
-              "matches",
-              options.deferredToolName,
-            ])
-          ) {
+          const searchResult = classifyHermesSearchResult(0, options.deferredToolName);
+          if (searchResult === "target") {
             plannedToolCall = {
               id: "call_hermes_tool_describe",
               name: "tool_describe",
-              arguments: { name: options.deferredToolName },
+              arguments: { names: [options.deferredToolName] },
             };
+          } else if (searchResult === "miss") {
+            protocolError = HERMES_DEFERRED_TOOL_SEARCH_MISS;
           } else {
-            protocolError = "Hermes tool_search did not return the deferred target";
+            protocolError = "Hermes returned an unexpected deferred tool result sequence";
           }
-        } else if (toolResultCount === 2) {
-          if (
-            hasExpectedToolResult(1, "call_hermes_tool_describe", [
-              options.deferredToolName,
-              "parameters",
-              "challenge",
-            ])
-          ) {
+        } else if (
+          toolResultCount === 2 &&
+          toolResults.at(-1)?.tool_call_id === "call_hermes_tool_describe"
+        ) {
+          if (hasExpectedHermesDescription(1, options.deferredToolName)) {
             plannedToolCall = {
               id: "call_hermes_tool_call",
               name: "tool_call",
@@ -444,7 +935,7 @@ export async function startCompatibleMock(options: {
             protocolError = "Hermes tool_describe did not return the deferred schema";
           }
         } else {
-          protocolError = "Hermes returned an unexpected number of tool results";
+          protocolError = "Hermes returned an unexpected deferred tool result sequence";
         }
       } else if (!sawAuthenticatedToolResult) {
         const directToolName = [...visibleToolNames].find((name) =>
@@ -458,30 +949,32 @@ export async function startCompatibleMock(options: {
           };
         }
       }
-      const responseMessage = sawAuthenticatedToolResult
-        ? {
-            role: "assistant",
-            content: options.toolResultToken,
-          }
-        : protocolError
-          ? { role: "assistant", content: `mock protocol error: ${protocolError}` }
-          : plannedToolCall && options.toolChallenge
-            ? {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  {
-                    index: 0,
-                    id: plannedToolCall.id,
-                    type: "function",
-                    function: {
-                      name: plannedToolCall.name,
-                      arguments: JSON.stringify(plannedToolCall.arguments),
+      const responseMessage = deniedToolProbeComplete
+        ? { role: "assistant", content: deniedToolProbe?.resultToken }
+        : sawAuthenticatedToolResult
+          ? {
+              role: "assistant",
+              content: options.toolResultToken,
+            }
+          : protocolError
+            ? { role: "assistant", content: `mock protocol error: ${protocolError}` }
+            : plannedToolCall && (deniedToolProbeRequested || options.toolChallenge)
+              ? {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: plannedToolCall.id,
+                      type: "function",
+                      function: {
+                        name: plannedToolCall.name,
+                        arguments: JSON.stringify(plannedToolCall.arguments),
+                      },
                     },
-                  },
-                ],
-              }
-            : { role: "assistant", content: "ok" };
+                  ],
+                }
+              : { role: "assistant", content: "ok" };
       const finishReason = "tool_calls" in responseMessage ? "tool_calls" : "stop";
       if (body.stream) {
         res.writeHead(200, {
@@ -551,9 +1044,9 @@ export async function startCompatibleMock(options: {
     jsonResponse(res, 404, { error: { message: "not found" } });
   });
 
-  await listenOnRandomPort(server);
+  const port = await listenOnRandomPort(server);
   return {
-    port: requireTcpPort(server, "compatible endpoint mock"),
+    port,
     close: () => closeServer(server),
   };
 }
@@ -563,8 +1056,13 @@ export async function startFakeMcpHttpsServer(options: {
   challenge?: string;
   resultToken?: string;
   tls?: { cert: Buffer; key: Buffer };
+  onCloseDiagnostics?: (diagnostics: FakeMcpHttpsDiagnostics) => Promise<void>;
 }): Promise<FakeMcpHttpsServer> {
   let expectedSecret = options.secret;
+  let nextSessionId = 1;
+  const sessions = new Map<string, string>();
+  const legacySessions = new Map<string, LegacyMcpSession>();
+  const serverEventStreams = new Set<http.ServerResponse>();
   const tls =
     options.tls ??
     (() => {
@@ -577,64 +1075,282 @@ export async function startFakeMcpHttpsServer(options: {
       }
       return { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
     })();
-  const requests: Array<{
-    method: string;
-    path: string;
-    auth: string;
-    body: string;
-  }> = [];
+  const requests: FakeMcpRequest[] = [];
+  const observations: FakeMcpRequest[] = [];
+  const tlsFailures: string[] = [];
+  const diagnostics: FakeMcpHttpsDiagnostics = {
+    secureConnections: 0,
+    requestHeaders: 0,
+    requestBodiesComplete: 0,
+    tlsClientErrors: {
+      ERR_SSL_HTTP_REQUEST: 0,
+      ERR_SSL_WRONG_VERSION_NUMBER: 0,
+      ERR_SSL_UNEXPECTED_EOF_WHILE_READING: 0,
+      ECONNRESET: 0,
+      OTHER: 0,
+    },
+  };
+  const increment = (value: number): number => Math.min(value + 1, 65_535);
+  const snapshot = (): FakeMcpHttpsDiagnostics => ({
+    ...diagnostics,
+    tlsClientErrors: { ...diagnostics.tlsClientErrors },
+  });
   const server = https.createServer(tls, async (req, res) => {
-    const requestPath = new URL(req.url ?? "/", "https://fake-mcp.local").pathname;
-    const body = await readRequestBody(req);
+    diagnostics.requestHeaders = increment(diagnostics.requestHeaders);
+    const requestUrl = new URL(req.url ?? "/", "https://fake-mcp.local");
+    const requestPath = requestUrl.pathname;
+    const legacySessionId = requestUrl.searchParams.get("legacySessionId") ?? "";
+    const legacySession = legacySessionId ? legacySessions.get(legacySessionId) : undefined;
     const auth = Array.isArray(req.headers.authorization)
       ? req.headers.authorization.join(",")
       : (req.headers.authorization ?? "");
+    const sessionId = Array.isArray(req.headers["mcp-session-id"])
+      ? req.headers["mcp-session-id"].join(",")
+      : (req.headers["mcp-session-id"] ?? "");
+    const protocolVersion = Array.isArray(req.headers["mcp-protocol-version"])
+      ? req.headers["mcp-protocol-version"].join(",")
+      : (req.headers["mcp-protocol-version"] ?? "");
+    const recordedObservation: FakeMcpRequest = {
+      method: req.method ?? "",
+      path: requestPath,
+      auth,
+      body: "",
+      sessionId,
+      protocolVersion,
+      ...(legacySessionId ? { legacySessionId } : {}),
+      ...(legacySession ? { legacyPhase: legacySession.phase } : {}),
+    };
+    observations.push(recordedObservation);
+    const body = await readRequestBody(req);
+    diagnostics.requestBodiesComplete = increment(diagnostics.requestBodiesComplete);
+    recordedObservation.body = body;
     let parsedPayload: McpRequestPayload | null = null;
     try {
       parsedPayload = JSON.parse(body) as McpRequestPayload;
     } catch {
       // The protocol error below handles malformed JSON after recording it.
     }
+    const observedRequestId = jsonRpcId(parsedPayload?.id);
+    if (observedRequestId !== undefined) recordedObservation.rpcId = observedRequestId;
+    if (typeof parsedPayload?.method === "string") {
+      recordedObservation.rpcMethod = parsedPayload.method;
+    }
+    if (parsedPayload?.method === "tools/call" && typeof parsedPayload.params?.name === "string") {
+      recordedObservation.rpcToolName = parsedPayload.params.name;
+    }
     // The public quick-tunnel readiness probe uses HEAD /mcp. Keep it out of
     // the protocol request ledger so zero-upstream decoy and policy-denial
     // assertions continue to measure only attempted MCP traffic.
-    if (req.method !== "HEAD") {
-      requests.push({
-        method: req.method ?? "",
-        path: requestPath,
-        auth,
-        body,
-        ...(typeof parsedPayload?.method === "string" ? { rpcMethod: parsedPayload.method } : {}),
-      });
-    }
-    if (requestPath !== "/mcp") {
-      jsonResponse(res, 404, { error: { message: "not found" } });
-      return;
-    }
-    if (req.method === "HEAD" || req.method === "GET") {
-      res.writeHead(405, { Allow: "POST" });
+    const recordedRequest = req.method === "HEAD" ? undefined : recordedObservation;
+    if (recordedRequest) requests.push(recordedRequest);
+    const respondJson = (status: number, payload: unknown): void => {
+      recordedObservation.responseStatus = status;
+      recordedObservation.responseHasResult =
+        typeof payload === "object" &&
+        payload !== null &&
+        Object.prototype.hasOwnProperty.call(payload, "result") &&
+        !Object.prototype.hasOwnProperty.call(payload, "error");
+      jsonResponse(res, status, payload);
+    };
+    const respondEmpty = (status: number, headers?: http.OutgoingHttpHeaders): void => {
+      recordedObservation.responseStatus = status;
+      res.writeHead(status, headers);
       res.end();
+    };
+    const respondRpc = (requestId: string | number | null, payload: unknown): void => {
+      if (!legacySessionId) {
+        respondJson(200, payload);
+        return;
+      }
+      const activeLegacySession = legacySessions.get(legacySessionId);
+      if (!activeLegacySession) {
+        respondJson(404, { error: { message: "legacy MCP event stream is unavailable" } });
+        return;
+      }
+      const queued = queueLegacyMcpResponse(activeLegacySession, requestId, payload);
+      if (!queued.ok) {
+        respondJson(queued.status, { error: { message: queued.message } });
+        return;
+      }
+      if (recordedRequest) {
+        recordedRequest.responseStatus = 202;
+        recordedRequest.legacyResponseSequence = queued.sequence;
+        recordedRequest.responseHasResult =
+          typeof payload === "object" &&
+          payload !== null &&
+          Object.prototype.hasOwnProperty.call(payload, "result") &&
+          !Object.prototype.hasOwnProperty.call(payload, "error");
+      }
+      res.writeHead(202);
+      res.end();
+    };
+    if (requestPath !== "/mcp") {
+      respondJson(404, { error: { message: "not found" } });
       return;
     }
-    if (req.method !== "POST") {
-      jsonResponse(res, 405, { error: { message: "method not allowed" } });
+    if (req.method === "HEAD") {
+      respondEmpty(405, { Allow: "POST" });
+      return;
+    }
+    if (req.method === "GET") {
+      if (auth !== `Bearer ${expectedSecret}`) {
+        respondJson(401, { error: { message: "missing rewritten bearer credential" } });
+        return;
+      }
+      if (sessionId === "" && protocolVersion === "") {
+        let eventSessionId: string;
+        do {
+          eventSessionId = randomBytes(LEGACY_MCP_SESSION_BYTES).toString("base64url");
+        } while (legacySessions.has(eventSessionId));
+        const eventSession: LegacyMcpSession = {
+          id: eventSessionId,
+          response: res,
+          phase: "opened",
+          pendingRequestIds: new Set(),
+          queuedBytes: 0,
+          responseSequence: 0,
+          writeChain: Promise.resolve(),
+        };
+        legacySessions.set(eventSessionId, eventSession);
+        if (recordedRequest) {
+          recordedRequest.responseStatus = 200;
+          recordedRequest.negotiatedLegacySessionId = eventSessionId;
+          recordedRequest.legacyPhase = eventSession.phase;
+        }
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        res.write(`event: endpoint\ndata: /mcp?legacySessionId=${eventSessionId}\n\n`);
+        serverEventStreams.add(res);
+        res.once("close", () => {
+          eventSession.phase = "closed";
+          legacySessions.delete(eventSessionId);
+          serverEventStreams.delete(res);
+        });
+        return;
+      }
+      const negotiatedProtocolVersion = sessions.get(sessionId);
+      if (!negotiatedProtocolVersion || protocolVersion !== negotiatedProtocolVersion) {
+        respondJson(400, { error: { message: "missing negotiated MCP session metadata" } });
+        return;
+      }
+      if (recordedRequest) recordedRequest.responseStatus = 200;
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      res.write(": connected\n\n");
+      serverEventStreams.add(res);
+      res.once("close", () => serverEventStreams.delete(res));
+      return;
+    }
+    if (req.method !== "POST" && req.method !== "DELETE") {
+      respondJson(405, { error: { message: "method not allowed" } });
       return;
     }
     if (auth !== `Bearer ${expectedSecret}`) {
-      jsonResponse(res, 401, { error: { message: "missing rewritten bearer credential" } });
+      respondJson(401, { error: { message: "missing rewritten bearer credential" } });
+      return;
+    }
+    if (req.method === "DELETE") {
+      if (legacySessionId) {
+        respondJson(405, { error: { message: "legacy MCP sessions close with the event stream" } });
+        return;
+      }
+      const negotiatedProtocolVersion = sessions.get(sessionId);
+      if (!negotiatedProtocolVersion || protocolVersion !== negotiatedProtocolVersion) {
+        respondJson(400, { error: { message: "missing negotiated MCP session metadata" } });
+        return;
+      }
+      sessions.delete(sessionId);
+      respondEmpty(204);
       return;
     }
 
     if (!parsedPayload) {
-      jsonResponse(res, 400, { error: { message: "invalid json" } });
+      respondJson(400, { error: { message: "invalid json" } });
+      return;
+    }
+    if (legacySessionId && !legacySession) {
+      respondJson(404, { error: { message: "legacy MCP event stream is unavailable" } });
       return;
     }
     if (
-      typeof parsedPayload.method === "string" &&
-      MCP_NOTIFICATION_METHODS.has(parsedPayload.method)
+      legacySession &&
+      (legacySession.phase === "closed" || !legacySessions.has(legacySessionId))
     ) {
-      res.writeHead(202);
-      res.end();
+      respondJson(410, { error: { message: "legacy MCP event stream is closed" } });
+      return;
+    }
+    const requestId = jsonRpcId(parsedPayload.id);
+    const isNotification =
+      typeof parsedPayload.method === "string" &&
+      MCP_NOTIFICATION_METHODS.has(parsedPayload.method);
+    if (legacySession) {
+      if (sessionId !== "") {
+        respondJson(400, {
+          error: { message: "legacy MCP requests must not mix session headers" },
+        });
+        return;
+      }
+      if (parsedPayload.method === "initialize") {
+        if (legacySession.phase !== "opened") {
+          respondJson(409, { error: { message: "legacy MCP session is already initialized" } });
+          return;
+        }
+        if (protocolVersion !== "") {
+          respondJson(400, { error: { message: "legacy MCP initialize sent premature metadata" } });
+          return;
+        }
+      } else {
+        if (legacySession.phase === "opened") {
+          respondJson(409, { error: { message: "legacy MCP session is not initialized" } });
+          return;
+        }
+        if (!legacySession.protocolVersion || protocolVersion !== legacySession.protocolVersion) {
+          respondJson(400, { error: { message: "missing negotiated legacy MCP metadata" } });
+          return;
+        }
+        if (parsedPayload.method === "notifications/initialized") {
+          if (legacySession.phase !== "awaiting-initialized") {
+            respondJson(409, { error: { message: "legacy MCP initialization phase is invalid" } });
+            return;
+          }
+        } else if (legacySession.phase !== "ready") {
+          respondJson(409, { error: { message: "legacy MCP session is not ready" } });
+          return;
+        }
+      }
+      if (!isNotification && requestId === undefined) {
+        respondJson(400, { error: { message: "legacy MCP request ID is required" } });
+        return;
+      }
+    }
+    const responseId = requestId === undefined ? 1 : requestId;
+    // This shared fixture also serves intentional stateless policy probes.
+    // Validate any supplied session metadata as an all-or-nothing pair; the
+    // focused discovery assertion separately requires the negotiated pair on
+    // every post-initialize request.
+    if (
+      !legacySessionId &&
+      parsedPayload.method !== "initialize" &&
+      (sessionId !== "" || protocolVersion !== "")
+    ) {
+      const negotiatedProtocolVersion = sessions.get(sessionId);
+      if (!negotiatedProtocolVersion || protocolVersion !== negotiatedProtocolVersion) {
+        respondJson(400, { error: { message: "missing negotiated MCP session metadata" } });
+        return;
+      }
+    }
+    if (isNotification) {
+      if (legacySession && parsedPayload.method === "notifications/initialized") {
+        legacySession.phase = "ready";
+        if (recordedRequest) recordedRequest.legacyPhase = legacySession.phase;
+      }
+      respondEmpty(202);
       return;
     }
     let result: unknown;
@@ -642,75 +1358,188 @@ export async function startFakeMcpHttpsServer(options: {
       const request = JSON.parse(body) as {
         params?: { protocolVersion?: string };
       };
+      const negotiatedProtocolVersion = request.params?.protocolVersion ?? "2025-03-26";
+      if (legacySession) {
+        legacySession.protocolVersion = negotiatedProtocolVersion;
+        legacySession.phase = "awaiting-initialized";
+        if (recordedRequest) {
+          recordedRequest.negotiatedProtocolVersion = negotiatedProtocolVersion;
+          recordedRequest.legacyPhase = legacySession.phase;
+        }
+      } else {
+        const negotiatedSessionId = `fake-session-${nextSessionId}`;
+        nextSessionId += 1;
+        sessions.set(negotiatedSessionId, negotiatedProtocolVersion);
+        res.setHeader("mcp-session-id", negotiatedSessionId);
+        if (recordedRequest) {
+          recordedRequest.negotiatedSessionId = negotiatedSessionId;
+          recordedRequest.negotiatedProtocolVersion = negotiatedProtocolVersion;
+        }
+      }
       result = {
-        protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
+        protocolVersion: negotiatedProtocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: "fake", version: "1.0.0" },
       };
     } else if (parsedPayload.method === "tools/list") {
-      result = {
-        tools: [
-          {
-            name: "fake_echo",
-            description: "Returns an authenticated MCP proof token",
-            inputSchema: {
-              type: "object",
-              properties: { challenge: { type: "string" } },
-              required: ["challenge"],
-              additionalProperties: false,
+      if (parsedPayload.params?.cursor === undefined) {
+        result = {
+          tools: [
+            {
+              name: "fake_echo",
+              description: "Returns an authenticated MCP proof token",
+              annotations: { readOnlyHint: true },
+              inputSchema: {
+                type: "object",
+                properties: { challenge: { type: "string" } },
+                required: ["challenge"],
+                additionalProperties: false,
+              },
             },
-          },
-        ],
-      };
-    } else if (parsedPayload.method === "tools/call") {
-      const challenge = parsedPayload.params?.arguments?.challenge;
-      if (
-        parsedPayload.params?.name !== "fake_echo" ||
-        (options.challenge !== undefined && challenge !== options.challenge)
-      ) {
-        jsonResponse(res, 200, {
+          ],
+          nextCursor: "fake-page-2",
+        };
+      } else if (parsedPayload.params.cursor === "fake-page-2") {
+        result = {
+          tools: [
+            {
+              name: "fake_status",
+              description: "Returns fixture status",
+              annotations: { readOnlyHint: true },
+              inputSchema: { type: "object", properties: {}, additionalProperties: false },
+            },
+          ],
+        };
+      } else {
+        respondRpc(responseId, {
           jsonrpc: "2.0",
-          id: parsedPayload.id ?? 1,
-          error: { code: -32602, message: "invalid fake_echo challenge" },
+          id: responseId,
+          error: { code: -32602, message: "invalid tools/list cursor" },
         });
         return;
       }
-      result = {
-        content: [
-          {
-            type: "text",
-            text: options.resultToken ?? `MCP_AUTH_REWRITE_OK::${String(challenge ?? "")}`,
-          },
-        ],
-        isError: false,
-      };
+    } else if (parsedPayload.method === "tools/call") {
+      const toolName = parsedPayload.params?.name;
+      const challenge = parsedPayload.params?.arguments?.challenge;
+      if (toolName === "fake_status") {
+        result = {
+          content: [{ type: "text", text: FAKE_MCP_STATUS_RESULT_TOKEN }],
+          isError: false,
+        };
+      } else {
+        if (
+          toolName !== "fake_echo" ||
+          (options.challenge !== undefined && challenge !== options.challenge)
+        ) {
+          respondRpc(responseId, {
+            jsonrpc: "2.0",
+            id: responseId,
+            error: { code: -32602, message: "invalid fake_echo challenge" },
+          });
+          return;
+        }
+        result = {
+          content: [
+            {
+              type: "text",
+              text: options.resultToken ?? `MCP_AUTH_REWRITE_OK::${String(challenge ?? "")}`,
+            },
+          ],
+          isError: false,
+        };
+      }
     } else if (
       typeof parsedPayload.method === "string" &&
       Object.prototype.hasOwnProperty.call(MCP_EMPTY_RESULT_BY_METHOD, parsedPayload.method)
     ) {
       result = MCP_EMPTY_RESULT_BY_METHOD[parsedPayload.method];
     } else {
-      jsonResponse(res, 200, {
+      respondRpc(responseId, {
         jsonrpc: "2.0",
-        id: parsedPayload.id ?? 1,
+        id: responseId,
         error: { code: -32601, message: "method not found" },
       });
       return;
     }
-    jsonResponse(res, 200, {
+    respondRpc(responseId, {
       jsonrpc: "2.0",
-      id: parsedPayload.id ?? 1,
+      id: responseId,
       result,
     });
   });
 
-  await listenOnRandomPort(server);
+  server.on("secureConnection", () => {
+    diagnostics.secureConnections = increment(diagnostics.secureConnections);
+  });
+  server.on("tlsClientError", (error: NodeJS.ErrnoException) => {
+    const code = error.code;
+    const bucket =
+      code && Object.hasOwn(diagnostics.tlsClientErrors, code)
+        ? (code as keyof FakeMcpHttpsDiagnostics["tlsClientErrors"])
+        : "OTHER";
+    diagnostics.tlsClientErrors[bucket] = increment(diagnostics.tlsClientErrors[bucket]);
+
+    if (tlsFailures.length >= 8) return;
+    const knownCodes = new Set([
+      "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+      "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
+      "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
+      "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+      "ECONNRESET",
+    ]);
+    tlsFailures.push(code && knownCodes.has(code) ? code : "OTHER");
+  });
+  const port = await listenOnRandomPort(server);
   return {
-    port: requireTcpPort(server, "fake MCP endpoint"),
+    diagnostics: snapshot,
+    port,
+    observations,
     requests,
+    tlsFailures,
+    activeLegacySessionCount: () => legacySessions.size,
     setSecret: (secret: string) => {
       expectedSecret = secret;
     },
-    close: () => closeServer(server),
+    close: async () => {
+      const errors: unknown[] = [];
+      try {
+        for (const response of serverEventStreams) response.destroy();
+        await closeServer(server);
+      } catch (error) {
+        errors.push(error);
+      } finally {
+        for (const session of legacySessions.values()) session.phase = "closed";
+        legacySessions.clear();
+      }
+      const persistDiagnostics = options.onCloseDiagnostics;
+      if (persistDiagnostics) {
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => persistDiagnostics(snapshot())),
+            new Promise<never>((_resolve, reject) => {
+              deadline = setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      `MCP HTTPS diagnostic persistence timed out after ${MCP_DIAGNOSTIC_PERSIST_TIMEOUT_MS} ms`,
+                    ),
+                  ),
+                MCP_DIAGNOSTIC_PERSIST_TIMEOUT_MS,
+              );
+            }),
+          ]);
+        } catch (error) {
+          errors.push(error);
+        } finally {
+          clearTimeout(deadline);
+        }
+      }
+      if (errors.length > 0) {
+        throw errors.length === 1
+          ? errors[0]
+          : new AggregateError(errors, "MCP HTTPS shutdown and diagnostic persistence failed");
+      }
+    },
   };
 }

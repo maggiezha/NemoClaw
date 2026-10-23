@@ -1,224 +1,1046 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import * as sandboxCommandCli from "../../adapters/openshell/sandbox-command-cli";
+import type { OpenShellSandboxBufferedCommandRequest } from "../../adapters/openshell/sandbox-command";
+import { fingerprintOpenShellSandboxId } from "../../adapters/openshell/sandbox-identity";
+import type { OpenShellSandboxObserver } from "../../adapters/openshell/sandbox-observer";
+import { createDockerRuntimeProviderBundle } from "../../onboard/runtime-provider/docker";
+import { createPodmanRuntimeProviderBundle } from "../../onboard/runtime-provider/podman";
+import { createRuntimeProviderBundleRegistry } from "../../onboard/runtime-provider/registry";
 import type { SandboxEntry } from "../../state/registry";
+import * as registry from "../../state/registry";
+import * as crossPortRegistryEsm from "../../state/registry/cross-port";
 import { type SandboxStartDeps, startSandbox } from "./start";
+import { resolveSandboxInferenceInvocationEndpoint } from "./inference-invocation-probe";
+import { nativeLocalIdentity } from "../../inference/native-local/contract";
+import {
+  HOSTED_NATIVE_PROVIDERS,
+  hostedNativeProvider,
+} from "../../inference/native-provider/hosted";
+
+// connect.ts loads this registry through require. Keep injected lifecycle fixtures
+// independent of host sandboxes; the sibling-gateway test restores the real lookup.
+const crossPortRegistry =
+  require("../../state/registry/cross-port") as typeof import("../../state/registry/cross-port");
+beforeEach(() => {
+  vi.spyOn(crossPortRegistry, "findSandboxAcrossGatewayRoots").mockReturnValue(null);
+  vi.spyOn(crossPortRegistryEsm, "getSandboxAcrossGatewayRoots").mockReturnValue(null);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function sandbox(values: Partial<SandboxEntry> = {}): SandboxEntry {
-  return { name: "my-sandbox", ...values };
+  return {
+    name: "my-sandbox",
+    lifecycleLiveIdentityFingerprint: fingerprintOpenShellSandboxId("sandbox-alpha")!,
+    ...values,
+  };
 }
 
 function harness(overrides: Partial<SandboxStartDeps> = {}) {
-  const getSandbox = vi.fn<NonNullable<SandboxStartDeps["getSandbox"]>>(() => sandbox());
-  const isDockerRuntimeDown = vi.fn<NonNullable<SandboxStartDeps["isDockerRuntimeDown"]>>(
-    () => false,
+  let storedSandbox = sandbox({ stopped: true });
+  const order: string[] = [];
+  const getSandbox = vi.fn<NonNullable<SandboxStartDeps["getSandbox"]>>(() => storedSandbox);
+  const updateSandbox = vi.fn<NonNullable<SandboxStartDeps["updateSandbox"]>>((_name, updates) => {
+    storedSandbox = { ...storedSandbox, ...updates };
+    return true;
+  });
+  const startOpenShellSandbox = vi.fn(async () => {
+    order.push("openshell-start");
+    return { kind: "accepted" as const };
+  });
+  const openShellLifecycle = {
+    startSandbox: startOpenShellSandbox,
+    stopSandbox: vi.fn(async () => ({ kind: "accepted" as const })),
+  };
+  const recoverPortableSandbox = vi.fn<NonNullable<SandboxStartDeps["recoverPortableSandbox"]>>(
+    async () => ({ kind: "not-installed" }),
   );
-  const printDockerRuntimeDownGuidance =
-    vi.fn<NonNullable<SandboxStartDeps["printDockerRuntimeDownGuidance"]>>();
-  const findLabeledSandboxContainers = vi.fn<
-    NonNullable<SandboxStartDeps["findLabeledSandboxContainers"]>
-  >(() => [{ name: "openshell-my-sandbox", status: "Exited (0) 2 hours ago", running: false }]);
-  const recoverDockerDriverSandbox = vi.fn<
-    NonNullable<SandboxStartDeps["recoverDockerDriverSandbox"]>
-  >(() => ({
-    recovered: true,
-    via: "started-stopped-original",
-    containerName: "openshell-my-sandbox",
-  }));
-  const dockerUnpause = vi.fn<NonNullable<SandboxStartDeps["dockerUnpause"]>>(() => ({
-    status: 0,
-  }));
-  const probeSandbox = vi.fn<NonNullable<SandboxStartDeps["probeSandbox"]>>(() =>
-    Promise.resolve(),
+  const qualifyLegacyPortableProfile = vi.fn<
+    NonNullable<SandboxStartDeps["qualifyLegacyPortableProfile"]>
+  >(() => false);
+  const requalifyPortableSandbox = vi.fn<NonNullable<SandboxStartDeps["requalifyPortableSandbox"]>>(
+    async () => ({ kind: "not-hermes" }),
+  );
+  const observer: OpenShellSandboxObserver = {
+    listSandboxes: vi.fn(async () => {
+      order.push("openshell-ready");
+      return {
+        ok: true as const,
+        value: {
+          sandboxes: [{ name: "my-sandbox", phase: "Ready", readiness: "ready" as const }],
+        },
+      };
+    }),
+  };
+  const verifyGateway = vi.fn<NonNullable<SandboxStartDeps["verifyGateway"]>>(async () => {
+    order.push("native-health");
+  });
+  const probeGatewayProcess = vi.fn<NonNullable<SandboxStartDeps["probeGatewayProcess"]>>(
+    async () => true,
   );
   const log = vi.fn<(message: string) => void>();
+  const runtimeProviders = createRuntimeProviderBundleRegistry([
+    ["docker", createDockerRuntimeProviderBundle()],
+  ]);
+  let elapsedMs = 0;
+  const delayGatewayProcessProbe = vi.fn(async (ms: number) => {
+    elapsedMs += ms;
+  });
   const deps: SandboxStartDeps = {
+    environment: {},
+    now: () => elapsedMs,
+    delayGatewayProcessProbe,
     getSandbox,
-    isDockerRuntimeDown,
-    printDockerRuntimeDownGuidance,
-    findLabeledSandboxContainers,
-    recoverDockerDriverSandbox,
-    dockerUnpause,
-    probeSandbox,
+    openShellLifecycle,
+    qualifyLegacyPortableProfile,
+    recoverPortableSandbox,
+    requalifyPortableSandbox,
+    updateSandbox,
+    runtimeProviders,
+    observer,
+    verifyGateway,
+    probeGatewayProcess,
     log,
+    withLifecycleLock: async (_sandboxName, operation) => operation(),
     ...overrides,
   };
   return {
     deps,
-    dockerUnpause,
-    findLabeledSandboxContainers,
     getSandbox,
-    isDockerRuntimeDown,
     log,
-    printDockerRuntimeDownGuidance,
-    probeSandbox,
-    recoverDockerDriverSandbox,
+    observer,
+    order,
+    probeGatewayProcess,
+    qualifyLegacyPortableProfile,
+    recoverPortableSandbox,
+    startOpenShellSandbox,
+    updateSandbox,
+    verifyGateway,
   };
 }
 
-describe("startSandbox", () => {
-  it("starts the stopped container and then probes gateway health (#6026)", async () => {
+function providerRegistry(providerId: "docker" | "podman") {
+  const engine = (operation: "host-doctor" | "sandbox-lifecycle") => ({
+    operation,
+    engineId: "podman",
+    displayName: "Podman",
+    authorityId: "podman:test",
+    endpointAuthorityId: "podman:test",
+    capture: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+    captureHost: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+  });
+  const providers = {
+    docker: () =>
+      createRuntimeProviderBundleRegistry([["docker", createDockerRuntimeProviderBundle()]]),
+    podman: () =>
+      createRuntimeProviderBundleRegistry([
+        [
+          "podman",
+          createPodmanRuntimeProviderBundle({
+            engines: {
+              hostDoctor: engine("host-doctor") as never,
+              sandboxLifecycle: engine("sandbox-lifecycle") as never,
+            },
+          }),
+        ],
+      ]),
+  };
+  return providers[providerId]();
+}
+
+describe("startSandbox native lifecycle", () => {
+  it("starts a sandbox from its sibling gateway registry and clears stop intent there", async () => {
+    vi.restoreAllMocks();
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-start-cross-root-"));
+    const registryDir = path.join(home, ".nemoclaw", "gateways", "8245");
+    const registryFile = path.join(registryDir, "sandboxes.json");
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      registryFile,
+      JSON.stringify({
+        defaultSandbox: "my-sandbox",
+        defaultSelectionRevision: 1,
+        sandboxes: {
+          "my-sandbox": {
+            name: "my-sandbox",
+            gatewayName: "nemoclaw-8245",
+            gatewayPort: 8245,
+            lifecycleLiveIdentityFingerprint: fingerprintOpenShellSandboxId("sandbox-alpha"),
+            openshellDriver: "docker",
+            stopped: true,
+          },
+        },
+      }),
+    );
+    vi.stubEnv("HOME", home);
+    try {
+      const h = harness();
+      const { getSandbox: _getSandbox, updateSandbox: _updateSandbox, ...deps } = h.deps;
+
+      await expect(startSandbox("my-sandbox", deps)).resolves.toEqual({ exitCode: 0 });
+
+      expect(
+        JSON.parse(fs.readFileSync(registryFile, "utf8")).sandboxes["my-sandbox"],
+      ).toMatchObject({ gatewayPort: 8245, stopped: false });
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["docker", "podman"] as const)(
+    "dispatches standard %s lifecycle through the shared OpenShell adapter",
+    async (providerId) => {
+      const h = harness({ runtimeProviders: providerRegistry(providerId) });
+      h.getSandbox.mockReturnValue(sandbox({ openshellDriver: providerId }));
+
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+
+      expect(h.startOpenShellSandbox).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          sandboxName: "my-sandbox",
+          sandboxIdentityFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        }),
+      );
+    },
+  );
+
+  it("derives the canonical gateway name from a persisted non-default port", async () => {
     const h = harness();
+    h.getSandbox.mockReturnValue(
+      sandbox({ gatewayName: undefined, gatewayPort: 18080, openshellDriver: "docker" }),
+    );
 
-    const result = await startSandbox("my-sandbox", h.deps);
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
 
-    expect(result.exitCode).toBe(0);
-    expect(h.recoverDockerDriverSandbox).toHaveBeenCalledWith("my-sandbox");
-    expect(h.probeSandbox).toHaveBeenCalledWith("my-sandbox");
-    expect(h.recoverDockerDriverSandbox.mock.invocationCallOrder[0]).toBeLessThan(
-      h.probeSandbox.mock.invocationCallOrder[0],
+    expect(h.startOpenShellSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: "named", gatewayName: "nemoclaw-18080" },
+      }),
     );
   });
 
-  it("reports the started container by name (#6026)", async () => {
+  it("waits for OpenShell readiness before observing native gateway health", async () => {
+    const h = harness();
+    h.getSandbox.mockReturnValue(
+      sandbox({ lifecycleGeneration: "standard-generation", stopped: true }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 0,
+    });
+
+    expect(h.order).toEqual(["openshell-start", "openshell-ready", "native-health"]);
+    expect(h.recoverPortableSandbox).not.toHaveBeenCalled();
+    expect(h.updateSandbox).toHaveBeenCalledWith("my-sandbox", {
+      stopped: false,
+    });
+  });
+
+  it("reports the OpenShell-owned sandbox start", async () => {
     const h = harness();
 
     await startSandbox("my-sandbox", h.deps);
 
-    const output = h.log.mock.calls.map(([line]) => line).join("\n");
-    expect(output).toContain("openshell-my-sandbox");
+    expect(h.log.mock.calls.map(([line]) => line).join("\n")).toContain(
+      "Sandbox 'my-sandbox' started through OpenShell",
+    );
   });
 
-  it("still probes when the container was already running (#6026)", async () => {
+  it("uses recorded portable authority without standard OpenShell lifecycle dispatch", async () => {
     const h = harness();
-    h.findLabeledSandboxContainers.mockReturnValue([
-      { name: "openshell-my-sandbox", status: "Up 5 minutes", running: true },
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        gatewayName: "nemoclaw",
+        lifecycleGeneration: "generation-alpha",
+        lifecycleLiveIdentityFingerprint: "identity-alpha",
+        openshellDriver: "docker",
+        portableLifecycleProfile: "hermes",
+      }),
+    );
+    h.recoverPortableSandbox.mockImplementation(async () => {
+      h.order.push("portable-start");
+      return { kind: "recovered" };
+    });
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 0,
+    });
+
+    expect(h.recoverPortableSandbox).toHaveBeenCalledOnce();
+    expect(h.startOpenShellSandbox).not.toHaveBeenCalled();
+    expect(h.verifyGateway).toHaveBeenCalledWith("my-sandbox");
+  });
+
+  it("admits only a receipt-qualified legacy Hermes portable profile", async () => {
+    const h = harness();
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        gatewayName: "nemoclaw",
+        lifecycleGeneration: "generation-alpha",
+        lifecycleLiveIdentityFingerprint: "identity-alpha",
+        openshellDriver: "docker",
+      }),
+    );
+    h.qualifyLegacyPortableProfile.mockReturnValue(true);
+    h.recoverPortableSandbox.mockResolvedValue({ kind: "recovered" });
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+
+    expect(h.recoverPortableSandbox).toHaveBeenCalledOnce();
+    expect(h.startOpenShellSandbox).not.toHaveBeenCalled();
+  });
+
+  it("keeps unqualified Docker Hermes state on the standard OpenShell path", async () => {
+    const h = harness();
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        gatewayName: "nemoclaw",
+        lifecycleGeneration: "standard-generation",
+        openshellDriver: "docker",
+      }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+
+    expect(h.qualifyLegacyPortableProfile).toHaveBeenCalledOnce();
+    expect(h.recoverPortableSandbox).not.toHaveBeenCalled();
+    expect(h.startOpenShellSandbox).toHaveBeenCalledOnce();
+    expect(h.updateSandbox).not.toHaveBeenCalledWith("my-sandbox", {
+      portableLifecycleProfile: "hermes",
+    });
+  });
+
+  it("propagates native gateway health failure", async () => {
+    const h = harness();
+    h.verifyGateway.mockRejectedValue(new Error("native gateway unavailable"));
+
+    await expect(startSandbox("my-sandbox", h.deps)).rejects.toThrow("native gateway unavailable");
+  });
+
+  it("pins the inference probe to the registered gateway after health", async () => {
+    const probeInferenceInvocation = vi.fn(async () => ({ ok: true }) as const);
+    const h = harness({ probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        gatewayName: "nemoclaw-19080",
+        provider: "ollama-local",
+        model: "nemotron-3-nano:30b",
+        preferredInferenceApi: "openai-completions",
+      }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 0,
+    });
+
+    expect(probeInferenceInvocation).toHaveBeenCalledWith(
+      {
+        sandboxName: "my-sandbox",
+        gatewayName: "nemoclaw-19080",
+        provider: "ollama-local",
+        model: "nemotron-3-nano:30b",
+        preferredInferenceApi: "openai-completions",
+      },
+      {},
+      95_000,
+    );
+    expect(probeInferenceInvocation.mock.invocationCallOrder[0]).toBeGreaterThan(
+      h.verifyGateway.mock.invocationCallOrder[0],
+    );
+    expect(h.probeGatewayProcess).not.toHaveBeenCalled();
+  });
+
+  it("waits for the Hermes gateway process to settle before checking gateway health", async () => {
+    const probeGatewayProcess = vi
+      .fn<NonNullable<SandboxStartDeps["probeGatewayProcess"]>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const delayGatewayProcessProbe = vi.fn(async () => {});
+    const h = harness({ probeGatewayProcess, delayGatewayProcessProbe });
+    h.getSandbox.mockReturnValue(
+      sandbox({ agent: "hermes", gatewayName: "nemoclaw-19080", stopped: true }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 0,
+    });
+
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(3);
+    expect(probeGatewayProcess).toHaveBeenCalledWith("my-sandbox", "nemoclaw-19080");
+    expect(delayGatewayProcessProbe.mock.calls).toEqual([[2_000], [2_000]]);
+    expect(h.verifyGateway).toHaveBeenCalledExactlyOnceWith("my-sandbox");
+    expect(h.verifyGateway.mock.invocationCallOrder[0]).toBeGreaterThan(
+      probeGatewayProcess.mock.invocationCallOrder[2],
+    );
+  });
+
+  it.each(["RUNNING", "UNAVAILABLE"])(
+    "observes Hermes startup health outcome %s",
+    async (health) => {
+      const requests: OpenShellSandboxBufferedCommandRequest[] = [];
+      const runBuffered = vi.fn(async (request: OpenShellSandboxBufferedCommandRequest) => {
+        requests.push(request);
+        return {
+          outcome: { kind: "completed" as const, exitCode: 0 },
+          stdout: `__NEMOCLAW_SANDBOX_EXEC_STARTED__\n${health}\n`,
+          stderr: "",
+        };
+      });
+      vi.spyOn(sandboxCommandCli, "createCliOpenShellSandboxCommandExecutor").mockReturnValue({
+        probeDirectory: vi.fn(async () => ({ state: "present" as const })),
+        runBuffered,
+        runStreaming: vi.fn(async () => ({
+          outcome: { kind: "completed" as const, exitCode: 0 },
+          release: () => undefined,
+        })),
+      });
+      vi.spyOn(registry, "getSandbox").mockReturnValue(
+        sandbox({ agent: "hermes", gatewayName: "nemoclaw-19080", stopped: true }),
+      );
+      const h = harness({ probeGatewayProcess: undefined });
+      h.getSandbox.mockReturnValue(
+        sandbox({ agent: "hermes", gatewayName: "nemoclaw-19080", stopped: true }),
+      );
+
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+        exitCode: health === "RUNNING" ? 0 : 1,
+      });
+
+      expect(requests).toHaveLength(health === "RUNNING" ? 1 : 6);
+      expect(h.verifyGateway).toHaveBeenCalledTimes(health === "RUNNING" ? 1 : 0);
+      expect(requests[0]).toEqual(
+        expect.objectContaining({
+          sandboxName: "my-sandbox",
+          target: { kind: "named", gatewayName: "nemoclaw-19080" },
+          command: expect.arrayContaining(["sh", "-c", expect.stringContaining("/health")]),
+        }),
+      );
+      expect(requests[0]?.command.join(" ")).not.toContain(
+        "/usr/local/bin/nemoclaw-gateway-control",
+      );
+    },
+  );
+
+  it.each(["openclaw", undefined])(
+    "waits for the stopped %s gateway HTTP listener before repairing forwards",
+    async (agent) => {
+      const probeGatewayProcess = vi
+        .fn(async () => true)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false);
+      const delayGatewayProcessProbe = vi.fn(async () => {});
+      const h = harness({ probeGatewayProcess, delayGatewayProcessProbe });
+      h.getSandbox.mockReturnValue(
+        sandbox({ agent, gatewayName: "nemoclaw-19080", stopped: true }),
+      );
+
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+      expect(probeGatewayProcess).toHaveBeenCalledTimes(4);
+      expect(probeGatewayProcess).toHaveBeenCalledWith("my-sandbox", "nemoclaw-19080", {
+        startup: { timeoutMs: 15_000 },
+      });
+      expect(delayGatewayProcessProbe.mock.calls).toEqual([[2_000], [2_000], [2_000]]);
+      expect(h.verifyGateway.mock.invocationCallOrder[0]).toBeGreaterThan(
+        probeGatewayProcess.mock.invocationCallOrder[3],
+      );
+    },
+  );
+
+  it.each([
+    [undefined, 30_000],
+    ["", 30_000],
+    ["-1", 30_000],
+    ["Infinity", 30_000],
+    ["invalid", 30_000],
+    ["0", 0],
+    ["0.25", 250],
+    ["4", 4_000],
+  ] as const)("bounds stopped OpenClaw startup with recovery timeout %s", async (value, budget) => {
+    let elapsed = 0;
+    const probeGatewayProcess = vi.fn(async () => false);
+    const delayGatewayProcessProbe = vi.fn(async (ms: number) => {
+      elapsed += ms;
+    });
+    const h = harness({
+      probeGatewayProcess,
+      delayGatewayProcessProbe,
+      now: () => elapsed,
+      environment: { NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: value },
+    });
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+    expect(elapsed).toBe(budget);
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(Math.ceil(budget / 2_000));
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+  });
+
+  it("uses a bounded shared override for a large finite startup setting", async () => {
+    const h = harness({ environment: { NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: "1e300" } });
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+    expect(h.probeGatewayProcess).toHaveBeenCalledWith("my-sandbox", "nemoclaw", {
+      startup: { timeoutMs: 15_000 },
+    });
+  });
+
+  it("charges slow probes and sleep to one deadline and passes only the remaining time", async () => {
+    let elapsed = 0;
+    const budgets: number[] = [];
+    const probeGatewayProcess = vi.fn<NonNullable<SandboxStartDeps["probeGatewayProcess"]>>(
+      async (_name, _gateway, options) => {
+        const remaining = options?.startup?.timeoutMs ?? 0;
+        budgets.push(remaining);
+        elapsed += Math.min(700, remaining);
+        return false;
+      },
+    );
+    const h = harness({
+      probeGatewayProcess,
+      now: () => elapsed,
+      delayGatewayProcessProbe: async (ms) => {
+        elapsed += ms;
+      },
+      environment: { NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: "3" },
+    });
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+    expect(elapsed).toBe(3_000);
+    expect(budgets).toEqual([3_000, 300]);
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+  });
+
+  it("rejects a positive observation that arrives after the startup deadline", async () => {
+    let elapsed = 0;
+    const h = harness({
+      probeGatewayProcess: async () => {
+        elapsed = 1_001;
+        return true;
+      },
+      now: () => elapsed,
+      environment: { NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: "1" },
+    });
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+  });
+
+  it("repeats stopped OpenClaw settlement after a timed-out start retry", async () => {
+    const probeGatewayProcess = vi
+      .fn<NonNullable<SandboxStartDeps["probeGatewayProcess"]>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const h = harness({
+      probeGatewayProcess,
+      environment: { NEMOCLAW_GATEWAY_RECOVERY_WAIT_SECONDS: "0.001" },
+    });
+    h.getSandbox.mockReturnValue(sandbox({ agent: "openclaw", stopped: true }));
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+    expect(h.updateSandbox).not.toHaveBeenCalled();
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(2);
+    expect(h.verifyGateway).toHaveBeenCalledOnce();
+    expect(h.verifyGateway.mock.invocationCallOrder[0]).toBeGreaterThan(
+      probeGatewayProcess.mock.invocationCallOrder[1],
+    );
+    expect(h.updateSandbox.mock.invocationCallOrder[0]).toBeGreaterThan(
+      h.verifyGateway.mock.invocationCallOrder[0],
+    );
+    expect(h.updateSandbox).toHaveBeenCalledWith("my-sandbox", { stopped: false });
+  });
+
+  it.each(["openclaw", undefined])(
+    "does not wait for %s when the sandbox was already running",
+    async (agent) => {
+      const h = harness();
+      h.getSandbox.mockReturnValue(sandbox({ agent, stopped: false }));
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+      expect(h.probeGatewayProcess).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns nonzero when the Hermes gateway stays stopped", async () => {
+    const probeGatewayProcess = vi.fn(async () => false);
+    const delayGatewayProcessProbe = vi.fn(async () => {});
+    const probeInferenceInvocation = vi.fn(async () => ({ ok: true }) as const);
+    const h = harness({
+      probeGatewayProcess,
+      delayGatewayProcessProbe,
+      probeInferenceInvocation,
+    });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        provider: "ollama-local",
+        model: "nemotron-3-nano:30b",
+        stopped: true,
+      }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 1,
+    });
+
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(6);
+    expect(delayGatewayProcessProbe.mock.calls).toEqual([
+      [2_000],
+      [2_000],
+      [2_000],
+      [2_000],
+      [2_000],
     ]);
-    h.recoverDockerDriverSandbox.mockReturnValue({
-      recovered: true,
-      via: "started-running-original",
-      containerName: "openshell-my-sandbox",
-    });
-
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(0);
-    expect(h.probeSandbox).toHaveBeenCalledWith("my-sandbox");
-    const output = h.log.mock.calls.map(([line]) => line).join("\n");
-    expect(output).toContain("already running");
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+    expect(probeInferenceInvocation).not.toHaveBeenCalled();
   });
 
-  it("unpauses a paused container instead of calling it already running (#6026)", async () => {
-    const h = harness();
-    h.findLabeledSandboxContainers.mockReturnValue([
-      { name: "openshell-my-sandbox", status: "Up 3 minutes (Paused)", running: true },
+  it("settles a transient unavailable Hermes observation before gateway verification", async () => {
+    const probeGatewayProcess = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(true);
+    const delayGatewayProcessProbe = vi.fn(async () => {});
+    const h = harness({ probeGatewayProcess, delayGatewayProcessProbe });
+    h.getSandbox.mockReturnValue(sandbox({ agent: "hermes", stopped: true }));
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(2);
+    expect(delayGatewayProcessProbe).toHaveBeenCalledOnce();
+    expect(h.verifyGateway).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed after persistently unavailable Hermes observations", async () => {
+    const probeGatewayProcess = vi.fn(async () => null);
+    const delayGatewayProcessProbe = vi.fn(async () => {});
+    const h = harness({ probeGatewayProcess, delayGatewayProcessProbe });
+    h.getSandbox.mockReturnValue(sandbox({ agent: "hermes", stopped: true }));
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+
+    expect(probeGatewayProcess).toHaveBeenCalledTimes(6);
+    expect(delayGatewayProcessProbe.mock.calls).toEqual([
+      [2_000],
+      [2_000],
+      [2_000],
+      [2_000],
+      [2_000],
     ]);
+    expect(h.verifyGateway).not.toHaveBeenCalled();
+  });
 
-    const result = await startSandbox("my-sandbox", h.deps);
+  it("passes an unavailable OpenClaw observation to gateway verification", async () => {
+    const probeGatewayProcess = vi.fn(async () => null);
+    const delayGatewayProcessProbe = vi.fn(async () => {});
+    const h = harness({ probeGatewayProcess, delayGatewayProcessProbe });
+    h.getSandbox.mockReturnValue(sandbox({ agent: "openclaw", stopped: true }));
+    h.verifyGateway.mockRejectedValue(new Error("native gateway route unavailable"));
 
-    expect(result.exitCode).toBe(0);
-    expect(h.dockerUnpause).toHaveBeenCalledWith("openshell-my-sandbox", {
-      ignoreError: true,
-      timeout: 30_000,
+    await expect(startSandbox("my-sandbox", h.deps)).rejects.toThrow(
+      "native gateway route unavailable",
+    );
+
+    expect(probeGatewayProcess).toHaveBeenCalledOnce();
+    expect(delayGatewayProcessProbe).not.toHaveBeenCalled();
+    expect(h.verifyGateway).toHaveBeenCalledOnce();
+  });
+
+  it("returns nonzero when the native gateway cannot serve an agent request", async () => {
+    const probeInferenceInvocation = vi.fn(
+      async () =>
+        ({
+          ok: false,
+          detail: "sandbox inference invocation probe returned HTTP 401",
+          httpStatus: 401,
+        }) as const,
+    );
+    const h = harness({ probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({ provider: "ollama-local", model: "nemotron-3-nano:30b" }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({
+      exitCode: 1,
     });
-    expect(h.recoverDockerDriverSandbox).not.toHaveBeenCalled();
-    expect(h.probeSandbox).toHaveBeenCalledWith("my-sandbox");
-    const output = h.log.mock.calls.map(([line]) => line).join("\n");
-    expect(output).toContain("unpaused");
+    expect(h.log.mock.calls.map(([line]) => line).join("\n")).toContain("HTTP 401");
+    expect(probeInferenceInvocation).toHaveBeenCalledOnce();
   });
 
-  it("surfaces a docker unpause failure with the container name (#6026)", async () => {
-    const h = harness();
-    h.findLabeledSandboxContainers.mockReturnValue([
-      { name: "openshell-my-sandbox", status: "Up 3 minutes (Paused)", running: true },
-    ]);
-    h.dockerUnpause.mockReturnValue({ status: 125 });
+  it("retries a transient HTTP 503 while a restarted inference route settles", async () => {
+    const probeInferenceInvocation = vi
+      .fn<NonNullable<SandboxStartDeps["probeInferenceInvocation"]>>()
+      .mockResolvedValueOnce({
+        ok: false,
+        detail: "sandbox inference invocation probe returned HTTP 503",
+        httpStatus: 503,
+      })
+      .mockResolvedValueOnce({ ok: true });
+    const delayInferenceInvocationProbe = vi.fn(async () => {});
+    const h = harness({ delayInferenceInvocationProbe, probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "pi",
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      }),
+    );
 
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(1);
-    expect(result.message).toContain("openshell-my-sandbox");
-    expect(result.message).toContain("125");
-    expect(h.probeSandbox).not.toHaveBeenCalled();
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+    expect(probeInferenceInvocation).toHaveBeenCalledTimes(2);
+    expect(delayInferenceInvocationProbe).toHaveBeenCalledExactlyOnceWith(2_000);
+    expect(h.log.mock.calls.map(([line]) => line).join("\n")).toContain("HTTP 503");
   });
 
-  it("restores a gpu-backup sibling through the recovery rename path (#6026)", async () => {
-    const h = harness();
-    h.recoverDockerDriverSandbox.mockReturnValue({
-      recovered: true,
-      via: "renamed-and-started-backup",
-      containerName: "openshell-my-sandbox",
+  it("settles a transient inference HTTP 503 after native startup", async () => {
+    const probeInferenceInvocation = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false as const,
+        detail: "sandbox inference invocation probe returned HTTP 503",
+        httpStatus: 503,
+      })
+      .mockResolvedValueOnce({ ok: true as const });
+    const delayInferenceInvocationProbe = vi.fn(async () => {});
+    const h = harness({ probeInferenceInvocation, delayInferenceInvocationProbe });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        provider: "nvidia",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+
+    expect(probeInferenceInvocation).toHaveBeenCalledTimes(2);
+    expect(delayInferenceInvocationProbe).toHaveBeenCalledWith(2_000);
+  });
+
+  it("fails closed after the bounded transient inference settlement window", async () => {
+    const probeInferenceInvocation = vi.fn(async () => ({
+      ok: false as const,
+      detail: "sandbox inference invocation probe returned HTTP 503",
+      httpStatus: 503,
+    }));
+    const delayInferenceInvocationProbe = vi.fn(async () => {});
+    const h = harness({ probeInferenceInvocation, delayInferenceInvocationProbe });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        agent: "hermes",
+        provider: "nvidia",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+
+    expect(probeInferenceInvocation).toHaveBeenCalledTimes(3);
+    expect(delayInferenceInvocationProbe.mock.calls).toEqual([[2_000], [2_000]]);
+  });
+
+  it("does not add Hermes startup settlement to OpenClaw inference", async () => {
+    const probeInferenceInvocation = vi.fn(async () => ({
+      ok: false as const,
+      detail: "sandbox inference invocation probe returned HTTP 503",
+      httpStatus: 503,
+    }));
+    const delayInferenceInvocationProbe = vi.fn(async () => {});
+    const h = harness({ probeInferenceInvocation, delayInferenceInvocationProbe });
+    h.getSandbox.mockReturnValue(
+      sandbox({ agent: "openclaw", provider: "nvidia", model: "nvidia/nemotron" }),
+    );
+
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+
+    expect(probeInferenceInvocation).toHaveBeenCalledOnce();
+    expect(delayInferenceInvocationProbe).not.toHaveBeenCalled();
+  });
+});
+
+const restartProviders = [
+  ...HOSTED_NATIVE_PROVIDERS,
+  {
+    logicalProvider: "nvidia-prod",
+    profileId: "nemoclaw-nvidia-inference-v1",
+    providerName: "nemoclaw-nvidia-prod-v1",
+    endpoint: "https://integrate.api.nvidia.com/v1",
+    api: "openai-completions",
+  },
+] as const;
+
+const restartCases = restartProviders.flatMap((provider) =>
+  (provider.api === "openai-completions" ? ["openclaw", "pi"] : ["openclaw"]).map((agent) => ({
+    ...provider,
+    agent,
+  })),
+);
+
+describe("startSandbox persisted native inference selection", () => {
+  it.each([
+    ["langchain-deepagents-code", "authenticated"],
+    ["langchain-deepagents-code", "sentinel"],
+    ["openclaw", "authenticated"],
+    ["openclaw", "sentinel"],
+  ] as const)("restarts %s through its recorded %s local provider", async (agent, authMode) => {
+    const binding = {
+      provider: agent === "openclaw" ? ("vllm-local" as const) : ("compatible-endpoint" as const),
+      ...(agent === "openclaw" ? { agent } : {}),
+      endpointUrl: "http://host.openshell.internal:8000/v1",
+      credentialEnv: "NEMOCLAW_LOCAL_INFERENCE_TOKEN",
+      authMode,
+      gatewayName: "nemoclaw-19080",
+      sandboxName: "my-sandbox",
+    };
+    const attachment = {
+      ...binding,
+      ...nativeLocalIdentity(binding),
+      schemaVersion: 1 as const,
+      providerId: "owned-local-provider-id",
+    };
+    const endpoints: string[] = [];
+    const probeInferenceInvocation = vi.fn<
+      NonNullable<SandboxStartDeps["probeInferenceInvocation"]>
+    >(async (input) => {
+      endpoints.push(resolveSandboxInferenceInvocationEndpoint(input));
+      return { ok: true };
     });
+    const h = harness({ probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        stopped: true,
+        agent,
+        provider: binding.provider,
+        model: "local-model",
+        gatewayName: binding.gatewayName,
+        preferredInferenceApi: "openai-completions",
+        nativeLocalProviderAttachment: attachment,
+      }),
+    );
 
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(0);
-    expect(h.probeSandbox).toHaveBeenCalledWith("my-sandbox");
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+    expect(endpoints).toEqual([`${binding.endpointUrl}/chat/completions`]);
+    expect(probeInferenceInvocation).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        sandboxName: binding.sandboxName,
+        gatewayName: binding.gatewayName,
+        agentName: agent,
+        provider: binding.provider,
+        model: "local-model",
+        nativeLocalProviderAttachment: attachment,
+      }),
+      {},
+      expect.any(Number),
+    );
+    expect(h.updateSandbox).toHaveBeenCalledWith(
+      "my-sandbox",
+      expect.objectContaining({ stopped: false }),
+    );
   });
 
-  it("names the Docker daemon outage instead of claiming the container was removed (#6026)", async () => {
-    const h = harness();
-    h.isDockerRuntimeDown.mockReturnValue(true);
+  const hermesEndpoint = "https://authenticated.nous.example/api/v1";
+  const hermesDefinition = hostedNativeProvider("hermes-provider", hermesEndpoint)!;
+  const hermesAttachment = {
+    schemaVersion: 1 as const,
+    profileId: hermesDefinition.profileId,
+    providerName: hermesDefinition.providerName,
+    providerId: "authenticated-hermes-provider-id",
+    endpointUrl: hermesEndpoint,
+    allowedIps: ["8.8.8.8"],
+  };
 
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(1);
-    expect(result.message).toBeUndefined();
-    expect(h.printDockerRuntimeDownGuidance).toHaveBeenCalledWith("my-sandbox", {
-      retryCommand: "start",
+  it("restarts Hermes through its persisted authenticated endpoint", async () => {
+    const endpoints: string[] = [];
+    const probeInferenceInvocation = vi.fn<
+      NonNullable<SandboxStartDeps["probeInferenceInvocation"]>
+    >(async (input) => {
+      endpoints.push(resolveSandboxInferenceInvocationEndpoint(input));
+      return { ok: true };
     });
-    expect(h.recoverDockerDriverSandbox).not.toHaveBeenCalled();
-    expect(h.probeSandbox).not.toHaveBeenCalled();
-  });
+    const h = harness({ probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        stopped: true,
+        agent: "hermes",
+        provider: "hermes-provider",
+        model: "authenticated-model",
+        preferredInferenceApi: "openai-completions",
+        nativeHostedProviderAttachment: hermesAttachment,
+      }),
+    );
 
-  it("fails with the recovery detail and a rebuild hint when no container exists (#6026)", async () => {
-    const h = harness();
-    h.findLabeledSandboxContainers.mockReturnValue([]);
-    h.recoverDockerDriverSandbox.mockReturnValue({
-      recovered: false,
-      via: null,
-      detail: "no Docker container labeled 'openshell.ai/sandbox-name=my-sandbox'",
-    });
-
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(1);
-    expect(result.message).toContain("no Docker container labeled");
-    expect(result.message).toContain("rebuild");
-    expect(h.probeSandbox).not.toHaveBeenCalled();
-  });
-
-  it("refuses an unregistered sandbox (#6026)", async () => {
-    const h = harness();
-    h.getSandbox.mockReturnValue(null);
-
-    const result = await startSandbox("ghost", h.deps);
-
-    expect(result.exitCode).toBe(1);
-    expect(result.message).toContain("not registered");
-    expect(h.recoverDockerDriverSandbox).not.toHaveBeenCalled();
-  });
-
-  it("refuses non-direct drivers instead of guessing at container control (#6026)", async () => {
-    const h = harness();
-    h.getSandbox.mockReturnValue(sandbox({ openshellDriver: "kubernetes" }));
-
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(1);
-    expect(result.message).toContain("kubernetes");
-    expect(h.recoverDockerDriverSandbox).not.toHaveBeenCalled();
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+    expect(probeInferenceInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "hermes-provider",
+        model: "authenticated-model",
+        nativeProvider: true,
+        nativeEndpointUrl: hermesEndpoint,
+      }),
+      {},
+      expect.any(Number),
+    );
+    expect(endpoints).toEqual(["https://authenticated.nous.example/api/v1/chat/completions"]);
+    expect(h.updateSandbox).toHaveBeenCalledWith(
+      "my-sandbox",
+      expect.objectContaining({ stopped: false }),
+    );
   });
 
   it.each([
-    ["null driver", sandbox({ openshellDriver: null })],
-    ["docker driver", sandbox({ openshellDriver: "docker" })],
-    ["vm driver", sandbox({ openshellDriver: "vm" })],
-  ])("allows the %s like privileged exec does (#6026)", async (_label, entry) => {
-    const h = harness();
-    h.getSandbox.mockReturnValue(entry);
+    { name: "unsafe endpoint", patch: { endpointUrl: "http://authenticated.nous.example/api/v1" } },
+    {
+      name: "different endpoint identity",
+      patch: { endpointUrl: "https://different.nous.example/api/v1" },
+    },
+    { name: "missing address pins", patch: { allowedIps: [] } },
+    { name: "private address pin", patch: { allowedIps: ["127.0.0.1"] } },
+  ])("refuses Hermes restart with $name before inference", async ({ patch }) => {
+    const probeInferenceInvocation = vi.fn(async () => ({ ok: true }) as const);
+    const h = harness({ probeInferenceInvocation });
+    h.getSandbox.mockReturnValue(
+      sandbox({
+        stopped: true,
+        agent: "hermes",
+        provider: "hermes-provider",
+        model: "authenticated-model",
+        nativeHostedProviderAttachment: { ...hermesAttachment, ...patch },
+      }),
+    );
 
-    const result = await startSandbox("my-sandbox", h.deps);
-
-    expect(result.exitCode).toBe(0);
+    await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+    expect(probeInferenceInvocation).not.toHaveBeenCalled();
+    expect(h.updateSandbox).not.toHaveBeenCalledWith(
+      "my-sandbox",
+      expect.objectContaining({ stopped: false }),
+    );
   });
 
-  it("propagates a probe rejection instead of reporting success (#6026)", async () => {
-    const h = harness();
-    h.probeSandbox.mockRejectedValue(new Error("probe exploded"));
+  it.each(restartCases)(
+    "restarts $agent with $logicalProvider using its attached native endpoint",
+    async (definition) => {
+      const endpoints: string[] = [];
+      const probeInferenceInvocation = vi.fn<
+        NonNullable<SandboxStartDeps["probeInferenceInvocation"]>
+      >(async (input) => {
+        endpoints.push(resolveSandboxInferenceInvocationEndpoint(input));
+        return { ok: true };
+      });
+      const h = harness({ probeInferenceInvocation });
+      const receipt = {
+        schemaVersion: 1 as const,
+        profileId: definition.profileId,
+        providerName: definition.providerName,
+        providerId: "owned-provider-id",
+      };
+      h.getSandbox.mockReturnValue(
+        sandbox({
+          stopped: true,
+          agent: definition.agent,
+          provider: definition.logicalProvider,
+          model: "fixture-model",
+          preferredInferenceApi: definition.api,
+          ...(definition.logicalProvider === "nvidia-prod"
+            ? {
+                nativeNvidiaProviderAttachment: {
+                  ...receipt,
+                  profileId: "nemoclaw-nvidia-inference-v1",
+                  providerName: "nemoclaw-nvidia-prod-v1",
+                },
+              }
+            : { nativeHostedProviderAttachment: receipt }),
+        }),
+      );
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+      const suffix = definition.api === "anthropic-messages" ? "/v1/messages" : "/chat/completions";
+      expect(endpoints).toEqual([definition.endpoint.replace(/\/+$/, "") + suffix]);
+      expect(h.updateSandbox).toHaveBeenCalledWith(
+        "my-sandbox",
+        expect.objectContaining({ stopped: false }),
+      );
+    },
+  );
 
-    await expect(startSandbox("my-sandbox", h.deps)).rejects.toThrow("probe exploded");
-  });
+  it.each(restartCases)(
+    "retains the $agent legacy shared route for $logicalProvider without native authority",
+    async (definition) => {
+      const endpoints: string[] = [];
+      const h = harness({
+        probeInferenceInvocation: async (input) => {
+          endpoints.push(resolveSandboxInferenceInvocationEndpoint(input));
+          return { ok: true };
+        },
+      });
+      h.getSandbox.mockReturnValue(
+        sandbox({
+          agent: definition.agent,
+          provider: definition.logicalProvider,
+          model: "fixture-model",
+          preferredInferenceApi: definition.api,
+        }),
+      );
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 0 });
+      expect(endpoints).toEqual([
+        "https://inference.local/v1/" +
+          (definition.api === "anthropic-messages" ? "messages" : "chat/completions"),
+      ]);
+    },
+  );
+
+  it.each([
+    {
+      nativeHostedProviderAttachment: {
+        schemaVersion: 1,
+        profileId: "nemoclaw-openai-inference-v1",
+        providerName: "nemoclaw-openai-api-v1",
+        providerId: "",
+      },
+    },
+    {
+      nativeHostedProviderAttachment: {
+        schemaVersion: 1,
+        profileId: "nemoclaw-gemini-inference-v1",
+        providerName: "nemoclaw-gemini-api-v1",
+        providerId: "wrong-selection",
+      },
+    },
+    {
+      nativeNvidiaProviderAttachment: {
+        schemaVersion: 1,
+        profileId: "nemoclaw-nvidia-inference-v1",
+        providerName: "nemoclaw-nvidia-prod-v1",
+        providerId: "wrong-selection",
+      },
+    },
+  ])(
+    "refuses invalid or mismatched persisted authority without probing [case %#]",
+    async (attachment) => {
+      const probeInferenceInvocation = vi.fn(async () => ({ ok: true }) as const);
+      const h = harness({ probeInferenceInvocation });
+      h.getSandbox.mockReturnValue(
+        sandbox({
+          stopped: true,
+          provider: "openai-api",
+          model: "fixture-model",
+          ...attachment,
+        } as Partial<SandboxEntry>),
+      );
+      await expect(startSandbox("my-sandbox", h.deps)).resolves.toEqual({ exitCode: 1 });
+      expect(probeInferenceInvocation).not.toHaveBeenCalled();
+      expect(h.updateSandbox).not.toHaveBeenCalledWith(
+        "my-sandbox",
+        expect.objectContaining({ stopped: false }),
+      );
+    },
+  );
 });

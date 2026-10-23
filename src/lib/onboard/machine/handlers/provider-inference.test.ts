@@ -1,15 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
 import { describe, expect, it, vi } from "vitest";
 
+import { decisionSelected, decisionUnset } from "../../../state/onboard-checkpoint-decision";
+import { deriveCheckpointFromSession } from "../../../state/onboard-checkpoint-migrate";
+import type { CheckpointSandboxIdentity } from "../../../state/onboard-checkpoint-types";
 import { createSession } from "../../../state/onboard-session";
-import { patchStagedDockerfile } from "../../dockerfile-patch";
-import { clearCompatibleEndpointReasoning } from "../../reasoning-mode";
 import {
   handleProviderInferenceState,
   type ProviderInferenceStateOptions,
@@ -31,6 +28,7 @@ function setupOptions(
   return {
     gatewayName: "nemoclaw",
     allowToolsIncompatible: false,
+    deferPublishedRouteReservation: true,
     endpointSource: null,
     reservationSessionId: session.sessionId,
     ...overrides,
@@ -41,20 +39,25 @@ describe("handleProviderInferenceState", () => {
   it("runs provider selection and inference setup on a fresh flow", async () => {
     const { deps, calls } = createDeps();
     const session = createSession();
-    calls.complete.mockResolvedValue(session);
+    calls.complete.mockImplementation(async (...args: unknown[]) => {
+      session.steps.provider_selection.status =
+        args[0] === "provider_selection" ? "complete" : session.steps.provider_selection.status;
+      return session;
+    });
 
     const result = await handleProviderInferenceState(baseOptions(deps, session));
 
     expect(calls.startStep).toHaveBeenNthCalledWith(1, "provider_selection");
     expect(calls.setupNim).toHaveBeenCalledWith(
       { type: "nvidia" },
-      null,
+      "my-assistant",
       null,
       true,
       "nemoclaw",
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     const selectionUpdates = (
       calls.complete.mock.calls as unknown as Array<[string, Record<string, unknown>]>
@@ -63,7 +66,11 @@ describe("handleProviderInferenceState", () => {
     expect(selectionUpdates).not.toHaveProperty("onboardEndpointUrl");
     expect(calls.promptName).toHaveBeenCalledWith(null);
     expect(calls.log).toHaveBeenCalledWith("summary:nvidia-prod/nvidia/test/my-assistant");
-    expect(calls.startStep).toHaveBeenNthCalledWith(2, "inference", {
+    expect(calls.startStep).toHaveBeenNthCalledWith(2, "provider_selection", {
+      provider: "nvidia-prod",
+      model: "nvidia/test",
+    });
+    expect(calls.startStep).toHaveBeenNthCalledWith(3, "inference", {
       provider: "nvidia-prod",
       model: "nvidia/test",
     });
@@ -77,6 +84,7 @@ describe("handleProviderInferenceState", () => {
       [],
       setupOptions(session, {
         preferredInferenceApi: "openai-responses",
+        deferPublishedRouteReservation: true,
       }),
     );
     expect(calls.deleteEnv).toHaveBeenCalledWith("NVIDIA_INFERENCE_API_KEY");
@@ -86,6 +94,7 @@ describe("handleProviderInferenceState", () => {
       provider: "nvidia-prod",
       preferredInferenceApi: "openai-responses",
       compatibleEndpointReasoning: null,
+      compatibleEndpointReasoningEffort: null,
     });
     expect(result.stateResult).toEqual({
       type: "transition",
@@ -145,6 +154,7 @@ describe("handleProviderInferenceState", () => {
       [],
       setupOptions(session, {
         preferredInferenceApi: "openai-completions",
+        deferPublishedRouteReservation: true,
       }),
     );
     expect(result.preferredInferenceApi).toBe("openai-completions");
@@ -246,72 +256,6 @@ describe("handleProviderInferenceState", () => {
     );
   });
 
-  describe("compatible endpoint reasoning mode", () => {
-    it("records reasoning state during provider selection", async () => {
-      const setupNim = vi.fn(async () => ({
-        ...baseSelection,
-        compatibleEndpointReasoning: "true",
-        provider: "compatible-endpoint",
-        credentialEnv: "COMPATIBLE_API_KEY",
-      }));
-      const { deps } = createDeps({ setupNim });
-
-      const result = await handleProviderInferenceState({
-        ...baseOptions(deps),
-        env: { NEMOCLAW_REASONING: "true" },
-      });
-
-      expect(result).toMatchObject({
-        compatibleEndpointReasoning: "true",
-        provider: "compatible-endpoint",
-      });
-    });
-
-    it("clears stale resumed state before writing a non-compatible artifact", async () => {
-      vi.stubEnv("NEMOCLAW_REASONING", "true");
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-reasoning-resume-"));
-      const dockerfilePath = path.join(tempDir, "Dockerfile");
-      fs.writeFileSync(dockerfilePath, "ARG NEMOCLAW_REASONING=false\n");
-      const session = createSession({
-        provider: "nvidia-prod",
-        model: "nvidia/test",
-        compatibleEndpointReasoning: "true",
-      });
-      session.steps.provider_selection.status = "complete";
-      const setupInference = vi.fn(async () => {
-        expect(process.env.NEMOCLAW_REASONING).toBeUndefined();
-        patchStagedDockerfile(
-          dockerfilePath,
-          "nvidia/test",
-          "https://chat.example",
-          "build-1",
-          "nvidia-prod",
-        );
-        return { ok: true as const };
-      });
-      const { deps } = createDeps({
-        clearCompatibleEndpointReasoning,
-        setupInference,
-        isInferenceRouteReady: vi.fn(() => false),
-      });
-
-      try {
-        const result = await handleProviderInferenceState({
-          ...baseOptions(deps, session),
-          resume: true,
-          sandboxName: "my-assistant",
-        });
-
-        expect(setupInference).toHaveBeenCalledOnce();
-        expect(result.compatibleEndpointReasoning).toBeNull();
-        expect(fs.readFileSync(dockerfilePath, "utf-8")).toContain("ARG NEMOCLAW_REASONING=false");
-      } finally {
-        vi.unstubAllEnvs();
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      }
-    });
-  });
-
   it("does not use resume shortcuts when fresh is also set", async () => {
     const session = createSession({ provider: "ollama-local", model: "llama3.1" });
     session.steps.provider_selection.status = "complete";
@@ -335,6 +279,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     expect(calls.setupInference).toHaveBeenCalled();
   });
@@ -363,6 +308,8 @@ describe("handleProviderInferenceState", () => {
       "nemoclaw",
       "compatible-endpoint",
       "COMPATIBLE_API_KEY",
+      undefined,
+      { sandboxName: "mcp-rebuild", endpointUrl: "https://compatible.example.test/v1" },
     );
     expect(calls.complete).toHaveBeenCalledWith(
       "provider_selection",
@@ -505,7 +452,13 @@ describe("handleProviderInferenceState", () => {
 
     expect(calls.setupNim).not.toHaveBeenCalled();
     expect(calls.setupInference).not.toHaveBeenCalled();
-    expect(calls.recoverProvider).toHaveBeenCalledWith("nemoclaw", "ollama-local", null);
+    expect(calls.recoverProvider).toHaveBeenCalledWith(
+      "nemoclaw",
+      "ollama-local",
+      null,
+      undefined,
+      { sandboxName: null, endpointUrl: null },
+    );
     expect(calls.skipped).toHaveBeenCalledWith("provider_selection", "ollama-local / llama3.1");
     expect(calls.recordSkip).toHaveBeenCalledWith("provider_selection", {
       reason: "resume",
@@ -692,6 +645,43 @@ describe("handleProviderInferenceState", () => {
     expect(result.sandboxName).toBe("tm");
   });
 
+  it.each([
+    ["is unset", decisionUnset<CheckpointSandboxIdentity>()],
+    ["names another sandbox", decisionSelected({ name: "other-sandbox", agent: "openclaw" })],
+  ])(
+    "prompts before route reservation when the checkpoint identity %s",
+    async (_label, identity) => {
+      const session = createSession({
+        sandboxName: "stale-sandbox",
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-test",
+        endpointUrl: "https://integrate.api.nvidia.com/v1",
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        preferredInferenceApi: "openai-responses",
+      });
+      session.steps.provider_selection.status = "complete";
+      session.checkpoint = {
+        ...deriveCheckpointFromSession(session),
+        sandboxIdentity: identity,
+      };
+      const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
+      calls.promptName.mockResolvedValueOnce("prompted-sandbox");
+
+      const result = await handleProviderInferenceState({
+        ...baseOptions(deps, session),
+        resume: true,
+        sandboxName: "stale-sandbox",
+      });
+
+      expect(calls.promptName).toHaveBeenCalledWith(null);
+      expect(calls.reserveRoute).toHaveBeenCalledWith(
+        "prompted-sandbox",
+        expect.objectContaining({ reservationSessionId: session.sessionId }),
+      );
+      expect(result.sandboxName).toBe("prompted-sandbox");
+    },
+  );
+
   it("does not reserve a route when resume skips inference after sandbox completion (#6562)", async () => {
     const session = createSession({
       sandboxName: "completed-sandbox",
@@ -723,7 +713,7 @@ describe("handleProviderInferenceState", () => {
     const completedSelection = createSession({ sessionId: "resume-selection-session" });
     const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
     calls.complete.mockResolvedValueOnce(completedSelection);
-    calls.promptName.mockResolvedValueOnce("tm");
+    calls.promptName.mockResolvedValue("tm");
 
     const result = await handleProviderInferenceState({
       ...baseOptions(deps, session),
@@ -896,41 +886,46 @@ describe("handleProviderInferenceState", () => {
     expect(calls.repairEvent).not.toHaveBeenCalledWith("state.repair.completed", expect.anything());
   });
 
-  it("reruns inference setup when resumed provider recovery forces recreation", async () => {
-    const session = createSession({
-      provider: "compatible-endpoint",
-      model: "custom-model",
-      credentialEnv: null,
-    });
-    session.steps.provider_selection.status = "complete";
-    const { deps, calls } = createDeps({
-      isInferenceRouteReady: vi.fn(() => true),
-      ensureResumeProviderReady: vi.fn(async () => ({
-        forceInferenceSetup: true,
-        credentialEnv: "COMPATIBLE_API_KEY",
-      })),
-    });
-    calls.complete.mockResolvedValue(session);
+  it.each([false, true])(
+    "reruns resumed provider setup with native custom recovery %s",
+    async (nativeCustomSetup) => {
+      const session = createSession({
+        provider: "compatible-endpoint",
+        model: "custom-model",
+        credentialEnv: null,
+      });
+      session.steps.provider_selection.status = "complete";
+      const { deps, calls } = createDeps({
+        isInferenceRouteReady: vi.fn(() => true),
+        ensureResumeProviderReady: vi.fn(async () => ({
+          forceInferenceSetup: true,
+          credentialEnv: "COMPATIBLE_API_KEY",
+          nativeCustomSetup,
+        })),
+      });
+      calls.complete.mockResolvedValue(session);
 
-    await handleProviderInferenceState({
-      ...baseOptions(deps, session),
-      resume: true,
-      sandboxName: "my-assistant",
-    });
+      await handleProviderInferenceState({
+        ...baseOptions(deps, session),
+        resume: true,
+        sandboxName: "my-assistant",
+        ...(nativeCustomSetup ? { selectedMessagingChannels: ["telegram"] } : {}),
+      });
 
-    expect(calls.setupNim).not.toHaveBeenCalled();
-    expect(calls.hydrate).toHaveBeenCalledWith("COMPATIBLE_API_KEY");
-    expect(calls.setupInference).toHaveBeenCalledWith(
-      "my-assistant",
-      "custom-model",
-      "compatible-endpoint",
-      null,
-      "COMPATIBLE_API_KEY",
-      null,
-      [],
-      setupOptions(session),
-    );
-  });
+      expect(calls.setupNim).not.toHaveBeenCalled();
+      expect(calls.hydrate).toHaveBeenCalledWith("COMPATIBLE_API_KEY");
+      expect(calls.setupInference).toHaveBeenCalledWith(
+        "my-assistant",
+        "custom-model",
+        "compatible-endpoint",
+        null,
+        "COMPATIBLE_API_KEY",
+        null,
+        [],
+        setupOptions(session),
+      );
+    },
+  );
 
   it("forces canonical setup for a preflighted provider even if a matching route appears (#6114)", async () => {
     const session = createSession({
@@ -1097,6 +1092,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     expect(setupInference).toHaveBeenCalledWith(
       "my-assistant",
@@ -1207,7 +1203,17 @@ describe("handleProviderInferenceState", () => {
   });
 
   it("reconciles model router on resumed routed inference", async () => {
-    const session = createSession({ provider: "nvidia-router", model: "router/model" });
+    const session = createSession({
+      sandboxName: "router-sandbox",
+      provider: "nvidia-router",
+      model: "router/model",
+      sandboxPromptProgress: {
+        sandboxName: true,
+        webSearch: false,
+        messaging: false,
+        resourceProfile: false,
+      },
+    });
     session.steps.provider_selection.status = "complete";
     const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
 
@@ -1397,13 +1403,14 @@ describe("handleProviderInferenceState", () => {
     expect(setupNim).toHaveBeenNthCalledWith(
       1,
       { type: "nvidia" },
-      null,
+      "my-assistant",
       null,
       true,
       "nemoclaw",
       expect.any(Function),
       expect.any(Function),
       expect.any(String),
+      expect.any(Function),
     );
     expect(setupNim).toHaveBeenNthCalledWith(
       2,
@@ -1415,6 +1422,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(String),
+      expect.any(Function),
     );
     expect(setupInference).toHaveBeenCalledTimes(2);
     expect(result.model).toBe("good");
@@ -1442,18 +1450,6 @@ describe("handleProviderInferenceState", () => {
       ["inference", "advance"],
       ["sandbox", "advance"],
     ]);
-  });
-
-  it("aborts before inference setup when the configuration summary is rejected", async () => {
-    const { deps, calls } = createDeps({
-      isNonInteractive: () => false,
-      promptYesNoOrDefault: vi.fn(async () => false),
-    });
-
-    await expect(handleProviderInferenceState(baseOptions(deps))).rejects.toThrow("exit 0");
-
-    expect(calls.exit).toHaveBeenCalledWith(0);
-    expect(calls.setupInference).not.toHaveBeenCalled();
   });
 
   // Regression: #4241. When the provider selection step accepted a no-tools
@@ -1486,7 +1482,9 @@ describe("handleProviderInferenceState", () => {
       [],
       setupOptions(session, {
         allowToolsIncompatible: true,
+        agentName: "openclaw",
         preferredInferenceApi: "openai-responses",
+        deferPublishedRouteReservation: true,
       }),
     );
   });

@@ -1,20 +1,46 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { type WaitUntilOptions, waitUntilAsync } from "../core/wait";
+import type { OpenShellGatewayLifecycle } from "../adapters/openshell/gateway-lifecycle";
+import type { OpenShellGatewayReuseObserver } from "../adapters/openshell/gateway-reuse";
+import type { WaitUntilOptions } from "../core/wait";
+import { envInt } from "./env";
+import {
+  createReadinessWaitOptions,
+  getLegacyPollDeadlineBudgetMs,
+  waitUntilAsync,
+} from "./readiness-wait";
 
-type RunCaptureOpenshell = (args: string[], opts?: { ignoreError?: boolean }) => string;
+export function getGatewayHealthWaitConfig(_startStatus = 0, containerState = "") {
+  const isArm64 = process.arch === "arm64";
+  const standardCount = envInt("NEMOCLAW_HEALTH_POLL_COUNT", isArm64 ? 30 : 12);
+  const standardInterval = envInt("NEMOCLAW_HEALTH_POLL_INTERVAL", isArm64 ? 10 : 5);
+  const extendedCount = envInt("NEMOCLAW_GATEWAY_START_POLL_COUNT", standardCount);
+  const extendedInterval = envInt("NEMOCLAW_GATEWAY_START_POLL_INTERVAL", standardInterval);
+  const normalizedState = String(containerState || "")
+    .trim()
+    .toLowerCase();
+  const normalizedContainerState = normalizedState || "missing";
+  const useExtendedWait = normalizedContainerState !== "missing";
+
+  return {
+    count: useExtendedWait ? extendedCount : standardCount,
+    interval: useExtendedWait ? extendedInterval : standardInterval,
+    extended: useExtendedWait,
+    containerState: normalizedContainerState,
+  };
+}
 
 export interface GatewayHealthWaitOptions {
-  attachGatewayMetadataIfNeeded: (options?: { forceRefresh?: boolean }) => void;
+  lifecycle: OpenShellGatewayLifecycle;
+  observer: OpenShellGatewayReuseObserver;
+  attachGatewayMetadataIfNeeded: (options?: { forceRefresh?: boolean }) => Promise<boolean>;
   gatewayClusterHealthcheckPassed: () => boolean;
   gatewayName: string;
   healthPollCount: number;
   healthPollIntervalSeconds: number;
-  isGatewayHealthy: (status: string, namedInfo: string, currentInfo: string) => boolean;
   isGatewayHttpReady: (signal?: AbortSignal) => Promise<boolean>;
   repairGatewayBootstrapSecrets: () => { repaired: boolean };
-  runCaptureOpenshell: RunCaptureOpenshell;
   sleepSeconds: (seconds: number) => void;
   now?: () => number;
 }
@@ -23,15 +49,7 @@ export function getGatewayHealthWaitBudgetMs(
   healthPollCount: number,
   healthPollIntervalSeconds: number,
 ): number {
-  const normalizedCount = Number.isFinite(healthPollCount) ? Math.max(0, healthPollCount) : 0;
-  const normalizedIntervalSeconds = Number.isFinite(healthPollIntervalSeconds)
-    ? Math.max(0, healthPollIntervalSeconds)
-    : 0;
-  if (normalizedCount <= 0 || normalizedIntervalSeconds <= 0) return 0;
-  const budgetMs = normalizedCount * normalizedIntervalSeconds * 1000;
-  return Number.isFinite(budgetMs)
-    ? Math.max(1, Math.min(Number.MAX_SAFE_INTEGER, budgetMs))
-    : Number.MAX_SAFE_INTEGER;
+  return getLegacyPollDeadlineBudgetMs(healthPollCount, healthPollIntervalSeconds);
 }
 
 export function formatGatewayHealthWaitBudget(
@@ -74,26 +92,13 @@ export function createGatewayHealthWaitOptions(
   const normalizedIntervalSeconds = Number.isFinite(healthPollIntervalSeconds)
     ? Math.max(0, healthPollIntervalSeconds)
     : 0;
-  const intervalMs = normalizedIntervalSeconds * 1000;
-  const commonOptions = {
-    initialIntervalMs: intervalMs,
-    maxIntervalMs: intervalMs,
-    backoffFactor: 1,
+  return createReadinessWaitOptions({
+    budgetMs: getGatewayHealthWaitBudgetMs(normalizedCount, normalizedIntervalSeconds),
+    maxIntervalMs: normalizedIntervalSeconds * 1000,
+    zeroBudgetAttempts: normalizedCount,
     now,
     sleep,
-  } satisfies WaitUntilOptions;
-
-  // A zero interval is an accepted fast-test and operator configuration. It
-  // has no meaningful time budget, so preserve the former bounded attempt
-  // semantics instead of turning scheduling overhead into a zero-probe wait.
-  if (intervalMs === 0) {
-    return { ...commonOptions, maxAttempts: normalizedCount };
-  }
-
-  return {
-    ...commonOptions,
-    deadlineMs: now() + getGatewayHealthWaitBudgetMs(normalizedCount, normalizedIntervalSeconds),
-  };
+  });
 }
 
 function startAbortableGatewayHttpProbe(
@@ -117,15 +122,15 @@ function startAbortableGatewayHttpProbe(
 }
 
 export async function waitForGatewayHealth({
+  lifecycle,
+  observer,
   attachGatewayMetadataIfNeeded,
   gatewayClusterHealthcheckPassed,
   gatewayName,
   healthPollCount,
   healthPollIntervalSeconds,
-  isGatewayHealthy,
   isGatewayHttpReady,
   repairGatewayBootstrapSecrets,
-  runCaptureOpenshell,
   sleepSeconds,
   now = Date.now,
 }: GatewayHealthWaitOptions): Promise<boolean> {
@@ -135,23 +140,23 @@ export async function waitForGatewayHealth({
     now,
     (ms) => sleepSeconds(ms / 1000),
   );
+  if (!waitOptions) return false;
+  const request = { target: { kind: "named" as const, gatewayName } };
+  const selected = await lifecycle.selectGateway(request);
+  if (!selected.ok) return false;
+  let attachmentAttempted = false;
   return (
     waitOptions !== null &&
     (await waitUntilAsync(async () => {
       const repairResult = repairGatewayBootstrapSecrets();
-      if (repairResult.repaired) {
-        attachGatewayMetadataIfNeeded({ forceRefresh: true });
-      } else if (gatewayClusterHealthcheckPassed()) {
-        attachGatewayMetadataIfNeeded();
+      if (!attachmentAttempted && (repairResult.repaired || gatewayClusterHealthcheckPassed())) {
+        attachmentAttempted = true;
+        if (!(await attachGatewayMetadataIfNeeded({ forceRefresh: repairResult.repaired })))
+          return false;
       }
       const httpProbe = startAbortableGatewayHttpProbe(isGatewayHttpReady);
-      runCaptureOpenshell(["gateway", "select", gatewayName], { ignoreError: true });
-      const status = runCaptureOpenshell(["status"], { ignoreError: true });
-      const namedInfo = runCaptureOpenshell(["gateway", "info", "-g", gatewayName], {
-        ignoreError: true,
-      });
-      const currentInfo = runCaptureOpenshell(["gateway", "info"], { ignoreError: true });
-      if (!isGatewayHealthy(status, namedInfo, currentInfo)) {
+      const observed = await observer.observeGatewayReuse(request);
+      if (observed.error || !observed.healthy || !observed.namedMetadata) {
         httpProbe.abort();
         return false;
       }

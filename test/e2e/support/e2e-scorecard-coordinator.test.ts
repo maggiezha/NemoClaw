@@ -24,7 +24,7 @@ const coordinator = require("../../../scripts/scorecard/coordinate-scorecard.mts
 
 function coordinatorInput(overrides: Partial<ScorecardInput> = {}): ScorecardInput {
   return {
-    eventName: "schedule",
+    eventName: "push",
     actor: "",
     serverUrl: "https://github.com",
     repo: { owner: "NVIDIA", repo: "NemoClaw" },
@@ -50,9 +50,9 @@ describe("scorecard coordinator selectors and run mode", () => {
     expect(coordinator.parseSelectors("   ")).toEqual([]);
   });
 
-  it("maps event and selectors to the scheduled, full, and selective run modes", () => {
-    expect(coordinator.deriveRunMode("schedule", "", "")).toEqual({
-      runMode: "Scheduled E2E",
+  it("maps event and selectors to the main-push, full, and selective run modes", () => {
+    expect(coordinator.deriveRunMode("push", "", "")).toEqual({
+      runMode: "Main push",
       isDispatch: false,
       isSelectiveDispatch: false,
     });
@@ -73,7 +73,7 @@ describe("scorecard coordinator selectors and run mode", () => {
 });
 
 describe("scorecard coordinator assembly", () => {
-  it("routes a clean scheduled run to the daily channel with a perfect summary", () => {
+  it("routes a clean main-push run to the daily channel with a perfect summary", () => {
     const { scorecardData, slackData, summaryMarkdown } = coordinator.buildScorecard(
       coordinatorInput({
         needs: { "cloud-onboard": { result: "success" }, "report-to-pr": { result: "success" } },
@@ -84,7 +84,7 @@ describe("scorecard coordinator assembly", () => {
       }),
     );
 
-    expect(scorecardData.runMode).toBe("Scheduled E2E");
+    expect(scorecardData.runMode).toBe("Main push");
     expect(scorecardData).toMatchObject({
       ran: 1,
       total: 1,
@@ -95,7 +95,7 @@ describe("scorecard coordinator assembly", () => {
     expect(slackData.channel).toBe("daily");
     expect(slackData.payload.attachments[0].color).toBe("good");
     expect(summaryMarkdown).toContain("## 🌅 NemoClaw E2E Scorecard — Jul 16");
-    expect(summaryMarkdown).toContain("**Run mode:** Scheduled E2E");
+    expect(summaryMarkdown).toContain("**Run mode:** Main push");
     expect(summaryMarkdown).toContain("🎉 **All jobs passed!**");
     expect(summaryMarkdown).toContain("Trace: cloud-onboard total 2.0s");
     expect(summaryMarkdown).toContain(
@@ -162,6 +162,74 @@ describe("scorecard coordinator assembly", () => {
     );
     expect(scorecardData).toMatchObject({ total: 2, success: 1, failure: 1, perfect: false });
     expect(scorecardData.failedJobs).toEqual([{ name: "hermes-slack", url: null }]);
+  });
+
+  it("separates runner queue time from execution time without exposing runner labels", () => {
+    const { summaryMarkdown } = coordinator.buildScorecard(
+      coordinatorInput({
+        apiJobs: [
+          {
+            completed_at: "2026-07-24T00:01:30Z",
+            conclusion: "failure",
+            created_at: "2026-07-24T00:00:00Z",
+            labels: ["private-larger-runner-label"],
+            name: "mcp-bridge",
+            started_at: "2026-07-24T00:00:30Z",
+            status: "completed",
+          },
+          {
+            completed_at: "2026-07-24T00:00:25Z",
+            conclusion: "success",
+            created_at: "2026-07-24T00:00:00Z",
+            labels: ["ubuntu-latest"],
+            name: "cloud-onboard",
+            started_at: "2026-07-24T00:00:05Z",
+            status: "completed",
+          },
+          {
+            completed_at: "2026-07-24T00:00:20Z",
+            conclusion: "success",
+            created_at: "invalid",
+            labels: ["self-hosted", "ubuntu-latest", "Linux"],
+            name: "jetson-nvmap-gpu",
+            started_at: "2026-07-24T00:00:10Z",
+            status: "completed",
+          },
+        ],
+        rawExplicitOnly: "jetson-nvmap-gpu",
+        rawJobs: "jetson-nvmap-gpu",
+      }),
+    );
+
+    expect(summaryMarkdown).toContain("### Runner wait vs execution");
+    expect(summaryMarkdown).toContain("| mcp-bridge | larger | failure | 30.0s | 60.0s |");
+    expect(summaryMarkdown).toContain("| cloud-onboard | standard | success | 5.0s | 20.0s |");
+    expect(summaryMarkdown).toContain("| jetson-nvmap-gpu | unknown | success | n/a | 10.0s |");
+    expect(summaryMarkdown).not.toContain("private-larger-runner-label");
+  });
+
+  it("bounds the job timing table by combined queue and execution time", () => {
+    const { summaryMarkdown } = coordinator.buildScorecard(
+      coordinatorInput({
+        apiJobs: Array.from({ length: 12 }, (_, index) => ({
+          completed_at: new Date(
+            Date.UTC(2026, 6, 24, 0, 0, index === 0 ? 21 : index + 1),
+          ).toISOString(),
+          conclusion: "success",
+          created_at: "2026-07-24T00:00:00.000Z",
+          labels: ["ubuntu-latest"],
+          name: `job-${String(index + 1).padStart(2, "0")}`,
+          started_at: index === 0 ? "2026-07-24T00:00:20.000Z" : "2026-07-24T00:00:00.000Z",
+          status: "completed",
+        })),
+      }),
+    );
+
+    expect(summaryMarkdown).toContain("| job-01 | standard | success | 20.0s | 1.0s |");
+    expect(summaryMarkdown).toContain("| job-12 | standard | success | 0.0s | 12.0s |");
+    expect(summaryMarkdown).toContain("| job-04 | standard | success | 0.0s | 4.0s |");
+    expect(summaryMarkdown).not.toContain("| job-03 |");
+    expect(summaryMarkdown).not.toContain("| job-02 |");
   });
 });
 

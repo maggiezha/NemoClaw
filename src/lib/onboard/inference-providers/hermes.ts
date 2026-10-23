@@ -4,6 +4,12 @@
 // Hermes Provider inference setup flow.
 // Extracted verbatim from onboard.setupInference (#767).
 
+import {
+  hostedNativeProvider,
+  canonicalHermesNativeEndpoint,
+  usesNativeHermesEndpoint,
+} from "../../inference/native-provider/hosted";
+import type { HermesInferenceCredentialRegistrar } from "../../hermes-provider-auth";
 import { rewriteConfigUrlsWithDnsPinning } from "../../sandbox/config";
 import type { HermesAuthMethod } from "../hermes-auth";
 import type { HermesDeps, SetupInferenceResult } from "./types";
@@ -33,8 +39,16 @@ export async function setupHermesProviderInference(
   // managed/OAuth path supplies the endpoint later (using the default managed
   // inference route), so SSRF validation only applies to an explicitly-supplied
   // custom endpoint.
+  const authority = deps.getNativeProviderAuthority?.();
+  const defaultEndpoint = hostedNativeProvider("hermes-provider")!.endpoint;
+  const recordedEndpoint = authority?.endpointUrl ?? (authority ? defaultEndpoint : undefined);
+  const usesNative =
+    provider === "hermes-provider" && usesNativeHermesEndpoint(endpointUrl, authority);
+  if (usesNative && (!deps.prepareNativeProvider || !deps.getNativeProviderAuthority)) {
+    throw new Error("Native Hermes setup is missing its ownership and registration dependencies");
+  }
   let resolvedEndpointUrl = endpointUrl;
-  if (endpointUrl) {
+  if (endpointUrl && !usesNative) {
     let parsedEndpoint: URL;
     try {
       parsedEndpoint = new URL(endpointUrl);
@@ -53,11 +67,14 @@ export async function setupHermesProviderInference(
     }
     // DNS-resolving + pinning validation closes the DNS-rebinding gap a
     // string-only hostname check leaves open. For HTTP this returns the
-    // pinned-IP URL. DNS-backed HTTPS fails closed until NemoClaw has a
-    // runtime-aware transport that can preserve TLS SNI/Host while pinning the
-    // resolved peer IP across the downstream OpenShell boundary.
+    // pinned-IP URL. DNS-backed HTTPS fails closed here: onboarding does not
+    // wire the HTTPS Pin Runtime adapter (see inference-set-route-containment.ts),
+    // so a DNS-backed HTTPS endpoint must be set after onboarding via
+    // `inference set --endpoint-url`.
     try {
-      const validated = await rewriteConfigUrlsWithDnsPinning(endpointUrl, deps.lookup);
+      const validated = await rewriteConfigUrlsWithDnsPinning(endpointUrl, deps.lookup, {
+        allowOpenShellBridge: true,
+      });
       resolvedEndpointUrl = typeof validated === "string" ? validated : endpointUrl;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -68,6 +85,8 @@ export async function setupHermesProviderInference(
   }
   const {
     runOpenshell,
+    inferenceRouteMutator,
+    gatewayName,
     upsertProvider: _upsertProvider, // intentionally unused; matches inline branch
     verifyInferenceRoute,
     verifyOnboardInferenceSmoke,
@@ -78,7 +97,6 @@ export async function setupHermesProviderInference(
     log,
     hermesProviderAuth,
     getHermesToolGatewayBroker,
-    providerExistsInGateway,
     normalizeHermesAuthMethod,
     resolveHermesNousApiKey,
     checkHermesProviderStoreReachable,
@@ -89,8 +107,6 @@ export async function setupHermesProviderInference(
       HERMES_AUTH_METHOD_OAUTH,
     },
     requireValue,
-    redact,
-    compactText,
   } = deps;
   void _upsertProvider;
 
@@ -100,7 +116,7 @@ export async function setupHermesProviderInference(
     (credentialEnv === HERMES_NOUS_API_KEY_CREDENTIAL_ENV
       ? HERMES_AUTH_METHOD_API_KEY
       : HERMES_AUTH_METHOD_OAUTH);
-  const providerStore = checkHermesProviderStoreReachable(runOpenshell);
+  const providerStore = await checkHermesProviderStoreReachable(runOpenshell);
   if (!providerStore.ok) {
     error("  ✗ OpenShell provider storage is unreachable.");
     error(`    ${providerStore.message}`);
@@ -108,12 +124,28 @@ export async function setupHermesProviderInference(
     if (isNonInteractive()) return exitProcess(1);
     return { retry: "selection" };
   }
-  const providerRegistered = hermesProviderAuth.isHermesProviderRegistered(runOpenshell);
+  const providerRegistered = usesNative
+    ? authority !== undefined
+    : await hermesProviderAuth.isHermesProviderRegistered(runOpenshell);
+  if (usesNative) resolvedEndpointUrl ??= recordedEndpoint ?? defaultEndpoint;
+  let nativePrepared = false;
+  const registerInferenceCredential: HermesInferenceCredentialRegistrar | undefined = usesNative
+    ? async ({ apiKey, baseUrl }) => {
+        const receipt = await deps.prepareNativeProvider!(
+          apiKey,
+          canonicalHermesNativeEndpoint(baseUrl),
+        );
+        resolvedEndpointUrl = receipt.endpointUrl ?? defaultEndpoint;
+        nativePrepared = true;
+        return { credentialEnv: "OPENAI_API_KEY" };
+      }
+    : undefined;
   const toolGatewayProviderRegistered =
     hermesToolGateways.length === 0
       ? true
-      : providerExistsInGateway(
-          getHermesToolGatewayBroker().getHermesToolGatewayProviderName(targetSandbox),
+      : await getHermesToolGatewayBroker().isHermesToolGatewayRefreshProviderRegistered(
+          targetSandbox,
+          runOpenshell,
         );
   const hasFreshNousApiKey =
     resolvedHermesAuthMethod === HERMES_AUTH_METHOD_API_KEY && !!resolveHermesNousApiKey();
@@ -130,11 +162,13 @@ export async function setupHermesProviderInference(
           ? await hermesProviderAuth.ensureHermesProviderApiKeyCredentials(targetSandbox, {
               apiKey: resolveHermesNousApiKey(),
               runOpenshell,
+              ...(registerInferenceCredential ? { registerInferenceCredential } : {}),
               baseUrl: resolvedEndpointUrl || undefined,
             })
           : await hermesProviderAuth.ensureHermesProviderOAuthCredentials(targetSandbox, {
               allowInteractiveLogin: !isNonInteractive(),
               runOpenshell,
+              ...(registerInferenceCredential ? { registerInferenceCredential } : {}),
               baseUrl: resolvedEndpointUrl || undefined,
               toolGatewayPresets: hermesToolGateways,
             });
@@ -155,16 +189,41 @@ export async function setupHermesProviderInference(
     }
   }
 
-  const applyResult = runOpenshell(
-    ["inference", "set", "--no-verify", "--provider", provider, "--model", model],
-    { ignoreError: true },
-  );
-  if (applyResult.status !== 0) {
-    const message =
-      compactText(redact(`${applyResult.stderr || ""} ${applyResult.stdout || ""}`)) ||
-      `Failed to configure inference provider '${provider}'.`;
-    error(`  ${message}`);
-    if (isNonInteractive()) return exitProcess(applyResult.status || 1);
+  if (usesNative) {
+    if (!nativePrepared) {
+      if (shouldPrepareHermesCredentials)
+        throw new Error("Hermes login did not publish a native provider credential");
+      const receipt = await deps.prepareNativeProvider!(null, resolvedEndpointUrl!);
+      resolvedEndpointUrl = receipt.endpointUrl ?? defaultEndpoint;
+    }
+    // Gateway-held credentials are verified from the new sandbox after attachment.
+    // They are not copied back to the host for a separate credentialed smoke request.
+    if (sandboxName) registry.updateSandbox(sandboxName, { model, provider });
+    log(`  ✓ Native Hermes provider prepared: ${provider} / ${model}`);
+    return {
+      ok: true,
+      nativeInference: { endpointUrl: resolvedEndpointUrl!, credentialEnv: "OPENAI_API_KEY" },
+    };
+  }
+
+  const applyResult = await inferenceRouteMutator.setInferenceRoute({
+    target: { kind: "named", gatewayName },
+    route: { provider, model },
+    verification: "skip",
+  });
+  if (!applyResult.ok) {
+    error(`  ${applyResult.error.message}`);
+    if (applyResult.ambiguous) {
+      error(
+        `  The route update result is unknown. Inspect gateway '${gatewayName}' before retrying onboarding.`,
+      );
+      return exitProcess(1);
+    }
+    if (isNonInteractive()) {
+      return exitProcess(
+        applyResult.error.kind === "command" ? (applyResult.error.exitCode ?? 1) : 1,
+      );
+    }
     return { retry: "selection" };
   }
 

@@ -24,6 +24,27 @@ describe("oclif metadata lookup", () => {
     expect(getRegisteredOclifCommandSummary("internal:uninstall:plan")).toBe(
       "Internal: build the NemoClaw uninstall plan",
     );
+    expect(getRegisteredOclifCommandSummary("internal:voice-gateway:serve")).toBe(
+      "Internal: serve the experimental voice gateway",
+    );
+  });
+
+  it("publishes the fixed voice-gateway descriptor contract without path flags (#9235)", () => {
+    const cli = path.join(process.cwd(), "bin", "nemoclaw.js");
+    const result = spawnSync(
+      process.execPath,
+      [cli, "internal", "voice-gateway", "serve", "--help"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, NEMOCLAW_EXPERIMENTAL_VOICE_GATEWAY: "1" },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("--deployment-credential-file");
+    expect(result.stdout).not.toContain("--openclaw-credential-file");
+    expect(result.stdout).toContain("descriptor 3");
+    expect(result.stdout).toContain("descriptor 4");
   });
 
   it("keeps generated manifest command IDs aligned with oclif Config", async () => {

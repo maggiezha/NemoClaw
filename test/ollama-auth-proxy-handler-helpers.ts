@@ -28,13 +28,14 @@ export interface BackendCapture {
 }
 
 export type StartProxyOptions = {
+  backendUrl?: string;
   onSpawn?: (child: ChildProcess) => void;
   readinessPort?: number;
   readinessTimeoutMs?: number;
 };
 
 /** Start a loopback stub backend that records the request it received. */
-export function startBackend(): Promise<{
+export function startBackend(response = { ok: true, models: [] as unknown[] }): Promise<{
   server: http.Server;
   port: number;
   captured: BackendCapture[];
@@ -50,7 +51,7 @@ export function startBackend(): Promise<{
     req.resume();
     req.on("end", () => {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, models: [] }));
+      res.end(JSON.stringify(response));
     });
   });
   return new Promise((resolve) => {
@@ -153,6 +154,7 @@ export async function startProxy(
       OLLAMA_PROXY_TOKEN: token,
       OLLAMA_PROXY_PORT: String(proxyPort),
       OLLAMA_BACKEND_PORT: String(backendPort),
+      ...(options.backendUrl ? { OLLAMA_BACKEND_URL: options.backendUrl } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

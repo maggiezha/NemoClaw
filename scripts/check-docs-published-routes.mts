@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Validate that internal cross-page links on drift-prone docs pages resolve to
-// real *published* Fern routes, not merely to source files that exist on disk.
+// Validate that internal cross-page links on every published docs page resolve
+// to real *published* Fern routes, not merely to source files that exist on
+// disk.
 //
 // Background (NemoClaw#5445): Fern publishes a page at a route built from its
 // navigation section slugs (docs/index.yml), which can differ from the source
@@ -13,23 +14,31 @@
 // points at a route that does not exist and 404s on the live site even though
 // the source file resolves on disk. PR #6290 made exactly that mistake because
 // `fern check` and source-path checks both passed. This checker resolves links
-// route-relative against the published route map so the drift cannot recur on
-// the commands reference page that has regressed repeatedly. Root-absolute
-// routes such as `/user-guide/openclaw/...` are valid too, and are checked
-// against the same published route map.
+// route-relative against the published route map so the drift cannot recur.
+// Root-absolute routes such as `/user-guide/openclaw/...` are valid too, and
+// are checked against the same published route map.
+//
+// NemoClaw#12328: this checker used to run only against a hand-maintained
+// allowlist of "guarded" source pages, so a broken link on any page outside
+// that list could publish and 404 with `npm run docs` reporting no errors.
+// It now runs against every page docs/index.yml actually publishes.
 
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse } from "yaml";
 
-import { renderAgentVariantPage } from "./sync-agent-variant-docs.mts";
+import { agentVariants, renderAgentVariantPage } from "./sync-agent-variant-docs.mts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const docsRoot = path.join(repoRoot, "docs");
-const agentVariants = ["openclaw", "hermes", "deepagents"] as const;
-
+const readmePath = path.join(repoRoot, "README.md");
 type AgentVariant = (typeof agentVariants)[number];
+const LEGACY_REDIRECT_VARIANTS = [
+  "openclaw",
+  "hermes",
+  "deepagents",
+] as const satisfies readonly AgentVariant[];
 
 export type PublishedRouteIndex = {
   /** Every published page route, e.g. `/user-guide/openclaw/reference/commands`. */
@@ -62,7 +71,7 @@ type NavNode = {
 // but remember that shared-source links must be checked after AgentOnly rendering.
 function agentVariantSourcePath(navPath: string): string | null {
   const match = navPath.match(
-    /^_build\/agent-variants\/(.+)\.(?:openclaw|hermes|deepagents)\.generated\.mdx$/,
+    /^_build\/agent-variants\/(.+)\.(?:openclaw|hermes|deepagents|pi)\.generated\.mdx$/,
   );
   return match ? `${match[1]}.mdx` : null;
 }
@@ -320,7 +329,9 @@ export function findBrokenPublishedRedirects(
     }
     const hasVariant =
       redirect.source.includes(":variant") || redirect.destination.includes(":variant");
-    const variants: Array<AgentVariant | null> = hasVariant ? [...agentVariants] : [null];
+    const variants: Array<AgentVariant | null> = hasVariant
+      ? [...LEGACY_REDIRECT_VARIANTS]
+      : [null];
     for (const variant of variants) {
       const source = variant ? redirect.source.replaceAll(":variant", variant) : redirect.source;
       const destination = variant
@@ -360,10 +371,11 @@ export function resolvePublishedRoute(fromRoute: string, target: string): string
 
 export type MarkdownLink = { text: string; target: string; line: number };
 
-/** Extract markdown links, skipping fenced code blocks and inline code spans. */
+/** Extract Markdown links and static MDX hrefs, excluding code examples. */
 export function extractMarkdownLinks(body: string): MarkdownLink[] {
   const links: MarkdownLink[] = [];
   const lines = body.split(/\r?\n/);
+  const hrefLines = new Array<string>(lines.length).fill("\0");
   // Track the opening fence char and length: a fence closes only on the same
   // char with length >= the opener (CommonMark), so a 3-backtick line inside a
   // 4-backtick or ~~~ block does not prematurely flip state.
@@ -387,6 +399,7 @@ export function extractMarkdownLinks(body: string): MarkdownLink[] {
     // keep an empty link-text group (`[]`) matchable so links whose text is
     // entirely an inline-code span (e.g. [`nemoclaw list`](...)) are still seen.
     const scan = rawLine.replace(/`[^`]*`/g, "");
+    hrefLines[i] = scan;
     // Tolerate an optional CommonMark link title: [text](target "title").
     const linkRe = /(?<!!)\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
     let match: RegExpExecArray | null;
@@ -394,7 +407,55 @@ export function extractMarkdownLinks(body: string): MarkdownLink[] {
       links.push({ text: match[1], target: match[2], line: i + 1 });
     }
   });
-  return links;
+  // Preserve line boundaries while preventing matches across fenced examples.
+  const hrefScan = hrefLines.join("\n");
+  const hrefRe = /(?<!\S)href\s*=\s*(?:\{\s*(["'])([^"'\0]+)\1\s*\}|(["'])([^"'\0]+)\3)/g;
+  let match: RegExpExecArray | null;
+  while ((match = hrefRe.exec(hrefScan)) !== null) {
+    links.push({
+      text: "MDX href",
+      target: match[2] ?? match[4],
+      line: hrefScan.slice(0, match.index).split("\n").length,
+    });
+  }
+  return links.sort((left, right) => left.line - right.line);
+}
+
+export type ReadmeDocsRouteViolation = MarkdownLink & { resolved: string };
+
+/** Validate official documentation links in README.md against published Fern routes. */
+export function findBrokenReadmeDocsRoutes(
+  index: PublishedRouteIndex,
+  readme: string = readFileSync(readmePath, "utf8"),
+): ReadmeDocsRouteViolation[] {
+  const docsOrigin = "https://docs.nvidia.com";
+  const docsBasePath = "/nemoclaw/latest";
+  const violations: ReadmeDocsRouteViolation[] = [];
+
+  for (const link of extractMarkdownLinks(readme)) {
+    let url: URL;
+    try {
+      url = new URL(link.target);
+    } catch {
+      continue;
+    }
+    if (
+      url.origin !== docsOrigin ||
+      (url.pathname !== docsBasePath && !url.pathname.startsWith(`${docsBasePath}/`))
+    ) {
+      continue;
+    }
+
+    const resolved =
+      url.pathname
+        .slice(docsBasePath.length)
+        .replace(/\.html$/, "")
+        .replace(/\/$/, "") || "/";
+    if (resolved !== "/" && !index.routes.has(resolved)) {
+      violations.push({ ...link, resolved });
+    }
+  }
+  return violations;
 }
 
 function isInternalRouteLink(target: string): boolean {
@@ -413,6 +474,27 @@ export type RouteViolation = {
   resolved: string;
 };
 
+export type PublishedPageBody = {
+  route: string;
+  body: string;
+};
+
+export function renderPublishedPageBodies(
+  sourcePath: string,
+  index: PublishedRouteIndex,
+  docsDir: string = docsRoot,
+): PublishedPageBody[] {
+  const publishedRoutes = index.sourceToRoutes.get(sourcePath);
+  if (!publishedRoutes || publishedRoutes.length === 0) {
+    throw new Error(`${sourcePath} is not a published navigation page in docs/index.yml`);
+  }
+  const source = readFileSync(path.join(docsDir, sourcePath), "utf8");
+  return publishedRoutes.map((publishedRoute) => ({
+    route: publishedRoute.route,
+    body: renderBodyForPublishedRoute(source, sourcePath, publishedRoute),
+  }));
+}
+
 /**
  * Validate every internal cross-page link on a docs source page against the
  * published route map. Returns the links that resolve to no published route.
@@ -422,19 +504,14 @@ export function findBrokenPublishedRoutes(
   index: PublishedRouteIndex,
   docsDir: string = docsRoot,
 ): RouteViolation[] {
-  const publishedRoutes = index.sourceToRoutes.get(sourcePath);
-  if (!publishedRoutes || publishedRoutes.length === 0) {
-    throw new Error(`${sourcePath} is not a published navigation page in docs/index.yml`);
-  }
-  const source = readFileSync(path.join(docsDir, sourcePath), "utf8");
   const violations: RouteViolation[] = [];
-  for (const publishedRoute of publishedRoutes) {
-    const body = renderBodyForPublishedRoute(source, sourcePath, publishedRoute);
+  for (const publishedPage of renderPublishedPageBodies(sourcePath, index, docsDir)) {
+    const { body } = publishedPage;
     const links = extractMarkdownLinks(body).filter((link) => isInternalRouteLink(link.target));
     for (const link of links) {
-      const resolved = resolvePublishedRoute(publishedRoute.route, link.target);
+      const resolved = resolvePublishedRoute(publishedPage.route, link.target);
       if (!index.routes.has(resolved)) {
-        violations.push({ sourcePath, fromRoute: publishedRoute.route, ...link, resolved });
+        violations.push({ sourcePath, fromRoute: publishedPage.route, ...link, resolved });
       }
     }
   }
@@ -481,35 +558,6 @@ export function findBrokenChangelogRoutes(
     }
   }
   return violations;
-}
-
-/**
- * Validate only inference links on a shared page whose other historical links
- * are outside this checker's scope while still rendering and checking every
- * agent variant.
- */
-export function findBrokenPublishedInferenceRoutes(
-  sourcePath: string,
-  index: PublishedRouteIndex,
-  docsDir: string = docsRoot,
-): RouteViolation[] {
-  return findBrokenPublishedRoutes(sourcePath, index, docsDir).filter((violation) =>
-    /\/inference(?:\/|$)/.test(violation.resolved),
-  );
-}
-
-/**
- * Validate only Manage Sandboxes links on a shared page whose other historical
- * links are outside this checker's scope.
- */
-export function findBrokenPublishedManageSandboxRoutes(
-  sourcePath: string,
-  index: PublishedRouteIndex,
-  docsDir: string = docsRoot,
-): RouteViolation[] {
-  return findBrokenPublishedRoutes(sourcePath, index, docsDir).filter((violation) =>
-    /\/manage-sandboxes(?:\/|$)/.test(violation.resolved),
-  );
 }
 
 function renderBodyForPublishedRoute(
@@ -566,34 +614,26 @@ export function resolvePageLinksByText(
   });
 }
 
-// Pages that have repeatedly regressed on source-path-vs-published-route drift
-// (NemoClaw#5445, #6290, #5465, #5460, #6601). Guard every inference and Manage
-// Sandboxes page because their nested navigation differs from source directories.
-const GUARDED_SOURCE_PAGES = [
-  "reference/commands.mdx",
-  "reference/network-policies.mdx",
-  "reference/platform-support.mdx",
-  ...readdirSync(path.join(docsRoot, "configure-agents"))
-    .filter((name) => name.endsWith(".mdx"))
-    .sort()
-    .map((name) => `configure-agents/${name}`),
-  ...readdirSync(path.join(docsRoot, "inference"))
-    .filter((name) => name.endsWith(".mdx"))
-    .sort()
-    .map((name) => `inference/${name}`),
-  ...readdirSync(path.join(docsRoot, "manage-sandboxes"))
-    .filter((name) => name.endsWith(".mdx"))
-    .sort()
-    .map((name) => `manage-sandboxes/${name}`),
-  "deployment/install-openclaw-plugins.mdx",
-  "deployment/sandbox-hardening.mdx",
-  "deployment/set-up-mcp-bridge.mdx",
-];
+// A generated agent-variant file (`_build/agent-variants/foo.openclaw.generated.mdx`)
+// and its shared source (`foo.mdx`) publish the same route; checking both would
+// report every broken link on a shared page twice. `buildPublishedRouteIndex`
+// keeps the generated path only so `renderPublishedPageBodies` can render each
+// variant from the shared source, so skip the generated path here.
+const GENERATED_AGENT_VARIANT_SOURCE_RE =
+  /^_build\/agent-variants\/.+\.(?:openclaw|hermes|deepagents|pi)\.generated\.mdx$/;
+
+/** Every source page that Fern actually publishes, derived from docs/index.yml. */
+export function publishedSourcePages(index: PublishedRouteIndex): string[] {
+  return [...index.sourceToRoutes.keys()]
+    .filter((source) => !GENERATED_AGENT_VARIANT_SOURCE_RE.test(source))
+    .sort();
+}
 
 function main(): void {
   const index = buildPublishedRouteIndex();
+  const sources = publishedSourcePages(index);
   const violations = [
-    ...GUARDED_SOURCE_PAGES.flatMap((source) => findBrokenPublishedRoutes(source, index)),
+    ...sources.flatMap((source) => findBrokenPublishedRoutes(source, index)),
     ...findBrokenChangelogRoutes(index),
   ];
   const redirectViolations = findBrokenPublishedRedirects(index);
@@ -601,10 +641,12 @@ function main(): void {
     ...findMissingDirectLegacyManageSandboxRedirects(),
     ...findMissingDirectLegacyReleaseNotesRedirects(),
   ];
+  const readmeDocsRouteViolations = findBrokenReadmeDocsRoutes(index);
   if (
     violations.length > 0 ||
     redirectViolations.length > 0 ||
-    legacyHtmlRedirectViolations.length > 0
+    legacyHtmlRedirectViolations.length > 0 ||
+    readmeDocsRouteViolations.length > 0
   ) {
     console.error(
       "check-docs-published-routes: internal links resolve to no published Fern route.",
@@ -634,10 +676,16 @@ function main(): void {
           (v.mustPrecede ? ` before ${v.mustPrecede}` : ""),
       );
     }
+    for (const v of readmeDocsRouteViolations) {
+      console.error(
+        `  README.md:${v.line} [${v.text}](${v.target})\n` +
+          `    resolves to ${v.resolved} — not a published route`,
+      );
+    }
     process.exit(1);
   }
   console.log(
-    `check-docs-published-routes: OK — ${GUARDED_SOURCE_PAGES.length} guarded page(s), native changelog links, and direct legacy redirects`,
+    `check-docs-published-routes: OK — ${sources.length} published page(s), README docs links, native changelog links, and direct legacy redirects`,
   );
 }
 

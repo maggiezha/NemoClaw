@@ -25,6 +25,7 @@ from deepagents.profiles.harness.harness_profiles import (
     _HARNESS_PROFILES,
     _harness_profile_for_model,
 )
+from deepagents_code import config as dcode_config
 from deepagents_code.agent import create_cli_agent
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -33,12 +34,12 @@ from langchain_openai import ChatOpenAI
 
 EXPECTED_VERSIONS = {
     "nemoclaw-deepagents-profile": "0.1.0",
-    "deepagents-code": "0.1.34",
-    "deepagents": "0.7.0a6",
-    "langchain": "1.3.11",
-    "langchain-core": "1.4.8",
-    "langgraph": "1.2.6",
-    "langchain-openai": "1.3.3",
+    "deepagents-code": "0.1.71",
+    "deepagents": "0.7.15",
+    "langchain": "1.4.3",
+    "langchain-core": "1.6.6",
+    "langgraph": "1.2.12",
+    "langchain-openai": "1.6.7",
 }
 EXPECTED_PROFILE_ENTRY_POINT = (
     "deepagents.harness_profiles",
@@ -47,10 +48,10 @@ EXPECTED_PROFILE_ENTRY_POINT = (
 )
 EXPECTED_PLUGIN_LICENSE_EXPRESSION = "Apache-2.0"
 EXPECTED_PLUGIN_SOURCE_SHA256 = (
-    "8fe85c62293c74147848732dc56c33e8ab60133fa41c071da4328ac60f2bf44f"
+    "d7bd880d47d423f27dee2997a96271f5f1c67b88fdafaf771e29b82c0ac8b947"
 )
 EXPECTED_NATIVE_PROFILE_SHA256 = (
-    "c8e8dd2b0182334b54be4f46ff0c7b45fbb95dc13bd9a92c249eb47a14fa13d7"
+    "eec0bfdb27522823f80e5f95a00e03071162c2a96aa71fbffc1c112c5184c01f"
 )
 EXPECTED_BOOTSTRAP_SHA256 = (
     "005a91e7fc4ca6b21220673dd9d02d6686bf63e1e4f1102d124b01f96886efcf"
@@ -74,6 +75,7 @@ EXPECTED_NATIVE_MIDDLEWARE = (
     "FinalAnswerGuardMiddleware",
 )
 MANAGED_GUARD = "NemoClawExecutePlaceholderGuardMiddleware"
+MANAGED_MESSAGE_COMPATIBILITY = "NemotronPolicyNudgeMiddleware"
 EXPECTED_MANAGED_MIDDLEWARE = (*EXPECTED_NATIVE_MIDDLEWARE, MANAGED_GUARD)
 DISPATCH_COMMAND = "printf NEMOCLAW_DISPATCH_OK"
 DENIED_DISPATCH_COMMAND = "uname -a"
@@ -385,6 +387,79 @@ def validate_direct_guard_contract() -> None:
     )
 
 
+class ModelRequest:
+    """Minimal request shape consumed by model-call middleware."""
+
+    def __init__(self, messages: list[HumanMessage]) -> None:
+        self.messages = messages
+        self.state = {"messages": messages, "checkpoint": "preserved-checkpoint"}
+        self.tools = [{"name": "read_file"}, {"name": "get_goal"}]
+
+    def override(self, *, messages: list[HumanMessage]) -> "ModelRequest":
+        result = ModelRequest(messages)
+        result.state = self.state
+        return result
+
+
+def validate_internal_message_compatibility() -> None:
+    """Keep native profile names in graph state but out of provider requests."""
+    profile = _harness_profile_for_model(make_model(MANAGED_MODEL_IDS[0]), None)
+    middleware = [
+        item
+        for item in middleware_items(profile)
+        if type(item).__name__ == MANAGED_MESSAGE_COMPATIBILITY
+    ]
+    require(len(middleware) == 1, "managed message compatibility is not unique")
+    compatibility = middleware[0]
+    require(
+        getattr(compatibility, "_nemoclaw_internal_name_compatibility", False),
+        "managed policy nudge does not carry message compatibility",
+    )
+
+    internal = HumanMessage(
+        content="managed nudge",
+        name="nemotron_domain_tool_preference",
+    )
+    named_user = HumanMessage(content="named user", name="user_supplied")
+    plain_user = HumanMessage(content="plain user")
+    request = ModelRequest([internal, named_user, plain_user])
+
+    sync_result = compatibility.wrap_model_call(request, lambda value: value)
+    require(sync_result.state is request.state, "sync compatibility lost graph state")
+    require(sync_result is not request, "sync compatibility did not copy the request")
+    require(
+        sync_result.messages[0].content == "managed nudge"
+        and sync_result.messages[0].name is None,
+        "sync compatibility changed content or retained the control name",
+    )
+    require(
+        sync_result.messages[1] is named_user
+        and sync_result.messages[2] is plain_user,
+        "sync compatibility changed unrelated messages",
+    )
+    require(
+        sync_result.messages[-1].name is None,
+        "sync compatibility retained the appended control name",
+    )
+    require(
+        internal.name == "nemotron_domain_tool_preference",
+        "sync compatibility changed graph-state metadata",
+    )
+
+    async def async_handler(value: ModelRequest) -> ModelRequest:
+        return value
+
+    async_result = asyncio.run(
+        compatibility.awrap_model_call(request, async_handler)
+    )
+    require(
+        async_result.state is request.state
+        and async_result.messages[0].name is None
+        and async_result.messages[-1].name is None,
+        "async compatibility retained a control name",
+    )
+
+
 def validate_parser_tool_visibility() -> None:
     cases = (
         ('{"tool": "bash", "cmd": "echo blocked"}', "execute"),
@@ -434,7 +509,6 @@ def dispatch_execute_once(
             model,
             "nemoclaw-profile-validation",
             sandbox=backend,
-            sandbox_type="nemoclaw-validation",
             system_prompt="Use the execute tool once, then report the result.",
             interactive=False,
             auto_approve=not restrict_shell,
@@ -539,12 +613,17 @@ def main() -> None:
             f"expected {distribution}=={expected}, found {actual}",
         )
 
+    require(
+        dcode_config.is_openai_prompt_cache_key_enabled() is False,
+        "managed OpenAI prompt cache affinity is enabled",
+    )
     validate_profile_entry_point()
     validate_official_sources()
     managed_models = [validate_profile(model_id) for model_id in MANAGED_MODEL_IDS]
     validate_canonical_profile()
     validate_parser_tool_visibility()
     validate_direct_guard_contract()
+    validate_internal_message_compatibility()
     validate_parser_dispatch_parity()
 
     # One graph construction materializes the shared middleware schemas and

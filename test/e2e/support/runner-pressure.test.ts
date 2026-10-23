@@ -15,11 +15,17 @@ import {
   renderLiveTestOutcome,
 } from "../../../tools/e2e/live-test-outcome.mts";
 import {
+  collectResourceSnapshot,
+  type ResourceSnapshotSources,
+  resourceSnapshotCommandPlan,
+} from "../../../tools/e2e/runner-pressure.mts";
+import {
   assertCanonicalTimestamp,
   assertPhaseLabel,
   BASELINE_LINE_PREFIX,
   CLASSIFICATION_LINE_PREFIX,
   classifyFailure,
+  collectLargestClassifiedProcess,
   countKernelOomKills,
   decideRetry,
   detectRunnerLoss,
@@ -30,12 +36,16 @@ import {
   parseCgroupMemoryEvents,
   parseCgroupScalar,
   parseClassificationLine,
+  parseCpuTicks,
   parseDockerSize,
   parseDockerStats,
+  parseDockerStatsEvidence,
   parseDockerSystemDf,
+  parseLargestClassifiedProcess,
   parseLoadAverages,
   parseMeminfo,
   parsePressure,
+  parseProcessMemoryStatus,
   parseTopProcesses,
   type ResourceSnapshot,
   renderBaselineLine,
@@ -57,7 +67,7 @@ const LINK_CREATORS = {
 } as const;
 
 function runHelper(args: string[], env: Record<string, string>) {
-  return spawnSync(process.execPath, ["--experimental-strip-types", HELPER, ...args], {
+  return spawnSync(process.execPath, [HELPER, ...args], {
     encoding: "utf-8",
     env: { ...process.env, ...env },
   });
@@ -118,6 +128,7 @@ function baseSnapshot(): ResourceSnapshot {
   return {
     phase: "rebuild-hermes.image-build",
     at: "2026-07-18T00:00:00.000Z",
+    cpu: { logicalCpuCount: 4, idleTicks: 200, totalTicks: 500 },
     meminfo: parseMeminfo(MEMINFO_FIXTURE),
     load: { load1: 3.5, load5: 2.1, load15: 1.0 },
     cgroup: {
@@ -129,6 +140,17 @@ function baseSnapshot(): ResourceSnapshot {
     memoryPressure: { someAvg10: 12.5, someAvg60: 4.2, fullAvg10: 1.1, fullAvg60: 0.3 },
     ioPressure: { someAvg10: 0.0, someAvg60: 0.0, fullAvg10: 0.0, fullAvg60: 0.0 },
     topProcesses: [{ rssKb: 900000 }, { rssKb: 400000 }],
+    largestProcess: {
+      class: "docker-buildkit",
+      rssKb: 900000,
+      breakdown: {
+        vmRssKb: 900000,
+        rssAnonKb: 700000,
+        rssFileKb: 190000,
+        rssShmemKb: 10000,
+        vmSwapKb: 1000,
+      },
+    },
     containers: [
       {
         cpuPercent: 95.2,
@@ -149,6 +171,19 @@ function baseSnapshot(): ResourceSnapshot {
     },
   };
 }
+
+function procStat(pid: number, comm: string, startTimeTicks = 12345): string {
+  return `${pid} (${comm}) ${["S", ...Array.from({ length: 18 }, () => "0"), startTimeTicks].join(" ")}\n`;
+}
+
+const BUILDKIT_STATUS = [
+  "Name:\tbuildkitd",
+  "RssFile:\t4000 kB",
+  "VmSwap:\t100 kB",
+  "VmRSS:\t13000 kB",
+  "RssShmem:\t1000 kB",
+  "RssAnon:\t8000 kB",
+].join("\n");
 
 describe("host measurement parsers (#7146)", () => {
   it("reads MemAvailable, Cached, SReclaimable, and swap from /proc/meminfo", () => {
@@ -197,23 +232,159 @@ describe("host measurement parsers (#7146)", () => {
       "some avg10=12.50 avg60=4.20 avg300=1.00 total=123456\nfull avg10=1.10 avg60=0.30 avg300=0.10 total=6543\n",
     );
     expect(psi).toEqual({ someAvg10: 12.5, someAvg60: 4.2, fullAvg10: 1.1, fullAvg60: 0.3 });
+    expect(parsePressure("full avg10=101.00 avg60=0.30 avg300=0.10 total=1\n")).toEqual({
+      someAvg10: null,
+      someAvg60: null,
+      fullAvg10: null,
+      fullAvg60: null,
+    });
+  });
+
+  it("parses safe CPU ticks and rejects impossible counters", () => {
+    expect(
+      parseCpuTicks(
+        "cpu  100 20 30 400 50 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8\ncpu1 1 2 3 4 5 6 7 8\n",
+      ),
+    ).toEqual({ logicalCpuCount: 2, idleTicks: 450, totalTicks: 621 });
+    expect(parseCpuTicks("cpu  1 1 1 1 1 1 1 9007199254740992\ncpu0 1\n")).toBeNull();
+    expect(parseCpuTicks("cpu malformed\n")).toBeNull();
   });
 
   it("keeps only RSS ranks for top processes, sorted and bounded", () => {
     const ps = [
-      "node             900000",
-      "dockerd          400000",
-      "sshd               8000",
-      "vitest           700000",
-      "tar              100000",
-      "bash               4000",
-      "gpg                2000",
+      "100 900000 node",
+      "101 400000 dockerd",
+      "102 8000 sshd",
+      "103 700000 vitest",
+      "104 100000 tar",
+      "105 4000 bash",
+      "106 2000 gpg",
     ].join("\n");
     const top = parseTopProcesses(ps);
     expect(top).toHaveLength(5);
     expect(top[0]).toEqual({ rssKb: 900000 });
     expect(JSON.stringify(top)).not.toContain("node");
     expect(top.map((p) => p.rssKb)).toEqual([...top.map((p) => p.rssKb)].sort((a, b) => b - a));
+    expect(parseTopProcesses("123\n")).toEqual([]);
+    expect(parseTopProcesses("123 45678\n")).toEqual([{ rssKb: 45678 }]);
+  });
+
+  it("reduces the largest process name to a fixed class", () => {
+    const largest = parseLargestClassifiedProcess(
+      "10 12000 openshelld\n11 130000 buildkitd\n12 900000 user controlled secret\n",
+    );
+    expect(largest).toEqual({ class: "other", rssKb: 900000 });
+    expect(parseLargestClassifiedProcess("10 12000 openshelld\n11 130000 buildkitd\n")).toEqual({
+      class: "docker-buildkit",
+      rssKb: 130000,
+    });
+    expect(JSON.stringify(largest)).not.toContain("user controlled secret");
+    expect(parseTopProcesses("11 130000 buildkitd\n12 900000 user controlled secret\n")[0]).toEqual(
+      { rssKb: 900000 },
+    );
+  });
+
+  it("parses one coherent process-memory breakdown in any field order", () => {
+    expect(parseProcessMemoryStatus(BUILDKIT_STATUS)).toEqual({
+      vmRssKb: 13000,
+      rssAnonKb: 8000,
+      rssFileKb: 4000,
+      rssShmemKb: 1000,
+      vmSwapKb: 100,
+    });
+    expect(parseProcessMemoryStatus(BUILDKIT_STATUS.replace("VmSwap:\t100 kB\n", ""))).toEqual({
+      vmRssKb: 13000,
+      rssAnonKb: 8000,
+      rssFileKb: 4000,
+      rssShmemKb: 1000,
+      vmSwapKb: null,
+    });
+  });
+
+  it.each([
+    ["missing resident field", BUILDKIT_STATUS.replace("RssAnon:\t8000 kB", "")],
+    ["negative field", BUILDKIT_STATUS.replace("RssAnon:\t8000 kB", "RssAnon:\t-1 kB")],
+    [
+      "overflowing field",
+      BUILDKIT_STATUS.replace("RssAnon:\t8000 kB", "RssAnon:\t9007199254740992 kB"),
+    ],
+    ["wrong unit", BUILDKIT_STATUS.replace("RssAnon:\t8000 kB", "RssAnon:\t8000 MB")],
+    ["duplicate field", `${BUILDKIT_STATUS}\nRssAnon:\t8000 kB`],
+    ["incoherent components", BUILDKIT_STATUS.replace("RssAnon:\t8000 kB", "RssAnon:\t8001 kB")],
+  ])("rejects a %s in process-memory status", (_label, status) => {
+    expect(parseProcessMemoryStatus(status)).toBeNull();
+  });
+
+  it("keeps PID and comm private while enriching only the globally largest Docker process", () => {
+    const paths: string[] = [];
+    const procfs = new Map([
+      ["/proc/42/stat", procStat(42, "buildkitd")],
+      ["/proc/42/status", `${BUILDKIT_STATUS}\nToken: ghp_status_secret\n`],
+    ]);
+    const selected = collectLargestClassifiedProcess(
+      "41 12000 openshelld\n42 13000 buildkitd\n",
+      (file) => {
+        paths.push(file);
+        return procfs.get(file) ?? null;
+      },
+    );
+    expect(selected).toEqual({
+      class: "docker-buildkit",
+      rssKb: 13000,
+      breakdown: {
+        vmRssKb: 13000,
+        rssAnonKb: 8000,
+        rssFileKb: 4000,
+        rssShmemKb: 1000,
+        vmSwapKb: 100,
+      },
+    });
+    expect(paths).toEqual(["/proc/42/stat", "/proc/42/status", "/proc/42/stat"]);
+    expect(JSON.stringify(selected)).not.toMatch(/42|buildkitd|ghp_status_secret/u);
+
+    let readAttempted = false;
+    const globalOther = collectLargestClassifiedProcess(
+      "42 13000 buildkitd\n43 14000 attacker-secret\n",
+      () => {
+        readAttempted = true;
+        return null;
+      },
+    );
+    expect(globalOther).toEqual({ class: "other", rssKb: 14000 });
+    expect(readAttempted).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "permission denial",
+      statReads: [null, null],
+      status: null,
+    },
+    {
+      label: "process exit",
+      statReads: [procStat(42, "buildkitd"), null],
+      status: BUILDKIT_STATUS,
+    },
+    {
+      label: "exact comm change",
+      statReads: [procStat(42, "buildkitd"), procStat(42, "dockerd")],
+      status: BUILDKIT_STATUS,
+    },
+    {
+      label: "same-class PID reuse",
+      statReads: [procStat(42, "buildkitd", 100), procStat(42, "buildkitd", 101)],
+      status: BUILDKIT_STATUS,
+    },
+  ])("retains total RSS but drops breakdown on $label", ({ statReads, status }) => {
+    let statIndex = 0;
+    const selected = collectLargestClassifiedProcess("42 13000 buildkitd\n", (file) =>
+      file.endsWith("/stat") ? (statReads[statIndex++] ?? null) : status,
+    );
+    expect(selected).toEqual({
+      class: "docker-buildkit",
+      rssKb: 13000,
+      breakdown: null,
+    });
   });
 
   it("converts Docker size strings across decimal and binary units", () => {
@@ -238,6 +409,22 @@ describe("host measurement parsers (#7146)", () => {
     expect(JSON.stringify(rows)).not.toContain("token-");
   });
 
+  it("aggregates maximum Docker CPU across rows outside the retained memory ranks", () => {
+    const stats = Array.from({ length: 6 }, (_, index) =>
+      JSON.stringify({
+        Name: `secret-${index}`,
+        CPUPerc: index === 5 ? "999%" : `${index + 1}%`,
+        MemUsage: `${6 - index}GiB / 16GiB`,
+      }),
+    ).join("\n");
+
+    const evidence = parseDockerStatsEvidence(stats);
+    expect(evidence.containers).toHaveLength(5);
+    expect(evidence.containers.map((row) => row.memBytes)).not.toContain(1024 ** 3);
+    expect(evidence.maximumCpuPercent).toBe(999);
+    expect(JSON.stringify(evidence)).not.toContain("secret-");
+  });
+
   it("attributes docker disk use to images, containers, and build cache", () => {
     const df = [
       JSON.stringify({ Type: "Images", Size: "20GiB", Reclaimable: "4GiB" }),
@@ -252,6 +439,161 @@ describe("host measurement parsers (#7146)", () => {
   });
 });
 
+describe("runner pressure collection profiles (#7146)", () => {
+  function snapshotSources(
+    calls: Array<{ command: string; args: string[]; timeout: number }>,
+    processOrder: string[] = [],
+  ): ResourceSnapshotSources {
+    return {
+      now: () => new Date("2026-07-23T12:00:00.000Z"),
+      readText: (file) => {
+        processOrder.push(file.startsWith("/proc/123/") ? file : "");
+        return (
+          new Map([
+            ["/proc/stat", "cpu  10 0 5 20 0 0 0 0\ncpu0 1 0 1 2 0 0 0 0\n"],
+            ["/proc/meminfo", MEMINFO_FIXTURE],
+            ["/sys/fs/cgroup/memory.current", "1000\n"],
+            ["/sys/fs/cgroup/memory.peak", "2000\n"],
+            ["/sys/fs/cgroup/memory.max", "max\n"],
+            ["/sys/fs/cgroup/memory.events", "oom 0\noom_kill 0\n"],
+            ["/sys/fs/cgroup/memory.pressure", "full avg10=1.00 avg60=2.00 avg300=1.00 total=1\n"],
+            ["/sys/fs/cgroup/io.pressure", "full avg10=3.00 avg60=4.00 avg300=1.00 total=1\n"],
+            ["/proc/123/stat", procStat(123, "buildkitd")],
+            ["/proc/123/status", BUILDKIT_STATUS],
+          ]).get(file) ?? null
+        );
+      },
+      run: (command, args, timeout) => {
+        calls.push({ command, args, timeout });
+        processOrder.push(command === "ps" ? "ps" : `${command} ${args[0] ?? ""}`);
+        const dockerDisk = [
+          JSON.stringify({ Type: "Images", Size: "3GiB" }),
+          JSON.stringify({ Type: "Containers", Size: "1GiB" }),
+          JSON.stringify({ Type: "Build Cache", Size: "2GiB" }),
+        ].join("\n");
+        const response = new Map([
+          ["ps", "123 13000 buildkitd\n"],
+          ["stats", `${JSON.stringify({ CPUPerc: "25%", MemUsage: "256MiB / 16GiB" })}\n`],
+        ]).get(command === "ps" ? command : (args[0] ?? ""));
+        return response ?? dockerDisk;
+      },
+      statfs: () => ({
+        bavail: 25,
+        blocks: 100,
+        bsize: 4096,
+        ffree: 50,
+        files: 200,
+      }),
+    };
+  }
+
+  it("preserves endpoint collection without subprocesses", () => {
+    const calls: Array<{ command: string; args: string[]; timeout: number }> = [];
+    const snapshot = collectResourceSnapshot(
+      "runner-comparison",
+      "comparison-endpoint",
+      snapshotSources(calls),
+    );
+
+    expect(resourceSnapshotCommandPlan("comparison-endpoint")).toEqual({
+      processTimeoutMs: null,
+      containerTimeoutMs: null,
+      dockerDiskTimeoutMs: null,
+    });
+    expect(calls).toEqual([]);
+    expect(snapshot.cpu).toEqual({ logicalCpuCount: 1, idleTicks: 20, totalTicks: 35 });
+    expect(snapshot.largestProcess).toBeNull();
+    expect(snapshot.containers).toEqual([]);
+    expect(snapshot.dockerDisk).toBeNull();
+  });
+
+  it("keeps periodic collection free of Docker probes", () => {
+    const calls: Array<{ command: string; args: string[]; timeout: number }> = [];
+    const snapshot = collectResourceSnapshot(
+      "rebuild-hermes.build",
+      "comparison-periodic",
+      snapshotSources(calls),
+    );
+
+    expect(resourceSnapshotCommandPlan("comparison-periodic")).toEqual({
+      processTimeoutMs: 1_000,
+      containerTimeoutMs: null,
+      dockerDiskTimeoutMs: null,
+    });
+    expect(calls).toEqual([{ command: "ps", args: ["-eo", "pid=,rss=,comm="], timeout: 1_000 }]);
+    expect(snapshot.largestProcess).toEqual({
+      class: "docker-buildkit",
+      rssKb: 13000,
+      breakdown: {
+        vmRssKb: 13000,
+        rssAnonKb: 8000,
+        rssFileKb: 4000,
+        rssShmemKb: 1000,
+        vmSwapKb: 100,
+      },
+    });
+    expect(snapshot.containers).toEqual([]);
+    expect(snapshot.dockerDisk).toBeNull();
+  });
+
+  it("retains bounded Docker evidence at phase boundaries", () => {
+    const calls: Array<{ command: string; args: string[]; timeout: number }> = [];
+    const processOrder: string[] = [];
+    const snapshot = collectResourceSnapshot(
+      "rebuild-hermes.export",
+      "comparison-phase",
+      snapshotSources(calls, processOrder),
+    );
+
+    expect(processOrder.filter(Boolean)).toEqual([
+      "ps",
+      "/proc/123/stat",
+      "/proc/123/status",
+      "/proc/123/stat",
+      "docker stats",
+      "docker system",
+    ]);
+    expect(calls).toEqual([
+      { command: "ps", args: ["-eo", "pid=,rss=,comm="], timeout: 1_000 },
+      {
+        command: "docker",
+        args: ["stats", "--no-stream", "--format", "{{json .}}"],
+        timeout: 2_000,
+      },
+      {
+        command: "docker",
+        args: ["system", "df", "--format", "{{json .}}"],
+        timeout: 2_000,
+      },
+    ]);
+    expect(snapshot.containers).toEqual([
+      { cpuPercent: 25, memBytes: 256 * 1024 ** 2, memLimitBytes: 16 * 1024 ** 3 },
+    ]);
+    expect(snapshot.maximumContainerCpuPercent).toBe(25);
+    expect(snapshot.dockerDisk).toEqual({
+      imagesBytes: 3 * 1024 ** 3,
+      containersBytes: 1024 ** 3,
+      buildCacheBytes: 2 * 1024 ** 3,
+    });
+  });
+
+  it("enriches the selected process before long full-profile Docker probes", () => {
+    const calls: Array<{ command: string; args: string[]; timeout: number }> = [];
+    const processOrder: string[] = [];
+    collectResourceSnapshot("failure", "full", snapshotSources(calls, processOrder));
+
+    expect(processOrder.filter(Boolean)).toEqual([
+      "ps",
+      "/proc/123/stat",
+      "/proc/123/status",
+      "/proc/123/stat",
+      "docker stats",
+      "docker system",
+    ]);
+    expect(calls.map((call) => call.timeout)).toEqual([15_000, 15_000, 15_000]);
+  });
+});
+
 describe("bounded secret-safe snapshot line (#7146)", () => {
   it("emits one prefixed line whose fields all come from the allowlisted shape", () => {
     const line = renderSnapshotLine(baseSnapshot());
@@ -261,9 +603,11 @@ describe("bounded secret-safe snapshot line (#7146)", () => {
       "at",
       "cgroup",
       "containers",
+      "cpu",
       "disk",
       "dockerDisk",
       "ioPressure",
+      "largestProcess",
       "load",
       "meminfo",
       "memoryPressure",
@@ -272,8 +616,20 @@ describe("bounded secret-safe snapshot line (#7146)", () => {
       "v",
     ]);
     expect(payload.meminfo.memAvailableKb).toBe(12288000);
+    expect(payload.cpu).toEqual({ logicalCpuCount: 4, idleTicks: 200, totalTicks: 500 });
     expect(payload.cgroup.limitBytes).toBeNull();
     expect(payload.topProcesses[0]).toEqual({ rank: 1, rssKb: 900000 });
+    expect(payload.largestProcess).toEqual({
+      class: "docker-buildkit",
+      rssKb: 900000,
+      breakdown: {
+        vmRssKb: 900000,
+        rssAnonKb: 700000,
+        rssFileKb: 190000,
+        rssShmemKb: 10000,
+        vmSwapKb: 1000,
+      },
+    });
     expect(payload.containers[0]).toEqual({
       rank: 1,
       cpuPercent: 95.2,
@@ -288,12 +644,15 @@ describe("bounded secret-safe snapshot line (#7146)", () => {
     (poisoned.meminfo as unknown as Record<string, unknown>).AWS_SECRET_ACCESS_KEY = "leak";
     (poisoned.topProcesses[0] as unknown as Record<string, unknown>).comm = "ghp_process_secret";
     (poisoned.containers[0] as unknown as Record<string, unknown>).name = "ghp_container_secret";
+    (poisoned.largestProcess?.breakdown as unknown as Record<string, unknown>).processSecret =
+      "ghp_breakdown_secret";
     const line = renderSnapshotLine(poisoned);
     expect(line).not.toContain("leak");
     expect(line).not.toContain("ghp_secret_value");
     expect(line).not.toContain("AWS_SECRET_ACCESS_KEY");
     expect(line).not.toContain("ghp_process_secret");
     expect(line).not.toContain("ghp_container_secret");
+    expect(line).not.toContain("ghp_breakdown_secret");
   });
 
   it("stays within the line bound by limiting ranked lists before rendering", () => {
@@ -301,7 +660,7 @@ describe("bounded secret-safe snapshot line (#7146)", () => {
     bloated.topProcesses = Array.from({ length: 500 }, (_, i) => ({
       rssKb: i,
     }));
-    bloated.containers = Array.from({ length: 500 }, (_, i) => ({
+    bloated.containers = Array.from({ length: 500 }, (_, _i) => ({
       cpuPercent: 1,
       memBytes: 1,
       memLimitBytes: 1,
@@ -314,25 +673,30 @@ describe("bounded secret-safe snapshot line (#7146)", () => {
     expect(payload.containers).toHaveLength(5);
   });
 
-  it("rejects phase labels that could inject argv options", () => {
-    expect(assertPhaseLabel("rebuild-hermes.image-build")).toBe("rebuild-hermes.image-build");
-    for (const bad of [undefined, "", "-oProxyCommand=x", "a b", "a$(x)", "a".repeat(80)]) {
+  it.each([undefined, "", "-oProxyCommand=x", "a b", "a$(x)", "a".repeat(80)])(
+    "rejects phase label %# that could inject argv options",
+    (bad) => {
       expect(() => assertPhaseLabel(bad)).toThrow(/phase label/);
-    }
+    },
+  );
+
+  it("accepts a bounded phase label", () => {
+    expect(assertPhaseLabel("rebuild-hermes.image-build")).toBe("rebuild-hermes.image-build");
   });
 
-  it("accepts only a bounded canonical UTC timestamp", () => {
+  it.each([
+    undefined,
+    "",
+    "2026-07-18",
+    "2026-07-18T00:00:00Z",
+    "2026-02-31T00:00:00.000Z",
+    `2026-07-18T00:00:00.000Z${"invalid".repeat(500)}`,
+  ])("rejects non-canonical UTC timestamp %#", (bad) => {
+    expect(() => assertCanonicalTimestamp(bad)).toThrow(/timestamp/);
+  });
+
+  it("accepts a bounded canonical UTC timestamp", () => {
     expect(assertCanonicalTimestamp("2026-07-18T00:00:00.000Z")).toBe("2026-07-18T00:00:00.000Z");
-    for (const bad of [
-      undefined,
-      "",
-      "2026-07-18",
-      "2026-07-18T00:00:00Z",
-      "2026-02-31T00:00:00.000Z",
-      `2026-07-18T00:00:00.000Z${"ghp_secret".repeat(500)}`,
-    ]) {
-      expect(() => assertCanonicalTimestamp(bad)).toThrow(/timestamp/);
-    }
   });
 });
 
@@ -570,32 +934,28 @@ describe("runner-loss signature and retry policy (#7146)", () => {
     expect(decision.reason).toContain("assertion");
   });
 
-  it("never retries classified OOM, disk-pressure, timeout, or unknown failures", () => {
-    for (const classification of [
-      "process-oom",
-      "container-oom",
-      "disk-pressure",
-      "timeout",
-      "unknown",
-    ] as const) {
+  it.each(["process-oom", "container-oom", "disk-pressure", "timeout", "unknown"] as const)(
+    "never retries a classified %s failure",
+    (classification) => {
       expect(decideRetry({ runnerLoss: false, classification, attempt: 1 }).retry).toBe(false);
-    }
-  });
+    },
+  );
 
-  it("fails closed when runner-loss evidence contradicts a terminal classification", () => {
-    for (const classification of [
-      "assertion",
-      "timeout",
-      "process-oom",
-      "container-oom",
-      "disk-pressure",
-      "unknown",
-    ] as const) {
+  it.each([
+    "assertion",
+    "timeout",
+    "process-oom",
+    "container-oom",
+    "disk-pressure",
+    "unknown",
+  ] as const)(
+    "fails closed when runner-loss evidence contradicts a terminal %s classification",
+    (classification) => {
       const decision = decideRetry({ runnerLoss: true, classification, attempt: 1 });
       expect(decision.retry).toBe(false);
       expect(decision.reason).toContain("terminal");
-    }
-  });
+    },
+  );
 
   it("permits exactly one retry for a confirmed runner loss and links the attempts", () => {
     const first = decideRetry({ runnerLoss: true, classification: null, attempt: 1 });
@@ -639,115 +999,132 @@ describe("runner-pressure CLI fail-closed entrypoint (#7146)", () => {
     });
   }, 90_000);
 
-  it("initializes private evidence files before the live test", () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-runner-evidence-"));
-    const baselinePath = path.join(directory, "baseline.jsonl");
-    const phaseBaselinesPath = path.join(directory, "phase-baselines.jsonl");
-    const classificationPath = path.join(directory, "classification.jsonl");
-    try {
-      const result = runHelper(["initialize-evidence"], {
+  it.each([
+    { scenario: "baseline evidence" },
+    { scenario: "phase baselines" },
+    { scenario: "classification evidence" },
+  ])(
+    "initializes private evidence files before the live test [$scenario]",
+    ({ scenario }) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-runner-evidence-"));
+      const baselinePath = path.join(directory, "baseline.jsonl");
+      const phaseBaselinesPath = path.join(directory, "phase-baselines.jsonl");
+      const classificationPath = path.join(directory, "classification.jsonl");
+      try {
+        const result = runHelper(["initialize-evidence"], {
+          DOCKER_OOM_CONTAINER: "",
+          E2E_PHASE: "unit-test",
+          E2E_RESOURCE_BASELINE_FILE: baselinePath,
+          E2E_RESOURCE_PHASE_BASELINES_FILE: phaseBaselinesPath,
+          E2E_TERMINAL_CLASSIFICATION_FILE: classificationPath,
+        });
+        expect(result.status).toBe(0);
+        expect(parseBaselineLine(fs.readFileSync(baselinePath, "utf8")).phase).toBe("unit-test");
+        expect(fs.readFileSync(phaseBaselinesPath, "utf8")).toBe("");
+        expect(fs.readFileSync(classificationPath, "utf8")).toBe("");
+        const file = (
+          {
+            "baseline evidence": baselinePath,
+            "phase baselines": phaseBaselinesPath,
+            "classification evidence": classificationPath,
+          } as const
+        )[scenario]!;
+        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  it.each(["assertion", "timeout"] as const)(
+    "classifies a trusted harness %s artifact through the real CLI",
+    (outcome) => {
+      withEvidenceFiles(outcome, (baselinePath, outcomePath) => {
+        const classificationPath = path.join(path.dirname(baselinePath), "classification.jsonl");
+        fs.writeFileSync(classificationPath, "", { mode: 0o600 });
+        const result = runHelper(["classify"], {
+          E2E_RESOURCE_BASELINE_FILE: baselinePath,
+          E2E_TERMINAL_CLASSIFICATION_FILE: classificationPath,
+          E2E_TEST_OUTCOME_FILE: outcomePath,
+        });
+        expect(result.status).toBe(0);
+        const line = result.stdout
+          .split("\n")
+          .find((l) => l.startsWith(CLASSIFICATION_LINE_PREFIX));
+        expect(line).toBeDefined();
+        expect(
+          JSON.parse((line as string).slice(CLASSIFICATION_LINE_PREFIX.length)).classification,
+        ).toBe(outcome);
+        expect(fs.readFileSync(classificationPath, "utf8").trim()).toBe(line);
+      });
+    },
+    90_000,
+  );
+
+  it.each(["symlink", "hardlink"] as const)(
+    "rejects %s-substituted baseline, phase, and classification evidence",
+    (linkKind) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-linked-evidence-"));
+      const baselinePath = path.join(directory, "baseline.jsonl");
+      const phaseBaselinesPath = path.join(directory, "phase-baselines.jsonl");
+      const classificationPath = path.join(directory, "classification.jsonl");
+      const outcomePath = path.join(directory, LIVE_TEST_OUTCOME_FILE);
+      const canonicalBaseline = `${renderBaselineLine({
+        phase: "unit-test",
+        at: "2026-07-18T00:00:00.000Z",
+        cgroupOomKills: 0,
+        kernelOomKillCount: 0,
+        containerOomKilled: false,
+      })}\n`;
+      const canonicalClassification = `${renderClassificationLine({
+        classification: "assertion",
+        reason: "protected target",
+      })}\n`;
+      const link = LINK_CREATORS[linkKind];
+      const environment = {
         DOCKER_OOM_CONTAINER: "",
         E2E_PHASE: "unit-test",
         E2E_RESOURCE_BASELINE_FILE: baselinePath,
         E2E_RESOURCE_PHASE_BASELINES_FILE: phaseBaselinesPath,
         E2E_TERMINAL_CLASSIFICATION_FILE: classificationPath,
-      });
-      expect(result.status).toBe(0);
-      expect(parseBaselineLine(fs.readFileSync(baselinePath, "utf8")).phase).toBe("unit-test");
-      expect(fs.readFileSync(phaseBaselinesPath, "utf8")).toBe("");
-      expect(fs.readFileSync(classificationPath, "utf8")).toBe("");
-      for (const file of [baselinePath, phaseBaselinesPath, classificationPath]) {
-        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-      }
-    } finally {
-      fs.rmSync(directory, { recursive: true, force: true });
-    }
-  }, 90_000);
-
-  it.each([
-    "assertion",
-    "timeout",
-  ] as const)("classifies a trusted harness %s artifact through the real CLI", (outcome) => {
-    withEvidenceFiles(outcome, (baselinePath, outcomePath) => {
-      const classificationPath = path.join(path.dirname(baselinePath), "classification.jsonl");
-      fs.writeFileSync(classificationPath, "", { mode: 0o600 });
-      const result = runHelper(["classify"], {
-        E2E_RESOURCE_BASELINE_FILE: baselinePath,
-        E2E_TERMINAL_CLASSIFICATION_FILE: classificationPath,
         E2E_TEST_OUTCOME_FILE: outcomePath,
-      });
-      expect(result.status).toBe(0);
-      const line = result.stdout.split("\n").find((l) => l.startsWith(CLASSIFICATION_LINE_PREFIX));
-      expect(line).toBeDefined();
-      expect(
-        JSON.parse((line as string).slice(CLASSIFICATION_LINE_PREFIX.length)).classification,
-      ).toBe(outcome);
-      expect(fs.readFileSync(classificationPath, "utf8").trim()).toBe(line);
-    });
-  }, 90_000);
+      };
+      try {
+        fs.writeFileSync(outcomePath, renderLiveTestOutcome("assertion"), { mode: 0o600 });
 
-  it.each([
-    "symlink",
-    "hardlink",
-  ] as const)("rejects %s-substituted baseline, phase, and classification evidence", (linkKind) => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-linked-evidence-"));
-    const baselinePath = path.join(directory, "baseline.jsonl");
-    const phaseBaselinesPath = path.join(directory, "phase-baselines.jsonl");
-    const classificationPath = path.join(directory, "classification.jsonl");
-    const outcomePath = path.join(directory, LIVE_TEST_OUTCOME_FILE);
-    const canonicalBaseline = `${renderBaselineLine({
-      phase: "unit-test",
-      at: "2026-07-18T00:00:00.000Z",
-      cgroupOomKills: 0,
-      kernelOomKillCount: 0,
-      containerOomKilled: false,
-    })}\n`;
-    const canonicalClassification = `${renderClassificationLine({
-      classification: "assertion",
-      reason: "protected target",
-    })}\n`;
-    const link = LINK_CREATORS[linkKind];
-    const environment = {
-      DOCKER_OOM_CONTAINER: "",
-      E2E_PHASE: "unit-test",
-      E2E_RESOURCE_BASELINE_FILE: baselinePath,
-      E2E_RESOURCE_PHASE_BASELINES_FILE: phaseBaselinesPath,
-      E2E_TERMINAL_CLASSIFICATION_FILE: classificationPath,
-      E2E_TEST_OUTCOME_FILE: outcomePath,
-    };
-    try {
-      fs.writeFileSync(outcomePath, renderLiveTestOutcome("assertion"), { mode: 0o600 });
+        const baselineTarget = path.join(directory, "baseline-target.jsonl");
+        fs.writeFileSync(baselineTarget, canonicalBaseline, { mode: 0o600 });
+        link(baselineTarget, baselinePath);
+        fs.writeFileSync(phaseBaselinesPath, "", { mode: 0o600 });
+        fs.writeFileSync(classificationPath, "", { mode: 0o600 });
+        expect(runHelper(["classify"], environment).status).not.toBe(0);
+        expect(fs.readFileSync(baselineTarget, "utf8")).toBe(canonicalBaseline);
 
-      const baselineTarget = path.join(directory, "baseline-target.jsonl");
-      fs.writeFileSync(baselineTarget, canonicalBaseline, { mode: 0o600 });
-      link(baselineTarget, baselinePath);
-      fs.writeFileSync(phaseBaselinesPath, "", { mode: 0o600 });
-      fs.writeFileSync(classificationPath, "", { mode: 0o600 });
-      expect(runHelper(["classify"], environment).status).not.toBe(0);
-      expect(fs.readFileSync(baselineTarget, "utf8")).toBe(canonicalBaseline);
+        fs.unlinkSync(baselinePath);
+        fs.writeFileSync(baselinePath, canonicalBaseline, { mode: 0o600 });
+        fs.unlinkSync(phaseBaselinesPath);
+        const phaseTarget = path.join(directory, "phase-target.jsonl");
+        fs.writeFileSync(phaseTarget, "", { mode: 0o600 });
+        link(phaseTarget, phaseBaselinesPath);
+        expect(runHelper(["classify"], environment).status).not.toBe(0);
+        expect(fs.readFileSync(phaseTarget, "utf8")).toBe("");
 
-      fs.unlinkSync(baselinePath);
-      fs.writeFileSync(baselinePath, canonicalBaseline, { mode: 0o600 });
-      fs.unlinkSync(phaseBaselinesPath);
-      const phaseTarget = path.join(directory, "phase-target.jsonl");
-      fs.writeFileSync(phaseTarget, "", { mode: 0o600 });
-      link(phaseTarget, phaseBaselinesPath);
-      expect(runHelper(["classify"], environment).status).not.toBe(0);
-      expect(fs.readFileSync(phaseTarget, "utf8")).toBe("");
-
-      fs.unlinkSync(phaseBaselinesPath);
-      fs.writeFileSync(phaseBaselinesPath, "", { mode: 0o600 });
-      fs.unlinkSync(classificationPath);
-      const classificationTarget = path.join(directory, "classification-target.jsonl");
-      fs.writeFileSync(classificationTarget, canonicalClassification, { mode: 0o600 });
-      link(classificationTarget, classificationPath);
-      expect(runHelper(["initialize-evidence"], environment).status).not.toBe(0);
-      expect(runHelper(["validate-classification"], environment).status).not.toBe(0);
-      expect(fs.readFileSync(classificationTarget, "utf8")).toBe(canonicalClassification);
-    } finally {
-      fs.rmSync(directory, { recursive: true, force: true });
-    }
-  }, 90_000);
+        fs.unlinkSync(phaseBaselinesPath);
+        fs.writeFileSync(phaseBaselinesPath, "", { mode: 0o600 });
+        fs.unlinkSync(classificationPath);
+        const classificationTarget = path.join(directory, "classification-target.jsonl");
+        fs.writeFileSync(classificationTarget, canonicalClassification, { mode: 0o600 });
+        link(classificationTarget, classificationPath);
+        expect(runHelper(["initialize-evidence"], environment).status).not.toBe(0);
+        expect(runHelper(["validate-classification"], environment).status).not.toBe(0);
+        expect(fs.readFileSync(classificationTarget, "utf8")).toBe(canonicalClassification);
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
 
   it("rejects missing or malformed pre-phase evidence before classification", () => {
     const missing = runHelper(["classify"], {});
@@ -829,11 +1206,13 @@ describe("runner-pressure CLI fail-closed entrypoint (#7146)", () => {
     expect(JSON.parse(loss.stdout.trim()).retry).toBe(true);
   }, 90_000);
 
-  it("fails closed on a missing or unsupported subcommand", () => {
-    for (const args of [[], ["snapshotx"], ["run"]]) {
-      const result = runHelper(args, {});
+  it.each([[[]], [["snapshotx"]], [["run"]]] as const)(
+    "fails closed on missing or unsupported subcommand %#",
+    (args) => {
+      const result = runHelper([...args], {});
       expect(result.status).toBe(2);
       expect(result.stderr).toContain("usage:");
-    }
-  }, 90_000);
+    },
+    90_000,
+  );
 });

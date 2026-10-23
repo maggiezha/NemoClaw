@@ -2,17 +2,92 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-import { HERMES_PROXY_API_KEY_PLACEHOLDER } from "../hermes-proxy-api-key";
+import { HERMES_PROXY_REWRITE_SENTINEL } from "../hermes-managed-route";
 import type { ConfigObject } from "../security/credential-filter";
 import { patchHermesInferenceConfig } from "./inference-set";
 
 describe("patchHermesInferenceConfig", () => {
-  it("updates only the Hermes model block for the selected route", () => {
+  it("replaces every credential when switching to native NVIDIA inference and back", () => {
+    const config: ConfigObject = {};
+    patchHermesInferenceConfig(config, "vllm-local", "local-model");
+    patchHermesInferenceConfig(config, "nvidia-prod", "nvidia/test-model");
+    const placeholder = "${NVIDIA_INFERENCE_API_KEY}";
+    expect(config).toMatchObject({
+      model: { api_key: placeholder },
+      providers: { "nvidia-prod": { api_key: placeholder } },
+      custom_providers: [{ api_key: placeholder }],
+    });
+    patchHermesInferenceConfig(config, "vllm-local", "local-model");
+    expect(config).toMatchObject({
+      model: { base_url: "https://inference.local/v1", api_key: HERMES_PROXY_REWRITE_SENTINEL },
+      providers: { "vllm-local": { api_key: HERMES_PROXY_REWRITE_SENTINEL } },
+      custom_providers: [{ api_key: HERMES_PROXY_REWRITE_SENTINEL }],
+    });
+  });
+
+  it("uses the attached provider handle on every Hermes native credential path", () => {
+    const config: ConfigObject = {};
+    const handle = "openshell:resolve:env:v12_NVIDIA_INFERENCE_API_KEY";
+    patchHermesInferenceConfig(
+      config,
+      "nvidia-prod",
+      "nvidia/test-model",
+      null,
+      undefined,
+      undefined,
+      true,
+      handle,
+    );
+    expect(config).toMatchObject({
+      model: { api_key: handle },
+      providers: { "nvidia-prod": { api_key: handle } },
+      custom_providers: [{ api_key: handle }],
+    });
+    expect(() =>
+      patchHermesInferenceConfig(
+        {},
+        "nvidia-prod",
+        "nvidia/test-model",
+        null,
+        undefined,
+        undefined,
+        true,
+        "nvapi-raw",
+      ),
+    ).toThrow(/provider-bound credential handle/u);
+    expect(() =>
+      patchHermesInferenceConfig(
+        {},
+        "nvidia-prod",
+        "nvidia/test-model",
+        null,
+        undefined,
+        undefined,
+        true,
+        "",
+      ),
+    ).toThrow(/provider-bound credential handle/u);
+    expect(() =>
+      patchHermesInferenceConfig(
+        {},
+        "vllm-local",
+        "local-model",
+        null,
+        undefined,
+        undefined,
+        true,
+        handle,
+      ),
+    ).toThrow(/provider-bound credential handle/u);
+  });
+
+  it("updates the complete Hermes route for the selected provider", () => {
     const config: ConfigObject = {
       model: {
         default: "moonshotai/kimi-k2.6",
         provider: "custom",
         base_url: "https://old.example/v1",
+        context_length: 32_768,
         temperature: 0.2,
       },
       models: {
@@ -31,10 +106,31 @@ describe("patchHermesInferenceConfig", () => {
     expect(config.model).toEqual({
       default: "openai/gpt-5.4-mini",
       provider: "custom",
-      base_url: "https://inference.local/v1",
-      api_key: HERMES_PROXY_API_KEY_PLACEHOLDER,
-      temperature: 0.2,
+      base_url: "https://inference-api.nousresearch.com/v1",
+      api_key: "${OPENAI_API_KEY}",
     });
+    expect(config._nemoclaw_upstream).toEqual({
+      provider: "hermes-provider",
+      provider_key: "hermes-provider",
+      model: "openai/gpt-5.4-mini",
+    });
+    expect(config.providers).toEqual({
+      "hermes-provider": {
+        name: "hermes-provider",
+        api: "https://inference-api.nousresearch.com/v1",
+        api_key: "${OPENAI_API_KEY}",
+        default_model: "openai/gpt-5.4-mini",
+        discover_models: true,
+      },
+    });
+    expect(config.custom_providers).toEqual([
+      {
+        name: "hermes-provider",
+        base_url: "https://inference-api.nousresearch.com/v1",
+        api_key: "${OPENAI_API_KEY}",
+        discover_models: true,
+      },
+    ]);
     expect(config.models).toEqual({
       providers: {
         inference: {
@@ -45,8 +141,29 @@ describe("patchHermesInferenceConfig", () => {
     expect(config.terminal).toEqual({ backend: "local" });
   });
 
-  it("replaces stale Hermes API keys with the OpenShell proxy placeholder", () => {
-    for (const api_key of ["no-key-required", "sk-real-looking-key-that-must-not-survive"]) {
+  it("writes the selected Hermes model context window instead of retaining the previous route", () => {
+    const config: ConfigObject = {
+      model: {
+        default: "old-model",
+        provider: "custom",
+        base_url: "https://old.example/v1",
+        context_length: 32_768,
+      },
+    };
+
+    patchHermesInferenceConfig(config, "hermes-provider", "openai/gpt-5.4-mini", null, 128_000);
+
+    expect(config.model).toEqual(
+      expect.objectContaining({
+        default: "openai/gpt-5.4-mini",
+        context_length: 128_000,
+      }),
+    );
+  });
+
+  it.each(["no-key-required", "sk-real-looking-key-that-must-not-survive"])(
+    "replaces stale Hermes API keys with the native credential placeholder [case %#]",
+    (api_key) => {
       const config: ConfigObject = {
         model: {
           default: "old-model",
@@ -58,9 +175,9 @@ describe("patchHermesInferenceConfig", () => {
 
       patchHermesInferenceConfig(config, "hermes-provider", "openai/gpt-5.4-mini");
 
-      expect((config.model as ConfigObject).api_key).toBe(HERMES_PROXY_API_KEY_PLACEHOLDER);
-    }
-  });
+      expect((config.model as ConfigObject).api_key).toBe("${OPENAI_API_KEY}");
+    },
+  );
 
   it("sets Hermes Anthropic Messages mode for Anthropic routes", () => {
     const config: ConfigObject = {
@@ -76,14 +193,14 @@ describe("patchHermesInferenceConfig", () => {
     expect(result.route).toMatchObject({
       providerKey: "anthropic",
       primaryModelRef: "anthropic/claude-sonnet-4-6",
-      inferenceBaseUrl: "https://inference.local",
+      inferenceBaseUrl: "https://api.anthropic.com",
       inferenceApi: "anthropic-messages",
     });
     expect(config.model).toEqual({
       default: "claude-sonnet-4-6",
       provider: "custom",
-      base_url: "https://inference.local",
-      api_key: HERMES_PROXY_API_KEY_PLACEHOLDER,
+      base_url: "https://api.anthropic.com",
+      api_key: "${ANTHROPIC_API_KEY}",
       api_mode: "anthropic_messages",
     });
   });
@@ -103,8 +220,8 @@ describe("patchHermesInferenceConfig", () => {
     expect(config.model).toEqual({
       default: "nvidia/nemotron-3-super-120b-a12b",
       provider: "custom",
-      base_url: "https://inference.local/v1",
-      api_key: HERMES_PROXY_API_KEY_PLACEHOLDER,
+      base_url: "https://integrate.api.nvidia.com/v1",
+      api_key: "${NVIDIA_INFERENCE_API_KEY}",
     });
   });
 
@@ -128,7 +245,7 @@ describe("patchHermesInferenceConfig", () => {
       default: "anthropic.claude-3-5-sonnet-20240620-v1:0",
       provider: "custom",
       base_url: "https://inference.local/v1",
-      api_key: HERMES_PROXY_API_KEY_PLACEHOLDER,
+      api_key: HERMES_PROXY_REWRITE_SENTINEL,
     });
   });
 });

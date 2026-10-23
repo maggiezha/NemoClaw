@@ -6,7 +6,10 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import YAML from "yaml";
+
+import { REPOSITORY_ROOT } from "./core/repository-root";
 
 const require = createRequire(import.meta.url);
 const SOURCE_AUTH = path.join(import.meta.dirname, "hermes-provider-auth.ts");
@@ -39,21 +42,44 @@ afterEach(() => {
 });
 
 describe("Hermes provider OpenShell credential handoff", () => {
-  it("inspects exact OpenShell credential key bindings without exposing values", () => {
+  it("inspects exact OpenShell credential key bindings without exposing values", async () => {
     const auth = loadAuth();
-    const binding = auth.inspectHermesProviderBinding(() => ({
+    const binding = await auth.inspectHermesProviderBinding(() => ({
       status: 0,
-      stdout: "Provider:\n\n  Name: hermes-provider\n  Credential keys: NOUS_API_KEY\n",
+      stdout:
+        "Name: hermes-provider\nType: openai\nCredential keys: NOUS_API_KEY\nConfig keys: OPENAI_BASE_URL\n",
       stderr: "",
     }));
     expect(binding).toEqual({ exists: true, credentialKeys: ["NOUS_API_KEY"] });
   });
 
-  it("fails closed when OpenShell provider details omit credential metadata", () => {
+  it("fails closed when OpenShell provider details omit credential metadata", async () => {
     const auth = loadAuth();
-    expect(
+    await expect(
       auth.inspectHermesProviderBinding(() => ({ status: 0, stdout: "Provider: exists" })),
-    ).toEqual({ exists: true, credentialKeys: null });
+    ).resolves.toEqual({ exists: true, credentialKeys: null });
+  });
+
+  it("registers the OpenAI provider without a compatibility-profile mutation (#11229)", async () => {
+    const auth = loadAuth();
+    const runOpenshell = vi
+      .fn()
+      .mockReturnValueOnce({ status: 1, stdout: "", stderr: "provider not found" })
+      .mockReturnValueOnce({ status: 0, stdout: "", stderr: "" });
+
+    await auth.registerHermesInferenceProvider("nous-key", runOpenshell);
+
+    expect(runOpenshell.mock.calls.map(([args]) => args)).toEqual([
+      ["provider", "get", "hermes-provider"],
+      expect.arrayContaining([
+        "provider",
+        "create",
+        "--name",
+        "hermes-provider",
+        "--type",
+        "openai",
+      ]),
+    ]);
   });
 
   it("registers Nous API-key inference in OpenShell without host-side persistence", async () => {
@@ -67,10 +93,13 @@ describe("Hermes provider OpenShell credential handoff", () => {
         apiKey: "nous-key-1",
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           calls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
+          return args[1] === "get"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr: "provider 'hermes-provider' not found",
+              }
+            : { status: 0, stdout: "", stderr: "" };
         },
       });
 
@@ -141,10 +170,13 @@ describe("Hermes provider OpenShell credential handoff", () => {
         noBrowser: true,
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           providerCalls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
-          }
-          return { status: 0, stdout: "", stderr: "" };
+          return args[1] === "get"
+            ? {
+                status: 1,
+                stdout: "",
+                stderr: "provider 'hermes-provider' not found",
+              }
+            : { status: 0, stdout: "", stderr: "" };
         },
       });
 
@@ -166,22 +198,91 @@ describe("Hermes provider OpenShell credential handoff", () => {
     }
   });
 
+  it.each(["oauth", "api_key"])(
+    "hands %s credentials to native registration without creating a legacy provider",
+    async (method) => {
+      const auth = loadAuth();
+      const runOpenshell = vi.fn();
+      const registerInferenceCredential = vi.fn(async () => ({ credentialEnv: "OPENAI_API_KEY" }));
+      const state =
+        method === "api_key"
+          ? await auth.ensureHermesProviderApiKeyCredentials("alpha", {
+              apiKey: "host-secret",
+              runOpenshell,
+              registerInferenceCredential,
+            })
+          : await auth.ensureHermesProviderOAuthCredentials("alpha", {
+              runOpenshell,
+              registerInferenceCredential,
+              noBrowser: true,
+              log: () => {},
+              fetch: async (url: string | URL) =>
+                new Response(
+                  JSON.stringify(
+                    String(url).endsWith("/api/oauth/device/code")
+                      ? {
+                          device_code: "device",
+                          user_code: "user",
+                          verification_uri: "https://portal.example/verify",
+                          expires_in: 900,
+                          interval: 1,
+                        }
+                      : String(url).endsWith("/api/oauth/token")
+                        ? {
+                            access_token: "access-token",
+                            refresh_token: "refresh-token",
+                            expires_in: 900,
+                            token_type: "Bearer",
+                          }
+                        : {
+                            api_key: "host-secret",
+                            key_id: "key-id",
+                            expires_in: 1800,
+                            inference_base_url: "https://staging.nous.example/v1",
+                          },
+                  ),
+                  { status: 200, headers: { "Content-Type": "application/json" } },
+                ),
+            });
+      expect(registerInferenceCredential).toHaveBeenCalledExactlyOnceWith({
+        apiKey: "host-secret",
+        credentialEnv: method === "api_key" ? "NOUS_API_KEY" : "OPENAI_API_KEY",
+        baseUrl:
+          method === "api_key"
+            ? "https://inference-api.nousresearch.com/v1"
+            : "https://staging.nous.example/v1",
+      });
+      expect(state.credential_env).toBe("OPENAI_API_KEY");
+      expect(runOpenshell).not.toHaveBeenCalled();
+      expect(JSON.stringify(state)).not.toMatch(/host-secret|access-token|refresh-token/u);
+    },
+  );
+
   it("registers a separate managed-tool refresh provider without writing raw OAuth state", async () => {
     const originalHome = process.env.HOME;
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hermes-tool-oauth-"));
     try {
       process.env.HOME = tmp;
-      const brokerCalls: Array<{ sandboxName?: string; refreshToken?: string }> = [];
       const auth = loadAuthWithBrokerStub({
-        registerHermesToolGatewayRefreshProvider: (sandboxName: string, refreshToken: string) => {
-          brokerCalls.push({ sandboxName, refreshToken });
-          return { providerName: `${sandboxName}-hermes-tool-gateway`, brokerToken: "broker-3" };
-        },
         ensureHermesToolGatewayBroker: (options: { refreshToken?: string }) => {
           expect(options.refreshToken).toBe("refresh-3");
           return true;
         },
       });
+      const broker = require(SOURCE_BROKER);
+      const profile = YAML.parse(
+        fs.readFileSync(
+          path.join(
+            REPOSITORY_ROOT,
+            "agents",
+            "hermes",
+            "host",
+            "nemoclaw-hermes-tool-gateway-v1.yaml",
+          ),
+          "utf8",
+        ),
+      );
+      let profileImported = false;
       const providerCalls: Array<{ args: string[]; env?: Record<string, string> }> = [];
       const state = await auth.ensureHermesProviderOAuthCredentials("my-assistant", {
         allowInteractiveLogin: true,
@@ -224,17 +325,50 @@ describe("Hermes provider OpenShell credential handoff", () => {
         noBrowser: true,
         runOpenshell: (args: string[], opts: { env?: Record<string, string> } = {}) => {
           providerCalls.push({ args, env: opts.env });
-          if (args[0] === "provider" && args[1] === "get") {
-            return { status: 1, stdout: "", stderr: "" };
+          switch (`${args[0]} ${args[1]} ${args[2]}`) {
+            case "provider profile export":
+              return profileImported
+                ? { status: 0, stdout: JSON.stringify(profile), stderr: "" }
+                : { status: 1, stdout: "", stderr: "provider profile not found" };
+            case "provider profile import":
+              profileImported = true;
+              return { status: 0, stdout: "", stderr: "" };
+            case `provider get ${args[2]}`:
+              return {
+                status: 1,
+                stdout: "",
+                stderr: `provider '${args[2]}' not found`,
+              };
+            case `provider create ${args[2]}`:
+              return { status: 0, stdout: "", stderr: "" };
+            default:
+              throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
           }
-          return { status: 0, stdout: "", stderr: "" };
         },
         toolGatewayPresets: ["nous-web", "nous-audio"],
       });
 
       expect(state.auth_method).toBe("oauth");
       expect(providerCalls.some((call) => call.env?.OPENAI_API_KEY === "agent-key-3")).toBe(true);
-      expect(brokerCalls).toEqual([{ sandboxName: "my-assistant", refreshToken: "refresh-3" }]);
+      const gatewayCalls = providerCalls.filter(
+        ({ args }) => args[1] === "profile" || args.includes("my-assistant-hermes-tool-gateway"),
+      );
+      expect(gatewayCalls.map(({ args }) => args.slice(0, 3).join(" "))).toEqual([
+        "provider profile export",
+        "provider profile import",
+        "provider profile export",
+        "provider get my-assistant-hermes-tool-gateway",
+        "provider get my-assistant-hermes-tool-gateway",
+        "provider create --name",
+        "provider profile export",
+      ]);
+      const create = gatewayCalls.find(({ args }) => args[1] === "create");
+      expect(create?.args).toContain("nemoclaw-hermes-tool-gateway-v1");
+      expect(create?.env?.NEMOCLAW_HERMES_TOOL_GATEWAY_REFRESH_TOKEN).toBe(
+        broker.getHermesToolGatewayBrokerToken("my-assistant"),
+      );
+      expect(create?.env?.NEMOCLAW_HERMES_TOOL_GATEWAY_REFRESH_TOKEN).not.toBe("refresh-3");
+      expect(JSON.stringify(providerCalls)).not.toContain("refresh-3");
       expect(fs.existsSync(path.join(tmp, ".nemoclaw", "hermes-oauth"))).toBe(false);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;

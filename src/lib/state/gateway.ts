@@ -2,26 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Pure classifiers for OpenShell gateway and sandbox state.
+ * Pure classifiers for OpenShell sandbox state.
  *
  * Every function here takes string output from openshell CLI commands and
  * returns a typed result — no I/O, no side effects.
  */
 
-const GATEWAY_NAME = "nemoclaw";
+// Transitional compatibility for legacy callers. Pure gateway reuse decisions
+// are owned by the domain layer.
+export {
+  getGatewayReuseState,
+  getReportedGatewayName,
+  hasActiveGatewayInfo,
+  hasStaleGateway,
+  isGatewayConnected,
+  isGatewayHealthy,
+  isSelectedGateway,
+  shouldSelectNamedGatewayForReuse,
+} from "../domain/gateway-reuse";
+export type { GatewayReuseState } from "../domain/gateway-reuse";
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_RE, "");
 }
-
-export type GatewayReuseState =
-  | "healthy"
-  | "active-unnamed"
-  | "foreign-active"
-  | "stale"
-  | "missing";
 
 export type SandboxState = "ready" | "not_ready" | "missing";
 
@@ -82,120 +87,16 @@ export function getSandboxFailurePhase(output: string, sandboxName: string): str
   return cols.find((col) => TERMINAL_SANDBOX_FAILURE_PHASES.has(col)) ?? null;
 }
 
-/**
- * Determine whether stale NemoClaw gateway output indicates a previous
- * session that should be cleaned up before the port preflight check.
- */
-export function hasStaleGateway(gwInfoOutput: string, gatewayName = GATEWAY_NAME): boolean {
-  const clean = typeof gwInfoOutput === "string" ? stripAnsi(gwInfoOutput) : "";
-  return (
-    clean.length > 0 &&
-    getReportedGatewayName(clean) === gatewayName &&
-    !clean.includes("No gateway metadata found")
-  );
-}
-
-export function getReportedGatewayName(output = ""): string | null {
-  if (typeof output !== "string") return null;
-  const clean = stripAnsi(output);
-  const match = clean.match(/^\s*Gateway:\s+([^\s]+)/m);
-  return match ? match[1] : null;
-}
-
-export function isGatewayConnected(statusOutput = ""): boolean {
-  if (typeof statusOutput !== "string") return false;
-  const clean = stripAnsi(statusOutput);
-  if (
-    /\b(Error|transport error|client error)\b/i.test(clean) ||
-    /Connection refused|Connection reset|No active gateway/i.test(clean)
-  ) {
-    return false;
-  }
-  return clean.includes("Connected") || clean.includes("Server Status");
-}
-
-export function hasActiveGatewayInfo(activeGatewayInfoOutput = ""): boolean {
-  return (
-    typeof activeGatewayInfoOutput === "string" &&
-    activeGatewayInfoOutput.includes("Gateway endpoint:") &&
-    !activeGatewayInfoOutput.includes("No gateway metadata found")
-  );
-}
-
-export function isSelectedGateway(statusOutput = "", gatewayName = GATEWAY_NAME): boolean {
-  return getReportedGatewayName(statusOutput) === gatewayName;
-}
-
-export function isGatewayHealthy(
-  statusOutput = "",
-  gwInfoOutput = "",
-  activeGatewayInfoOutput = "",
-  gatewayName = GATEWAY_NAME,
-): boolean {
-  const namedGatewayKnown = hasStaleGateway(gwInfoOutput, gatewayName);
-  const activeGatewayName =
-    getReportedGatewayName(statusOutput) || getReportedGatewayName(activeGatewayInfoOutput);
-  const connected = isGatewayConnected(statusOutput);
-  const activeInfo = hasActiveGatewayInfo(activeGatewayInfoOutput);
-
-  // Primary path: status reports connected and gateway name matches
-  if (connected && activeGatewayName === gatewayName) return true;
-
-  // Fallback: status is empty (ARM64/non-TTY) but gateway info confirms
-  // the named gateway exists and has an active endpoint
-  const statusEmpty =
-    typeof statusOutput === "string" && stripAnsi(statusOutput).trim().length === 0;
-  if (statusEmpty && namedGatewayKnown && activeInfo && activeGatewayName === gatewayName)
-    return true;
-
-  return false;
-}
-
-export function getGatewayReuseState(
-  statusOutput = "",
-  gwInfoOutput = "",
-  activeGatewayInfoOutput = "",
-  gatewayName = GATEWAY_NAME,
-): GatewayReuseState {
-  if (isGatewayHealthy(statusOutput, gwInfoOutput, activeGatewayInfoOutput, gatewayName)) {
-    return "healthy";
-  }
-  const connected = isGatewayConnected(statusOutput);
-  const activeGatewayName =
-    getReportedGatewayName(statusOutput) || getReportedGatewayName(activeGatewayInfoOutput);
-  const activeInfo = hasActiveGatewayInfo(activeGatewayInfoOutput);
-  if (connected && activeGatewayName === gatewayName) {
-    return "active-unnamed";
-  }
-  if ((connected || activeInfo) && activeGatewayName && activeGatewayName !== gatewayName) {
-    return "foreign-active";
-  }
-  if (hasStaleGateway(gwInfoOutput, gatewayName)) {
-    return "stale";
-  }
-  if (activeInfo) {
-    return "active-unnamed";
-  }
-  return "missing";
-}
-
-export function shouldSelectNamedGatewayForReuse(
-  statusOutput = "",
-  gwInfoOutput = "",
-  activeGatewayInfoOutput = "",
-  gatewayName = GATEWAY_NAME,
-): boolean {
-  return (
-    getGatewayReuseState(statusOutput, gwInfoOutput, activeGatewayInfoOutput, gatewayName) ===
-      "foreign-active" && hasStaleGateway(gwInfoOutput, gatewayName)
-  );
-}
-
 export function parseSandboxPhase(getOutput: string): string | null {
   if (typeof getOutput !== "string") return null;
   const clean = stripAnsi(getOutput);
   const match = clean.match(/^\s*Phase:\s+(\S+)/m);
   return match ? match[1] : null;
+}
+
+/** True only for the OpenShell phase that requires a lifecycle start. */
+export function sandboxPhaseNeedsLifecycleStart(phase: string | null): boolean {
+  return phase === "Stopped";
 }
 
 // Phases that represent a settled, non-transitional failure rather than a
@@ -213,7 +114,10 @@ export const TERMINAL_SANDBOX_PHASES = new Set<string>([
 ]);
 
 export function isTerminalSandboxPhase(phase: string | null | undefined): boolean {
-  return !!phase && TERMINAL_SANDBOX_PHASES.has(phase);
+  return (
+    !!phase &&
+    [...TERMINAL_SANDBOX_PHASES].some((terminal) => terminal.toLowerCase() === phase.toLowerCase())
+  );
 }
 
 export function getSandboxStateFromOutputs(

@@ -14,6 +14,7 @@ const { probeAnthropicEndpoint, probeOpenAiLikeEndpointOptimized } =
       apiKey: string | null | undefined,
       options?: {
         probeStreaming?: boolean;
+        requireStreamingToolCalling?: boolean;
         pinnedAddresses?: readonly string[];
         trustedPrivateCapability?: TrustedPrivateEndpointCapability;
       },
@@ -36,12 +37,18 @@ type OpenAiLikeProbe = (
 import {
   assertEndpointResolvesPublic,
   type EndpointDnsLookupFn,
-  parseTrustedPrivateInferenceHosts,
+  parseTrustedPrivateInferenceHostsFromEnv,
 } from "../inference/endpoint-ssrf-preflight";
 import { shouldForceCompletionsApi } from "../validation";
-import { getProbeRecovery } from "../validation-recovery";
+import {
+  getProbeRecovery,
+  getTransportRecoveryMessage,
+  type ProbeLike,
+} from "../validation-recovery";
 import { summarizeProbeForDisplay } from "./probe-diagnostics";
+import { formatOnboardEndpointDiagnostic } from "./diagnostics/redaction";
 import { normalizeReasoningFlag } from "./reasoning-mode";
+import { OnboardDeferredExitError } from "./session-bootstrap";
 
 export type EndpointValidationResult =
   | {
@@ -50,10 +57,35 @@ export type EndpointValidationResult =
       retry?: undefined;
       /** Public addresses approved for this custom endpoint's host probes. */
       pinnedAddresses?: string[];
-      /** Non-forgeable proof of the exact private subset admitted by the operator allowlist. */
+      /** Non-forgeable proof of the exact host and complete pins admitted by the operator allowlist. */
       trustedPrivateCapability?: TrustedPrivateEndpointCapability;
     }
   | { ok: false; retry: "credential" | "selection" | "retry" | "model"; api?: undefined };
+
+export interface OpenAiSelectionValidationOptions {
+  /** In-memory credential for managed local endpoints; never read from ambient env. */
+  apiKey?: string | null;
+  /** Approved no-DNS endpoint pin; [] also disables ambient proxies for managed IP URLs. */
+  pinnedAddresses?: readonly string[];
+  trustedPrivateCapability?: TrustedPrivateEndpointCapability;
+  authMode?: "bearer" | "query-param";
+  extraHeaders?: readonly string[];
+  requireResponsesToolCalling?: boolean;
+  requireChatCompletionsToolCalling?: boolean;
+  retryChatCompletionsToolReadiness?: boolean;
+  useNvidiaEndpointProbePayload?: boolean;
+  /** Provider identity used only for safe, provider-specific diagnostics. */
+  provider?: string;
+  /** Provider-owned default model used only for safe, provider-specific diagnostics. */
+  providerDefaultModel?: string;
+  revalidateSandboxIdentity?: (operation: string) => void;
+
+  skipResponsesProbe?: boolean;
+  probeStreaming?: boolean;
+  allowHostDockerInternal?: boolean;
+  probeFromDocker?: { expectedPort: number } | null;
+  capabilityCache?: OnboardInferenceCapabilityCache;
+}
 
 export interface InferenceSelectionValidationDeps {
   isNonInteractive(): boolean;
@@ -65,11 +97,17 @@ export interface InferenceSelectionValidationDeps {
   resolveEndpointHost?: EndpointDnsLookupFn;
   /** Exact private endpoint hosts trusted by the operator (tests may inject this). */
   trustedPrivateEndpointHosts?: readonly string[];
+  /**
+   * Optional abort teardown hook for tests. Production loads the helper lazily
+   * so openshell binaries stay out of the validation unit graph.
+   */
+  teardownOrphanManagedGatewayOnAbort?: () => boolean | Promise<boolean>;
   promptValidationRecovery(
     label: string,
     recovery: ReturnType<typeof getProbeRecovery>,
     credentialEnv?: string | null,
     helpUrl?: string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<"credential" | "selection" | "retry" | "model">;
 }
 
@@ -81,16 +119,7 @@ export interface InferenceSelectionValidationHelpers {
     credentialEnv?: string | null,
     retryMessage?: string,
     helpUrl?: string | null,
-    options?: {
-      authMode?: "bearer" | "query-param";
-      extraHeaders?: readonly string[];
-      requireResponsesToolCalling?: boolean;
-      requireChatCompletionsToolCalling?: boolean;
-      skipResponsesProbe?: boolean;
-      probeStreaming?: boolean;
-      allowHostDockerInternal?: boolean;
-      capabilityCache?: OnboardInferenceCapabilityCache;
-    },
+    options?: OpenAiSelectionValidationOptions,
   ): Promise<EndpointValidationResult>;
   validateAnthropicSelectionWithRetryMessage(
     label: string,
@@ -99,6 +128,7 @@ export interface InferenceSelectionValidationHelpers {
     credentialEnv: string,
     retryMessage?: string,
     helpUrl?: string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<EndpointValidationResult>;
   validateCustomOpenAiLikeSelection(
     label: string,
@@ -106,6 +136,8 @@ export interface InferenceSelectionValidationHelpers {
     model: string,
     credentialEnv: string,
     helpUrl?: string | null,
+    capabilityCache?: OnboardInferenceCapabilityCache,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<EndpointValidationResult>;
   validateCustomAnthropicSelection(
     label: string,
@@ -115,6 +147,7 @@ export interface InferenceSelectionValidationHelpers {
     helpUrl?: string | null,
     options?: {
       intendedApi?: "anthropic-messages" | "openai-completions";
+      revalidateSandboxIdentity?: (operation: string) => void;
     },
   ): Promise<EndpointValidationResult>;
 }
@@ -135,22 +168,123 @@ export function createInferenceSelectionValidationHelpers(
   const runAnthropicProbe = deps.probeAnthropicEndpoint ?? probeAnthropicEndpoint;
   const runOpenAiLikeProbe = deps.probeOpenAiLikeEndpoint ?? probeOpenAiLikeEndpointOptimized;
   const trustedPrivateEndpointHosts =
-    deps.trustedPrivateEndpointHosts ??
-    parseTrustedPrivateInferenceHosts(process.env.NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS);
+    deps.trustedPrivateEndpointHosts ?? parseTrustedPrivateInferenceHostsFromEnv(process.env);
 
-  function exitNonInteractiveValidationFailure(): never {
+  async function exitNonInteractiveValidationFailure(): Promise<never> {
+    // #8952: tear down an unowned managed gateway before fatal exit.
+    let gatewayCleanupComplete = false;
+    try {
+      const teardown =
+        deps.teardownOrphanManagedGatewayOnAbort ??
+        (() => {
+          const { teardownOrphanManagedGatewayOnAbort } =
+            require("./gateway-destroy") as typeof import("./gateway-destroy");
+          return teardownOrphanManagedGatewayOnAbort();
+        });
+      gatewayCleanupComplete = await teardown();
+    } catch (error) {
+      // Helper never throws; this covers require/load / inject failures.
+      console.error(
+        `  Gateway teardown after onboard abort failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     process.exitCode = 1;
-    (process.exit as (code?: number) => void)(1);
-    throw new Error("Non-interactive endpoint validation failed.");
+    throw new OnboardDeferredExitError(1, {
+      preserveIncompleteSession: gatewayCleanupComplete,
+    });
   }
 
   function printValidationFailure(
     label: string,
-    probe?: { failures?: unknown[]; message?: unknown },
+    probe?: { failures?: unknown[]; message?: unknown; advisory?: unknown },
+    endpointUrl?: string,
   ): void {
     console.error(`  ${label} endpoint validation failed.`);
+    if (endpointUrl) {
+      console.error(`  Endpoint: ${formatOnboardEndpointDiagnostic(endpointUrl)}`);
+    }
     if (probe) console.error(`  Validation probe summary: ${summarizeProbeForDisplay(probe)}.`);
     console.error("  Validation details were omitted to avoid exposing credentials.");
+    if (!probe) return;
+    // An interactive run reaches transport guidance through the recovery
+    // prompt. A non-interactive run exits at the next statement, so without
+    // this the operator is left with a bare "curl exit 28" and no next step.
+    if (deps.isNonInteractive()) {
+      const recovery = getProbeRecovery(probe as ProbeLike);
+      if (recovery.kind === "transport" && "failure" in recovery) {
+        console.error(getTransportRecoveryMessage(recovery.failure));
+      }
+    }
+    // The probe's curated advisory rides on `message`, which no caller prints
+    // because it can carry provider response bodies. Neither path shows it
+    // today, so print it here for both (#10413).
+    if (typeof probe.advisory === "string" && probe.advisory) {
+      console.error(`  ${probe.advisory}`);
+    }
+  }
+
+  function hasGeminiChatCompletionsHttpFailure(
+    provider: string | undefined,
+    probe: { failures?: unknown[] },
+    status: number,
+  ): boolean {
+    if (provider !== "gemini-api" || !Array.isArray(probe.failures)) return false;
+    return probe.failures.some((failure) => {
+      if (!failure || typeof failure !== "object") return false;
+      const { name, httpStatus } = failure as Record<string, unknown>;
+      return (
+        typeof name === "string" && name.startsWith("Chat Completions API") && httpStatus === status
+      );
+    });
+  }
+
+  function printGeminiRuntimeNotFoundGuidance(
+    provider: string | undefined,
+    probe: { failures?: unknown[] },
+  ): void {
+    if (!hasGeminiChatCompletionsHttpFailure(provider, probe, 404)) return;
+    console.error(
+      "  This 404 came from Google's OpenAI-compatible Chat Completions runtime route, not the native /v1beta/models catalog.",
+    );
+    console.error(
+      "  NemoClaw cannot continue from catalog availability alone because the sandbox uses that Chat Completions route at runtime.",
+    );
+  }
+
+  function printGeminiBadRequestGuidance(
+    provider: string | undefined,
+    selectedModel: string,
+    providerDefaultModel: string | undefined,
+    credentialEnv: string | null,
+    probe: { failures?: unknown[] },
+  ): void {
+    if (!hasGeminiChatCompletionsHttpFailure(provider, probe, 400)) return;
+
+    const recovery = getProbeRecovery(probe as ProbeLike, { allowModelRetry: true });
+    if (recovery.kind === "credential") {
+      const credentialName = /^[A-Z][A-Z0-9_]*$/.test(credentialEnv ?? "")
+        ? `\`${credentialEnv}\``
+        : "the selected Gemini credential";
+      console.error(
+        `  Google rejected the Gemini credential. Verify or rotate ${credentialName}, then rerun the original onboarding command.`,
+      );
+      return;
+    }
+    const defaultModel = String(providerDefaultModel ?? "").trim();
+    if (defaultModel && selectedModel !== defaultModel) {
+      console.error(
+        `  Google rejected the configured model or Chat Completions request. Retry the original command with \`NEMOCLAW_MODEL=${defaultModel}\`.`,
+      );
+    } else if (defaultModel) {
+      console.error(
+        "  Google rejected the configured model or Chat Completions request. The selected model is already the configured Gemini default.",
+      );
+    } else {
+      console.error("  Google rejected the configured model or Chat Completions request.");
+    }
+    console.error(
+      "  Verify that the selected model has OpenAI-compatible function-calling access for this API key in Google AI Studio before retrying.",
+    );
   }
 
   // DNS-backed SSRF preflight for user-supplied custom endpoints. Resolves the
@@ -165,6 +299,7 @@ export function createInferenceSelectionValidationHelpers(
     endpointUrl: string,
     credentialEnv: string | null,
     helpUrl: string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<
     | { blocked: EndpointValidationResult }
     | {
@@ -186,7 +321,7 @@ export function createInferenceSelectionValidationHelpers(
       if (preflight.trustedPrivateEndpoint) {
         console.warn(
           "  ⚠ Using an operator-trusted private inference endpoint; keep " +
-            "NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS restricted to infrastructure you control.",
+            "trusted-private host configuration restricted to infrastructure you control.",
         );
       }
       return {
@@ -220,15 +355,16 @@ export function createInferenceSelectionValidationHelpers(
         },
       ],
     };
-    printValidationFailure(label, syntheticProbe);
+    printValidationFailure(label, syntheticProbe, endpointUrl);
     if (deps.isNonInteractive()) {
-      exitNonInteractiveValidationFailure();
+      await exitNonInteractiveValidationFailure();
     }
     const retry = await deps.promptValidationRecovery(
       label,
       getProbeRecovery(syntheticProbe),
       credentialEnv,
       helpUrl,
+      revalidateSandboxIdentity,
     );
     if (retry === "selection") {
       console.log("  Please choose a provider/model again.");
@@ -244,33 +380,40 @@ export function createInferenceSelectionValidationHelpers(
     credentialEnv: string | null = null,
     retryMessage = "Please choose a provider/model again.",
     helpUrl: string | null = null,
-    options: {
-      authMode?: "bearer" | "query-param";
-      extraHeaders?: readonly string[];
-      requireResponsesToolCalling?: boolean;
-      requireChatCompletionsToolCalling?: boolean;
-      skipResponsesProbe?: boolean;
-      probeStreaming?: boolean;
-      allowHostDockerInternal?: boolean;
-      capabilityCache?: OnboardInferenceCapabilityCache;
-    } = {},
+    options: OpenAiSelectionValidationOptions = {},
   ): Promise<EndpointValidationResult> {
-    const apiKey = credentialEnv ? resolveCredential(credentialEnv) : "";
+    const { apiKey: explicitApiKey, provider, ...probeOptions } = options;
+    const apiKey =
+      explicitApiKey !== undefined
+        ? explicitApiKey
+        : credentialEnv
+          ? resolveCredential(credentialEnv)
+          : "";
     const probe = await runOpenAiLikeProbe(endpointUrl, model, apiKey, {
-      ...options,
+      ...probeOptions,
       calibrateTimeouts: true,
+      ...(provider ? { provider } : {}),
     });
     if (!probe.ok) {
-      options.capabilityCache?.invalidate();
+      probeOptions.capabilityCache?.invalidate();
       printValidationFailure(label, probe);
+      printGeminiRuntimeNotFoundGuidance(provider, probe);
+      printGeminiBadRequestGuidance(
+        provider,
+        model,
+        probeOptions.providerDefaultModel,
+        credentialEnv,
+        probe,
+      );
       if (deps.isNonInteractive()) {
-        exitNonInteractiveValidationFailure();
+        await exitNonInteractiveValidationFailure();
       }
       const retry = await deps.promptValidationRecovery(
         label,
         getProbeRecovery(probe),
         credentialEnv,
         helpUrl,
+        options.revalidateSandboxIdentity,
       );
       if (retry === "selection") {
         console.log(`  ${retryMessage}`);
@@ -278,6 +421,7 @@ export function createInferenceSelectionValidationHelpers(
       }
       return { ok: false, retry };
     }
+    options.revalidateSandboxIdentity?.("report validated inference endpoint");
     if (probe.note) {
       console.log(`  ℹ ${probe.note}`);
     } else {
@@ -285,12 +429,14 @@ export function createInferenceSelectionValidationHelpers(
     }
     const api = probe.api ?? "openai-completions";
     if (api === "openai-completions" && probe.validated !== false) {
-      options.capabilityCache?.rememberCompletedOpenAiChat({
+      probeOptions.capabilityCache?.rememberCompletedOpenAiChat({
         endpointUrl,
         model,
-        authMode: options.authMode,
-        requireChatCompletionsToolCalling: options.requireChatCompletionsToolCalling,
-        extraHeaders: options.extraHeaders,
+        authMode: probeOptions.authMode,
+        requireChatCompletionsToolCalling: probeOptions.requireChatCompletionsToolCalling,
+        extraHeaders: probeOptions.extraHeaders,
+        pinnedAddresses: probeOptions.pinnedAddresses,
+        trustedPrivateCapability: probeOptions.trustedPrivateCapability,
       });
     }
     return { ok: true, api };
@@ -303,19 +449,21 @@ export function createInferenceSelectionValidationHelpers(
     credentialEnv: string,
     retryMessage = "Please choose a provider/model again.",
     helpUrl: string | null = null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<EndpointValidationResult> {
     const apiKey = resolveCredential(credentialEnv);
     const probe = runAnthropicProbe(endpointUrl, model, apiKey);
     if (!probe.ok) {
       printValidationFailure(label, probe);
       if (deps.isNonInteractive()) {
-        exitNonInteractiveValidationFailure();
+        await exitNonInteractiveValidationFailure();
       }
       const retry = await deps.promptValidationRecovery(
         label,
         getProbeRecovery(probe),
         credentialEnv,
         helpUrl,
+        revalidateSandboxIdentity,
       );
       if (retry === "selection") {
         console.log(`  ${retryMessage}`);
@@ -323,6 +471,7 @@ export function createInferenceSelectionValidationHelpers(
       }
       return { ok: false, retry };
     }
+    revalidateSandboxIdentity?.("report validated inference endpoint");
     console.log(`  ${probe.label} available — ${deps.agentProductName()} will use ${probe.api}.`);
     return { ok: true, api: probe.api };
   }
@@ -333,12 +482,15 @@ export function createInferenceSelectionValidationHelpers(
     model: string,
     credentialEnv: string,
     helpUrl: string | null = null,
+    capabilityCache?: OnboardInferenceCapabilityCache,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ): Promise<EndpointValidationResult> {
     const preflight = await preflightCustomEndpointOrFail(
       label,
       endpointUrl,
       credentialEnv,
       helpUrl,
+      revalidateSandboxIdentity,
     );
     if ("blocked" in preflight) return preflight.blocked;
     const { pinnedAddresses, trustedPrivateCapability } = preflight;
@@ -355,6 +507,7 @@ export function createInferenceSelectionValidationHelpers(
       trustedPrivateCapability,
     });
     if (probe.ok) {
+      revalidateSandboxIdentity?.("report validated inference endpoint");
       if (probe.note) {
         console.log(`  ℹ ${probe.note}`);
       } else {
@@ -362,22 +515,32 @@ export function createInferenceSelectionValidationHelpers(
           `  ${probe.label} available — ${deps.agentProductName()} will use ${probe.api}.`,
         );
       }
+      const api = probe.api ?? "openai-completions";
+      if (api === "openai-completions" && probe.validated !== false) {
+        capabilityCache?.rememberCompletedOpenAiChat({
+          endpointUrl,
+          model,
+          pinnedAddresses,
+          trustedPrivateCapability,
+        });
+      }
       return {
         ok: true,
-        api: probe.api ?? "openai-completions",
+        api,
         pinnedAddresses,
         ...(trustedPrivateCapability ? { trustedPrivateCapability } : {}),
       };
     }
-    printValidationFailure(label, probe);
+    printValidationFailure(label, probe, endpointUrl);
     if (deps.isNonInteractive()) {
-      exitNonInteractiveValidationFailure();
+      await exitNonInteractiveValidationFailure();
     }
     const retry = await deps.promptValidationRecovery(
       label,
       getProbeRecovery(probe, { allowModelRetry: true }),
       credentialEnv,
       helpUrl,
+      revalidateSandboxIdentity,
     );
     if (retry === "selection") {
       console.log("  Please choose a provider/model again.");
@@ -394,6 +557,7 @@ export function createInferenceSelectionValidationHelpers(
     helpUrl: string | null = null,
     options: {
       intendedApi?: "anthropic-messages" | "openai-completions";
+      revalidateSandboxIdentity?: (operation: string) => void;
     } = {},
   ): Promise<EndpointValidationResult> {
     const preflight = await preflightCustomEndpointOrFail(
@@ -401,6 +565,7 @@ export function createInferenceSelectionValidationHelpers(
       endpointUrl,
       credentialEnv,
       helpUrl,
+      options.revalidateSandboxIdentity,
     );
     if ("blocked" in preflight) return preflight.blocked;
     const { pinnedAddresses, trustedPrivateCapability } = preflight;
@@ -410,7 +575,8 @@ export function createInferenceSelectionValidationHelpers(
     // Validate the protocol surface that the selected agent will actually use.
     // Hermes routes custom Anthropic providers through the managed OpenAI
     // frontend, while native Anthropic consumers require strict SSE validation
-    // for duplicate/missing/out-of-order events (#6289).
+    // for duplicate/missing/out-of-order events (#6289) and a native tool_use
+    // result rather than JSON-shaped assistant text (#7967).
     const probe =
       intendedApi === "openai-completions"
         ? await runOpenAiLikeProbe(
@@ -428,10 +594,12 @@ export function createInferenceSelectionValidationHelpers(
             // Reasoning-only compatible endpoints often reject streaming probes,
             // so mirror the custom OpenAI-compatible path and skip streaming.
             probeStreaming: !reasoningEnabled,
+            requireStreamingToolCalling: !reasoningEnabled,
             pinnedAddresses,
             trustedPrivateCapability,
           });
     if (probe.ok) {
+      options.revalidateSandboxIdentity?.("report validated inference endpoint");
       if (probe.note) {
         console.log(`  ℹ ${probe.note}`);
       } else {
@@ -446,15 +614,21 @@ export function createInferenceSelectionValidationHelpers(
         ...(trustedPrivateCapability ? { trustedPrivateCapability } : {}),
       };
     }
-    printValidationFailure(label, probe);
+    printValidationFailure(label, probe, endpointUrl);
     const recovery = getProbeRecovery(probe, { allowModelRetry: true });
     if (intendedApi === "openai-completions" && recovery.kind === "endpoint") {
       printOpenAiSurfaceGuidance();
     }
     if (deps.isNonInteractive()) {
-      exitNonInteractiveValidationFailure();
+      await exitNonInteractiveValidationFailure();
     }
-    const retry = await deps.promptValidationRecovery(label, recovery, credentialEnv, helpUrl);
+    const retry = await deps.promptValidationRecovery(
+      label,
+      recovery,
+      credentialEnv,
+      helpUrl,
+      options.revalidateSandboxIdentity,
+    );
     if (retry === "selection") {
       console.log("  Please choose a provider/model again.");
       console.log("");

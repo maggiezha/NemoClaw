@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { resolveOpenshell } from "./adapters/openshell/resolve";
+import { createCliOpenShellSandboxObserver } from "./adapters/openshell/sandbox-observer-cli";
+import { namedOpenShellGateway } from "./adapters/openshell/sandbox-observer";
 import { captureOpenshell } from "./adapters/openshell/runtime";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
 import { GATEWAY_PORT } from "./core/ports";
@@ -16,8 +18,8 @@ import {
 import { withGatewayRouteMutationLock } from "./inference/gateway-route-mutation-lock";
 import { resolveGatewayName, resolveSandboxGatewayName } from "./onboard/gateway-binding";
 import { validateName } from "./runner";
-import { parseLiveSandboxEntries } from "./runtime-recovery";
 import * as onboardSession from "./state/onboard-session";
+import { withCurrentPortableHostFenceTry } from "./state/portable-uninstall-retirement";
 import type { SandboxEntry } from "./state/registry";
 import * as registry from "./state/registry";
 import { getSandboxEntryInference } from "./state/registry-entry-view";
@@ -37,13 +39,21 @@ export type RecoveredSandboxEntry = SandboxEntry & {
 
 type Session = ReturnType<typeof onboardSession.loadSession>;
 
+/** Route a metadata-only destroy retry using recovery retained in the selected state root. */
+export function hasIdentityFreeRetainedRecovery(sandboxName: string): boolean {
+  return onboardSession
+    .listRetainedSandboxRecoveryRecords()
+    .some(
+      (record) => record.sandboxName === sandboxName && record.sandboxIdentityFingerprint === null,
+    );
+}
+
 type RecoveredSandboxMetadata = Partial<
   Pick<
     SandboxEntry,
     | "model"
     | "provider"
     | "gpuEnabled"
-    | "policies"
     | "nimContainer"
     | "agent"
     | "observabilityEnabled"
@@ -51,9 +61,7 @@ type RecoveredSandboxMetadata = Partial<
     | "credentialEnv"
     | "preferredInferenceApi"
   >
-> & {
-  policyPresets?: string[] | null;
-};
+>;
 
 /**
  * Build a minimal-safe registry entry for a recovered sandbox from whatever
@@ -69,11 +77,6 @@ function buildRecoveredSandboxEntry(
     model: metadata.model || null,
     provider: metadata.provider || null,
     gpuEnabled: metadata.gpuEnabled === true,
-    policies: Array.isArray(metadata.policies)
-      ? metadata.policies
-      : Array.isArray(metadata.policyPresets)
-        ? metadata.policyPresets
-        : [],
     nimContainer: metadata.nimContainer || null,
     endpointUrl: metadata.endpointUrl ?? null,
     credentialEnv: metadata.credentialEnv ?? null,
@@ -227,7 +230,6 @@ function seedRecoveryMetadata(
       model: session.model || null,
       provider: session.provider || null,
       nimContainer: session.nimContainer || null,
-      policyPresets: session.policyPresets || null,
       agent: session.agent || null,
       endpointUrl: session.endpointUrl ?? null,
       credentialEnv: session.credentialEnv ?? null,
@@ -260,7 +262,7 @@ function seedRecoveryMetadata(
  * only when OpenShell is connected to a NemoClaw-managed gateway (the bare
  * `nemoclaw` or a per-port `nemoclaw-<port>`), never a foreign gateway.
  */
-function canInspectLiveGatewayReadOnly(): boolean {
+async function canInspectLiveGatewayReadOnly(): Promise<boolean> {
   // #5714: unseeded `nemoclaw list` recovery must never mutate gateway state
   // (no select/start). Require `healthy_named` — the active gateway IS the
   // NemoClaw gateway this process resolves/targets. We deliberately do NOT
@@ -272,7 +274,7 @@ function canInspectLiveGatewayReadOnly(): boolean {
   // and never advertises a sandbox the next command cannot act on. Probes are
   // non-fatal so a hung gateway falls back to the empty registry instead of
   // exiting the process.
-  const lifecycle = getNamedGatewayLifecycleState(undefined, { ignoreProbeErrors: true });
+  const lifecycle = await getNamedGatewayLifecycleState();
   return lifecycle.state === "healthy_named";
 }
 
@@ -317,7 +319,7 @@ async function recoverRegistryFromLiveGateway(
     return { recoveredFromGateway: 0, ephemeralSandboxes: [] };
   }
   const canInspectLiveGateway = readOnly
-    ? canInspectLiveGatewayReadOnly()
+    ? await canInspectLiveGatewayReadOnly()
     : await canInspectLiveGatewayViaRecovery();
   if (!canInspectLiveGateway) {
     return { recoveredFromGateway: 0, ephemeralSandboxes: [] };
@@ -325,18 +327,28 @@ async function recoverRegistryFromLiveGateway(
 
   let recoveredFromGateway = 0;
   const ephemeralSandboxes: RecoveredSandboxEntry[] = [];
-  const liveList = captureOpenshell(["sandbox", "list"], {
-    ignoreError: true,
-    timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+  // Scope the live-sandbox list to the gateway this recovery targets. An
+  // unscoped `sandbox list` returns every sandbox on the host. On a host
+  // running two NemoClaw gateways, recovery therefore registered the sibling
+  // gateway's sandboxes under this gateway, and every later sandbox-scoped
+  // status and exec command resolved that binding and reported the sandbox as
+  // Provisioning or absent from the live gateway (#7105). `-g` targets the
+  // named gateway without selecting it, matching the readiness poll in
+  // `connect` and `captureNamedGatewaySandboxListReadOnly`.
+  const liveList = await createCliOpenShellSandboxObserver({
+    capture: captureOpenshell,
+    defaultTimeoutMs: OPENSHELL_PROBE_TIMEOUT_MS,
+  }).listSandboxes({
+    target: namedOpenShellGateway(gatewayName),
+    timeoutMs: OPENSHELL_PROBE_TIMEOUT_MS,
   });
   // Only trust the output of a clean `sandbox list`. On a non-zero/failed probe
-  // (timeout, transport error) OpenShell may print free-form text whose first
-  // token parseLiveSandboxEntries would otherwise mistake for a sandbox name.
-  if (liveList.status !== 0) {
+  // (timeout, transport error) the typed observer returns an error instead of
+  // treating command diagnostics as sandbox rows.
+  if (!liveList.ok) {
     return { recoveredFromGateway: 0, ephemeralSandboxes: [] };
   }
-  const liveEntries = parseLiveSandboxEntries(liveList.output);
-  for (const { name, phase } of liveEntries) {
+  for (const { name, phase } of liveList.value.sandboxes) {
     const metadata = metadataByName.get(name) || undefined;
     if (readOnly) {
       // Unseeded recovery: surface the live sandbox for THIS `list` only and do
@@ -461,21 +473,23 @@ export async function recoverRegistryEntries({
   if (!hasRecoverySeed) {
     return recoverRegistryEntriesFromSnapshot(current, session, requestedSandboxName, gatewayName);
   }
-  return withGatewayRouteMutationLock(gatewayName, async () => {
-    const lockedCurrent = registry.listSandboxes();
-    const lockedSession = onboardSession.loadSession();
-    const lockedCheck = shouldRecoverRegistryEntries(
-      lockedCurrent,
-      lockedSession,
-      requestedSandboxName,
-    );
-    return lockedCheck.shouldRecover
-      ? recoverRegistryEntriesFromSnapshot(
-          lockedCurrent,
-          lockedSession,
-          requestedSandboxName,
-          gatewayName,
-        )
-      : { ...lockedCurrent, recoveredFromSession: false, recoveredFromGateway: 0 };
-  });
+  return withCurrentPortableHostFenceTry(() =>
+    withGatewayRouteMutationLock(gatewayName, async () => {
+      const lockedCurrent = registry.listSandboxes();
+      const lockedSession = onboardSession.loadSession();
+      const lockedCheck = shouldRecoverRegistryEntries(
+        lockedCurrent,
+        lockedSession,
+        requestedSandboxName,
+      );
+      return lockedCheck.shouldRecover
+        ? recoverRegistryEntriesFromSnapshot(
+            lockedCurrent,
+            lockedSession,
+            requestedSandboxName,
+            gatewayName,
+          )
+        : { ...lockedCurrent, recoveredFromSession: false, recoveredFromGateway: 0 };
+    }),
+  );
 }

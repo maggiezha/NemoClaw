@@ -6,7 +6,10 @@ import { createPrivateKey, createPublicKey, type KeyObject, X509Certificate } fr
 import fs from "node:fs";
 import path from "node:path";
 
-// See docs/security/openshell-0.0.72-compatibility-review.mdx for the source-of-truth review.
+import { isPortableExperimentalProfile, PORTABLE_HOST_GATEWAY_IP } from "./docker-driver-platform";
+import { resolveConfiguredRuntimeProvider } from "./runtime-provider/selection";
+
+// See docs/security/gateway-authentication-controls.mdx for the public compatibility boundary.
 export const DOCKER_DRIVER_GATEWAY_LOCAL_TLS_DIR_NAME = "tls";
 
 const REQUIRED_SERVER_DNS_SANS = ["host.openshell.internal", "localhost"];
@@ -25,6 +28,7 @@ export type DockerDriverGatewayLocalTlsBundle = {
 export interface EnsureDockerDriverGatewayLocalTlsBundleOptions {
   env?: NodeJS.ProcessEnv;
   gatewayBin: string;
+  platform?: NodeJS.Platform;
   spawnSyncImpl?: typeof spawnSync;
   stateDir: string;
 }
@@ -47,7 +51,10 @@ export function getDockerDriverGatewayLocalTlsBundle(
   };
 }
 
-export function dockerDriverGatewayLocalTlsBundleIsComplete(stateDir: string): boolean {
+export function dockerDriverGatewayLocalTlsBundleIsComplete(
+  stateDir: string,
+  requiredServerIpSans: readonly string[] = REQUIRED_SERVER_IP_SANS,
+): boolean {
   const bundle = getDockerDriverGatewayLocalTlsBundle(stateDir);
   const expectedFiles = [
     bundle.caPath,
@@ -74,8 +81,42 @@ export function dockerDriverGatewayLocalTlsBundleIsComplete(stateDir: string): b
     certificateMatchesPrivateKey(clientCert, clientKey) &&
     certificateVerifiesAgainstCa(serverCert, ca) &&
     certificateVerifiesAgainstCa(clientCert, ca) &&
-    certificateHasRequiredServerSubjectAltNames(serverCert)
+    certificateHasRequiredServerSubjectAltNames(serverCert, requiredServerIpSans)
   );
+}
+
+/** Return only a complete, cryptographically valid client TLS authority rooted in this state. */
+export function resolveCompleteDockerDriverGatewayLocalTlsDir(
+  stateDir: string,
+): string | undefined {
+  return dockerDriverGatewayLocalTlsBundleIsComplete(stateDir)
+    ? getDockerDriverGatewayLocalTlsDir(stateDir)
+    : undefined;
+}
+
+/** Return whether persisted gateway state declares or contains local TLS authority. */
+export function dockerDriverGatewayLocalTlsAuthorityIsConfigured(stateDir: string): boolean {
+  const bundle = getDockerDriverGatewayLocalTlsBundle(stateDir);
+  if (
+    [
+      bundle.caPath,
+      bundle.serverCertPath,
+      bundle.serverKeyPath,
+      bundle.clientCertPath,
+      bundle.clientKeyPath,
+    ].some((filePath) => fs.existsSync(filePath))
+  ) {
+    return true;
+  }
+  try {
+    const config = fs.readFileSync(path.join(stateDir, "openshell-gateway.toml"), "utf-8");
+    return (
+      config.includes("[openshell.gateway.mtls_auth]") ||
+      config.includes("require_client_auth = true")
+    );
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
 }
 
 export function buildDockerDriverGatewayLocalTlsEnv(stateDir: string): Record<string, string> {
@@ -156,7 +197,10 @@ function certificateVerifiesAgainstCa(certificate: X509Certificate, ca: X509Cert
   }
 }
 
-function certificateHasRequiredServerSubjectAltNames(certificate: X509Certificate): boolean {
+function certificateHasRequiredServerSubjectAltNames(
+  certificate: X509Certificate,
+  requiredServerIpSans: readonly string[],
+): boolean {
   const subjectAltNames = new Set(
     (certificate.subjectAltName ?? "")
       .split(",")
@@ -165,7 +209,7 @@ function certificateHasRequiredServerSubjectAltNames(certificate: X509Certificat
   );
   return (
     REQUIRED_SERVER_DNS_SANS.every((dnsName) => subjectAltNames.has(`dns:${dnsName}`)) &&
-    REQUIRED_SERVER_IP_SANS.every(
+    requiredServerIpSans.every(
       (ipAddress) =>
         subjectAltNames.has(`ip address:${ipAddress}`) || subjectAltNames.has(`ip:${ipAddress}`),
     )
@@ -182,13 +226,28 @@ function normalizeDockerDriverGatewayLocalTlsBundlePermissions(
 export function ensureDockerDriverGatewayLocalTlsBundle({
   env = process.env,
   gatewayBin,
+  platform = process.platform,
   spawnSyncImpl = spawnSync,
   stateDir,
 }: EnsureDockerDriverGatewayLocalTlsBundleOptions): DockerDriverGatewayLocalTlsBundle {
   const bundle = getDockerDriverGatewayLocalTlsBundle(stateDir);
+  const portable = isPortableExperimentalProfile(env);
+  const requiredProviderIpSans = portable
+    ? [PORTABLE_HOST_GATEWAY_IP]
+    : (() => {
+        const provider = resolveConfiguredRuntimeProvider(platform, process.arch, env);
+        if (!provider.gateway.supported) {
+          throw new Error("The selected runtime provider does not support a host-managed gateway.");
+        }
+        return provider.gateway.observeHostRuntime({
+          environment: env,
+          platform,
+        }).requiredServerIpSans;
+      })();
+  const requiredServerIpSans = [...REQUIRED_SERVER_IP_SANS, ...requiredProviderIpSans];
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(stateDir, 0o700);
-  if (dockerDriverGatewayLocalTlsBundleIsComplete(stateDir)) {
+  if (dockerDriverGatewayLocalTlsBundleIsComplete(stateDir, requiredServerIpSans)) {
     normalizeDockerDriverGatewayLocalTlsBundlePermissions(bundle);
     return bundle;
   }
@@ -205,6 +264,7 @@ export function ensureDockerDriverGatewayLocalTlsBundle({
       "localhost",
       "--server-san",
       "127.0.0.1",
+      ...requiredProviderIpSans.flatMap((ipAddress) => ["--server-san", ipAddress]),
     ],
     {
       encoding: "utf-8",
@@ -229,7 +289,7 @@ export function ensureDockerDriverGatewayLocalTlsBundle({
     const detail = sanitizeDockerDriverGatewayLocalTlsErrorDetail(rawDetail, bundle, stateDir);
     throw new Error(`OpenShell gateway certificate generation failed: ${detail}`);
   }
-  if (!dockerDriverGatewayLocalTlsBundleIsComplete(stateDir)) {
+  if (!dockerDriverGatewayLocalTlsBundleIsComplete(stateDir, requiredServerIpSans)) {
     const detail = sanitizeDockerDriverGatewayLocalTlsErrorDetail(
       `incomplete mTLS bundle in ${bundle.localTlsDir}`,
       bundle,

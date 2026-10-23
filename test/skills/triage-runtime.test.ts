@@ -14,18 +14,13 @@ interface TriageFixture {
   approvedOnly?: boolean;
 }
 
-const requiredChecks = [
-  "checks",
-  "check-hash",
-  "changes",
-  "commit-lint",
-  "dco-check",
-  "E2E / PR Gate",
-].map((name) => ({
-  name,
-  status: "COMPLETED",
-  conclusion: "SUCCESS",
-}));
+const requiredChecks = ["checks", "check-hash", "changes", "commit-lint", "dco-check"].map(
+  (name) => ({
+    name,
+    status: "COMPLETED",
+    conclusion: "SUCCESS",
+  }),
+);
 
 const pullRequests = [
   {
@@ -123,7 +118,6 @@ if (args[0] === "api" && args[1] === "--paginate" && args[2]?.startsWith("repos/
   fs.chmodSync(ghPath, 0o755);
 
   const args = [
-    "--experimental-strip-types",
     "--no-warnings",
     ".agents/skills/nemoclaw-maintainer-day/scripts/triage.ts",
     "--limit",
@@ -135,7 +129,11 @@ if (args[0] === "api" && args[1] === "--paginate" && args[2]?.startsWith("repos/
     return spawnSync(process.execPath, args, {
       cwd: process.cwd(),
       encoding: "utf-8",
-      env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+      env: {
+        ...process.env,
+        NODE_OPTIONS: "",
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
     });
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -143,6 +141,21 @@ if (args[0] === "api" && args[1] === "--paginate" && args[2]?.startsWith("repos/
 }
 
 describe("maintainer triage runtime behavior", () => {
+  it("treats the five current required checks as green without the retired E2E context", () => {
+    const result = runTriage({
+      projectOutput: "",
+      reviewDecisions: { 101: "APPROVED", 102: "REVIEW_REQUIRED", 103: "REVIEW_REQUIRED" },
+      approvedOnly: true,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const output = JSON.parse(result.stdout);
+    expect(output.queue).toEqual([
+      expect.objectContaining({ number: 101, bucket: "merge-now", reasons: [] }),
+    ]);
+    expect(result.stderr).toContain("Classified: 1 merge-now");
+  });
+
   it("maps live Project Priority into scoring and ignores legacy priority labels", () => {
     const result = runTriage({
       projectOutput: [
@@ -155,7 +168,7 @@ describe("maintainer triage runtime behavior", () => {
         .join("\n"),
     });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     const output = JSON.parse(result.stdout);
     expect(output.queue.map((item: { number: number }) => item.number)).toEqual([101, 102, 103]);
     expect(output.queue).toEqual(
@@ -174,7 +187,7 @@ describe("maintainer triage runtime behavior", () => {
       approvedOnly: true,
     });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     const output = JSON.parse(result.stdout);
     expect(output.scanned).toBe(3);
     expect(output.queue.map((item: { number: number }) => item.number)).toEqual([101]);
@@ -184,7 +197,7 @@ describe("maintainer triage runtime behavior", () => {
   it("reports malformed Project data and continues without priority boosts", () => {
     const result = runTriage({ projectOutput: "not-json" });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toContain(
       "Could not parse Project 199 item data; continuing without priority boosts.",
     );

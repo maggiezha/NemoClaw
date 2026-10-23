@@ -1,24 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-const MAX_PROVIDER_OUTPUT_BYTES = 16 * 1024;
-const MAX_PROVIDER_NAME_LENGTH = 128;
-const MAX_PROVIDER_TYPE_LENGTH = 64;
-const MAX_PROVIDER_KEYS = 32;
-const MAX_PROVIDER_KEY_LENGTH = 128;
-const SAFE_PROVIDER_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
-const SAFE_PROVIDER_KEY = /^[A-Z_][A-Z0-9_]*$/;
-const ANSI_OSC_PATTERN = /\x1B\][\s\S]*?(?:\x07|\x1B\\|$)/gu;
-const ANSI_CSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/gu;
-const LEADING_FIELD_LABEL_RESET_PATTERN = /^(?:\x1B\[0m)*[ \t]*/u;
-const UNSAFE_FIELD_VALUE_CONTROL_PATTERN = /[\x00-\x08\x0A-\x1F\x7F-\x9F]/u;
+import { reportsExactProviderNotFound } from "../adapters/openshell/provider-diagnostic-cli";
+import type { OpenShellProviderMetadata } from "../adapters/openshell/provider-adapter";
+import {
+  isValidCliOpenShellProviderIdentifier,
+  parseCliOpenShellProviderMetadata,
+} from "../adapters/openshell/provider-metadata-cli";
 
-export type GatewayProviderMetadata = {
-  name: string;
-  type: string;
-  credentialKeys: string[];
-  configKeys: string[];
-};
+const PROVIDER_PROBE_DIAGNOSTIC_LIMIT = 64 * 1024;
+const PROVIDER_PROBE_TIMEOUT_MS = 5_000;
+
+export type GatewayProviderMetadata = Omit<OpenShellProviderMetadata, "revision">;
+
+// #9813 owns the remaining raw CLI consumers of these compatibility exports.
+// New consumers must use OpenShellProviderAdapter typed results.
+export function parseGatewayProviderMetadata(output: string): GatewayProviderMetadata | null {
+  const metadata = parseCliOpenShellProviderMetadata(output);
+  if (!metadata) return null;
+  const { revision: _revision, ...legacyMetadata } = metadata;
+  return legacyMetadata;
+}
 
 export type GatewayProviderBinding = {
   name: string;
@@ -33,6 +35,8 @@ export type GatewayCredentialOnlyProviderBinding = {
   credentialKey: string;
 };
 
+export type GatewayCredentialFamilyProviderBinding = GatewayCredentialOnlyProviderBinding;
+
 /** Match the complete non-secret provider identity used for route decisions. */
 export function matchesGatewayProviderBinding(
   metadata: GatewayProviderMetadata | null,
@@ -40,12 +44,12 @@ export function matchesGatewayProviderBinding(
 ): boolean {
   return Boolean(
     metadata &&
-      metadata.name === expected.name &&
-      metadata.type === expected.type &&
-      metadata.credentialKeys.length === 1 &&
-      metadata.credentialKeys[0] === expected.credentialKey &&
-      metadata.configKeys.length === 1 &&
-      metadata.configKeys[0] === expected.configKey,
+    metadata.name === expected.name &&
+    metadata.type === expected.type &&
+    metadata.credentialKeys.length === 1 &&
+    metadata.credentialKeys[0] === expected.credentialKey &&
+    metadata.configKeys.length === 1 &&
+    metadata.configKeys[0] === expected.configKey,
   );
 }
 
@@ -56,118 +60,116 @@ export function matchesGatewayCredentialOnlyProviderBinding(
 ): boolean {
   return Boolean(
     metadata &&
-      metadata.name === expected.name &&
-      metadata.type === expected.type &&
-      metadata.credentialKeys.length === 1 &&
-      metadata.credentialKeys[0] === expected.credentialKey &&
-      metadata.configKeys.length === 0,
+    metadata.name === expected.name &&
+    metadata.type === expected.type &&
+    metadata.credentialKeys.length === 1 &&
+    metadata.credentialKeys[0] === expected.credentialKey &&
+    metadata.configKeys.length === 0,
+  );
+}
+
+/** Match a canonical credential plus credentials in its namespaced family. */
+export function matchesGatewayCredentialFamilyProviderBinding(
+  metadata: GatewayProviderMetadata | null,
+  expected: GatewayCredentialFamilyProviderBinding,
+): boolean {
+  return Boolean(
+    metadata &&
+    metadata.name === expected.name &&
+    metadata.type === expected.type &&
+    metadata.configKeys.length === 0 &&
+    metadata.credentialKeys.includes(expected.credentialKey) &&
+    metadata.credentialKeys.every(
+      (key) => key === expected.credentialKey || key.startsWith(`${expected.credentialKey}_`),
+    ),
   );
 }
 
 type GatewayProviderCommandResult = {
-  status: number | null;
-  stdout?: string | Buffer | null;
-  stderr?: string | Buffer | null;
+  status?: number | null;
+  stdout?: unknown;
+  stderr?: unknown;
+  output?: unknown;
+  error?: unknown;
+  signal?: unknown;
 };
 
 type GatewayProviderRunner = (
   args: string[],
   options: {
     ignoreError: true;
+    maxBuffer?: number;
     suppressOutput: true;
     stdio: ["ignore", "pipe", "pipe"];
+    timeout?: number;
   },
 ) => GatewayProviderCommandResult;
 
-type ProviderField = "Name" | "Type" | "Credential keys" | "Config keys";
+export type GatewayCredentialOnlyProviderInspection =
+  | { readonly kind: "collision" }
+  | { readonly kind: "exact" }
+  | { readonly kind: "indeterminate" }
+  | { readonly kind: "missing" };
 
-const PROVIDER_FIELD_PATTERN = /^\s*(Name|Type|Credential keys|Config keys):\s*(.*?)\s*$/i;
-const CANONICAL_PROVIDER_FIELDS = new Map<string, ProviderField>([
-  ["name", "Name"],
-  ["type", "Type"],
-  ["credential keys", "Credential keys"],
-  ["config keys", "Config keys"],
-]);
-
-function isSafeIdentifier(value: string, maxLength: number): boolean {
-  return value.length > 0 && value.length <= maxLength && SAFE_PROVIDER_IDENTIFIER.test(value);
+function commandStreamText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString("utf8");
+  if (Array.isArray(value)) return value.map(commandStreamText).filter(Boolean).join("\n");
+  return "";
 }
 
-function parseProviderKeys(value: string): string[] | null {
-  if (value === "<none>") return [];
-
-  const keys = value.split(",").map((key) => key.trim());
-  if (
-    keys.length === 0 ||
-    keys.length > MAX_PROVIDER_KEYS ||
-    keys.some(
-      (key) =>
-        key.length === 0 || key.length > MAX_PROVIDER_KEY_LENGTH || !SAFE_PROVIDER_KEY.test(key),
-    ) ||
-    new Set(keys).size !== keys.length
-  ) {
-    return null;
-  }
-  return keys;
+function providerCommandOutput(result: GatewayProviderCommandResult): string {
+  const streams = [result.stderr, result.stdout]
+    .map(commandStreamText)
+    .filter((value) => value.length > 0);
+  return streams.length > 0 ? streams.join("\n") : commandStreamText(result.output);
 }
 
-function commandStreamText(value: string | Buffer | null | undefined): string {
-  return Buffer.isBuffer(value) ? value.toString("utf8") : (value ?? "");
-}
-
-function hasUnsafeRawProviderFieldValue(rawLine: string): boolean {
-  const separatorIndex = rawLine.indexOf(":");
-  if (separatorIndex < 0) return true;
-  const rawValue = rawLine.slice(separatorIndex + 1).replace(LEADING_FIELD_LABEL_RESET_PATTERN, "");
-  return UNSAFE_FIELD_VALUE_CONTROL_PATTERN.test(rawValue);
-}
-
-/**
- * Parse the non-secret identity and binding keys emitted by `openshell provider get`.
- * Provider display output is untrusted: it must stay bounded, contain each required
- * field exactly once, and use only the syntax accepted by recovery decisions.
- * Provider-specific binding semantics remain at the authorization boundary in
- * `assessRecoveredProviderCredentialReuse`; this parser deliberately has no
- * selected-provider context and cannot authorize credential reuse by itself.
- */
-export function parseGatewayProviderMetadata(output: string): GatewayProviderMetadata | null {
-  if (Buffer.byteLength(output, "utf8") > MAX_PROVIDER_OUTPUT_BYTES) return null;
-
-  const fields = new Map<ProviderField, string>();
-
-  for (const rawLine of output.split(/\r?\n/u)) {
-    const line = rawLine.replace(ANSI_OSC_PATTERN, "").replace(ANSI_CSI_PATTERN, "");
-    const match = line.match(PROVIDER_FIELD_PATTERN);
-    if (!match) continue;
-    // OpenShell styles field labels, then emits identity values as plain text.
-    // Permit the label's immediate SGR reset, but reject escape/control bytes
-    // once the semantic value begins instead of normalizing an injected value.
-    if (hasUnsafeRawProviderFieldValue(rawLine)) return null;
-    const field = CANONICAL_PROVIDER_FIELDS.get(match[1].toLowerCase());
-    if (!field || fields.has(field)) return null;
-    fields.set(field, match[2].trim());
+function inspectGatewayCredentialBinding(
+  expected: GatewayCredentialOnlyProviderBinding,
+  runOpenshell: GatewayProviderRunner,
+  matches: (
+    metadata: GatewayProviderMetadata | null,
+    expected: GatewayCredentialOnlyProviderBinding,
+  ) => boolean,
+): GatewayCredentialOnlyProviderInspection {
+  let result: GatewayProviderCommandResult;
+  try {
+    result = runOpenshell(["provider", "get", expected.name], {
+      ignoreError: true,
+      maxBuffer: PROVIDER_PROBE_DIAGNOSTIC_LIMIT,
+      suppressOutput: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: PROVIDER_PROBE_TIMEOUT_MS,
+    });
+  } catch {
+    return { kind: "indeterminate" };
   }
 
-  const name = fields.get("Name");
-  const type = fields.get("Type");
-  const credentialKeysValue = fields.get("Credential keys");
-  const configKeysValue = fields.get("Config keys");
-  if (
-    name === undefined ||
-    type === undefined ||
-    credentialKeysValue === undefined ||
-    configKeysValue === undefined ||
-    !isSafeIdentifier(name, MAX_PROVIDER_NAME_LENGTH) ||
-    !isSafeIdentifier(type, MAX_PROVIDER_TYPE_LENGTH)
-  ) {
-    return null;
+  const output = providerCommandOutput(result);
+  if (result.error || result.signal || result.status !== 0) {
+    return !result.error &&
+      !result.signal &&
+      result.status === 1 &&
+      reportsExactProviderNotFound(output, expected.name, PROVIDER_PROBE_DIAGNOSTIC_LIMIT)
+      ? { kind: "missing" }
+      : { kind: "indeterminate" };
   }
 
-  const credentialKeys = parseProviderKeys(credentialKeysValue);
-  const configKeys = parseProviderKeys(configKeysValue);
-  if (!credentialKeys || !configKeys) return null;
+  const metadata = parseGatewayProviderMetadata(output);
+  return matches(metadata, expected) ? { kind: "exact" } : { kind: "collision" };
+}
 
-  return { name, type, credentialKeys, configKeys };
+/** Distinguish a credential family from absence and lookup failure. */
+export function inspectGatewayCredentialFamilyProviderBinding(
+  expected: GatewayCredentialFamilyProviderBinding,
+  runOpenshell: GatewayProviderRunner,
+): GatewayCredentialOnlyProviderInspection {
+  return inspectGatewayCredentialBinding(
+    expected,
+    runOpenshell,
+    matchesGatewayCredentialFamilyProviderBinding,
+  );
 }
 
 /** Read one exact provider identity without reading or exporting credential values. */
@@ -176,7 +178,7 @@ export function readGatewayProviderMetadata(
   runOpenshell: GatewayProviderRunner,
   gatewayName?: string | null,
 ): GatewayProviderMetadata | null {
-  if (!isSafeIdentifier(name, MAX_PROVIDER_NAME_LENGTH)) return null;
+  if (!isValidCliOpenShellProviderIdentifier(name)) return null;
 
   const args = ["provider", "get"];
   if (gatewayName) args.push("-g", gatewayName);

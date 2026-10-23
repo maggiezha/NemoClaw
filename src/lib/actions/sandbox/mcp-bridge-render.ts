@@ -21,17 +21,17 @@ export function renderMcpBridgeList(
   }
   console.log(`  MCP servers for sandbox '${sandboxName}':`);
   for (const status of statuses) {
-    const policy = status.policy.gatewayPresent ? "policy" : "policy?";
+    const policy = status.policy.present ? "policy" : "policy?";
     const provider =
-      status.provider.registryPresent &&
-      status.provider.gatewayPresent &&
+      status.provider.name &&
+      status.provider.present &&
       status.provider.attached === true &&
       status.provider.credentialReady === true
         ? "provider"
         : "provider?";
     const env = status.env.names.length > 0 ? status.env.names.join(", ") : "(none)";
     console.log(
-      `    ${status.server.padEnd(18)} ${policy.padEnd(8)} ${provider.padEnd(10)} env: ${env}${status.addState ? `  add:${status.addState}` : ""}`,
+      `    ${status.server.padEnd(18)} ${policy.padEnd(8)} ${provider.padEnd(10)} env: ${env}`,
     );
   }
   console.log("");
@@ -45,7 +45,7 @@ export function renderMcpBridgeStatus(
   if (statuses.length === 0) {
     console.log("");
     console.log(`  MCP servers for sandbox '${sandboxName}': none`);
-    console.log(`    agent: ${agent.name}`);
+    console.log("    agent: configured");
     console.log(`    support: ${agent.mcpCapability.support}`);
     if (agent.mcpCapability.reason) console.log(`    reason: ${agent.mcpCapability.reason}`);
     console.log("");
@@ -58,10 +58,17 @@ export function renderMcpBridgeStatus(
     console.log(`    support: ${status.support.mode}`);
     if (status.support.reason) console.log(`    reason: ${status.support.reason}`);
     if (status.url) console.log(`    endpoint: ${status.url}`);
-    if (status.addState) console.log(`    add transaction: incomplete (${status.addState})`);
-    console.log(
-      `    provider: ${status.provider.registryPresent ? status.provider.name : "(none)"}`,
-    );
+    if (status.trustedPrivateTarget) {
+      console.log(`    trusted private host: ${status.trustedPrivateTarget.host}`);
+      console.log(`    private address pins: ${status.trustedPrivateTarget.state}`);
+    }
+    if (status.publicTarget) {
+      console.log(`    public host: ${status.publicTarget.host}`);
+      console.log(`    public address pins: ${status.publicTarget.state}`);
+      if (status.publicTarget.detail)
+        console.log(`    public address detail: ${status.publicTarget.detail}`);
+    }
+    console.log(`    provider: ${status.provider.name ?? "(none)"}`);
     console.log(
       `    provider attached: ${status.provider.attached === null ? "unknown" : status.provider.attached ? "yes" : "no"}`,
     );
@@ -70,7 +77,7 @@ export function renderMcpBridgeStatus(
     );
     if (status.provider.detail) console.log(`    provider detail: ${status.provider.detail}`);
     console.log(
-      `    policy: ${status.policy.gatewayPresent === null ? "unknown" : status.policy.gatewayPresent ? "present" : "missing"}`,
+      `    policy: ${status.policy.present === null ? "unknown" : status.policy.present ? "present" : "missing"}`,
     );
     console.log(
       `    adapter: ${status.adapter.registered === null ? "unknown" : status.adapter.registered ? "registered" : "missing"}`,
@@ -89,6 +96,23 @@ export function renderMcpBridgeStatus(
               : `unknown${resolution.detail ? ` (${resolution.detail})` : ""}`
         }`,
       );
+    }
+    const discovery = status.toolDiscovery;
+    if (discovery) {
+      const failureContext = discovery.ok
+        ? ""
+        : ` [${discovery.failureClass ?? "runtime"}, ${discovery.failedStage ?? "runtime"}, runtime exit ${discovery.commandStatus ?? "unavailable"}]`;
+      console.log(
+        `    tool discovery: ${
+          discovery.ok
+            ? "successful"
+            : `FAILED${failureContext}${discovery.detail ? ` (${discovery.detail})` : ""}`
+        }`,
+      );
+      console.log(
+        `    tools discovered: ${discovery.count}${discovery.truncated ? " (partial)" : ""}`,
+      );
+      for (const tool of discovery.tools) console.log(`      - ${tool}`);
     }
     for (const warning of status.warnings) console.log(`    warning: ${warning}`);
   }

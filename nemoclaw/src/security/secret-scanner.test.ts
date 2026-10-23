@@ -11,6 +11,7 @@ const FAKE = {
   openai: "sk-" + "abc123def456ghi789jkl012mno",
   openaiProject: "sk-proj-" + "abc123_def456-ghi789_jkl012-mno345",
   github: "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+  githubFineGrained: "github_pat_" + "ABCDEFGHIJKLMNO_PQRSTUVWXYZabc",
   aws: "AKIA" + "IOSFODNN7EXAMPLE",
   slack: "xoxb-" + "123456789-abcdefghij",
   slackApp: "xapp-" + "1-A0000-12345-abcdef",
@@ -50,6 +51,12 @@ describe("scanForSecrets", () => {
 
     it("detects a GitHub personal access token", () => {
       const matches = scanForSecrets(`token: ${FAKE.github}`);
+      expect(matches).toHaveLength(1);
+      expect(matches[0].pattern).toBe("GitHub token");
+    });
+
+    it("detects an underscore-bearing fine-grained GitHub personal access token", () => {
+      const matches = scanForSecrets(`token: ${FAKE.githubFineGrained}`);
       expect(matches).toHaveLength(1);
       expect(matches[0].pattern).toBe("GitHub token");
     });
@@ -267,6 +274,7 @@ describe("isMemoryPath", () => {
 
   it("does not match unanchored workspace in project paths", () => {
     expect(isMemoryPath("/sandbox/my-project/workspace/readme.md")).toBe(false);
+    expect(isMemoryPath("/sandbox/my-project/workspace-main/readme.md")).toBe(false);
   });
 
   it("matches MEMORY.md even outside the OpenClaw workspace", () => {
@@ -321,6 +329,10 @@ describe("isMemoryPath", () => {
   it("matches named-workspace daily memory paths", () => {
     expect(isMemoryPath("workspace/memory/2026-05-29.md")).toBe(true);
     expect(isMemoryPath("workspace-main/memory/2026-05-29.md")).toBe(true);
+    // The gateway-managed runtime resolves those writes to absolute paths, so
+    // the named workspace must classify the same way the default one does.
+    expect(isMemoryPath("/sandbox/.openclaw/workspace-main/memory/2026-05-29.md")).toBe(true);
+    expect(isMemoryPath("/sandbox/.openclaw/workspace-support/notes.md")).toBe(true);
   });
 
   it("does not match unrelated relative memory subdirectories", () => {

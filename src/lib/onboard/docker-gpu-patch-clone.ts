@@ -7,9 +7,19 @@ import type {
   DockerGpuPatchMode,
   DockerUlimit,
 } from "./docker-gpu-patch-types";
-import { openshellSandboxCommandEnvValue } from "./docker-startup-command-env";
+import {
+  OPENSHELL_MAIN_PROCESS_SPEC_ENV,
+  openshellSandboxCommandEnvValue,
+  replaceOpenShellMainProcessSpecCommand,
+} from "./docker-startup-command-env";
 
 const OPENSHELL_SANDBOX_COMMAND_ENV = "OPENSHELL_SANDBOX_COMMAND";
+const OPENSHELL_SANDBOX_ENTRYPOINT = "/opt/openshell/bin/openshell-sandbox";
+const OPENSHELL_V0_0_99_WORKDIR_COMMAND = ["--workdir", "/sandbox"] as const;
+const OPENSHELL_OCI_IMAGE_USER_ENV = "OPENSHELL_OCI_IMAGE_USER";
+const OPENSHELL_SANDBOX_UID_ENV = "OPENSHELL_SANDBOX_UID";
+const OPENSHELL_SANDBOX_GID_ENV = "OPENSHELL_SANDBOX_GID";
+const NEMOCLAW_STARTUP_EXECUTABLES = new Set(["nemoclaw-start", "/usr/local/bin/nemoclaw-start"]);
 const GPU_ENV_KEYS = new Set([
   "NVIDIA_VISIBLE_DEVICES",
   "NVIDIA_DRIVER_CAPABILITIES",
@@ -69,6 +79,97 @@ function pushStringFlag(args: string[], flag: string, value: unknown): void {
   if (normalized) args.push(flag, normalized);
 }
 
+function managedPortKey(value: string): string {
+  const match = /^(\d{1,5})\/(tcp|udp|sctp)$/u.exec(value);
+  const port = Number(match?.[1]);
+  if (!match || !Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`Managed bootstrap Docker port '${value}' is invalid.`);
+  }
+  return value;
+}
+
+function managedPublishedPort(hostIp: unknown, hostPort: unknown, containerPort: string): string {
+  const ip = String(hostIp ?? "").trim();
+  const published = String(hostPort ?? "").trim();
+  if (!/^\d{1,5}$/u.test(published) || Number(published) < 1 || Number(published) > 65_535) {
+    throw new Error(`Managed bootstrap Docker binding for '${containerPort}' is invalid.`);
+  }
+  if (ip.includes("\0") || /\s/u.test(ip)) {
+    throw new Error(`Managed bootstrap Docker binding for '${containerPort}' is invalid.`);
+  }
+  const address = ip.includes(":") && !ip.startsWith("[") ? `[${ip}]` : ip;
+  return address ? `${address}:${published}:${containerPort}` : `${published}:${containerPort}`;
+}
+
+function pushManagedPortArgs(args: string[], inspect: DockerContainerInspect): void {
+  const exposed = inspect.Config?.ExposedPorts ?? {};
+  const bindings = inspect.HostConfig?.PortBindings ?? {};
+  for (const port of new Set([...Object.keys(exposed), ...Object.keys(bindings)])) {
+    const normalizedPort = managedPortKey(port);
+    args.push("--expose", normalizedPort);
+    const entries = bindings[port];
+    if (entries === null || entries === undefined) continue;
+    if (!Array.isArray(entries)) {
+      throw new Error(`Managed bootstrap Docker bindings for '${port}' are invalid.`);
+    }
+    for (const entry of entries) {
+      args.push("--publish", managedPublishedPort(entry?.HostIp, entry?.HostPort, normalizedPort));
+    }
+  }
+}
+
+function managedDuration(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`Managed bootstrap Docker ${label} is invalid.`);
+  }
+  return `${String(value)}ns`;
+}
+
+function pushManagedHealthcheckArgs(args: string[], inspect: DockerContainerInspect): void {
+  const healthcheck = inspect.Config?.Healthcheck;
+  if (healthcheck === undefined || healthcheck === null) return;
+  const test = healthcheck.Test ?? [];
+  if (!Array.isArray(test) || test.some((entry) => typeof entry !== "string")) {
+    throw new Error("Managed bootstrap Docker healthcheck command is invalid.");
+  }
+  if (test.length === 1 && test[0] === "NONE") {
+    args.push("--no-healthcheck");
+  } else if (test.length === 2 && test[0] === "CMD-SHELL" && test[1]) {
+    args.push("--health-cmd", test[1]);
+  } else {
+    throw new Error("Managed bootstrap Docker healthcheck command cannot be reproduced exactly.");
+  }
+  for (const [flag, value, label] of [
+    ["--health-interval", healthcheck.Interval, "healthcheck interval"],
+    ["--health-timeout", healthcheck.Timeout, "healthcheck timeout"],
+    ["--health-start-period", healthcheck.StartPeriod, "healthcheck start period"],
+    ["--health-start-interval", healthcheck.StartInterval, "healthcheck start interval"],
+  ] as const) {
+    const duration = managedDuration(value, label);
+    if (duration !== null) args.push(flag, duration);
+  }
+  if (healthcheck.Retries !== undefined && healthcheck.Retries !== null) {
+    if (!Number.isSafeInteger(healthcheck.Retries) || healthcheck.Retries < 0) {
+      throw new Error("Managed bootstrap Docker healthcheck retries are invalid.");
+    }
+    args.push("--health-retries", String(healthcheck.Retries));
+  }
+}
+
+function managedNetworkMode(inspect: DockerContainerInspect, configured: unknown): string {
+  const mode = String(configured ?? "").trim();
+  const networks = Object.keys(inspect.NetworkSettings?.Networks ?? {});
+  if (
+    networks.length === 1 &&
+    ["", "bridge", "default", "podman"].includes(mode) &&
+    !["bridge", "default", "podman"].includes(networks[0]!)
+  ) {
+    return networks[0]!;
+  }
+  return mode;
+}
+
 function normalizeRequiredUlimit(ulimit: DockerUlimit): DockerUlimit {
   const name = String(ulimit.name).trim();
   if (!/^[a-z][a-z0-9_]*$/u.test(name)) {
@@ -85,6 +186,13 @@ function normalizeRequiredUlimit(ulimit: DockerUlimit): DockerUlimit {
   return { name, soft: ulimit.soft, hard: ulimit.hard };
 }
 
+export function normalizeDockerUlimitName(name: unknown): string {
+  const normalized = String(name ?? "").trim();
+  return /^RLIMIT_[A-Z][A-Z0-9_]*$/u.test(normalized)
+    ? normalized.slice("RLIMIT_".length).toLowerCase()
+    : normalized;
+}
+
 export function validateRequiredDockerUlimits(
   required: readonly DockerUlimit[] | null | undefined,
 ): void {
@@ -97,7 +205,7 @@ function dockerUlimits(
 ): DockerUlimit[] {
   const merged = new Map<string, DockerUlimit>();
   for (const ulimit of inspect.HostConfig?.Ulimits ?? []) {
-    const name = String(ulimit.Name ?? "").trim();
+    const name = normalizeDockerUlimitName(ulimit.Name);
     const soft = ulimit.Soft;
     const hard = ulimit.Hard;
     if (
@@ -216,6 +324,32 @@ function dockerVolumeMountValue(mount: DockerStructuredMount): string {
   return values.join(",");
 }
 
+function dockerImageMountValue(mount: DockerStructuredMount): string {
+  if (String(mount.Consistency ?? "") !== "") {
+    throw new Error("Docker image mount consistency is not supported during recreation.");
+  }
+  assertUnusedMountOption(mount.BindOptions, "BindOptions for an image mount");
+  assertUnusedMountOption(mount.VolumeOptions, "VolumeOptions for an image mount");
+  assertUnusedMountOption(mount.TmpfsOptions, "TmpfsOptions for an image mount");
+
+  const source = String(mount.Source ?? "").trim();
+  if (!source || /[\0,]/u.test(source)) {
+    throw new Error("Docker image mount source is invalid.");
+  }
+  const target = mountValue(mount.Target, "target");
+  if (!target.startsWith("/")) {
+    throw new Error("Docker structured mount target must be an absolute container path.");
+  }
+  if (!optionalMountBoolean(mount.ReadOnly, "ReadOnly")) {
+    throw new Error("Docker image mounts must remain read-only during recreation.");
+  }
+  const values = [`type=image`, `src=${source}`, `dst=${target}`];
+  // Podman's Docker-compatible API translates Docker's `readonly` flag to
+  // `ro=true`, which its image-mount parser rejects. Image mounts default to
+  // read-only when the option is omitted.
+  return values.join(",");
+}
+
 function dockerStructuredMountArgs(inspect: DockerContainerInspect): string[] {
   const args: string[] = [];
   for (const mount of inspect.HostConfig?.Mounts ?? []) {
@@ -229,6 +363,9 @@ function dockerStructuredMountArgs(inspect: DockerContainerInspect): string[] {
       case "volume":
         args.push("--mount", dockerVolumeMountValue(mount));
         break;
+      case "image":
+        args.push("--mount", dockerImageMountValue(mount));
+        break;
       default:
         throw new Error(`Unsupported Docker structured mount type '${String(mount.Type)}'.`);
     }
@@ -238,6 +375,12 @@ function dockerStructuredMountArgs(inspect: DockerContainerInspect): string[] {
 
 function pushNumberFlag(args: string[], flag: string, value: unknown): void {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    args.push(flag, String(value));
+  }
+}
+
+function pushNonZeroIntegerFlag(args: string[], flag: string, value: unknown): void {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value !== 0) {
     args.push(flag, String(value));
   }
 }
@@ -275,12 +418,36 @@ export function getDockerGpuPatchNetworkMode(
   return networkOverride === "host" ? "host" : "preserve";
 }
 
+/**
+ * Return the compatibility resolver that clone construction will inject.
+ * Keep this decision shared with the pre-mutation DNS probe so explicit DNS
+ * and host networking cannot be tested against an override they will not use.
+ */
+export function getDockerGpuCloneFallbackDns(
+  inspect: DockerContainerInspect,
+  options: DockerGpuCloneRunOptions = {},
+): string | null {
+  const host = inspect.HostConfig || {};
+  const networkMode = options.networkMode ?? host.NetworkMode;
+  if (networkMode === "host" || stringArray(host.Dns).length > 0) return null;
+  const fallback = String(options.sandboxFallbackDns ?? "").trim();
+  return fallback || null;
+}
+
 export function sameContainerId(
   left: string | null | undefined,
   right: string | null | undefined,
 ): boolean {
   if (!left || !right) return false;
   return left.startsWith(right) || right.startsWith(left);
+}
+
+/** Return only a complete Docker container ID that is safe for exact-ID cleanup. */
+export function fullDockerContainerId(value: string | null | undefined): string | null {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  return /^[0-9a-f]{64}$/u.test(normalized) ? normalized : null;
 }
 
 function dockerNetworkAliases(
@@ -303,6 +470,112 @@ function dockerNetworkAliases(
     .filter((alias) => !sameContainerId(alias, containerId));
 }
 
+function exactArrayEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function exactEnvironmentEntries(environment: readonly string[], key: string): string[] {
+  return environment.filter((entry) => envKey(entry) === key);
+}
+
+function isExactNemoClawOciWorkspaceBoundary(
+  config: NonNullable<DockerContainerInspect["Config"]>,
+  intendedWorkloadArgv: readonly string[] | null | undefined,
+): boolean {
+  const entrypoint = stringArray(config.Entrypoint);
+  const configuredCommand = stringArray(config.Cmd);
+  const labels = config.Labels ?? {};
+  const startupExecutable = intendedWorkloadArgv?.at(-1);
+  return (
+    config.User === "0" &&
+    config.WorkingDir === "/" &&
+    exactArrayEqual(entrypoint, [OPENSHELL_SANDBOX_ENTRYPOINT]) &&
+    (configuredCommand.length === 0 ||
+      exactArrayEqual(configuredCommand, OPENSHELL_V0_0_99_WORKDIR_COMMAND)) &&
+    labels["openshell.ai/managed-by"] === "openshell" &&
+    typeof startupExecutable === "string" &&
+    NEMOCLAW_STARTUP_EXECUTABLES.has(startupExecutable)
+  );
+}
+
+function validateOpenShellOciIdentityMetadata(environment: readonly string[]): boolean {
+  const ociUsers = exactEnvironmentEntries(environment, OPENSHELL_OCI_IMAGE_USER_ENV);
+  const sandboxUids = exactEnvironmentEntries(environment, OPENSHELL_SANDBOX_UID_ENV);
+  const sandboxGids = exactEnvironmentEntries(environment, OPENSHELL_SANDBOX_GID_ENV);
+  if (ociUsers.length === 0 && sandboxUids.length === 0 && sandboxGids.length === 0) {
+    // OpenShell through v0.0.85 did not publish OCI identity metadata.
+    return false;
+  }
+  if (
+    ociUsers.length === 0 &&
+    sandboxUids.length === 1 &&
+    sandboxUids[0] === `${OPENSHELL_SANDBOX_UID_ENV}=` &&
+    sandboxGids.length === 1 &&
+    sandboxGids[0] === `${OPENSHELL_SANDBOX_GID_ENV}=`
+  ) {
+    // A prior reviewed recreation already removed only the OCI-user marker.
+    return false;
+  }
+  const ociUserPrefix = `${OPENSHELL_OCI_IMAGE_USER_ENV}=`;
+  if (
+    ociUsers.length !== 1 ||
+    !ociUsers[0]?.startsWith(ociUserPrefix) ||
+    ociUsers[0] === ociUserPrefix ||
+    sandboxUids.length !== 1 ||
+    sandboxUids[0] !== `${OPENSHELL_SANDBOX_UID_ENV}=` ||
+    sandboxGids.length !== 1 ||
+    sandboxGids[0] !== `${OPENSHELL_SANDBOX_GID_ENV}=`
+  ) {
+    throw new Error(
+      "OpenShell workspace identity metadata is not the reviewed Docker compatibility contract.",
+    );
+  }
+  return true;
+}
+
+/**
+ * OpenShell 0.0.99 began using `OPENSHELL_OCI_IMAGE_USER` presence to prepare
+ * its default workspace. That preparation changes the `/sandbox` owner before
+ * the workload starts, which breaks NemoClaw's config-parent ownership
+ * requirement. The recreated Docker supervisor retains NemoClaw's explicit
+ * sandbox policy, so omitting only this marker replays the pre-0.0.99 workspace
+ * behavior without changing the process identity selected by policy.
+ */
+export function shouldOmitOpenShellOciImageUser(
+  inspect: DockerContainerInspect,
+  intendedWorkloadArgv: readonly string[] | null | undefined,
+): boolean {
+  const config: NonNullable<DockerContainerInspect["Config"]> = inspect.Config ?? {};
+  return isExactNemoClawOciWorkspaceBoundary(config, intendedWorkloadArgv)
+    ? validateOpenShellOciIdentityMetadata(stringArray(config.Env))
+    : false;
+}
+
+function dockerContainerCommandArgs(
+  entrypoint: readonly string[],
+  configuredCommand: readonly string[],
+  sandboxCommand: string | null,
+  commandOverride: readonly string[] | null | undefined,
+): string[] {
+  if (commandOverride != null) return [...commandOverride];
+  if (!sandboxCommand) return [...entrypoint.slice(1), ...configuredCommand];
+
+  // OpenShell through v0.0.85 cleared the image command, while v0.0.99
+  // requires this exact supervisor workdir tuple. Preserve only the reviewed
+  // release contract: replaying arbitrary image-controlled command arguments
+  // at the root supervisor boundary would widen the recreation trust surface.
+  if (!exactArrayEqual(entrypoint, [OPENSHELL_SANDBOX_ENTRYPOINT])) {
+    throw new Error(
+      "OpenShell sandbox supervisor command is not a reviewed restart-safe contract.",
+    );
+  }
+  if (configuredCommand.length === 0) return [];
+  if (exactArrayEqual(configuredCommand, OPENSHELL_V0_0_99_WORKDIR_COMMAND)) {
+    return [...configuredCommand];
+  }
+  throw new Error("OpenShell sandbox supervisor command is not a reviewed restart-safe contract.");
+}
+
 export function buildDockerGpuCloneRunArgs(
   inspect: DockerContainerInspect,
   mode: DockerGpuPatchMode,
@@ -313,7 +586,15 @@ export function buildDockerGpuCloneRunArgs(
   const image = String(options.image || config.Image || "").trim();
   if (!image) throw new Error("Docker inspect output did not include Config.Image.");
 
-  const args: string[] = ["--name", dockerContainerName(inspect), ...mode.args];
+  const containerName = String(options.containerName ?? dockerContainerName(inspect)).trim();
+  if (
+    containerName.length === 0 ||
+    containerName.length > 253 ||
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/u.test(containerName)
+  ) {
+    throw new Error("Docker clone container name is invalid.");
+  }
+  const args: string[] = ["--name", containerName, ...mode.args];
   const gpuAugment = mode.kind !== "startup-command";
 
   // Startup-command recreation must retain OpenShell's native CDI attachment.
@@ -332,13 +613,66 @@ export function buildDockerGpuCloneRunArgs(
   pushStringFlag(args, "--workdir", config.WorkingDir);
   if (config.Tty) args.push("--tty");
   if (config.OpenStdin) args.push("--interactive");
+  if (options.preserveManagedLaunchSpec) {
+    pushManagedPortArgs(args, inspect);
+    pushManagedHealthcheckArgs(args, inspect);
+    if (config.StopTimeout !== undefined && config.StopTimeout !== null) {
+      if (!Number.isSafeInteger(config.StopTimeout) || config.StopTimeout < 0) {
+        throw new Error("Managed bootstrap Docker stop timeout is invalid.");
+      }
+      args.push("--stop-timeout", String(config.StopTimeout));
+    }
+    if (host.OomScoreAdj !== undefined && host.OomScoreAdj !== null) {
+      if (
+        !Number.isSafeInteger(host.OomScoreAdj) ||
+        host.OomScoreAdj < -1_000 ||
+        host.OomScoreAdj > 1_000
+      ) {
+        throw new Error("Managed bootstrap Docker OOM score adjustment is invalid.");
+      }
+      // Native Podman is rootless and clamps an inspected request of zero to
+      // the API-service user's effective floor when the container starts.
+      // Request that stable effective value up front so stopped and running
+      // inspection report one launch contract.
+      const oomScoreAdj =
+        host.Annotations?.["io.container.manager"] === "libpod" && host.OomScoreAdj === 0
+          ? 500
+          : host.OomScoreAdj;
+      args.push("--oom-score-adj", String(oomScoreAdj));
+    }
+  }
 
-  const sandboxCommand = openshellSandboxCommandEnvValue(options.openshellSandboxCommand);
+  const inspectedMainProcessSpec = envValue(config.Env, OPENSHELL_MAIN_PROCESS_SPEC_ENV);
+  const sandboxCommand = inspectedMainProcessSpec
+    ? null
+    : openshellSandboxCommandEnvValue(options.openshellSandboxCommand);
+  const intendedMainProcessSpec =
+    inspectedMainProcessSpec && options.openshellSandboxCommand
+      ? replaceOpenShellMainProcessSpecCommand(
+          inspectedMainProcessSpec,
+          options.openshellSandboxCommand,
+        )
+      : null;
+  const omitOciImageUser = shouldOmitOpenShellOciImageUser(
+    inspect,
+    options.openshellSandboxCommand,
+  );
   let sawSandboxCommand = false;
+  let sawMainProcessSpec = false;
   for (const env of stringArray(config.Env).filter(
-    (entry) => !gpuAugment || !GPU_ENV_KEYS.has(envKey(entry)),
+    (entry) =>
+      (!gpuAugment || !GPU_ENV_KEYS.has(envKey(entry))) &&
+      (!omitOciImageUser || envKey(entry) !== OPENSHELL_OCI_IMAGE_USER_ENV),
   )) {
     const key = envKey(env);
+    if (key === OPENSHELL_MAIN_PROCESS_SPEC_ENV && intendedMainProcessSpec) {
+      sawMainProcessSpec = true;
+      args.push("--env", `${OPENSHELL_MAIN_PROCESS_SPEC_ENV}=${intendedMainProcessSpec}`);
+      continue;
+    }
+    if (key === OPENSHELL_SANDBOX_COMMAND_ENV && inspectedMainProcessSpec) {
+      continue;
+    }
     if (key === OPENSHELL_SANDBOX_COMMAND_ENV && sandboxCommand) {
       sawSandboxCommand = true;
       args.push("--env", `${OPENSHELL_SANDBOX_COMMAND_ENV}=${sandboxCommand}`);
@@ -346,10 +680,17 @@ export function buildDockerGpuCloneRunArgs(
     }
     args.push("--env", replaceEnvValue(env, "OPENSHELL_ENDPOINT", options.openshellEndpoint));
   }
-  if (sandboxCommand && !sawSandboxCommand) {
+  if (intendedMainProcessSpec && !sawMainProcessSpec) {
+    args.push("--env", `${OPENSHELL_MAIN_PROCESS_SPEC_ENV}=${intendedMainProcessSpec}`);
+  } else if (sandboxCommand && !sawSandboxCommand && !inspectedMainProcessSpec) {
     args.push("--env", `${OPENSHELL_SANDBOX_COMMAND_ENV}=${sandboxCommand}`);
   }
 
+  const annotations = host.Annotations || {};
+  for (const key of Object.keys(annotations).sort()) {
+    const value = annotations[key];
+    if (value !== undefined && value !== null) args.push("--annotation", `${key}=${value}`);
+  }
   const labels = config.Labels || {};
   for (const key of Object.keys(labels).sort()) {
     const value = labels[key];
@@ -357,7 +698,10 @@ export function buildDockerGpuCloneRunArgs(
   }
   for (const bind of stringArray(host.Binds)) args.push("--volume", bind);
   args.push(...dockerStructuredMountArgs(inspect));
-  const networkMode = options.networkMode ?? host.NetworkMode;
+  const configuredNetworkMode = options.networkMode ?? host.NetworkMode;
+  const networkMode = options.preserveManagedLaunchSpec
+    ? managedNetworkMode(inspect, configuredNetworkMode)
+    : configuredNetworkMode;
   pushStringFlag(args, "--network", networkMode);
   for (const alias of dockerNetworkAliases(inspect, networkMode))
     args.push("--network-alias", alias);
@@ -397,9 +741,8 @@ export function buildDockerGpuCloneRunArgs(
     const dnsServers = stringArray(host.Dns);
     for (const dns of dnsServers) args.push("--dns", dns);
     for (const dnsSearch of stringArray(host.DnsSearch)) args.push("--dns-search", dnsSearch);
-    if (dnsServers.length === 0 && options.sandboxFallbackDns) {
-      args.push("--dns", options.sandboxFallbackDns);
-    }
+    const fallbackDns = getDockerGpuCloneFallbackDns(inspect, options);
+    if (fallbackDns) args.push("--dns", fallbackDns);
   }
 
   pushNumberFlag(args, "--memory", host.Memory);
@@ -409,6 +752,7 @@ export function buildDockerGpuCloneRunArgs(
   pushNumberFlag(args, "--cpu-quota", host.CpuQuota);
   pushNumberFlag(args, "--cpu-period", host.CpuPeriod);
   pushNumberFlag(args, "--shm-size", host.ShmSize);
+  pushNonZeroIntegerFlag(args, "--pids-limit", host.PidsLimit);
   if (typeof host.NanoCpus === "number" && host.NanoCpus > 0) {
     args.push("--cpus", dockerCpusFromNanoCpus(host.NanoCpus));
   }
@@ -420,8 +764,18 @@ export function buildDockerGpuCloneRunArgs(
   if (host.Init) args.push("--init");
 
   const entrypoint = stringArray(config.Entrypoint);
-  if (entrypoint.length > 0) args.push("--entrypoint", entrypoint[0]);
-  const commandArgs = sandboxCommand ? [] : [...entrypoint.slice(1), ...stringArray(config.Cmd)];
+  const replacementEntrypoint = String(options.containerEntrypoint ?? "").trim();
+  if (replacementEntrypoint) {
+    args.push("--entrypoint", replacementEntrypoint);
+  } else if (entrypoint.length > 0) {
+    args.push("--entrypoint", entrypoint[0]);
+  }
+  const commandArgs = dockerContainerCommandArgs(
+    entrypoint,
+    stringArray(config.Cmd),
+    sandboxCommand,
+    options.containerCommand,
+  );
   args.push(image, ...commandArgs);
   return args;
 }

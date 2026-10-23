@@ -200,7 +200,10 @@ function containerdRootFromConfig(deps: StorageProbeDeps): ContainerdRootResult 
     const parsed = parseToml(deps.readFile(DEFAULT_CONTAINERD_CONFIG)) as Record<string, unknown>;
     if (parsed.imports !== undefined) {
       if (!Array.isArray(parsed.imports)) {
-        return { ok: false, reason: "containerd config declares malformed imports" };
+        return {
+          ok: false,
+          reason: "containerd config declares malformed imports",
+        };
       }
       if (parsed.imports.length > 0) {
         return {
@@ -231,21 +234,21 @@ function localDockerHostProblem(info: DockerInfoShape, deps: StorageProbeDeps): 
   if (info.OSType !== "linux") return "Docker is not using a Linux engine";
 
   const dockerHost = deps.dockerHost?.trim() ?? "";
-  // An explicit DOCKER_CONTEXT overrides DOCKER_HOST in the Docker CLI.
-  const explicitContext = deps.dockerContext?.trim() ?? "";
-  if (explicitContext) {
-    if (explicitContext !== "default") {
-      return `Docker uses a named context (${explicitContext}) whose host filesystem cannot be inspected`;
-    }
-    return null;
-  }
-
   if (dockerHost) {
     if (isDefaultDockerSocket(dockerHost)) return null;
     if (dockerHost.startsWith("unix://") || path.isAbsolute(dockerHost)) {
       return `Docker uses a non-default socket (${dockerHost}) whose host filesystem cannot be inspected`;
     }
     return `Docker uses a remote endpoint (${dockerHost})`;
+  }
+
+  // A context selects the daemon only when DOCKER_HOST is absent.
+  const explicitContext = deps.dockerContext?.trim() ?? "";
+  if (explicitContext) {
+    if (explicitContext !== "default") {
+      return `Docker uses a named context (${explicitContext}) whose host filesystem cannot be inspected`;
+    }
+    return null;
   }
 
   const reportedContext =
@@ -268,7 +271,10 @@ export function resolveDockerStorageLocations(
 
   const dockerRoot = absoluteString(info.DockerRootDir);
   if (!dockerRoot) {
-    return { ok: false, reason: "docker info did not report an absolute DockerRootDir" };
+    return {
+      ok: false,
+      reason: "docker info did not report an absolute DockerRootDir",
+    };
   }
   if (!isContainerdImageStore(info)) {
     const driver = typeof info.Driver === "string" ? info.Driver : "";
@@ -365,7 +371,10 @@ export function probeDockerStorage(overrides: Partial<StorageProbeDeps> = {}): S
   }
   return limiting
     ? { ok: true, capacity: limiting }
-    : { ok: false, reason: "docker info did not report a usable image-storage path" };
+    : {
+        ok: false,
+        reason: "docker info did not report a usable image-storage path",
+      };
 }
 
 interface HostStorageProbeDeps {
@@ -523,6 +532,38 @@ export function measureDirectorySizeBytes(
     return total;
   }
   try {
+    return walk(targetPath);
+  } catch {
+    return 0n;
+  }
+}
+
+/**
+ * Return allocated bytes that removing the directory tree selected for replacement will reclaim.
+ * The walk uses lstat so symlinks never contribute target storage. Files with
+ * other hard links do not count because removing this tree might not release
+ * their blocks. Any unreadable or malformed tree returns zero.
+ */
+export function measureReclaimableDirectorySizeBytes(targetPath: string): bigint {
+  try {
+    const root = fs.lstatSync(targetPath, { bigint: true });
+    if (!root.isDirectory() || root.isSymbolicLink()) return 0n;
+
+    const walk = (directory: string): bigint => {
+      let total = 0n;
+      for (const name of fs.readdirSync(directory)) {
+        const entryPath = path.join(directory, name);
+        const stat = fs.lstatSync(entryPath, { bigint: true });
+        if (stat.isDirectory()) {
+          total += walk(entryPath);
+          continue;
+        }
+        if (!stat.isFile() || stat.nlink !== 1n) continue;
+        total += stat.blocks * 512n;
+      }
+      return total;
+    };
+
     return walk(targetPath);
   } catch {
     return 0n;

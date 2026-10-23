@@ -12,6 +12,10 @@ const SUPERVISOR_TLS_ENV_NAMES = [
   "OPENSHELL_TLS_CERT",
   "OPENSHELL_TLS_KEY",
 ] as const;
+const OPENSHELL_SANDBOX_ID_LABEL = "openshell.ai/sandbox-id";
+const OPENSHELL_SANDBOX_WORKSPACE_LABEL = "openshell.ai/sandbox-workspace";
+const OPENSHELL_DEFAULT_WORKSPACE = "default";
+const SAFE_OPENSHELL_IDENTITY_COMPONENT = /^[a-z0-9][a-z0-9_.-]*$/u;
 const ENTRYPOINT_ARGV = ["nemoclaw-dcode-entrypoint", "-f", "/dev/null"] as const;
 const CONNECT_CHILD_OK = "NEMOCLAW_EXACT_MAIN_CONNECT_CHILD_OK";
 
@@ -112,14 +116,17 @@ function exactMainDockerContainerId(output: string, sandboxName: string): string
       `expected exactly one running Docker container for ${sandboxName}, found ${rows.length}`,
     );
   }
-  const [id, name, ...unexpected] = rows[0].split("\t");
-  const expectedName = `openshell-${sandboxName}`;
+  const [id, name, sandboxId, sandboxWorkspace, ...unexpected] = rows[0].split("\t");
+  const expectedName = `openshell-${OPENSHELL_DEFAULT_WORKSPACE}--${sandboxName}-${sandboxId}`;
   if (
     !id ||
-    !/^[0-9a-f]{12,64}$/u.test(id) ||
+    !/^[0-9a-f]{64}$/u.test(id) ||
     !name ||
+    !sandboxId ||
+    !SAFE_OPENSHELL_IDENTITY_COMPONENT.test(sandboxId) ||
+    sandboxWorkspace !== OPENSHELL_DEFAULT_WORKSPACE ||
     unexpected.length > 0 ||
-    (name !== expectedName && !name.startsWith(`${expectedName}-`))
+    name !== expectedName
   ) {
     throw new Error(`unexpected OpenShell Docker container identity for ${sandboxName}`);
   }
@@ -182,7 +189,7 @@ export async function assertExactMainChildProcessContracts(
       "--filter",
       `label=openshell.ai/sandbox-name=${sandboxName}`,
       "--format",
-      "{{.ID}}\t{{.Names}}",
+      `{{.ID}}\t{{.Names}}\t{{.Label "${OPENSHELL_SANDBOX_ID_LABEL}"}}\t{{.Label "${OPENSHELL_SANDBOX_WORKSPACE_LABEL}"}}`,
     ],
     {
       artifactName: "exact-main-entrypoint-container-identity",
@@ -217,17 +224,17 @@ export async function assertExactMainChildProcessContracts(
   );
   assertChildProofReport(execChild, "exec");
 
-  // OpenShell main exposes connect only as a forced-TTY shell. Feed a bounded
-  // script on stdin and make the remote shell return the assertion status;
-  // an exact output marker distinguishes executed output from TTY input echo.
+  // NemoClaw connect opens a fresh TTY shell; OpenShell 0.0.116 connect instead
+  // attaches the running entrypoint. Feed the probe to NemoClaw's shell and
+  // require its exact output marker and assertion exit status.
   const connectChild = await host.command(
     "bash",
     [
       "-lc",
-      'printf \'%s\\n\' "$1" | "$2" sandbox connect "$3"',
+      'printf \'%s\\n\' "$1" | "$2" "$3" connect',
       "exact-main-connect-child",
       CONNECT_CHILD_PROBE,
-      host.openshellCommandPath,
+      host.commandPath,
       sandboxName,
     ],
     {

@@ -1,20 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   configureDcodeSession,
   makeDcodeSandboxEntry,
-} from "../../../../test/helpers/rebuild-dcode-flow-support";
+} from "../../../../test/helpers/rebuild-dcode-flow-helpers";
+import { expectNoSandboxDelete } from "../../../../test/helpers/rebuild-delete-assertions";
 import {
   createRebuildFlowHarness,
-  resetRebuildFlowTestEnvironment,
-  restoreRebuildFlowTestEnvironment,
-} from "../../../../test/helpers/rebuild-flow-harness";
+  installRebuildFlowTestHooks,
+} from "../../../../test/helpers/rebuild-flow-generic-harness";
 
 describe("rebuildSandbox DCode flow: mutation edge", () => {
-  beforeEach(resetRebuildFlowTestEnvironment);
-  afterEach(restoreRebuildFlowTestEnvironment);
+  installRebuildFlowTestHooks({ acceptThirdPartySoftware: true });
 
   it("finishes DCode preparation and recheck before backup, delete, and recreate (#6195)", async () => {
     const mcpEntry = { server: "search", providerName: "mcp-search" };
@@ -67,32 +66,79 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
     const [firstRouteOrder, preBackupRouteOrder, preMcpRouteOrder, deleteEdgeRouteOrder] =
       harness.preflightDcodeRouteSpy.mock.invocationCallOrder;
     const imageOrder = harness.prepareManagedDcodeRebuildImageSpy.mock.invocationCallOrder[0];
-    const shieldsOrder = harness.openShieldsSpy.mock.invocationCallOrder[0];
     const backupOrder = harness.backupSandboxStateSpy.mock.invocationCallOrder[0];
     const mcpPreparationOrder = harness.prepareMcpBridgesForRebuildSpy.mock.invocationCallOrder[0];
-    const warningProbeOrder =
-      harness.warnUnpreservedUserManagedFilesSpy.mock.invocationCallOrder[0];
     const deleteCall = harness.runOpenshellSpy.mock.calls.findIndex(
-      ([args]) => Array.isArray(args) && args.join(" ") === "sandbox delete alpha",
+      ([args]) => Array.isArray(args) && args.join(" ") === "sandbox delete -g nemoclaw alpha",
     );
     const deleteOrder = harness.runOpenshellSpy.mock.invocationCallOrder[deleteCall];
     const onboardOrder = harness.onboardSpy.mock.invocationCallOrder[0];
 
     expect(firstRouteOrder).toBeLessThan(imageOrder);
     expect(imageOrder).toBeLessThan(preBackupRouteOrder);
-    expect(preBackupRouteOrder).toBeLessThan(shieldsOrder);
-    expect(shieldsOrder).toBeLessThan(backupOrder);
+    expect(preBackupRouteOrder).toBeLessThan(backupOrder);
     expect(backupOrder).toBeLessThan(preMcpRouteOrder);
     expect(preMcpRouteOrder).toBeLessThan(mcpPreparationOrder);
-    expect(mcpPreparationOrder).toBeLessThan(warningProbeOrder);
-    expect(warningProbeOrder).toBeLessThan(deleteEdgeRouteOrder);
+    expect(mcpPreparationOrder).toBeLessThan(deleteEdgeRouteOrder);
     expect(deleteEdgeRouteOrder).toBeLessThan(deleteOrder);
     expect(deleteOrder).toBeLessThan(onboardOrder);
     expect(harness.disposePreparedDcodeRebuildImageSpy).toHaveBeenCalledWith(
       harness.preparedDcodeBuildContext,
     );
-    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry]);
+    expect(harness.restoreMcpBridgesAfterRebuildSpy).toHaveBeenCalledWith("alpha", [mcpEntry], {
+      gatewayName: "nemoclaw",
+      workspace: "default",
+    });
   });
+
+  it("retires removed Shields state after a complete DCode terminal-agent rebuild", async () => {
+    const harness = createRebuildFlowHarness({
+      agentName: "langchain-deepagents-code",
+      sandboxEntry: makeDcodeSandboxEntry(),
+      dcodeRouteResults: [{ ok: true }, { ok: true }, { ok: true }, { ok: true }],
+    });
+    configureDcodeSession(harness);
+    harness.enforceRemovedImmutabilityMigrationBoundarySpy.mockReturnValue({
+      stateRecord: "/tmp/shields-alpha.json",
+      recoveryArtifacts: [],
+    });
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+    ).resolves.toBeUndefined();
+
+    expect(harness.retireRemovedImmutabilityStateRecordSpy).toHaveBeenCalledWith(
+      "alpha",
+      "mutable-rebuild",
+    );
+  });
+
+  it("retains removed Shields state when a DCode terminal-agent restore fails", async () => {
+    const harness = createRebuildFlowHarness({
+      agentName: "langchain-deepagents-code",
+      sandboxEntry: makeDcodeSandboxEntry(),
+      dcodeRouteResults: [{ ok: true }, { ok: true }, { ok: true }, { ok: true }],
+      restoreSandboxState: () => ({
+        success: false,
+        restoredDirs: [],
+        restoredFiles: [],
+        failedDirs: ["state"],
+        failedFiles: [],
+      }),
+    });
+    configureDcodeSession(harness);
+    harness.enforceRemovedImmutabilityMigrationBoundarySpy.mockReturnValue({
+      stateRecord: "/tmp/shields-alpha.json",
+      recoveryArtifacts: [],
+    });
+
+    await expect(
+      harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+    ).rejects.toThrow(/State restore remained incomplete/u);
+
+    expect(harness.retireRemovedImmutabilityStateRecordSpy).not.toHaveBeenCalled();
+  });
+
   it("rolls back managed MCP mutation when DCode inputs drift during MCP preparation (#6195)", async () => {
     const detached = { server: "search", providerName: "mcp-search" };
     const scrubbed = { server: "filesystem", adapter: "deepagents-config" };
@@ -113,17 +159,18 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
       harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
     ).rejects.toThrow("the prepared DCode replacement inputs changed before deletion");
 
-    expect(harness.prepareMcpBridgesForRebuildSpy).toHaveBeenCalledWith("alpha");
+    expect(harness.prepareMcpBridgesForRebuildSpy).toHaveBeenCalledWith(
+      "alpha",
+      { gatewayName: "nemoclaw", workspace: "default" },
+      [detached],
+    );
     expect(harness.reattachMcpProvidersAfterRebuildAbortSpy).toHaveBeenCalledWith(
       "alpha",
       [detached],
       [scrubbed],
+      { gatewayName: "nemoclaw", workspace: "default" },
     );
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.onboardSpy).not.toHaveBeenCalled();
-    expect(harness.relockSpy).toHaveBeenCalledWith("alpha", expect.any(Object), true, "nemoclaw");
   });
 });

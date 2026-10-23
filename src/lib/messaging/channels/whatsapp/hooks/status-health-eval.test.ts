@@ -22,7 +22,7 @@ function baseInput(overrides: Partial<WhatsappProbeInput> = {}): WhatsappProbeIn
     recentLogSignals: [],
     probeReachable: true,
     probedAt: PROBED_AT,
-    presetInRegistry: true,
+    presetApplied: true,
     presetOnGateway: true,
     channelEnabledInRegistry: true,
     ...overrides,
@@ -53,7 +53,7 @@ describe("evaluateWhatsappDiagnostics", () => {
 
   it("returns policy_gap when the whatsapp preset is missing", () => {
     const report = evaluateWhatsappDiagnostics(
-      baseInput({ presetInRegistry: false, presetOnGateway: false }),
+      baseInput({ presetApplied: false, presetOnGateway: false }),
     );
     expect(report.verdict).toBe("policy_gap");
     const policy = report.signals.find((s) => s.label === "Policy coverage");
@@ -75,6 +75,132 @@ describe("evaluateWhatsappDiagnostics", () => {
     const pairing = report.signals.find((s) => s.label === "Pairing / session");
     expect(pairing?.hint).toMatch(/hermes whatsapp/);
     expect(report.hints.join(" ")).toMatch(/hermes whatsapp/);
+  });
+
+  it("guides legacy Hermes dashboard sessions through channel removal and re-pairing (#8184)", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: false,
+        sessionLocations: {
+          gatewaySessionCreds: false,
+          dashboardSessionCreds: true,
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    const pairing = report.signals.find((s) => s.label === "Pairing / session");
+    const hints = report.hints.join(" ");
+    expect(report.verdict).toBe("unpaired");
+    expect(session?.severity).toBe("warn");
+    expect(session?.detail).toMatch(/dashboard-home has WhatsApp credentials/);
+    expect(pairing?.hint).toContain("`nemoclaw <sandbox> channels remove whatsapp`");
+    expect(session?.hint).toContain("`nemoclaw <sandbox> channels add whatsapp`");
+    expect(session?.hint).toMatch(/Pair again from the dashboard/);
+    expect(hints).toContain("/sandbox/.hermes/platforms/whatsapp/session");
+    expect(hints).toContain("`nemoclaw <sandbox> channels status --channel whatsapp`");
+    expect(hints).not.toContain("platforms.whatsapp.extra.session_path");
+    expect(hints).not.toContain("profiles/dashboard-home/platforms/whatsapp/session");
+  });
+
+  it("keeps Hermes gateway session file evidence out of the live-health verdict", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: null,
+        sessionLocations: {
+          gatewaySessionCreds: true,
+          dashboardSessionCreds: false,
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    expect(report.verdict).toBe("unknown");
+    expect(session?.severity).toBe("ok");
+    expect(session?.detail).toMatch(/gateway session path contains WhatsApp credentials/);
+  });
+
+  it("reports duplicate Hermes session paths without claiming live health (#8184)", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: null,
+        sessionLocations: {
+          gatewaySessionCreds: true,
+          dashboardSessionCreds: true,
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    expect(report.verdict).toBe("unknown");
+    expect(session?.severity).toBe("info");
+    expect(session?.detail).toBe("both Hermes session paths contain WhatsApp credentials");
+    expect(session?.hint).toBe("use one active WhatsApp bridge for the paired account");
+  });
+
+  it("accepts credentials found through the configured session path (#8718)", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: null,
+        sessionLocations: {
+          gatewaySessionCreds: true,
+          dashboardSessionCreds: true,
+          gatewaySessionPathSource: "config",
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    const override = report.signals.find((s) => s.label === "Session path override");
+    expect(report.verdict).toBe("unknown");
+    expect(session?.severity).toBe("ok");
+    expect(session?.detail).toBe(
+      "the configured Hermes WhatsApp session path contains credentials",
+    );
+    expect(override?.severity).toBe("info");
+    expect(override?.detail).toContain("platforms.whatsapp.extra.session_path");
+  });
+
+  it("stops repeating the repair command when the configured session path is empty (#8718)", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: false,
+        sessionLocations: {
+          gatewaySessionCreds: false,
+          dashboardSessionCreds: true,
+          gatewaySessionPathSource: "config",
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    expect(report.verdict).toBe("unpaired");
+    expect(session?.severity).toBe("warn");
+    expect(session?.detail).toBe(
+      "the configured Hermes WhatsApp session path has no WhatsApp credentials",
+    );
+    expect(report.hints.join(" ")).not.toContain("--config-accept-new-path");
+    expect(report.hints.join(" ")).toContain("hermes whatsapp");
+  });
+
+  it("warns when the configured session path is not a supported sandbox path (#8718)", () => {
+    const report = evaluateWhatsappDiagnostics(
+      baseInput({
+        agent: "hermes",
+        paired: false,
+        sessionLocations: {
+          gatewaySessionCreds: false,
+          dashboardSessionCreds: true,
+          gatewaySessionPathSource: "unsupported",
+        },
+      }),
+    );
+    const session = report.signals.find((s) => s.label === "Session location");
+    const override = report.signals.find((s) => s.label === "Session path override");
+    expect(session?.severity).toBe("warn");
+    expect(session?.detail).toMatch(/dashboard-home has WhatsApp credentials/);
+    expect(override?.severity).toBe("warn");
+    expect(override?.detail).toContain("not a supported session path");
   });
 
   it("returns idle when paired with a live WebSocket but no inbound event observed", () => {
@@ -180,7 +306,7 @@ describe("evaluateWhatsappDiagnostics", () => {
 
   it("warns when the preset is recorded locally but missing from the gateway", () => {
     const report = evaluateWhatsappDiagnostics(
-      baseInput({ presetInRegistry: true, presetOnGateway: false }),
+      baseInput({ presetApplied: true, presetOnGateway: false }),
     );
     const policy = report.signals.find((s) => s.label === "Policy coverage");
     expect(policy?.severity).toBe("fail");
@@ -211,7 +337,7 @@ describe("evaluateWhatsappDiagnostics", () => {
 
   it("treats a missing local preset as fail even when the gateway is unreachable", () => {
     const report = evaluateWhatsappDiagnostics(
-      baseInput({ presetInRegistry: false, presetOnGateway: null }),
+      baseInput({ presetApplied: false, presetOnGateway: null }),
     );
     const policy = report.signals.find((s) => s.label === "Policy coverage");
     expect(policy?.severity).toBe("fail");
@@ -342,24 +468,21 @@ describe("parseWhatsappHeartbeat", () => {
     ).toBe(true);
   });
 
-  it("rejects loose Date.parse-compatible timestamps that are not strict ISO 8601", () => {
-    // Regression guard: `Date.parse` accepts values like a bare integer or
-    // `Date.toString()` output with parenthesized text. Treating those as
-    // valid timestamps would (a) leak the raw string into the JSON report
-    // and (b) mark malformed heartbeat text as healthy inbound evidence.
-    for (const bad of [
-      "42",
-      "Wed May 28 2026 04:00:00 GMT+0000 (Coordinated Universal Time)",
-      "2026/05/28 04:00:00",
-      "not a date",
-    ]) {
+  it.each([
+    "42",
+    "Wed May 28 2026 04:00:00 GMT+0000 (Coordinated Universal Time)",
+    "2026/05/28 04:00:00",
+    "not a date",
+  ])(
+    "rejects loose Date.parse-compatible timestamps that are not strict ISO 8601 [case %#]",
+    (bad) => {
       const result = parseWhatsappHeartbeat(JSON.stringify({ lastInboundAt: bad }));
       expect(
         "heartbeat" in result && result.heartbeat.lastInboundAt,
         `expected ${JSON.stringify(bad)} to be rejected`,
       ).toBeNull();
-    }
-  });
+    },
+  );
 
   it("normalizes accepted timestamps to canonical ISO form", () => {
     const result = parseWhatsappHeartbeat(

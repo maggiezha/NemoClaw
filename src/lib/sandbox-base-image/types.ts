@@ -27,6 +27,7 @@ export type SandboxBaseImageResolutionMetadata = {
   ref: string;
   digest: string | null;
   source: SandboxBaseImageResolutionSource;
+  sourceRevision?: string;
   pinnedRemoteRef?: string;
   imageId: string;
   os: string;
@@ -40,6 +41,8 @@ export type ResolveBaseImageOptions = {
   imageName: string;
   dockerfilePath: string;
   inputPaths?: string[];
+
+  buildArgs?: Record<string, string>;
   localTag: string;
   envVar?: string;
   label?: string;
@@ -48,8 +51,9 @@ export type ResolveBaseImageOptions = {
   rootDir?: string;
   env?: NodeJS.ProcessEnv;
   pinnedRemoteRef?: string;
-  preferPinnedRemoteRef?: boolean;
-  validateImage?: (imageRef: string) => boolean;
+  requirePinnedRemoteRef?: boolean;
+  allowLocalFallback?: boolean;
+  validateImage?: (imageRef: string, context?: SandboxBaseImageValidationContext) => boolean;
   validationDescription?: string;
   resolutionHint?: SandboxBaseImageResolutionMetadata | null;
   forceRefresh?: boolean;
@@ -69,6 +73,11 @@ export type SandboxBaseImageResolution = {
   glibcVersion: string | null;
   metadata?: SandboxBaseImageResolutionMetadata;
 };
+
+export type SandboxBaseImageValidationContext = Pick<
+  SandboxBaseImageResolution,
+  "source" | "pinnedRemoteRef"
+>;
 
 export type LocalImageMetadata = {
   Id?: unknown;

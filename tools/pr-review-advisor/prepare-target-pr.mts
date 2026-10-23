@@ -4,9 +4,10 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-// pull_request_target content is fetched manually so no PR-controlled action,
+// PR content is fetched manually so no PR-controlled action,
 // hook, submodule, LFS filter, or package setup can run. Every input that is
 // interpolated into a git ref is validated against a strict allow-list before
 // any git command runs, and commands execute via execFileSync (no shell), so a
@@ -16,12 +17,21 @@ const TARGET_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 const TARGET_PR_PATTERN = /^[0-9]+$/u;
 const TARGET_BASE_PATTERN = /^[A-Za-z0-9._/-]+$/u;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
-const DEFAULT_TARGET_DIR = "/tmp/pr-review-advisor-target";
+const DEFAULT_TARGET_DIR = "/tmp/pr-review-advisor-target/pr-workdir";
 
 export class PrepareTargetPrError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PrepareTargetPrError";
+  }
+}
+
+export class SupersededPrError extends PrepareTargetPrError {
+  constructor(expected: string, actual: string) {
+    super(
+      `Review superseded: fetched pull ref ${actual} does not match the triggering PR head SHA ${expected}`,
+    );
+    this.name = "SupersededPrError";
   }
 }
 
@@ -72,6 +82,28 @@ export function validatePrepareTargetPrInput(input: PrepareTargetPrInput): void 
   }
 }
 
+export function validatePrepareTargetDirectory(
+  value: string,
+  currentDirectory = process.cwd(),
+): string {
+  if (!value || value.includes("\0")) {
+    fail("target directory must be a non-empty filesystem path");
+  }
+  const resolved = path.resolve(value);
+  const relativeCurrentDirectory = path.relative(resolved, path.resolve(currentDirectory));
+  const containsCurrentDirectory =
+    relativeCurrentDirectory === "" ||
+    (!relativeCurrentDirectory.startsWith("..") && !path.isAbsolute(relativeCurrentDirectory));
+  if (
+    resolved === path.parse(resolved).root ||
+    path.basename(resolved) !== "pr-workdir" ||
+    containsCurrentDirectory
+  ) {
+    fail("target directory must resolve to a dedicated pr-workdir directory");
+  }
+  return resolved;
+}
+
 /**
  * Fetch and check out a target PR's head into an isolated, hardened workspace,
  * verifying the fetched base/head against the immutable SHAs from the
@@ -85,7 +117,7 @@ export function prepareTargetPr(
 ): { workdir: string; prNumber: string } {
   validatePrepareTargetPrInput(input);
 
-  const targetDir = options.targetDir ?? DEFAULT_TARGET_DIR;
+  const targetDir = validatePrepareTargetDirectory(options.targetDir ?? DEFAULT_TARGET_DIR);
   const runGit =
     options.runGit ??
     ((args: string[]): string =>
@@ -139,7 +171,7 @@ export function prepareTargetPr(
   );
   const actualHead = git("rev-parse", "HEAD");
   if (input.expectedHeadSha && actualHead !== input.expectedHeadSha) {
-    fail("Fetched pull ref does not match the triggering PR head SHA");
+    throw new SupersededPrError(input.expectedHeadSha, actualHead);
   }
 
   appendEnv("ADVISOR_WORKDIR", targetDir);
@@ -149,14 +181,20 @@ export function prepareTargetPr(
 
 function main(): void {
   try {
-    prepareTargetPr({
-      targetRepo: process.env.TARGET_REPO ?? "",
-      targetPr: process.env.TARGET_PR ?? "",
-      targetBase: process.env.TARGET_BASE ?? "",
-      prBaseSha: process.env.PR_BASE_SHA || undefined,
-      expectedHeadSha: process.env.EXPECTED_HEAD_SHA || undefined,
-    });
+    prepareTargetPr(
+      {
+        targetRepo: process.env.TARGET_REPO ?? "",
+        targetPr: process.env.TARGET_PR ?? "",
+        targetBase: process.env.TARGET_BASE ?? "",
+        prBaseSha: process.env.PR_BASE_SHA || undefined,
+        expectedHeadSha: process.env.EXPECTED_HEAD_SHA || undefined,
+      },
+      { targetDir: process.env.TARGET_DIR || undefined },
+    );
   } catch (error) {
+    if (error instanceof SupersededPrError && process.env.GITHUB_OUTPUT) {
+      fs.appendFileSync(process.env.GITHUB_OUTPUT, "classification=superseded\n");
+    }
     const message = error instanceof Error ? error.message : String(error);
     console.error(`::error::${message}`);
     process.exit(1);

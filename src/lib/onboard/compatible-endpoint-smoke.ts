@@ -1,11 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { NATIVE_LOCAL_RUNTIME_REFERENCE_PATTERN } from "../inference/native-local/agent-config";
+import {
+  normalizeNativeLocalProviderAttachment,
+  type NativeLocalProviderAttachment,
+} from "../inference/native-local/contract";
+import { verifyNativeLocalProviderAttachment } from "../inference/native-local/profile";
 import type { StdioOptions } from "node:child_process";
+import type { SandboxEntry } from "../state/registry";
+import { recordedNativeProviderAttachment } from "../inference/native-provider/recorded-selection";
+import { fixedNativeProviderForAttachment } from "../inference/native-provider/fixed";
+import { nativeHostedAgentConfig } from "../inference/native-provider/agent-config";
+import { nativeProviderLifecycle } from "../inference/native-provider";
+import { probeSandboxInferenceInvocation } from "../actions/sandbox/inference-invocation-probe";
+import type { OpenShellSandboxBufferedCommandExecutor } from "../adapters/openshell/sandbox-command";
+import { createCliOpenShellProviderAdapter } from "../adapters/openshell/provider-adapter-cli";
 import { shellQuote } from "../core/shell-quote";
 import { compactText } from "../core/url-utils";
 import { INFERENCE_ROUTE_URL, MANAGED_PROVIDER_ID } from "../inference/config";
 import { resolveMaxTokensField } from "../inference/max-tokens-field";
+import type { HostLocalInferenceSandboxProofAuthority } from "./runtime-provider/host-local-inference-routing";
 import {
   buildCompatibleEndpointSmokeRequestScript,
   RETRYABLE_HTTP_STATUS_PYTHON_EXPRESSION,
@@ -43,14 +58,32 @@ const COMPATIBLE_ENDPOINT_SMOKE_ATTEMPTS = 3;
 const COMPATIBLE_ENDPOINT_SMOKE_REQUEST_TIMEOUT_SECONDS = 60;
 const COMPATIBLE_ENDPOINT_SMOKE_RETRY_DELAY_SECONDS = 5;
 const COMPATIBLE_ENDPOINT_SMOKE_COMMAND_OVERHEAD_SECONDS = 30;
+const PROVIDER_NEUTRAL_SMOKE_INFERENCE_PROOF_COUNT = 3;
+const PROVIDER_NEUTRAL_SMOKE_DIRECT_DENY_TIMEOUT_SECONDS = 10;
+const COMPATIBLE_ENDPOINT_SMOKE_PROOF_TIMEOUT_SECONDS =
+  COMPATIBLE_ENDPOINT_SMOKE_ATTEMPTS * COMPATIBLE_ENDPOINT_SMOKE_REQUEST_TIMEOUT_SECONDS +
+  totalRetryBackoffSeconds(
+    COMPATIBLE_ENDPOINT_SMOKE_ATTEMPTS,
+    COMPATIBLE_ENDPOINT_SMOKE_RETRY_DELAY_SECONDS,
+  );
 const COMPATIBLE_ENDPOINT_SMOKE_COMMAND_TIMEOUT_MS =
-  (COMPATIBLE_ENDPOINT_SMOKE_ATTEMPTS * COMPATIBLE_ENDPOINT_SMOKE_REQUEST_TIMEOUT_SECONDS +
-    totalRetryBackoffSeconds(
-      COMPATIBLE_ENDPOINT_SMOKE_ATTEMPTS,
-      COMPATIBLE_ENDPOINT_SMOKE_RETRY_DELAY_SECONDS,
-    ) +
+  (COMPATIBLE_ENDPOINT_SMOKE_PROOF_TIMEOUT_SECONDS +
     COMPATIBLE_ENDPOINT_SMOKE_COMMAND_OVERHEAD_SECONDS) *
   1000;
+const PROVIDER_NEUTRAL_SMOKE_COMMAND_TIMEOUT_MS =
+  (PROVIDER_NEUTRAL_SMOKE_INFERENCE_PROOF_COUNT * COMPATIBLE_ENDPOINT_SMOKE_PROOF_TIMEOUT_SECONDS +
+    PROVIDER_NEUTRAL_SMOKE_DIRECT_DENY_TIMEOUT_SECONDS +
+    COMPATIBLE_ENDPOINT_SMOKE_COMMAND_OVERHEAD_SECONDS) *
+  1000;
+const OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT = Object.freeze({
+  version: 1,
+  httpStatus: 403,
+  error: "policy_denied",
+  method: "POST",
+  host: "host.openshell.internal",
+  path: "/v1/chat/completions",
+  detailSuffix: "not permitted by policy",
+});
 
 /**
  * Normalizes optional token-budget overrides while preserving safe defaults for
@@ -69,24 +102,6 @@ function nonNegativeInt(value: number | undefined, fallback: number): number {
 }
 
 /**
- * Returns whether onboarding should validate the compatible endpoint through
- * the OpenClaw sandbox instead of only checking host-side configuration.
- */
-export function shouldRunCompatibleEndpointSandboxSmoke(
-  provider: string | null | undefined,
-  messagingChannels: string[] | null | undefined,
-  agent: CompatibleEndpointSmokeAgent = null,
-): boolean {
-  const agentName = agent?.name || "openclaw";
-  return (
-    agentName === "openclaw" &&
-    provider === "compatible-endpoint" &&
-    Array.isArray(messagingChannels) &&
-    messagingChannels.length > 0
-  );
-}
-
-/**
  * Converts child-process output into text for diagnostics without assuming
  * whether Node returned strings, buffers, nulls, or primitive values.
  */
@@ -97,101 +112,338 @@ export function spawnOutputToString(value: unknown): string {
   return String(value);
 }
 
-export function verifyCompatibleEndpointSandboxSmoke(options: {
+export async function verifyCompatibleEndpointSandboxSmoke(options: {
   sandboxName: string;
   provider: string;
   model: string;
   runOpenshell: CompatibleEndpointSmokeRun;
+  sandboxCommandExecutor: OpenShellSandboxBufferedCommandExecutor;
   redact: (value: string) => string;
   endpointUrl?: string | null;
   credentialEnv?: string | null;
   messagingChannels?: string[] | null;
+  registeredSelection?: SandboxEntry | null;
   agent?: CompatibleEndpointSmokeAgent;
-}): void {
+  /** Force the provider-neutral inference.local proof for any supported agent. */
+  forceCanonicalRoute?: boolean;
+  nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+  hostLocalInferenceProofAuthority?: HostLocalInferenceSandboxProofAuthority;
+  /** Recheck sandbox identity after the sandbox proof and before success output. */
+  beforeSuccess?: () => void;
+  /** Let lifecycle callers report failure through their own recovery boundary. */
+  onFailure?: (exitCode: number) => never;
+}): Promise<void> {
+  const fail: (exitCode: number) => never = options.onFailure ?? process.exit;
+  const agentName = options.agent?.name || "openclaw";
+  const local = normalizeNativeLocalProviderAttachment(options.nativeLocalProviderAttachment);
+  if (options.nativeLocalProviderAttachment && !local)
+    throw new Error("Invalid native local inference ownership receipt.");
   if (
-    !shouldRunCompatibleEndpointSandboxSmoke(
-      options.provider,
-      options.messagingChannels,
-      options.agent,
-    )
+    !local &&
+    options.forceCanonicalRoute !== true &&
+    (agentName !== "openclaw" || options.provider !== "compatible-endpoint")
   ) {
     return;
   }
 
-  console.log("  Verifying compatible endpoint through the messaging sandbox...");
+  const forceCanonicalRoute = options.forceCanonicalRoute === true || Boolean(local);
+  const providerName = local?.providerName ?? options.provider;
+  console.log(
+    local
+      ? "  Verifying native local inference through the sandbox runtime..."
+      : forceCanonicalRoute
+        ? "  Verifying provider-neutral inference through the sandbox runtime..."
+        : "  Verifying compatible endpoint through the sandbox runtime...",
+  );
 
-  const providerResult = options.runOpenshell(["provider", "get", options.provider], {
-    ignoreError: true,
-    suppressOutput: true,
-    stdio: ["ignore", "pipe", "pipe"],
+  const target = local
+    ? { kind: "named" as const, gatewayName: local.gatewayName }
+    : { kind: "selected" as const };
+  const adapter = createCliOpenShellProviderAdapter({
+    run: (command, runOptions) => {
+      const result = options.runOpenshell(command, runOptions);
+      return {
+        status: result.status,
+        stdout:
+          typeof result.stdout === "string" || Buffer.isBuffer(result.stdout)
+            ? result.stdout
+            : null,
+        stderr:
+          typeof result.stderr === "string" || Buffer.isBuffer(result.stderr)
+            ? result.stderr
+            : null,
+      };
+    },
   });
-  const providerDetails = [
-    spawnOutputToString(providerResult.stdout),
-    spawnOutputToString(providerResult.stderr),
-  ]
-    .join("\n")
-    .trim();
-
-  if (providerResult.status !== 0) {
-    console.error(
-      `  Compatible endpoint provider '${options.provider}' is missing from the OpenShell gateway.`,
-    );
-    console.error(
-      "  The sandbox would start Telegram, but agent turns would fail before reaching the model.",
-    );
-    if (providerDetails) {
-      console.error(`  ${compactText(options.redact(providerDetails)).slice(0, 800)}`);
+  const selection = options.registeredSelection;
+  const native =
+    selection && !forceCanonicalRoute
+      ? recordedNativeProviderAttachment({
+          ...selection,
+          provider: options.provider,
+          endpointUrl: options.endpointUrl ?? selection.endpointUrl,
+          credentialEnv: options.credentialEnv ?? selection.credentialEnv,
+        })
+      : undefined;
+  if (native && selection) {
+    if (selection.model !== options.model) {
+      throw new Error("Compatible endpoint verification does not match the registered model.");
     }
-    process.exit(providerResult.status || 1);
-  }
-
-  if (
-    options.endpointUrl &&
-    providerDetails &&
-    /OPENAI_BASE_URL|baseUrl|base URL|endpoint/i.test(providerDetails) &&
-    !providerDetails.includes(options.endpointUrl)
-  ) {
-    console.warn(
-      `  \u26a0 Gateway provider '${options.provider}' did not report the selected endpoint URL.`,
+    const nativeTarget = selection.gatewayName
+      ? { kind: "named" as const, gatewayName: selection.gatewayName }
+      : target;
+    await nativeProviderLifecycle(
+      fixedNativeProviderForAttachment(native),
+    ).verifyNativeProviderAttachment({
+      adapter,
+      target: nativeTarget,
+      sandboxName: options.sandboxName,
+      expected: native,
+    });
+    const configCheck = buildCompatibleEndpointConfigSmokeScript(options.model, {
+      baseUrl: native.endpointUrl!,
+      credentialEnv: nativeHostedAgentConfig(options.provider, native.endpointUrl!)!.credentialEnv,
+      api: native.custom?.api,
+    });
+    const result = await probeSandboxInferenceInvocation(
+      {
+        sandboxName: options.sandboxName,
+        provider: options.provider,
+        model: options.model,
+        preferredInferenceApi: native.custom?.api ?? selection.preferredInferenceApi ?? null,
+        nativeProvider: true,
+        nativeEndpointUrl: native.endpointUrl,
+      },
+      {
+        execute: async (_name, command, timeout) => {
+          const completed = await options.sandboxCommandExecutor.runBuffered({
+            sandboxName: options.sandboxName,
+            target: nativeTarget,
+            command: ["sh", "-c", `set -eu\n{\n${configCheck}\n} >/dev/null\n${command}`],
+            timeoutMilliseconds: timeout,
+          });
+          return completed.outcome.kind === "completed"
+            ? {
+                status: completed.outcome.exitCode,
+                stdout: completed.stdout,
+                stderr: completed.stderr,
+              }
+            : null;
+        },
+      },
     );
-    console.warn("    Continuing to the sandbox-side inference.local smoke check.");
+    if (!result.ok) {
+      console.error(`  Compatible endpoint sandbox smoke check failed: ${result.detail}.`);
+      fail(1);
+    }
+    options.beforeSuccess?.();
+    console.log(
+      "  ✓ Compatible endpoint responds through its attached native provider inside the sandbox",
+    );
+    return;
+  }
+  if (local)
+    await verifyNativeLocalProviderAttachment({
+      adapter,
+      sandboxName: options.sandboxName,
+      expected: local,
+    });
+  const providerResult = await adapter.getProvider({
+    target,
+    providerName: local?.providerName ?? options.provider,
+  });
+
+  if (!providerResult.ok) {
+    console.error(
+      forceCanonicalRoute
+        ? `  Provider-neutral inference provider '${providerName}' is missing or unreachable in the OpenShell gateway.`
+        : `  Compatible endpoint provider '${options.provider}' is missing from the OpenShell gateway.`,
+    );
+    console.error(
+      local
+        ? "  Native sandbox inference cannot reach the selected model provider."
+        : "  The sandbox inference.local route cannot reach the selected model provider.",
+    );
+    console.error(`  ${compactText(options.redact(providerResult.error.message)).slice(0, 800)}`);
+    fail(1);
   }
   if (
+    !local &&
     options.credentialEnv &&
-    providerDetails &&
-    /credential|api key|secret/i.test(providerDetails) &&
-    !providerDetails.includes(options.credentialEnv)
+    !providerResult.value.credentialKeys.includes(options.credentialEnv)
   ) {
     console.warn(
       `  \u26a0 Gateway provider '${options.provider}' did not report the selected credential binding.`,
     );
   }
 
-  const script = buildCompatibleEndpointSandboxSmokeCommand(options.model);
-  const smokeResult = options.runOpenshell(
-    ["sandbox", "exec", "-n", options.sandboxName, "--", "sh", "-lc", script],
-    {
-      ignoreError: true,
-      suppressOutput: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: COMPATIBLE_ENDPOINT_SMOKE_COMMAND_TIMEOUT_MS,
-    },
-  );
-  const smokeOutput = [
-    spawnOutputToString(smokeResult.stdout),
-    spawnOutputToString(smokeResult.stderr),
-  ]
-    .join("\n")
-    .trim();
+  const script = forceCanonicalRoute
+    ? buildProviderNeutralInferenceSandboxSmokeScript(
+        options.model,
+        options.hostLocalInferenceProofAuthority,
+        local,
+      )
+    : buildCompatibleEndpointSandboxSmokeCommand(options.model);
+  const smokeResult = await options.sandboxCommandExecutor.runBuffered({
+    sandboxName: options.sandboxName,
+    target,
+    command: forceCanonicalRoute ? ["python3", "-c", script] : ["sh", "-lc", script],
+    timeoutMilliseconds: forceCanonicalRoute
+      ? PROVIDER_NEUTRAL_SMOKE_COMMAND_TIMEOUT_MS
+      : COMPATIBLE_ENDPOINT_SMOKE_COMMAND_TIMEOUT_MS,
+  });
+  const smokeOutput = [smokeResult.stdout, smokeResult.stderr].join("\n").trim();
+  const smokeStatus = smokeResult.outcome.kind === "completed" ? smokeResult.outcome.exitCode : 1;
 
-  if (smokeResult.status !== 0 || !/INFERENCE_SMOKE_OK/.test(smokeOutput)) {
-    console.error("  Compatible endpoint sandbox smoke check failed.");
-    console.error("  Telegram provider startup is not the root cause; inference.local failed.");
+  if (smokeStatus !== 0 || !/INFERENCE_SMOKE_OK/.test(smokeOutput)) {
+    console.error(
+      forceCanonicalRoute
+        ? "  Provider-neutral sandbox inference smoke check failed."
+        : "  Compatible endpoint sandbox smoke check failed.",
+    );
+    if (!forceCanonicalRoute) {
+      console.error(
+        "  Messaging setup is not the root cause; the sandbox inference.local route failed.",
+      );
+    }
     if (smokeOutput) console.error(`  ${compactText(options.redact(smokeOutput)).slice(0, 1200)}`);
-    process.exit(smokeResult.status || 1);
+    fail(smokeStatus || 1);
   }
 
-  console.log("  \u2713 Compatible endpoint responds through inference.local inside the sandbox");
+  options.beforeSuccess?.();
+  console.log(
+    local
+      ? "  \u2713 Native local inference responds inside the sandbox"
+      : options.forceCanonicalRoute
+        ? "  \u2713 Provider responds through inference.local inside the sandbox"
+        : "  \u2713 Compatible endpoint responds through inference.local inside the sandbox",
+  );
+}
+
+/** Bind the ordinary and post-restore checks to the same runtime adapters. */
+export function createCompatibleEndpointSmoke(
+  runOpenshell: (
+    args: string[],
+    options?: NonNullable<Parameters<CompatibleEndpointSmokeRun>[1]> & { env?: NodeJS.ProcessEnv },
+  ) => ReturnType<CompatibleEndpointSmokeRun>,
+  sandboxCommandExecutor: OpenShellSandboxBufferedCommandExecutor,
+  redact: (value: string) => string,
+  getSandbox: (name: string) => SandboxEntry | null | undefined,
+) {
+  type SmokeOptions = Parameters<typeof verifyCompatibleEndpointSandboxSmoke>[0];
+  const nativeSelection = (
+    options: Pick<SmokeOptions, "sandboxName" | "provider" | "endpointUrl">,
+  ) => {
+    const recorded = getSandbox(options.sandboxName)?.nativeLocalProviderAttachment;
+    if (recorded === undefined) return {};
+    const receipt = normalizeNativeLocalProviderAttachment(recorded);
+    if (!receipt)
+      throw new Error(
+        "Native local inference requires its recorded provider attachment. Recreate this beta sandbox.",
+      );
+    return { nativeLocalProviderAttachment: receipt };
+  };
+  return {
+    verify(
+      options: Omit<SmokeOptions, "runOpenshell" | "sandboxCommandExecutor" | "redact">,
+      run = runOpenshell,
+    ): Promise<void> {
+      return verifyCompatibleEndpointSandboxSmoke({
+        ...options,
+        registeredSelection: getSandbox(options.sandboxName),
+        ...nativeSelection(options),
+        runOpenshell: run,
+        sandboxCommandExecutor,
+        redact,
+      });
+    },
+    verifyRebuilt(
+      options: Pick<
+        SmokeOptions,
+        "sandboxName" | "provider" | "model" | "endpointUrl" | "credentialEnv"
+      > & {
+        environment: NodeJS.ProcessEnv;
+        gatewayName?: string;
+      },
+    ): Promise<void> {
+      const { environment, gatewayName, ...selection } = options;
+      return verifyCompatibleEndpointSandboxSmoke({
+        ...selection,
+        registeredSelection: getSandbox(selection.sandboxName),
+        ...nativeSelection(selection),
+        onFailure: (exitCode) => {
+          throw new Error(`Compatible endpoint verification failed (exit ${exitCode}).`);
+        },
+        runOpenshell: (args, runOptions) => runOpenshell(args, { ...runOptions, env: environment }),
+        sandboxCommandExecutor: {
+          runBuffered: (request) =>
+            sandboxCommandExecutor.runBuffered({
+              ...request,
+              environment,
+              ...(gatewayName ? { target: { kind: "named", gatewayName } as const } : {}),
+            }),
+        },
+        redact,
+      });
+    },
+  };
+}
+
+/** Check the agent configuration before sending a request through the selected route. */
+export function buildCompatibleEndpointConfigSmokeScript(
+  model: string,
+  options: { configPath?: string; baseUrl?: string; credentialEnv?: string; api?: string } = {},
+): string {
+  return `python3 - ${shellQuote(options.configPath ?? "/sandbox/.openclaw/openclaw.json")} ${shellQuote(model)} ${shellQuote(options.baseUrl ?? INFERENCE_ROUTE_URL)} ${shellQuote(options.credentialEnv ?? "")} ${shellQuote(options.api ?? "")} <<'PYCFG'
+import json
+import sys
+
+path = sys.argv[1]
+model = sys.argv[2]
+base_url = sys.argv[3]
+credential_env = sys.argv[4]
+api_key = "unused"
+if credential_env:
+    import os
+    import re
+    api_key = os.environ.get(credential_env, "")
+    if not re.fullmatch(r"openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_" + re.escape(credential_env), api_key):
+        print("native inference credential reference is missing or invalid", file=sys.stderr)
+        sys.exit(1)
+
+def die(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception as exc:
+    die("could not read openclaw.json: %s" % exc)
+
+providers = cfg.get("models", {}).get("providers", {})
+if not isinstance(providers, dict):
+    die("openclaw.json models.providers is not an object")
+if "deepinfra" in providers:
+    die("openclaw.json contains a direct deepinfra provider; expected managed inference provider")
+
+provider = providers.get("${MANAGED_PROVIDER_ID}")
+if not isinstance(provider, dict):
+    die("openclaw.json missing models.providers.${MANAGED_PROVIDER_ID}")
+if provider.get("baseUrl") != base_url:
+    die("models.providers.${MANAGED_PROVIDER_ID}.baseUrl does not match the selected route")
+if sys.argv[5] and provider.get("api") != sys.argv[5]:
+    die("models.providers.${MANAGED_PROVIDER_ID}.api does not match the selected route")
+if provider.get("apiKey") != api_key:
+    die("models.providers.${MANAGED_PROVIDER_ID}.apiKey must match the selected non-secret placeholder")
+
+primary = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary")
+expected_primary = "${MANAGED_PROVIDER_ID}/" + model
+if primary != expected_primary:
+    die("agents.defaults.model.primary is %r; expected %r" % (primary, expected_primary))
+
+print("OPENCLAW_CONFIG_OK")
+PYCFG`;
 }
 
 /**
@@ -232,44 +484,7 @@ SMOKE_ATTEMPTS=${attempts}
 SMOKE_REQUEST_TIMEOUT_SECONDS=${COMPATIBLE_ENDPOINT_SMOKE_REQUEST_TIMEOUT_SECONDS}
 SMOKE_RETRY_DELAY_SECONDS=${retryDelaySeconds}
 
-python3 - "$CONFIG" "$MODEL" <<'PYCFG'
-import json
-import sys
-
-path = sys.argv[1]
-model = sys.argv[2]
-
-def die(message):
-    print(message, file=sys.stderr)
-    sys.exit(1)
-
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-except Exception as exc:
-    die("could not read openclaw.json: %s" % exc)
-
-providers = cfg.get("models", {}).get("providers", {})
-if not isinstance(providers, dict):
-    die("openclaw.json models.providers is not an object")
-if "deepinfra" in providers:
-    die("openclaw.json contains a direct deepinfra provider; expected managed inference provider")
-
-provider = providers.get("${MANAGED_PROVIDER_ID}")
-if not isinstance(provider, dict):
-    die("openclaw.json missing models.providers.${MANAGED_PROVIDER_ID}")
-if provider.get("baseUrl") != "${INFERENCE_ROUTE_URL}":
-    die("models.providers.${MANAGED_PROVIDER_ID}.baseUrl is %r; expected ${INFERENCE_ROUTE_URL}" % provider.get("baseUrl"))
-if provider.get("apiKey") != "unused":
-    die("models.providers.${MANAGED_PROVIDER_ID}.apiKey must remain the non-secret placeholder 'unused'")
-
-primary = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary")
-expected_primary = "${MANAGED_PROVIDER_ID}/" + model
-if primary != expected_primary:
-    die("agents.defaults.model.primary is %r; expected %r" % (primary, expected_primary))
-
-print("OPENCLAW_CONFIG_OK")
-PYCFG
+${buildCompatibleEndpointConfigSmokeScript(model, { configPath })}
 
 payload_file="$(mktemp)"
 response_file="$(mktemp)"
@@ -424,4 +639,258 @@ done
 
 export function buildCompatibleEndpointSandboxSmokeCommand(model: string): string {
   return buildCompatibleEndpointSandboxSmokeScript(model);
+}
+
+/**
+ * Runs a Python standard-library request inside the sandbox, proving a real
+ * chat response through the selected endpoint and explicit denial outside its policy.
+ */
+export function buildProviderNeutralInferenceSandboxSmokeScript(
+  model: string,
+  authority: HostLocalInferenceSandboxProofAuthority | undefined,
+  local?: NativeLocalProviderAttachment,
+): string {
+  const expectedHealthPath =
+    authority?.service === "ollama"
+      ? "/api/tags"
+      : authority?.service === "nim"
+        ? "/v1/health/ready"
+        : authority?.service === "vllm" || authority?.service === "llama-cpp"
+          ? "/health"
+          : null;
+  if (
+    !local &&
+    (!authority ||
+      !Number.isSafeInteger(authority.directHostPort) ||
+      authority.directHostPort < 1 ||
+      authority.directHostPort > 65_535 ||
+      authority.directHealthPath !== expectedHealthPath)
+  ) {
+    throw new Error("Provider-neutral sandbox smoke requires exact provider health authority.");
+  }
+  const endpointLabel = local ? "Native local inference" : "inference.local";
+  const inferenceUrl = JSON.stringify(
+    `${local?.endpointUrl ?? INFERENCE_ROUTE_URL}/chat/completions`,
+  );
+  const maxTokensField = JSON.stringify(resolveMaxTokensField(model));
+  const modelValue = JSON.stringify(model);
+  const toolCallingRequired = authority?.toolCallingRequired ? "True" : "False";
+  const directAuthority = local
+    ? new URL(local.endpointUrl).host
+    : `${OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.host}:${String(authority!.directHostPort)}`;
+  const deniedPath = local
+    ? `${new URL(local.endpointUrl).pathname}/nemoclaw-denied`
+    : OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.path;
+  const directUrl = JSON.stringify(`http://${directAuthority}${deniedPath}`);
+  const directMethod = JSON.stringify(OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.method);
+  const directDenialError = JSON.stringify(OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.error);
+  const directDenialDetail = JSON.stringify(
+    `${OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.method} ${directAuthority}${deniedPath} ${OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.detailSuffix}`,
+  );
+  const authSetup = local
+    ? `credential = os.environ.get("NEMOCLAW_LOCAL_INFERENCE_TOKEN", "")
+if not re.fullmatch(${JSON.stringify(NATIVE_LOCAL_RUNTIME_REFERENCE_PATTERN)}, credential):
+    print("Native local inference requires an issued credential reference", file=sys.stderr)
+    sys.exit(2)
+auth_headers = {"Authorization": "Bearer " + credential}`
+    : "auth_headers = {}";
+  return `
+import errno
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+${authSetup}
+inference_url = ${inferenceUrl}
+model = ${modelValue}
+max_tokens_field = ${maxTokensField}
+tool_calling_required = ${toolCallingRequired}
+max_response_bytes = 1048576
+inference_opener = urllib.request.build_opener()
+direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def post_inference(payload, label):
+    request = urllib.request.Request(
+        inference_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **auth_headers},
+        method="POST",
+    )
+    response_data = None
+    for attempt in range(3):
+        try:
+            with inference_opener.open(request, timeout=60) as response:
+                if response.status < 200 or response.status > 299:
+                    raise RuntimeError("${endpointLabel} returned HTTP %s" % response.status)
+                response_bytes = response.read(max_response_bytes + 1)
+                if len(response_bytes) > max_response_bytes:
+                    print("${endpointLabel} %s proof response exceeded byte limit" % label, file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    response_data = json.loads(response_bytes.decode("utf-8", errors="strict"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    print("${endpointLabel} %s proof returned invalid JSON" % label, file=sys.stderr)
+                    sys.exit(1)
+            break
+        except urllib.error.HTTPError as error:
+            if 500 <= error.code <= 599 and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            print("${endpointLabel} %s proof returned terminal HTTP %s" % (label, error.code), file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            print("${endpointLabel} %s proof transport failed after bounded retries" % label, file=sys.stderr)
+            sys.exit(1)
+    if not isinstance(response_data, dict) or response_data.get("model") != model:
+        print("${endpointLabel} %s proof returned a different model identity" % label, file=sys.stderr)
+        sys.exit(1)
+    return response_data
+
+response_data = post_inference({
+    "model": model,
+    "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+    max_tokens_field: 512,
+}, "content")
+
+def classify_content_shape(data):
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return "CHOICES_MISSING", None, False
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return "MESSAGE_MISSING", None, False
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return "CONTENT", content, False
+    reasoning = message.get("reasoning_content")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return "REASONING_ONLY", None, choice.get("finish_reason") == "length"
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        return "TOOL_CALL_ONLY", None, False
+    if choice.get("finish_reason") == "length":
+        return "EMPTY_LENGTH", None, False
+    return "EMPTY_OTHER", None, False
+
+content_shape, content, retry_reasoning = classify_content_shape(response_data)
+if retry_reasoning:
+    print(
+        "${endpointLabel} content proof returned REASONING_ONLY at the initial token limit; retrying once with a larger content budget",
+        file=sys.stderr,
+    )
+    response_data = post_inference({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly: PONG"}],
+        max_tokens_field: 1024,
+    }, "content")
+    content_shape, content, _ = classify_content_shape(response_data)
+if not isinstance(content, str) or not content.strip():
+    print("${endpointLabel} content proof failed: %s" % content_shape, file=sys.stderr)
+    sys.exit(1)
+
+if tool_calling_required:
+    tool_name = "nemoclaw_route_probe"
+    tool_data = post_inference({
+        "model": model,
+        "messages": [{"role": "user", "content": "Call the required route probe tool."}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "Prove tool calling through the selected inference route.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": tool_name}},
+        max_tokens_field: 512,
+    }, "tool")
+    tool_choices = tool_data.get("choices")
+    tool_choice = tool_choices[0] if isinstance(tool_choices, list) and tool_choices and isinstance(tool_choices[0], dict) else {}
+    tool_message = tool_choice.get("message") if isinstance(tool_choice.get("message"), dict) else {}
+    tool_calls = tool_message.get("tool_calls")
+    matching_call = next((call for call in tool_calls if isinstance(call, dict) and isinstance(call.get("function"), dict) and call["function"].get("name") == tool_name), None) if isinstance(tool_calls, list) else None
+    if matching_call is None:
+        print("${endpointLabel} tool proof did not return the required tool call", file=sys.stderr)
+        sys.exit(1)
+    arguments = matching_call["function"].get("arguments")
+    try:
+        decoded_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        decoded_arguments = None
+    if not isinstance(decoded_arguments, dict) or decoded_arguments:
+        print("${endpointLabel} tool proof returned invalid tool arguments", file=sys.stderr)
+        sys.exit(1)
+
+direct_url = ${directUrl}
+direct_method = ${directMethod}
+direct_denial_contract_version = ${String(OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.version)}
+direct_denial_http_status = ${String(OPEN_SHELL_DIRECT_POLICY_DENIAL_CONTRACT.httpStatus)}
+direct_denial_error = ${directDenialError}
+direct_denial_detail = ${directDenialDetail}
+direct_deny_timeout_seconds = ${String(PROVIDER_NEUTRAL_SMOKE_DIRECT_DENY_TIMEOUT_SECONDS)}
+direct_request = urllib.request.Request(
+    direct_url,
+    data=json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "Prove direct inference is denied."}],
+        max_tokens_field: 1,
+    }).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method=direct_method,
+)
+try:
+    with direct_opener.open(direct_request, timeout=direct_deny_timeout_seconds) as direct_response:
+        print(
+            "direct host inference route unexpectedly returned HTTP %s" % direct_response.status,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+except urllib.error.HTTPError as error:
+    denial_bytes = error.read(max_response_bytes + 1)
+    if len(denial_bytes) > max_response_bytes:
+        print("direct host inference policy-denial response exceeded byte limit", file=sys.stderr)
+        sys.exit(1)
+    try:
+        denial_text = denial_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        print("direct host inference policy-denial response was not valid UTF-8", file=sys.stderr)
+        sys.exit(1)
+    try:
+        denial = json.loads(denial_text)
+    except json.JSONDecodeError:
+        print("direct host inference policy-denial response was not valid JSON", file=sys.stderr)
+        sys.exit(1)
+    detail = denial.get("detail") if isinstance(denial, dict) else None
+    if (
+        error.code != direct_denial_http_status
+        or not isinstance(denial, dict)
+        or denial.get("error") != direct_denial_error
+    ):
+        print("direct host inference response was not an OpenShell policy denial", file=sys.stderr)
+        sys.exit(1)
+    if detail != direct_denial_detail:
+        print(
+            "direct host inference OpenShell policy-denial contract v%s format drifted"
+            % direct_denial_contract_version,
+            file=sys.stderr,
+        )
+        sys.exit(1)
+except urllib.error.URLError as error:
+    reason = error.reason
+    if not isinstance(reason, ConnectionRefusedError) or reason.errno != errno.ECONNREFUSED:
+        print("direct host inference deny could not be proven", file=sys.stderr)
+        sys.exit(1)
+
+print("INFERENCE_SMOKE_OK " + content.strip()[:200])
+`.trim();
 }

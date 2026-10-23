@@ -4,9 +4,19 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import type { E2eExecutionMetadata } from "../../../tools/e2e/execution-coverage.mts";
+import {
+  type E2eGatewayRuntime,
+  type E2eGatewayRuntimeSupport,
+  type E2eRuntimeProvider,
+  e2eRuntimeProviders,
+  runtimeCoverageVariant,
+  runtimeExecutionId,
+} from "../../../tools/e2e/gateway-runtime.mts";
+import { liveTargetTimeoutContract } from "../../../tools/e2e/onboard-timeout-contract.mts";
+import { liveTargetTestTitle, requireLiveTargetExecution } from "./execution.ts";
 import { listTargets, requireTargets } from "./registry.ts";
 import { resolveRunnerForTarget } from "./runner-routing.ts";
-import { type LiveTargetSupport, liveTargetSupport } from "./runtime-support.ts";
 import type { TargetDefinition } from "./types.ts";
 
 interface Args {
@@ -15,8 +25,11 @@ interface Args {
   targets: string[];
 }
 
-export interface LiveTargetMatrixEntry {
+export interface LiveTargetMatrixEntry extends E2eExecutionMetadata {
   id: string;
+  execution_id: string;
+  runtime_provider: E2eRuntimeProvider;
+  coverage_variant: string;
   runner: string;
   label: string;
   platform: string;
@@ -26,9 +39,8 @@ export interface LiveTargetMatrixEntry {
   expectedStateId: string;
   suites: string[];
   requiredSecrets: string[];
-  supported: boolean;
-  supportReasons: string[];
   pendingRuntimeSuites: string[];
+  timeout_minutes: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -71,52 +83,48 @@ function printList() {
   }
 }
 
-function buildLabel(target: TargetDefinition): string {
-  const platform = target.environment?.platform ?? "unknown-platform";
-  const suites = target.suiteIds ?? [];
-  if (target.expectedFailure) {
-    const cls = target.expectedFailure.errorClass ?? "expected-failure";
-    return `${platform} · ${target.id} · expect-fail:${cls}`;
-  }
-  if (suites.length === 0) {
-    return `${platform} · ${target.id}`;
-  }
-  if (suites.length <= 3) {
-    return `${platform} · ${target.id} · ${suites.join("+")}`;
-  }
-  return `${platform} · ${target.id} · ${suites.length} suites`;
-}
-
 function liveMatrixEntry(
   target: TargetDefinition,
-  support: LiveTargetSupport,
+  runtimeProvider: E2eRuntimeProvider,
 ): LiveTargetMatrixEntry {
   const { runner } = resolveRunnerForTarget(target);
   return {
     id: target.id,
+    ...requireLiveTargetExecution(target),
+    execution_id: runtimeExecutionId(target.id, "", runtimeProvider),
+    runtime_provider: runtimeProvider,
+    coverage_variant: runtimeCoverageVariant("", runtimeProvider),
     runner,
-    label: buildLabel(target),
-    platform: target.environment?.platform ?? "unknown",
-    install: target.environment?.install ?? "unknown",
-    runtime: target.environment?.runtime ?? "unknown",
-    onboarding: target.environment?.onboarding ?? "unknown",
-    expectedStateId: target.expectedStateId ?? "",
-    suites: target.suiteIds ?? [],
-    requiredSecrets: target.requiredSecrets ?? [],
-    supported: support.supported,
-    supportReasons: support.reasons,
-    pendingRuntimeSuites: support.pendingRuntimeSuites,
+    label: `${liveTargetTestTitle(target)} [${runtimeProvider}]`,
+    platform: target.environment.platform,
+    install: target.environment.install,
+    runtime: target.environment.runtime,
+    onboarding: target.environment.onboarding,
+    expectedStateId: target.expectedStateId,
+    suites: target.suiteIds,
+    requiredSecrets: target.requiredSecrets,
+    pendingRuntimeSuites: target.suiteIds,
+    timeout_minutes: liveTargetTimeoutContract(
+      target.environment.lifecycle,
+      target.configExport.expectation,
+    ).targetTimeoutMinutes,
   };
 }
 
-export function buildLiveTargetMatrix(ids: string[] = []): LiveTargetMatrixEntry[] {
-  const targetSupport = (ids.length > 0 ? requireTargets(ids) : listTargets()).map((target) => ({
-    target,
-    support: liveTargetSupport(target),
-  }));
-  const liveEntries =
-    ids.length > 0 ? targetSupport : targetSupport.filter(({ support }) => support.supported);
-  return liveEntries.map(({ target, support }) => liveMatrixEntry(target, support));
+export function liveTargetGatewayRuntimes(target: TargetDefinition): E2eGatewayRuntimeSupport {
+  return target.gatewayRuntimes;
+}
+
+export function buildLiveTargetMatrix(
+  ids: string[] = [],
+  gatewayRuntimes: readonly E2eGatewayRuntime[] = ["docker"],
+): LiveTargetMatrixEntry[] {
+  const targets = ids.length === 0 ? listTargets() : requireTargets(ids);
+  return targets.flatMap((target) =>
+    e2eRuntimeProviders(liveTargetGatewayRuntimes(target), gatewayRuntimes).map((runtimeProvider) =>
+      liveMatrixEntry(target, runtimeProvider),
+    ),
+  );
 }
 
 function emitLiveMatrix(ids: string[]) {

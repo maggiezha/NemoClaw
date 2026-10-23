@@ -4,12 +4,13 @@
 import { type SpawnSyncOptionsWithStringEncoding, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-
+import { redirectInheritedChildStdoutToStderr } from "../cli/stdout-guard";
 import {
   type OpenShellInstallResult,
   type OpenshellInstallVersionResolution,
   resolveOpenshellInstallVersion,
 } from "./openshell-install";
+import { getOpenshellChannel } from "./openshell-version";
 
 const GH_LIMIT = 1000;
 const PER_PAGE = 100;
@@ -169,12 +170,17 @@ export function computeOpenshellInstallEnv(
   baseEnv: NodeJS.ProcessEnv,
   deps: OpenshellInstallPinDeps,
 ): OpenshellInstallEnvDirective {
-  const channel = (baseEnv.NEMOCLAW_OPENSHELL_CHANNEL ?? "auto").trim();
-  // Dev installs already identify a non-stable build source. Stable release
-  // discovery must not block that current-main proof path merely because the
-  // next semver release has not been published yet.
-  const pin: OpenshellInstallPinResult =
-    channel === "dev" ? { kind: "no-max" } : resolveOpenshellInstallPin(deps);
+  const channel = getOpenshellChannel(baseEnv);
+  if (channel === "dev") {
+    const error = deps.error ?? ((m: string) => console.error(m));
+    error("");
+    error(
+      "  ✗ NemoClaw requires exact stable OpenShell 0.0.116; the dev channel is not supported.",
+    );
+    error("");
+    return { env: null };
+  }
+  const pin: OpenshellInstallPinResult = resolveOpenshellInstallPin(deps);
   if (pin.kind === "incompatible") {
     const error = deps.error ?? ((m: string) => console.error(m));
     error("");
@@ -188,11 +194,6 @@ export function computeOpenshellInstallEnv(
   if (blueprintMin) overlay.NEMOCLAW_OPENSHELL_MIN_VERSION = blueprintMin;
   if (blueprintMax) overlay.NEMOCLAW_OPENSHELL_MAX_VERSION = blueprintMax;
   if (pin.kind === "pin") overlay.NEMOCLAW_OPENSHELL_PIN_VERSION = pin.version;
-  if (channel === "dev") {
-    const env = { ...baseEnv, ...overlay };
-    delete env.NEMOCLAW_OPENSHELL_PIN_VERSION;
-    return { env };
-  }
   return Object.keys(overlay).length === 0 ? { env: baseEnv } : { env: { ...baseEnv, ...overlay } };
 }
 
@@ -203,6 +204,31 @@ export type RunOpenshellInstallDeps = OpenshellInstallPinDeps & {
   getFutureShellPathHint: (binDir: string, pathValue?: string) => string | null;
   setOpenshellBin: (binPath: string | null) => void;
 };
+
+export type PrependInstalledUserLocalOpenshellPathDeps = {
+  env?: NodeJS.ProcessEnv;
+  getFutureShellPathHint: RunOpenshellInstallDeps["getFutureShellPathHint"];
+};
+
+/** Keep the installed user-local OpenShell directory first across separate NemoClaw command processes. */
+export function prependInstalledUserLocalOpenshellPath(
+  deps: PrependInstalledUserLocalOpenshellPathDeps,
+): string | null {
+  const env = deps.env ?? process.env;
+  const localBin = env.XDG_BIN_HOME || path.join(env.HOME || "", ".local", "bin");
+  const openshellPath = path.join(localBin, "openshell");
+  try {
+    if (!fs.statSync(openshellPath).isFile()) return null;
+    fs.accessSync(openshellPath, fs.constants.X_OK);
+  } catch {
+    return null;
+  }
+  const futureShellPathHint = deps.getFutureShellPathHint(localBin, env.PATH ?? "");
+  if (futureShellPathHint !== null) {
+    env.PATH = env.PATH ? `${localBin}${path.delimiter}${env.PATH}` : localBin;
+  }
+  return futureShellPathHint;
+}
 
 /**
  * Execute `scripts/install-openshell.sh`, wiring in the blueprint-driven pin
@@ -227,20 +253,14 @@ export function runOpenshellInstall(deps: RunOpenshellInstallDeps): OpenShellIns
   const result = spawnSync("bash", [path.join(deps.scriptsDir, "install-openshell.sh")], {
     cwd: deps.cwd,
     env: installEnv,
-    stdio: ["ignore", "inherit", "inherit"],
+    stdio: redirectInheritedChildStdoutToStderr(["ignore", "inherit", "inherit"]),
     timeout: 300_000,
   });
   if (result.status !== 0) {
     return { installed: false, localBin: null, futureShellPathHint: null };
   }
   const localBin = process.env.XDG_BIN_HOME || path.join(process.env.HOME || "", ".local", "bin");
-  const openshellPath = path.join(localBin, "openshell");
-  const futureShellPathHint = fs.existsSync(openshellPath)
-    ? deps.getFutureShellPathHint(localBin, process.env.PATH)
-    : null;
-  if (fs.existsSync(openshellPath) && futureShellPathHint) {
-    process.env.PATH = `${localBin}${path.delimiter}${process.env.PATH}`;
-  }
+  const futureShellPathHint = prependInstalledUserLocalOpenshellPath(deps);
   const bin = deps.resolveOpenshell();
   deps.setOpenshellBin(bin);
   if (bin) process.env.NEMOCLAW_OPENSHELL_BIN = bin;

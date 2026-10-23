@@ -8,9 +8,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildLiveVitestArgs,
+  DGX_EXPRESS_TEST_PATH,
+  INFERENCE_ROUTING_TEST_PATH,
   LIVE_VITEST_PROJECT,
+  MCP_BRIDGE_TEST_PATH,
   type LiveVitestSpawner,
   RISK_SIGNAL_REPORTER,
+  resolveLiveSelector,
   runLiveVitestCommand,
   validateLiveProject,
   validateLiveSelector,
@@ -19,6 +23,7 @@ import {
 
 const LIVE_VITEST_TOOL = path.resolve("tools/e2e/live-vitest-invocation.mts");
 const TSX = path.resolve("node_modules", ".bin", "tsx");
+const FULL_E2E_TEST_PATH = "test/e2e/live/full-e2e.test.ts";
 
 describe("validateLiveProject (#6961)", () => {
   it("accepts the live project and defaults to it", () => {
@@ -26,11 +31,12 @@ describe("validateLiveProject (#6961)", () => {
     expect(validateLiveProject(undefined)).toBe(LIVE_VITEST_PROJECT);
   });
 
-  it("rejects any other project", () => {
-    for (const project of ["cli", "e2e-support", "e2e-live-extra", "integration"]) {
+  it.each(["cli", "e2e-support", "e2e-live-extra", "integration"])(
+    "rejects any other project [case %#]",
+    (project) => {
       expect(() => validateLiveProject(project)).toThrow(/unsupported vitest project/);
-    }
-  });
+    },
+  );
 });
 
 describe("validateLiveTestPath (#6961)", () => {
@@ -55,16 +61,14 @@ describe("validateLiveTestPath (#6961)", () => {
     expect(() => validateLiveTestPath("/etc/passwd")).toThrow(/unsupported character|absolute/);
   });
 
-  it("rejects shell metacharacters", () => {
-    for (const bad of [
-      "test/e2e/live/x.test.ts; rm -rf /",
-      "test/e2e/live/$(whoami).test.ts",
-      "test/e2e/live/x.test.ts && curl evil",
-      "test/e2e/live/`id`.test.ts",
-      "test/e2e/live/x.test.ts|cat",
-    ]) {
-      expect(() => validateLiveTestPath(bad)).toThrow(/unsupported character/);
-    }
+  it.each([
+    "test/e2e/live/x.test.ts; rm -rf /",
+    "test/e2e/live/$(whoami).test.ts",
+    "test/e2e/live/x.test.ts && curl evil",
+    "test/e2e/live/`id`.test.ts",
+    "test/e2e/live/x.test.ts|cat",
+  ])("rejects shell metacharacters [case %#]", (bad) => {
+    expect(() => validateLiveTestPath(bad)).toThrow(/unsupported character/);
   });
 
   it("requires a .test.ts file", () => {
@@ -91,17 +95,58 @@ describe("validateLiveSelector (#6961)", () => {
     expect(validateLiveSelector("   ")).toBeUndefined();
   });
 
-  it("rejects shell metacharacters in the expanded selector", () => {
-    for (const bad of [
-      "^$(touch pwned)$",
-      "^x$; rm -rf /",
-      "^x$ && evil",
-      "^`id`$",
-      "^x|y$",
-      "^x>out$",
-    ]) {
+  it.each(["^$(touch pwned)$", "^x$; rm -rf /", "^x$ && evil", "^`id`$", "^x|y$", "^x>out$"])(
+    "rejects shell metacharacters in the expanded selector [case %#]",
+    (bad) => {
       expect(() => validateLiveSelector(bad)).toThrow(/unsupported character/);
-    }
+    },
+  );
+});
+
+describe("resolveLiveSelector (#6901)", () => {
+  it.each([
+    ["openclaw", "^mcp-bridge$"],
+    ["hermes", "^mcp-bridge-hermes$"],
+    ["deepagents", "^mcp-bridge-deepagents$"],
+  ])(
+    "infers the reviewed %s selector for trusted base-workflow compatibility",
+    (agent, expected) => {
+      expect(
+        resolveLiveSelector(MCP_BRIDGE_TEST_PATH, undefined, {
+          NEMOCLAW_MCP_BRIDGE_AGENT: agent,
+        }),
+      ).toBe(expected);
+      expect(
+        resolveLiveSelector(MCP_BRIDGE_TEST_PATH, expected, {
+          NEMOCLAW_MCP_BRIDGE_AGENT: agent,
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it("keeps the existing OpenClaw default for local MCP runs", () => {
+    expect(resolveLiveSelector(MCP_BRIDGE_TEST_PATH, undefined, {})).toBe("^mcp-bridge$");
+  });
+
+  it("rejects an unsupported MCP agent or mismatched explicit selector", () => {
+    expect(() =>
+      resolveLiveSelector(MCP_BRIDGE_TEST_PATH, undefined, {
+        NEMOCLAW_MCP_BRIDGE_AGENT: "all",
+      }),
+    ).toThrow(/unsupported NEMOCLAW_MCP_BRIDGE_AGENT/u);
+    expect(() =>
+      resolveLiveSelector(MCP_BRIDGE_TEST_PATH, "^mcp-bridge-hermes$", {
+        NEMOCLAW_MCP_BRIDGE_AGENT: "openclaw",
+      }),
+    ).toThrow(/does not match agent/u);
+  });
+
+  it("does not infer selectors for unrelated live tests", () => {
+    expect(
+      resolveLiveSelector(FULL_E2E_TEST_PATH, undefined, {
+        NEMOCLAW_MCP_BRIDGE_AGENT: "hermes",
+      }),
+    ).toBeUndefined();
   });
 });
 
@@ -110,7 +155,7 @@ describe("buildLiveVitestArgs (#6961)", () => {
     expect(
       buildLiveVitestArgs({
         testPath: "test/e2e/live/registry-targets.test.ts",
-        selector: "^ubuntu-repo-cloud-openclaw$",
+        selector: "^ubuntu-repo-cloud-openclaw:",
       }),
     ).toEqual([
       "vitest",
@@ -119,7 +164,7 @@ describe("buildLiveVitestArgs (#6961)", () => {
       "e2e-live",
       "test/e2e/live/registry-targets.test.ts",
       "-t",
-      "^ubuntu-repo-cloud-openclaw$",
+      "^ubuntu-repo-cloud-openclaw:",
       "--silent=false",
       "--reporter=default",
       `--reporter=${RISK_SIGNAL_REPORTER}`,
@@ -129,18 +174,25 @@ describe("buildLiveVitestArgs (#6961)", () => {
   it("omits the selector arguments for a single-file target", () => {
     expect(
       buildLiveVitestArgs({
-        testPath: "test/e2e/live/diagnostics.test.ts",
+        testPath: FULL_E2E_TEST_PATH,
       }),
     ).toEqual([
       "vitest",
       "run",
       "--project",
       "e2e-live",
-      "test/e2e/live/diagnostics.test.ts",
+      FULL_E2E_TEST_PATH,
       "--silent=false",
       "--reporter=default",
       `--reporter=${RISK_SIGNAL_REPORTER}`,
     ]);
+  });
+
+  it("fails fast only for inference-routing (#9622)", () => {
+    expect(buildLiveVitestArgs({ testPath: INFERENCE_ROUTING_TEST_PATH })).toContain("--bail=1");
+    expect(buildLiveVitestArgs({ testPath: "test/e2e/live/onboard-resume.test.ts" })).not.toContain(
+      "--bail=1",
+    );
   });
 
   it("fails closed on an invalid input before producing any argv", () => {
@@ -161,7 +213,7 @@ describe("buildLiveVitestArgs (#6961)", () => {
 });
 
 describe("runLiveVitestCommand (#6961)", () => {
-  const validArgs = ["run", "--test-path", "test/e2e/live/diagnostics.test.ts"];
+  const validArgs = ["run", "--test-path", FULL_E2E_TEST_PATH];
 
   it.each([
     ["child status", { status: 7, signal: null }, 7],
@@ -182,7 +234,7 @@ describe("runLiveVitestCommand (#6961)", () => {
         "run",
         "--project",
         "e2e-live",
-        "test/e2e/live/diagnostics.test.ts",
+        FULL_E2E_TEST_PATH,
         "--silent=false",
         "--reporter=default",
         `--reporter=${RISK_SIGNAL_REPORTER}`,
@@ -202,11 +254,24 @@ describe("runLiveVitestCommand (#6961)", () => {
     expect(() => runLiveVitestCommand(validArgs, spawn)).toThrow(launchError);
   });
 
+  it("passes the inferred MCP selector to Vitest when trusted base YAML omits it", () => {
+    let spawned: Parameters<LiveVitestSpawner> | undefined;
+    const spawn: LiveVitestSpawner = (...args) => {
+      spawned = args;
+      return { status: 0 };
+    };
+
+    expect(
+      runLiveVitestCommand(["run", "--test-path", MCP_BRIDGE_TEST_PATH], spawn, {
+        NEMOCLAW_MCP_BRIDGE_AGENT: "hermes",
+      }),
+    ).toBe(0);
+    expect(spawned?.[1]).toContain("-t");
+    expect(spawned?.[1]).toContain("^mcp-bridge-hermes$");
+  });
+
   it.each([
-    [
-      "unknown option",
-      ["run", "--test-path", "test/e2e/live/diagnostics.test.ts", "--selctor", "^x$"],
-    ],
+    ["unknown option", ["run", "--test-path", FULL_E2E_TEST_PATH, "--selctor", "^x$"]],
     ["bare selector", [...validArgs, "--selector"]],
   ])("rejects an %s before spawning Vitest", (_label, args) => {
     let spawned = false;
@@ -245,3 +310,99 @@ describe("runLiveVitestCommand (#6961)", () => {
     expect(result.stderr).toContain('expected "run"');
   });
 });
+
+it.each([
+  ["spark-express-vllm", "^spark-express-vllm:"],
+  ["dgx-station-express", "^dgx-station-express:"],
+])("runs only the selected %s case from the shared DGX file", (target, selector) => {
+  let spawned: Parameters<LiveVitestSpawner> | undefined;
+  const spawn: LiveVitestSpawner = (...args) => {
+    spawned = args;
+    return { status: 0 };
+  };
+  expect(
+    runLiveVitestCommand(
+      ["run", "--test-path", DGX_EXPRESS_TEST_PATH, "--selector", selector],
+      spawn,
+      { E2E_TARGET_ID: target },
+    ),
+  ).toBe(0);
+  expect(spawned?.[1]).toEqual(buildLiveVitestArgs({ testPath: DGX_EXPRESS_TEST_PATH, selector }));
+  expect(spawned?.[1]).toContain(selector);
+});
+
+it.each([
+  ["dgx-station-express", []],
+  ["spark-express-vllm", []],
+  [undefined, ["--selector", "^dgx-station-express:"]],
+  ["unknown", ["--selector", "^dgx-station-express:"]],
+  ["spark-express-vllm", ["--selector", "^dgx-station-express:"]],
+  ["dgx-station-express", ["--selector", "^spark-express-vllm:"]],
+  ["dgx-station-express", ["--selector", "^dgx"]],
+] as const)("rejects a DGX selector mismatch before spawning: %s / %j", (target, selectorArgs) => {
+  let spawned = false;
+  const spawn: LiveVitestSpawner = () => {
+    spawned = true;
+    return { status: 0 };
+  };
+  expect(() =>
+    runLiveVitestCommand(["run", "--test-path", DGX_EXPRESS_TEST_PATH, ...selectorArgs], spawn, {
+      E2E_TARGET_ID: target,
+    }),
+  ).toThrow("DGX Express requires an explicit selector matching E2E_TARGET_ID");
+  expect(spawned).toBe(false);
+});
+
+it.each([
+  ["spark-express-vllm", "^spark-express-vllm:"],
+  ["dgx-station-express", "^dgx-station-express:"],
+])(
+  "collects exactly the %s live case without executing hardware operations",
+  (target, selector) => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.resolve("node_modules/vitest/vitest.mjs"),
+        "list",
+        "--project",
+        "e2e-live",
+        DGX_EXPRESS_TEST_PATH,
+        "--json",
+        "-t",
+        selector,
+      ],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        timeout: 30_000,
+        killSignal: "SIGKILL",
+        env: {
+          ...process.env,
+          NEMOCLAW_RUN_LIVE_E2E: "1",
+          NEMOCLAW_E2E_PHASE_COLLECTION: "1",
+          E2E_TARGET_ID: target,
+        },
+      },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    const tests = JSON.parse(result.stdout);
+    expect(tests).toHaveLength(1);
+    expect(tests[0]).toMatchObject({ name: expect.stringMatching(new RegExp(selector)) });
+  },
+);
+
+it.each(["test/e2e/live/./dgx-express.test.ts", "test/e2e/live//dgx-express.test.ts"])(
+  "applies DGX selector checks to an equivalent test path: %s",
+  (testPath) => {
+    expect(validateLiveTestPath(testPath)).toBe(DGX_EXPRESS_TEST_PATH);
+    expect(() =>
+      runLiveVitestCommand(
+        ["run", "--test-path", testPath],
+        () => {
+          throw new Error("unexpected spawn");
+        },
+        { E2E_TARGET_ID: "dgx-station-express" },
+      ),
+    ).toThrow("DGX Express requires an explicit selector matching E2E_TARGET_ID");
+  },
+);

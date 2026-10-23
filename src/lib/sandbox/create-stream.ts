@@ -20,13 +20,16 @@ export interface StreamSandboxCreateResult {
   output: string;
   sawProgress: boolean;
   forcedReady?: boolean;
+  readyTerminationTimedOut?: boolean;
 }
 
 export interface StreamSandboxCreateOptions {
+  /** Schema-owned build context. Ordinary create paths keep the repository root. */
+  cwd?: string;
   readyCheck?: (() => boolean) | null;
   // Optional poll side effect. Must be paired with failureCheck so any
   // observed side-effect error has an authoritative terminal-state classifier.
-  onPoll?: (() => void) | null;
+  onPoll?: (() => void | Promise<void>) | null;
   failureCheck?: (() => string | null | undefined) | null;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
@@ -37,6 +40,10 @@ export interface StreamSandboxCreateOptions {
   // alone cannot detach the create stream until at least one streamed output
   // line matches a configured pattern.
   readyCheckOutputPatterns?: readonly RegExp[];
+  // When Ready is used to cancel a long-lived create client, wait for that
+  // client to exit before returning so a following ownership cutover cannot
+  // overlap the still-active OpenShell create operation.
+  waitForReadyTermination?: boolean;
   // Initial progress phase:
   //   build  — docker-building the sandbox image
   //   upload — pushing the built image into the gateway registry
@@ -60,6 +67,7 @@ export interface StreamableReadable {
 export interface StreamableChildProcess {
   stdout: StreamableReadable | null;
   stderr: StreamableReadable | null;
+  pid?: number;
   kill?(signal?: NodeJS.Signals | number): boolean;
   removeAllListeners?(event?: string | symbol): void;
   unref?(): void;
@@ -69,6 +77,7 @@ export interface StreamableChildProcess {
 
 const CLASSIC_DOCKER_STEP_RE = /^\s*Step (\d+)\/(\d+) : (.+)$/;
 const BUILDKIT_STEP_RE = /^#(\d+)\s+(.+)$/;
+const READY_TERMINATION_TIMEOUT_MS = 5_000;
 
 /**
  * @deprecated Prefer the argv overload `streamSandboxCreate(command, args, env, options)` for
@@ -105,9 +114,12 @@ export function streamSandboxCreate(
       "streamSandboxCreate onPoll requires failureCheck (e.g., dockerGpuCreatePatch.createFailureMessage)",
     );
   }
-  const child: StreamableChildProcess = (options.spawnImpl ?? spawn)(spawnCommand, commandArgs, {
-    cwd: ROOT,
+  const spawnChild = options.spawnImpl ?? spawn;
+  const ownProcessGroup = spawnChild === spawn && process.platform !== "win32";
+  const child: StreamableChildProcess = spawnChild(spawnCommand, commandArgs, {
+    cwd: options.cwd ?? ROOT,
     env,
+    detached: ownProcessGroup,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -125,6 +137,8 @@ export function streamSandboxCreate(
   let printedReadyCheckOutputWait = false;
   let settled = false;
   let polling = false;
+  let waitingForReadyTermination = false;
+  let readyTerminationTimer: ReturnType<typeof setTimeout> | null = null;
   const pollIntervalMs = options.pollIntervalMs || 2000;
   const heartbeatIntervalMs = options.heartbeatIntervalMs || 5000;
   const silentPhaseMs = options.silentPhaseMs || 15000;
@@ -329,14 +343,51 @@ export function streamSandboxCreate(
     }
   }
 
+  function terminateChild(signal: NodeJS.Signals) {
+    try {
+      if (ownProcessGroup && typeof child.pid === "number" && child.pid > 0) {
+        process.kill(-child.pid, signal);
+      } else {
+        child.kill?.(signal);
+      }
+    } catch {
+      // Best effort only — the child may have already exited.
+    }
+  }
+
+  function terminateChildOnHostExit() {
+    if (!settled) terminateChild("SIGKILL");
+  }
+
+  function removeHostExitListeners() {
+    process.removeListener("exit", terminateChildOnHostExit);
+    process.removeListener("SIGINT", onHostSigint);
+    process.removeListener("SIGTERM", onHostSigterm);
+  }
+
+  function handleHostSignal(signal: NodeJS.Signals) {
+    terminateChildOnHostExit();
+    removeHostExitListeners();
+    process.kill(process.pid, signal);
+  }
+
+  const onHostSigint = () => handleHostSignal("SIGINT");
+  const onHostSigterm = () => handleHostSignal("SIGTERM");
+
+  process.once("exit", terminateChildOnHostExit);
+  process.on("SIGINT", onHostSigint);
+  process.on("SIGTERM", onHostSigterm);
+
   function finish(status: number, overrides: Partial<StreamSandboxCreateResult> = {}) {
     if (settled) return;
     settled = true;
+    removeHostExitListeners();
     flushPendingLines();
     if (!buildTimingFinished && buildStartedAtMs !== null) {
       finishBuildTiming(status === 0 ? "completed" : "stopped");
     }
     if (readyTimer) clearInterval(readyTimer);
+    if (readyTerminationTimer) clearTimeout(readyTerminationTimer);
     clearInterval(heartbeatTimer);
     resolvePromise({
       status,
@@ -360,8 +411,8 @@ export function streamSandboxCreate(
   child.stderr?.on("data", (chunk) => onChunk("stderr", chunk));
 
   const readyTimer = options.readyCheck
-    ? setInterval(() => {
-        if (settled || polling) return;
+    ? setInterval(async () => {
+        if (settled || polling || waitingForReadyTermination) return;
         polling = true;
         try {
           let ready = false;
@@ -385,13 +436,22 @@ export function streamSandboxCreate(
               }
               return;
             }
-            const detail = "Sandbox reported Ready before create stream exited; continuing.";
+            const detail = options.waitForReadyTermination
+              ? "Sandbox reported Ready; waiting for the create ownership handoff to finish."
+              : "Sandbox reported Ready before create stream exited; continuing.";
             lines.push(detail);
             printProgressLine(`  ${detail}`);
-            try {
-              child.kill?.("SIGTERM");
-            } catch {
-              // Best effort only — the child may have already exited.
+            terminateChild("SIGTERM");
+            if (options.waitForReadyTermination) {
+              waitingForReadyTermination = true;
+              readyTerminationTimer = setTimeout(() => {
+                lines.push("OpenShell create client did not exit after Ready; aborting cutover.");
+                terminateChild("SIGKILL");
+                finish(1, { readyTerminationTimedOut: true });
+              }, READY_TERMINATION_TIMEOUT_MS);
+              readyTerminationTimer.unref?.();
+              sawProgress = true;
+              return;
             }
             detachChild();
             sawProgress = true;
@@ -401,24 +461,21 @@ export function streamSandboxCreate(
 
           let pollFailure: string | null | undefined;
           try {
-            options.onPoll?.();
+            await options.onPoll?.();
           } catch (error) {
             emitTraceEvent("sandbox_create_poll_error", {
               message: redact(error instanceof Error ? error.message : String(error)),
             });
             pollFailure = options.failureCheck?.() ?? "Sandbox create poll side effect failed.";
           }
+          if (settled || waitingForReadyTermination) return;
 
           const failure = pollFailure ?? options.failureCheck?.();
           if (!failure) return;
           const detail = String(failure);
           lines.push(detail);
           printProgressLine(`  ${detail}`);
-          try {
-            child.kill?.("SIGTERM");
-          } catch {
-            // Best effort only — the child may have already exited.
-          }
+          terminateChild("SIGTERM");
           detachChild();
           sawProgress = true;
           finish(1);
@@ -472,6 +529,10 @@ export function streamSandboxCreate(
       // One last ready-check: the sandbox may have become Ready between the
       // last poll tick and the stream exit (e.g. SSH 255 after "Created sandbox:").
       flushPendingLines();
+      if (waitingForReadyTermination) {
+        finish(0, { forcedReady: true });
+        return;
+      }
       if (code && code !== 0 && options.readyCheck) {
         try {
           if (options.readyCheck() && readyCheckOutputMatched) {

@@ -4,8 +4,24 @@
 import {
   checkGatewayRouteCompatibility,
   formatGatewayRouteConflict,
+  formatGatewayRouteImpactWarning,
+  isAdvisoryGatewayRouteConflict,
 } from "../inference/gateway-route-compatibility";
+import {
+  buildHttpsPinRouteBaseUrl,
+  computeHttpsPinRouteId,
+  type HttpsPinCredentialProviderType,
+  isHttpsPinRuntimeEligible,
+} from "../inference/https-pin-runtime";
+import { unsafeEndpointUrlViolation } from "../core/endpoint-url-safety";
+import { OLLAMA_LOCAL_CREDENTIAL_ENV } from "../inference/ollama/contract";
 import { resolveSandboxGatewayName } from "../onboard/gateway-binding";
+import {
+  isLegacyRecordedLoopbackNoAuthCompatibleEndpointUrl,
+  isLoopbackNoAuthCompatibleEndpointUrl,
+} from "../onboard/inference-providers/compatible-endpoint-gateway-route";
+import { isAllowedOpenShellSandboxBridgeUrl } from "../private-networks";
+import { ConfigUrlValidationError } from "../sandbox/config";
 import type { ConfigValue } from "../security/credential-filter";
 import type { Session } from "../state/onboard-session";
 import type { SandboxEntry } from "../state/registry";
@@ -36,16 +52,91 @@ export interface ExplicitCustomRouteOptions {
 
 type RewriteConfigUrlsWithDnsPinning = (value: ConfigValue) => Promise<ConfigValue>;
 
+/**
+ * Resolves a DNS-backed HTTPS custom endpoint to a pinned, locally-terminated
+ * route base URL instead of the raw operator-supplied URL. OpenShell never
+ * sees the real hostname; the returned URL always targets the trusted
+ * `host.openshell.internal` bridge, matching the shape already exempted by the
+ * shared OpenShell sandbox bridge URL predicate.
+ */
+export interface EnsureHttpsPinRuntimeAdapterOptions {
+  gatewayName: string;
+  provider: string;
+  endpointUrl: string;
+  providerType: HttpsPinCredentialProviderType;
+  credentialValue: string;
+  discoverAllowedSourceCidrs?: () => readonly string[];
+}
+export type EnsureHttpsPinRuntimeAdapterFn = (
+  options: EnsureHttpsPinRuntimeAdapterOptions,
+) => Promise<{ baseUrl: string; credentialEnv: string; token: string; routeId: string }>;
+
+export interface InferenceSetProviderBinding {
+  baseUrl: string;
+  credentialEnv: string;
+  token: string;
+  providerType: HttpsPinCredentialProviderType;
+}
+
+export interface HttpsPinProviderBinding extends InferenceSetProviderBinding {
+  routeId: string;
+}
+
+/** OpenShell's host verifier cannot resolve routes exposed only on its sandbox bridge. */
+export function isSandboxBridgeProviderBinding(
+  binding: InferenceSetProviderBinding | null,
+): boolean {
+  return binding !== null && isAllowedOpenShellSandboxBridgeUrl(new URL(binding.baseUrl));
+}
+
+type EnsureHttpsPinAdapterRoute = (endpointUrl: string) => Promise<string>;
+
 export interface PreparedInferenceSetRoute {
   gatewayName: string;
   preliminaryExplicitMetadata: RegistryInferenceMetadata | null;
+  /** Invocation-only source URL; never persisted for HTTPS-pin routes. */
+  preliminaryExplicitSourceEndpointUrl: string | null;
   preliminaryRegistryMetadata: RegistryInferenceMetadata;
+  preliminaryRouteImpactWarning: string | null;
 }
 
 const CUSTOM_COMPATIBLE_CREDENTIAL_ENV: Record<string, string> = {
   "compatible-endpoint": "COMPATIBLE_API_KEY",
   "compatible-anthropic-endpoint": "COMPATIBLE_ANTHROPIC_API_KEY",
 };
+
+/**
+ * A loopback custom endpoint onboarded without authentication
+ * (`NEMOCLAW_COMPATIBLE_AUTH_MODE=none`) is published to the gateway through
+ * NemoClaw's local no-auth proxy: the gateway provider carries the proxy
+ * credential key and a `host.openshell.internal` base URL, while the registry
+ * keeps the operator's loopback URL together with the proxy credential env.
+ * That registry row is the sandbox's durable provenance, so `inference set`
+ * must compare, persist, and verify against it instead of the canonical
+ * API-key binding, which this sandbox never had.
+ */
+export function usesLoopbackNoAuthProxyRoute(
+  entry: Pick<SandboxEntry, "provider" | "endpointUrl" | "credentialEnv">,
+  provider: string,
+): boolean {
+  return (
+    isCustomCompatibleProvider(provider) &&
+    entry.provider === provider &&
+    entry.credentialEnv === OLLAMA_LOCAL_CREDENTIAL_ENV &&
+    (isLoopbackNoAuthCompatibleEndpointUrl(provider, entry.endpointUrl) ||
+      isLegacyRecordedLoopbackNoAuthCompatibleEndpointUrl(provider, entry.endpointUrl))
+  );
+}
+
+/** The credential env a sandbox's custom-compatible provider is durably bound to. */
+export function sandboxCustomCompatibleCredentialEnv(
+  entry: Pick<SandboxEntry, "provider" | "endpointUrl" | "credentialEnv">,
+  provider: string,
+): string {
+  return usesLoopbackNoAuthProxyRoute(entry, provider)
+    ? OLLAMA_LOCAL_CREDENTIAL_ENV
+    : CUSTOM_COMPATIBLE_CREDENTIAL_ENV[provider];
+}
 
 const INFERENCE_SET_APIS = new Set([
   "openai-completions",
@@ -65,21 +156,17 @@ function hasExplicitCustomMetadata(options: ExplicitCustomRouteOptions): boolean
   return Boolean(options.endpointUrl || options.credentialEnv || options.inferenceApi);
 }
 
-// TRUST BOUNDARY: host.openshell.internal is the single sandbox-to-host bridge
-// hostname provisioned by OpenShell. It resolves to the Docker host gateway
-// only inside the sandbox network namespace. This exemption is intentionally
-// limited below to HTTP, an explicit unprivileged port, and the exact hostname;
-// do not extend it to HTTPS, wildcard subdomains, localhost, RFC1918 literals,
-// or other internal DNS names.
-const ALLOWED_PRIVATE_CUSTOM_ENDPOINT_HOSTS = new Set(["host.openshell.internal"]);
-
 function normalizeEndpointUrlShape(value: string): { url: URL; normalized: string } {
   const url = new URL(value);
-  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
     throw new Error("unsupported URL shape");
   }
-  url.search = "";
-  url.hash = "";
   const pathname = url.pathname.replace(/\/+$/, "");
   url.pathname = pathname || "/";
   return {
@@ -89,33 +176,39 @@ function normalizeEndpointUrlShape(value: string): { url: URL; normalized: strin
 }
 
 function normalizeCustomEndpointUrlWithoutDns(value: string | null | undefined): string {
-  const raw = typeof value === "string" ? value.trim() : "";
+  const input = typeof value === "string" ? value : "";
+  const raw = input.trim();
   if (!raw)
     throw new InferenceSetError("endpoint-url is required for custom-compatible metadata.", 2);
+  let normalized: string;
   try {
-    return normalizeEndpointUrlShape(raw).normalized;
+    normalized = normalizeEndpointUrlShape(raw).normalized;
   } catch {
     throw new InferenceSetError(
-      "endpoint-url must be a valid http(s) URL without embedded credentials.",
+      "endpoint-url must be a valid http(s) URL without userinfo, query, or fragment components.",
       2,
     );
   }
+  // #9301: reject control characters, percent-encoded control characters,
+  // spaces, and shell metacharacters before any provider, registry, or
+  // sandbox mutation, matching onboarding intake. The shape check above owns
+  // the userinfo, query, fragment, scheme, and parse classes and their
+  // established message.
+  const violation = unsafeEndpointUrlViolation(input);
+  if (violation) {
+    throw new InferenceSetError(`endpoint-url ${violation.reason}`, 2);
+  }
+  return normalized;
 }
 
 export async function normalizeCustomEndpointUrl(
   value: string | null | undefined,
   rewriteUrlWithDnsPinning: RewriteConfigUrlsWithDnsPinning,
+  ensureHttpsPinAdapterRoute?: EnsureHttpsPinAdapterRoute,
 ): Promise<string> {
   const normalized = normalizeCustomEndpointUrlWithoutDns(value);
   const shaped = normalizeEndpointUrlShape(normalized);
-  const hostname = shaped.url.hostname.replace(/\.$/, "").toLowerCase();
-  const port = Number(shaped.url.port);
-  if (
-    ALLOWED_PRIVATE_CUSTOM_ENDPOINT_HOSTS.has(hostname) &&
-    shaped.url.protocol === "http:" &&
-    Number.isInteger(port) &&
-    port >= 1024
-  ) {
+  if (isAllowedOpenShellSandboxBridgeUrl(shaped.url)) {
     // This is the single sandbox-to-host bridge name that NemoClaw itself
     // provisions for local inference. Its supported routes are explicit
     // unprivileged HTTP listeners; do not generalize this exemption to HTTPS,
@@ -124,25 +217,57 @@ export async function normalizeCustomEndpointUrl(
     return normalized;
   }
 
+  // A DNS-backed HTTPS endpoint cannot be pinned by IP substitution alone: the
+  // TLS certificate requires the real hostname as SNI, so OpenShell's own
+  // re-resolution at request time would race the SSRF preflight (TOCTOU) if
+  // it saw that hostname directly. Route it through the local HTTPS-pin
+  // runtime adapter instead, which re-validates the address immediately
+  // before connecting and hides the real hostname from the OpenShell runtime
+  // boundary entirely.
+  if (ensureHttpsPinAdapterRoute && isHttpsPinRuntimeEligible(normalized)) {
+    try {
+      const effectiveRoute = await ensureHttpsPinAdapterRoute(normalized);
+      if (typeof effectiveRoute !== "string")
+        throw new Error("HTTPS pin adapter returned a non-string value");
+      // Persist only the sandbox-facing adapter route. The source hostname is
+      // retained in invocation state long enough to validate and register the
+      // host adapter, but must not cross into the sandbox registry/session.
+      return normalizeEndpointUrlShape(effectiveRoute).normalized;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new InferenceSetError(`${ENDPOINT_URL_NOT_ALLOWED_PREFIX} ${message}`, 2);
+    }
+  }
+
   try {
     const validated = await rewriteUrlWithDnsPinning(normalized);
     if (typeof validated !== "string") throw new Error("URL validator returned a non-string value");
     return normalizeEndpointUrlShape(validated).normalized;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new InferenceSetError(`${ENDPOINT_URL_NOT_ALLOWED_PREFIX} ${message}`, 2);
+    // The generic DNS-pinning validator's message stays scoped to arbitrary
+    // persisted config values; only this inference-set call site knows the
+    // rejected field is an inference endpoint, so it adds the adapter hint.
+    const hint =
+      error instanceof ConfigUrlValidationError && error.reason === "dns_backed_https_unsupported"
+        ? " This endpoint should have been routed through the HTTPS Pin Runtime adapter; retry, and report a bug if this persists."
+        : "";
+    throw new InferenceSetError(`${ENDPOINT_URL_NOT_ALLOWED_PREFIX} ${message}${hint}`, 2);
   }
 }
 
 function normalizeExplicitCredentialEnv(
   provider: string,
   value: string | null | undefined,
+  expected: string,
 ): string {
-  const expected = CUSTOM_COMPATIBLE_CREDENTIAL_ENV[provider];
   const normalized = typeof value === "string" && value.trim() ? value.trim() : expected;
   if (normalized !== expected) {
     throw new InferenceSetError(
-      `credential-env for '${provider}' must be '${expected}' so rebuild can safely reuse it.`,
+      expected === OLLAMA_LOCAL_CREDENTIAL_ENV
+        ? `credential-env for '${provider}' must be '${expected}': this sandbox's endpoint was ` +
+            `onboarded without authentication, so its provider is bound to the local no-auth proxy credential.`
+        : `credential-env for '${provider}' must be '${expected}' so rebuild can safely reuse it.`,
       2,
     );
   }
@@ -176,8 +301,14 @@ function normalizeExplicitInferenceApi(provider: string, value: string | null | 
 function explicitCustomProviderMetadataWithoutDns(
   provider: string,
   options: ExplicitCustomRouteOptions,
-): RegistryInferenceMetadata | null {
-  if (!hasExplicitCustomMetadata(options)) return null;
+  gatewayName: string,
+  onboardEndpointUrl: string | null,
+  durableCredentialEnv: string,
+): {
+  metadata: RegistryInferenceMetadata | null;
+  sourceEndpointUrl: string | null;
+} {
+  if (!hasExplicitCustomMetadata(options)) return { metadata: null, sourceEndpointUrl: null };
   if (!isCustomCompatibleProvider(provider)) {
     throw new InferenceSetError(
       "endpoint-url, credential-env, and inference-api are only supported for compatible-endpoint and compatible-anthropic-endpoint.",
@@ -187,15 +318,32 @@ function explicitCustomProviderMetadataWithoutDns(
 
   // Source boundary: custom-compatible endpoint URLs are operator-supplied and
   // not discoverable from the gateway provider registry with a sandbox-scoped
-  // trust guarantee. Treat these explicit flags as the durable metadata source
-  // for this switch, after URL and credential-env validation, instead of
-  // borrowing from an unrelated onboard session or global OpenShell provider.
+  // trust guarantee. Treat these explicit flags as this invocation's source,
+  // after URL and credential-env validation, instead of borrowing from an
+  // unrelated onboard session or global OpenShell provider.
+  const sourceEndpointUrl = normalizeCustomEndpointUrlWithoutDns(options.endpointUrl);
+  const normalizedOnboardEndpoint = onboardEndpointUrl
+    ? normalizeCustomEndpointUrlWithoutDns(onboardEndpointUrl)
+    : null;
+  const reusesOnboardEndpoint =
+    normalizedOnboardEndpoint !== null && sourceEndpointUrl === normalizedOnboardEndpoint;
+  const endpointUrl =
+    !reusesOnboardEndpoint && isHttpsPinRuntimeEligible(sourceEndpointUrl)
+      ? buildHttpsPinRouteBaseUrl(computeHttpsPinRouteId(gatewayName, provider, sourceEndpointUrl))
+      : sourceEndpointUrl;
   return {
-    endpointUrl: normalizeCustomEndpointUrlWithoutDns(options.endpointUrl),
-    endpointSource: "inference-set",
-    credentialEnv: normalizeExplicitCredentialEnv(provider, options.credentialEnv),
-    preferredInferenceApi: normalizeExplicitInferenceApi(provider, options.inferenceApi),
-    nimContainer: null,
+    metadata: {
+      endpointUrl,
+      endpointSource: reusesOnboardEndpoint ? "onboard" : "inference-set",
+      credentialEnv: normalizeExplicitCredentialEnv(
+        provider,
+        options.credentialEnv,
+        durableCredentialEnv,
+      ),
+      preferredInferenceApi: normalizeExplicitInferenceApi(provider, options.inferenceApi),
+      nimContainer: null,
+    },
+    sourceEndpointUrl,
   };
 }
 
@@ -260,23 +408,25 @@ function registryMetadataForProviderSwitch(options: {
   };
 }
 
-function assertGatewayRouteCompatibility(options: {
+function routeImpactWarningOrThrow(options: {
   gatewayName: string;
   sandboxName: string;
   provider: string;
   model: string;
   metadata: RegistryInferenceMetadata;
   sandboxes: SandboxEntry[];
-}): void {
+}): string | null {
   const compatibility = checkGatewayRouteCompatibility({
     gatewayName: options.gatewayName,
     sandboxName: options.sandboxName,
     route: { provider: options.provider, model: options.model, ...options.metadata },
     sandboxes: options.sandboxes,
   });
-  if (!compatibility.ok) {
-    throw new InferenceSetError(formatGatewayRouteConflict(compatibility), 2);
+  if (compatibility.ok) return null;
+  if (isAdvisoryGatewayRouteConflict(compatibility)) {
+    return formatGatewayRouteImpactWarning(compatibility, "inference-set");
   }
+  throw new InferenceSetError(formatGatewayRouteConflict(compatibility), 2);
 }
 
 export function prepareInferenceSetRoute(options: {
@@ -299,10 +449,16 @@ export function prepareInferenceSetRoute(options: {
     );
   }
 
-  const preliminaryExplicitMetadata = explicitCustomProviderMetadataWithoutDns(
+  const explicit = explicitCustomProviderMetadataWithoutDns(
     options.provider,
     options.customRoute,
+    gatewayName,
+    options.entry.provider === options.provider && options.entry.endpointSource === "onboard"
+      ? (options.entry.endpointUrl ?? null)
+      : null,
+    sandboxCustomCompatibleCredentialEnv(options.entry, options.provider),
   );
+  const preliminaryExplicitMetadata = explicit.metadata;
   const preliminaryRegistryMetadata = registryMetadataForProviderSwitch({
     entry: options.entry,
     provider: options.provider,
@@ -311,7 +467,7 @@ export function prepareInferenceSetRoute(options: {
     session: options.session,
     explicitMetadata: preliminaryExplicitMetadata,
   });
-  assertGatewayRouteCompatibility({
+  const preliminaryRouteImpactWarning = routeImpactWarningOrThrow({
     gatewayName,
     sandboxName: options.sandboxName,
     provider: options.provider,
@@ -319,7 +475,13 @@ export function prepareInferenceSetRoute(options: {
     metadata: preliminaryRegistryMetadata,
     sandboxes: options.sandboxes,
   });
-  return { gatewayName, preliminaryExplicitMetadata, preliminaryRegistryMetadata };
+  return {
+    gatewayName,
+    preliminaryExplicitMetadata,
+    preliminaryExplicitSourceEndpointUrl: explicit.sourceEndpointUrl,
+    preliminaryRegistryMetadata,
+    preliminaryRouteImpactWarning,
+  };
 }
 
 export async function finalizeInferenceSetRoute(options: {
@@ -331,22 +493,94 @@ export async function finalizeInferenceSetRoute(options: {
   onboardEndpointUrl: string | null;
   getSandboxes: () => SandboxEntry[];
   rewriteUrlWithDnsPinning: RewriteConfigUrlsWithDnsPinning;
+  resolveCredentialValue: (credentialEnv: string) => string;
+  ensureHttpsPinRuntimeAdapter: EnsureHttpsPinRuntimeAdapterFn;
+  effectiveInferenceApi?: string | null;
+  nativeProvider?: boolean;
 }): Promise<{
   registryMetadata: RegistryInferenceMetadata;
   explicitPreferredInferenceApi: string | null;
+  directProviderBinding: InferenceSetProviderBinding | null;
+  httpsPinProviderBinding: HttpsPinProviderBinding | null;
+  routeImpactWarning: string | null;
 }> {
   const { prepared } = options;
+  if (options.nativeProvider) {
+    const metadata = prepared.preliminaryExplicitMetadata ?? prepared.preliminaryRegistryMetadata;
+    return {
+      registryMetadata: {
+        ...metadata,
+        ...(prepared.preliminaryExplicitSourceEndpointUrl
+          ? {
+              endpointUrl: prepared.preliminaryExplicitSourceEndpointUrl,
+              endpointSource: "inference-set" as const,
+            }
+          : {}),
+      },
+      explicitPreferredInferenceApi:
+        prepared.preliminaryExplicitMetadata?.preferredInferenceApi ?? null,
+      directProviderBinding: null,
+      httpsPinProviderBinding: null,
+      routeImpactWarning: null,
+    };
+  }
   if (!prepared.preliminaryExplicitMetadata) {
     return {
       registryMetadata: prepared.preliminaryRegistryMetadata,
       explicitPreferredInferenceApi: null,
+      directProviderBinding: null,
+      httpsPinProviderBinding: null,
+      routeImpactWarning: prepared.preliminaryRouteImpactWarning,
     };
   }
+  // Bound once per finalize call: preparation already pinned the credential env
+  // var name to this sandbox's durable provenance — the canonical provider key,
+  // or the loopback no-auth proxy key for an endpoint onboarded without
+  // authentication (normalizeExplicitCredentialEnv enforced this). The real
+  // credential value is resolved once at invocation time through the injected
+  // credential resolver. Direct routes return it only in the invocation-local
+  // provider binding consumed below; no registry or sandbox field receives it.
+  const providerCredentialEnv =
+    prepared.preliminaryExplicitMetadata.credentialEnv ??
+    CUSTOM_COMPATIBLE_CREDENTIAL_ENV[options.provider];
+  const credentialValue = options.resolveCredentialValue(providerCredentialEnv);
+  const providerType: HttpsPinCredentialProviderType =
+    (options.effectiveInferenceApi ??
+      prepared.preliminaryExplicitMetadata.preferredInferenceApi) === "anthropic-messages"
+      ? "anthropic"
+      : "openai";
+  // Set only when the adapter route is actually used. The canonical provider
+  // credential key stays stable; only its invocation-local value becomes the
+  // route-scoped adapter token.
+  let httpsPinProviderBinding: HttpsPinProviderBinding | null = null;
+  const ensureHttpsPinAdapterRoute: EnsureHttpsPinAdapterRoute = async (endpointUrl) => {
+    // The credential is held only for this invocation and handed directly
+    // to the adapter. It is never persisted, returned, or copied to a shared
+    // process.env slot.
+    const adapter = await options.ensureHttpsPinRuntimeAdapter({
+      gatewayName: prepared.gatewayName,
+      provider: options.provider,
+      endpointUrl,
+      providerType,
+      credentialValue,
+    });
+    httpsPinProviderBinding = {
+      ...adapter,
+      // Keep the provider's one durable credential key. Only its
+      // invocation-local value changes to the route-scoped token; using a
+      // second key risks OpenShell merging credential bindings on an attached
+      // provider instead of replacing the old key.
+      credentialEnv: providerCredentialEnv,
+      providerType,
+    };
+    return adapter.baseUrl;
+  };
   let endpointUrl: string;
   let endpointSource: RegistryInferenceMetadata["endpointSource"];
   try {
     const suppliedEndpoint = normalizeCustomEndpointUrlWithoutDns(
-      prepared.preliminaryExplicitMetadata.endpointUrl,
+      prepared.preliminaryExplicitSourceEndpointUrl ??
+        prepared.preliminaryExplicitMetadata.endpointUrl,
     );
     const onboardEndpoint = options.onboardEndpointUrl
       ? normalizeCustomEndpointUrlWithoutDns(options.onboardEndpointUrl)
@@ -363,6 +597,7 @@ export async function finalizeInferenceSetRoute(options: {
       endpointUrl = await normalizeCustomEndpointUrl(
         suppliedEndpoint,
         options.rewriteUrlWithDnsPinning,
+        ensureHttpsPinAdapterRoute,
       );
       endpointSource = "inference-set";
     }
@@ -390,7 +625,15 @@ export async function finalizeInferenceSetRoute(options: {
     endpointUrl,
     endpointSource,
   };
-  assertGatewayRouteCompatibility({
+  const directProviderBinding: InferenceSetProviderBinding | null = httpsPinProviderBinding
+    ? null
+    : {
+        baseUrl: endpointUrl,
+        credentialEnv: providerCredentialEnv,
+        token: credentialValue,
+        providerType,
+      };
+  const routeImpactWarning = routeImpactWarningOrThrow({
     gatewayName: prepared.gatewayName,
     sandboxName: options.sandboxName,
     provider: options.provider,
@@ -401,5 +644,8 @@ export async function finalizeInferenceSetRoute(options: {
   return {
     registryMetadata,
     explicitPreferredInferenceApi: registryMetadata.preferredInferenceApi ?? null,
+    directProviderBinding,
+    httpsPinProviderBinding,
+    routeImpactWarning,
   };
 }

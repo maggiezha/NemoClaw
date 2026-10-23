@@ -14,6 +14,7 @@ import {
   type StagedBuildContext,
   stageOptimizedSandboxBuildContext,
 } from "../sandbox/build-context";
+import { SandboxBaseImageResolutionError } from "../sandbox-base-image";
 import {
   CUSTOM_BUILD_CONTEXT_WARN_BYTES,
   createCustomBuildContextFilter,
@@ -50,6 +51,14 @@ export interface PreparedSandboxBuildContext extends CreateSandboxBuildContextRe
   };
 }
 
+function isSameFile(leftPath: string, rightPath: string): boolean {
+  try {
+    return fs.realpathSync(leftPath) === fs.realpathSync(rightPath);
+  } catch {
+    return path.resolve(leftPath) === path.resolve(rightPath);
+  }
+}
+
 function createCleanupBuildContext(buildCtx: string): () => boolean {
   return () => {
     try {
@@ -81,6 +90,45 @@ export function stageCreateSandboxBuildContext(
     if (!fs.statSync(fromResolved).isFile()) {
       error(`  Custom Dockerfile path is not a file: ${fromResolved}`);
       exit(1);
+    }
+    // The managed agent Dockerfile copies repository-root paths (src/,
+    // scripts/, nemoclaw-blueprint/), so the parent-directory contract can
+    // never satisfy it. Stage it exactly like the managed build instead of
+    // failing at the first COPY (#7205).
+    const agentDockerfile = input.agent?.dockerfilePath ?? null;
+    const defaultDockerfile = path.join(input.root, "Dockerfile");
+    if (!input.agent && isSameFile(fromResolved, defaultDockerfile)) {
+      // OpenClaw is represented by a null agent. Treat only the exact default
+      // repository Dockerfile as the generated source that the default path
+      // already trusts; every other caller-supplied Dockerfile remains custom.
+      log(`  Using trusted OpenClaw Dockerfile: ${fromResolved}`);
+      log("  Staging the repository root as the default OpenClaw build context.");
+      build = (input.stageDefaultSandboxBuildContext ?? stageOptimizedSandboxBuildContext)(
+        input.root,
+      );
+      return {
+        ...build,
+        origin: "generated",
+        cleanupBuildCtx: createCleanupBuildContext(build.buildCtx),
+      };
+    }
+    if (input.agent && agentDockerfile && isSameFile(fromResolved, agentDockerfile)) {
+      log(`  Using trusted ${input.agent.displayName} Dockerfile: ${fromResolved}`);
+      log(`  Staging the repository root as the managed ${input.agent.displayName} build context.`);
+      try {
+        build = input.createAgentSandbox(input.agent);
+      } catch (err) {
+        if (err instanceof SandboxBaseImageResolutionError) {
+          error(`  ${err.message}`);
+          exit(1);
+        }
+        throw err;
+      }
+      return {
+        ...build,
+        origin: "generated",
+        cleanupBuildCtx: createCleanupBuildContext(build.buildCtx),
+      };
     }
     const buildContextDir = path.dirname(fromResolved);
     if (isInsideIgnoredCustomBuildContextPath(buildContextDir)) {
@@ -138,7 +186,15 @@ export function stageCreateSandboxBuildContext(
     }
     build = { buildCtx, stagedDockerfile };
   } else if (input.agent) {
-    build = input.createAgentSandbox(input.agent);
+    try {
+      build = input.createAgentSandbox(input.agent);
+    } catch (err) {
+      if (err instanceof SandboxBaseImageResolutionError) {
+        error(`  ${err.message}`);
+        exit(1);
+      }
+      throw err;
+    }
   } else {
     build = (input.stageDefaultSandboxBuildContext ?? stageOptimizedSandboxBuildContext)(
       input.root,

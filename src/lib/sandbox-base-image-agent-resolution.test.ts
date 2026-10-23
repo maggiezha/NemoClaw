@@ -115,15 +115,17 @@ describe("agent-specific sandbox base-image resolution", () => {
           NEMOCLAW_SANDBOX_BASE_LOCAL_BUILD: "0",
         },
         validateImage,
-        validationDescription: "deepagents-code==0.1.34",
+        validationDescription: "deepagents-code==0.1.55",
       }),
     ).toThrow("override 'ghcr.io/nvidia/nemoclaw/sandbox-base:stale-dcode' could not be resolved");
     expect(dockerMocks.pull).toHaveBeenCalledWith(staleRef, {
       ignoreError: true,
       suppressOutput: true,
     });
-    expect(validateImage).toHaveBeenCalledWith(staleRef);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("deepagents-code==0.1.34"));
+    expect(validateImage).toHaveBeenCalledWith(staleRef, { source: "override" });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("lacks a required runtime capability"),
+    );
     expect(dockerMocks.build).not.toHaveBeenCalled();
     warn.mockRestore();
   });

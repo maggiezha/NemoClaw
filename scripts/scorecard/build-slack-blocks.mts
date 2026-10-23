@@ -3,7 +3,7 @@
 
 /** Pure Slack payload builder for the consolidated E2E scorecard. */
 
-type ScorecardRunMode = "Scheduled E2E" | "Manual full run" | "Selective dispatch" | (string & {});
+type ScorecardRunMode = "Main push" | "Manual full run" | "Selective dispatch" | (string & {});
 
 type ScorecardData = {
   today: string;
@@ -37,9 +37,72 @@ type SlackButtonElement = {
 type SlackActionsBlock = { type: "actions"; elements: SlackButtonElement[] };
 type SlackBlock = SlackActionsBlock | SlackContextBlock | SlackSectionBlock;
 
+const SLACK_SECTION_TEXT_LIMIT = 3_000;
+const FAILED_JOBS_CONTINUED_HEADING = "*Failed jobs (continued):*";
+
+function truncateSlackLabel(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
+}
+
+function buildFailedJobEntry(
+  job: ScorecardData["failedJobs"][number],
+  runUrl: string,
+  maxLength: number,
+): string {
+  if (!job.url) {
+    const prefix = "• `";
+    const suffix = "`";
+    return `${prefix}${truncateSlackLabel(job.name, maxLength - prefix.length - suffix.length)}${suffix}`;
+  }
+
+  const directLinkOverhead = `• <${job.url}|>`.length;
+  const linkUrl = directLinkOverhead < maxLength ? job.url : runUrl;
+  const prefix = `• <${linkUrl}|`;
+  const suffix = ">";
+  const labelLength = maxLength - prefix.length - suffix.length;
+  if (labelLength < 1) throw new Error("scorecard run URL exceeds Slack section text limit");
+  return `${prefix}${truncateSlackLabel(job.name, labelLength)}${suffix}`;
+}
+
+function buildFailedJobBlocks(data: ScorecardData): SlackSectionBlock[] {
+  const initialHeading = `*Failed jobs (${data.failedJobs.length}):*`;
+  const maxEntryLength =
+    SLACK_SECTION_TEXT_LIMIT -
+    Math.max(initialHeading.length, FAILED_JOBS_CONTINUED_HEADING.length) -
+    1;
+  const entries = data.failedJobs.map((job) =>
+    buildFailedJobEntry(job, data.runUrl, maxEntryLength),
+  );
+  const blocks: SlackSectionBlock[] = [];
+  let heading = initialHeading;
+  let lines: string[] = [];
+
+  for (const entry of entries) {
+    const candidate = [heading, ...lines, entry].join("\n");
+    if (candidate.length > SLACK_SECTION_TEXT_LIMIT && lines.length > 0) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: [heading, ...lines].join("\n") },
+      });
+      heading = FAILED_JOBS_CONTINUED_HEADING;
+      lines = [entry];
+    } else {
+      lines.push(entry);
+    }
+  }
+
+  if (lines.length > 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: [heading, ...lines].join("\n") },
+    });
+  }
+  return blocks;
+}
+
 function buildBlocks(data: ScorecardData): SlackBlock[] {
   const blocks: SlackBlock[] = [];
-  const showActor = data.runMode !== "Scheduled E2E" && Boolean(data.actor);
+  const showActor = data.runMode !== "Main push" && Boolean(data.actor);
   const runModeText = showActor ? `${data.runMode} (by *${data.actor}*)` : data.runMode;
   const contextElements: SlackMrkdwnText[] = [
     { type: "mrkdwn", text: `*Run mode:* ${runModeText}` },
@@ -75,16 +138,7 @@ function buildBlocks(data: ScorecardData): SlackBlock[] {
       text: { type: "mrkdwn", text: ":tada: *All jobs passed!*" },
     });
   } else if (data.failedJobs.length > 0) {
-    const list = data.failedJobs
-      .map((job) => (job.url ? `• <${job.url}|${job.name}>` : `• \`${job.name}\``))
-      .join("\n");
-    blocks.push({
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*Failed jobs (${data.failedJobs.length}):*\n${list}`,
-      },
-    });
+    blocks.push(...buildFailedJobBlocks(data));
   }
 
   if (data.traceTimingLine) {
@@ -120,8 +174,8 @@ function buildBlocks(data: ScorecardData): SlackBlock[] {
 function buildFallbackText(data: ScorecardData): string {
   let modeSegment: string;
   switch (data.runMode) {
-    case "Scheduled E2E":
-      modeSegment = "🗓️ DAILY";
+    case "Main push":
+      modeSegment = "🚀 MAIN PUSH";
       break;
     case "Manual full run":
       modeSegment = data.actor ? `🛠 Manual full by ${data.actor}` : "🛠 Manual full";
@@ -146,7 +200,7 @@ function getStatusColor(data: ScorecardData): SlackStatusColor {
 type SlackChannel = "daily" | "fullrun" | "preview";
 
 function getSlackChannel(data: ScorecardData): SlackChannel {
-  if (data.runMode === "Scheduled E2E") return "daily";
+  if (data.runMode === "Main push") return "daily";
   if (data.runMode === "Manual full run") return "fullrun";
   return "preview";
 }

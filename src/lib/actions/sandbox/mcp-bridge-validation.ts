@@ -1,35 +1,45 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { type SpawnSyncReturns, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 
 import { resolveOpenshell } from "../../adapters/openshell/resolve";
-import type { McpBridgeEntry } from "../../state/registry";
+import { diagnosticPreview, isValidName, NAME_ALLOWED_FORMAT } from "../../sandbox-name-contract";
+import {
+  inspectMcpDeniedToolSelectors,
+  MCP_DENIED_TOOL_SELECTOR_MAX_COUNT,
+} from "../../security/mcp-denied-tool-selector";
+import {
+  normalizeTrustedPrivateHost,
+  parseTrustedPrivateHosts,
+} from "../../security/trusted-private-endpoint";
+import type { McpSourceEntry } from "./mcp-bridge-contracts";
 import { buildSubprocessEnv, isSubprocessEnvNameAllowed } from "../../subprocess-env";
 import {
   McpBridgeError,
   type ParsedEnvReference,
   type ParsedMcpAddArgs,
+  type ParsedMcpUpdateArgs,
 } from "./mcp-bridge-contracts";
 import { normalizeMcpServerUrl } from "./mcp-bridge-url-validation";
 // This static import is intentionally fail-closed: TypeScript/build packaging
 // must reject a missing or malformed security manifest instead of letting the
 // CLI start with a weakened credential-name denylist. Input, package, image,
 // and workflow contracts pin its structure, installed path, and version.
-import childVisibleCredentialManifest from "./openshell-child-visible-credentials.v0.0.85.json";
+import childVisibleCredentialManifest from "./openshell-child-visible-credentials.v0.0.116.json";
 
 export {
   MCP_SERVER_URL_MAX_LENGTH,
   normalizeMcpServerUrl,
   parseMcpUrl,
-  validateMcpServerUrlResolvedTarget,
+  preflightMcpServerUrlResolvedTarget,
 } from "./mcp-bridge-url-validation";
 
 const VALID_SERVER_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const VALID_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const OPENSHELL_REVISIONED_CREDENTIAL_NAME_RE = /^v[0-9]+_[A-Za-z0-9_]+$/;
-const VALID_SANDBOX_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+const OPENSHELL_STABLE_CREDENTIAL_NAME_RE = /^s[a-f0-9]{64}_[A-Za-z0-9_]+$/;
 const OPENSHELL_VERSION_OUTPUT_RE =
   /^openshell\s+([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/;
 const OPENSHELL_VERSION_PROBE_TIMEOUT_MS = 5_000;
@@ -60,10 +70,12 @@ export class McpCredentialBoundaryRuntimeVersionError extends McpBridgeError {
   }
 }
 
-type OpenshellVersionCommandResult = Pick<
-  SpawnSyncReturns<string>,
-  "error" | "status" | "stderr" | "stdout"
->;
+type OpenshellVersionCommandResult = {
+  error?: Error;
+  status: number | null;
+  stderr: string;
+  stdout: string;
+};
 
 export interface McpCredentialBoundaryRuntimeDeps {
   resolveOpenshell?: () => string | null;
@@ -141,7 +153,7 @@ export function assertMcpCredentialBoundaryRuntimeVersion(
 // key and exposes or executes the provider value outside the intended request.
 // sourceBoundary: the versioned JSON manifest pins OpenShell-owned keys to the
 // shipped source commit; NemoClaw owns host and agent runtime-control rejects.
-// whyNotSourceFix: v0.0.85 exposes provider keys to every fresh sandbox exec
+// whyNotSourceFix: v0.0.116 intentionally projects bound credential placeholders
 // and does not advertise safe credential-name capabilities at runtime.
 // regressionTest: the mcp-bridge-input validation/runtime suites check every
 // pinned and runtime key; package contracts require version alignment.
@@ -151,7 +163,7 @@ const OPENSHELL_RAW_CHILD_ENV_KEYS = new Set(childVisibleCredentialManifest.rawC
 const OPENSHELL_REWRITTEN_CHILD_ENV_KEYS = new Set(
   childVisibleCredentialManifest.rewrittenChildValueKeys,
 );
-// OpenShell attaches provider keys to every fresh sandbox exec. A placeholder
+// OpenShell attaches bound provider placeholders to fresh sandbox execs. A placeholder
 // under one of these names can alter a loader, shell, or supported agent
 // runtime before the requested command starts (for example, PYTHONHOME makes
 // Python fail during initialization). Require operators to use a dedicated
@@ -160,9 +172,9 @@ const SANDBOX_RUNTIME_CONTROL_ENV_KEYS = new Set(childVisibleCredentialManifest.
 const SANDBOX_RUNTIME_CONTROL_ENV_PREFIXES = childVisibleCredentialManifest.runtimeControlPrefixes;
 const MCP_PROVIDER_HASH_BYTES = 8;
 export function validateSandboxName(name: string): void {
-  if (!name || name.length > 63 || !VALID_SANDBOX_RE.test(name)) {
+  if (!isValidName(name)) {
     throw new McpBridgeError(
-      `Invalid sandbox name '${name}'. Names must be 1-63 lowercase alphanumeric characters with optional internal hyphens.`,
+      `Invalid sandbox name ${diagnosticPreview(name)}. Allowed format: ${NAME_ALLOWED_FORMAT}.`,
       2,
     );
   }
@@ -171,10 +183,30 @@ export function validateSandboxName(name: string): void {
 export function validateMcpServerName(name: string): void {
   if (!VALID_SERVER_RE.test(name)) {
     throw new McpBridgeError(
-      `Invalid MCP server name '${name}'. Names must start with a letter and contain only letters, digits, hyphens, and underscores.`,
+      `Invalid MCP server name ${diagnosticPreview(name)}. Names must start with a letter and contain only letters, digits, hyphens, and underscores.`,
       2,
     );
   }
+}
+
+export function normalizeMcpDenyTools(tools: readonly string[]): string[] {
+  const inspection = inspectMcpDeniedToolSelectors(tools);
+  if (!inspection.ok && inspection.reason === "too-many") {
+    throw new McpBridgeError(
+      `MCP denied-tool policy accepts at most ${String(MCP_DENIED_TOOL_SELECTOR_MAX_COUNT)} selectors.`,
+      2,
+    );
+  }
+  if (!inspection.ok) {
+    throw new McpBridgeError(
+      `Invalid MCP denied-tool selector ${diagnosticPreview(inspection.invalidSelector)}. Use 1 to 128 letters, digits, dots, underscores, hyphens, or OpenShell glob characters.`,
+      2,
+    );
+  }
+  if (inspection.duplicate) {
+    throw new McpBridgeError("Duplicate --deny-tool declarations are not accepted.", 2);
+  }
+  return inspection.selectors;
 }
 
 export function validateMcpCredentialEnvName(name: string): void {
@@ -182,6 +214,12 @@ export function validateMcpCredentialEnvName(name: string): void {
   if (OPENSHELL_REVISIONED_CREDENTIAL_NAME_RE.test(name)) {
     throw new McpBridgeError(
       `MCP credential environment name '${name}' is reserved for OpenShell credential revisions and would be skipped instead of attached. Use a dedicated secret name such as MY_SERVICE_MCP_TOKEN.`,
+      2,
+    );
+  }
+  if (OPENSHELL_STABLE_CREDENTIAL_NAME_RE.test(name)) {
+    throw new McpBridgeError(
+      `MCP credential environment name '${name}' is reserved for OpenShell stable credential handles and would be skipped instead of attached. Use a dedicated secret name such as MY_SERVICE_MCP_TOKEN.`,
       2,
     );
   }
@@ -218,7 +256,7 @@ export function validateMcpCredentialEnvName(name: string): void {
 export function validatePersistedMcpCredentialEnvName(name: string): void {
   if (!VALID_ENV_RE.test(name)) {
     throw new McpBridgeError(
-      `Invalid environment variable name '${name}'. Names must match [A-Za-z_][A-Za-z0-9_]*.`,
+      `Invalid environment variable name ${diagnosticPreview(name)}. Names must match [A-Za-z_][A-Za-z0-9_]*.`,
       2,
     );
   }
@@ -226,8 +264,10 @@ export function validatePersistedMcpCredentialEnvName(name: string): void {
 
 export function parseMcpAddArgs(argv: string[]): ParsedMcpAddArgs {
   const env: ParsedEnvReference[] = [];
+  const denyTools: string[] = [];
+  const trustedPrivateHosts: string[] = [];
   let server = "";
-  let url = "";
+  let rawUrl = "";
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -266,11 +306,37 @@ export function parseMcpAddArgs(argv: string[]): ParsedMcpAddArgs {
       continue;
     }
     if (token === "--url") {
-      url = normalizeMcpServerUrl(argv[++i] ?? "");
+      rawUrl = argv[++i] ?? "";
+      continue;
+    }
+    if (token === "--deny-tool") {
+      denyTools.push(argv[++i] ?? "");
+      continue;
+    }
+    if (token?.startsWith("--deny-tool=")) {
+      denyTools.push(token.slice("--deny-tool=".length));
       continue;
     }
     if (token?.startsWith("--url=")) {
-      url = normalizeMcpServerUrl(token.slice("--url=".length));
+      rawUrl = token.slice("--url=".length);
+      continue;
+    }
+    if (token === "--trusted-private-host") {
+      try {
+        trustedPrivateHosts.push(normalizeTrustedPrivateHost(argv[++i] ?? ""));
+      } catch (error) {
+        throw new McpBridgeError(error instanceof Error ? error.message : String(error), 2);
+      }
+      continue;
+    }
+    if (token?.startsWith("--trusted-private-host=")) {
+      try {
+        trustedPrivateHosts.push(
+          normalizeTrustedPrivateHost(token.slice("--trusted-private-host=".length)),
+        );
+      } catch (error) {
+        throw new McpBridgeError(error instanceof Error ? error.message : String(error), 2);
+      }
       continue;
     }
     if (token?.startsWith("-")) {
@@ -282,19 +348,44 @@ export function parseMcpAddArgs(argv: string[]): ParsedMcpAddArgs {
       continue;
     }
     throw new McpBridgeError(
-      "Usage: nemoclaw <sandbox> mcp add <server> --url <https-mcp-url> --env KEY",
+      "Usage: nemoclaw <sandbox> mcp add <server> --url <https-mcp-url> --env KEY [--deny-tool TOOL ...] [--trusted-private-host HOST]",
       2,
     );
   }
 
   if (!server) {
     throw new McpBridgeError(
-      "Usage: nemoclaw <sandbox> mcp add <server> --url <https-mcp-url> --env KEY",
+      "Usage: nemoclaw <sandbox> mcp add <server> --url <https-mcp-url> --env KEY [--deny-tool TOOL ...] [--trusted-private-host HOST]",
       2,
     );
   }
-  if (!url) {
+  if (!rawUrl) {
     throw new McpBridgeError("MCP server URL is required. Pass --url <https-mcp-url>.", 2);
+  }
+  if (new Set(trustedPrivateHosts).size !== trustedPrivateHosts.length) {
+    throw new McpBridgeError(
+      "Duplicate --trusted-private-host declarations are not accepted after normalization.",
+      2,
+    );
+  }
+  let configuredTrustedPrivateHosts: string[];
+  try {
+    configuredTrustedPrivateHosts = parseTrustedPrivateHosts(
+      process.env.NEMOCLAW_TRUSTED_PRIVATE_HOSTS,
+    );
+  } catch (error) {
+    throw new McpBridgeError(error instanceof Error ? error.message : String(error), 2);
+  }
+  const url = normalizeMcpServerUrl(rawUrl, {
+    trustedPrivateHosts: [...new Set([...trustedPrivateHosts, ...configuredTrustedPrivateHosts])],
+  });
+  const urlHost = new URL(url).hostname.toLowerCase();
+  const unrelatedTrustedHost = trustedPrivateHosts.find((host) => host !== urlHost);
+  if (unrelatedTrustedHost) {
+    throw new McpBridgeError(
+      `--trusted-private-host ${unrelatedTrustedHost} does not match MCP server URL host '${urlHost}'.`,
+      2,
+    );
   }
   if (env.length !== 1) {
     throw new McpBridgeError(
@@ -303,7 +394,78 @@ export function parseMcpAddArgs(argv: string[]): ParsedMcpAddArgs {
     );
   }
 
-  return { server, url, env };
+  const normalizedDenyTools = normalizeMcpDenyTools(denyTools);
+
+  return {
+    server,
+    url,
+    env,
+    ...(normalizedDenyTools.length > 0 ? { denyTools: normalizedDenyTools } : {}),
+    ...(trustedPrivateHosts.length > 0 ? { trustedPrivateHosts } : {}),
+  };
+}
+
+export function parseMcpUpdateArgs(argv: string[]): ParsedMcpUpdateArgs {
+  const denyTools: string[] = [];
+  let server = "";
+  let clearDenyTools = false;
+  let refreshPublicPins = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--deny-tool") {
+      denyTools.push(argv[++i] ?? "");
+      continue;
+    }
+    if (token?.startsWith("--deny-tool=")) {
+      denyTools.push(token.slice("--deny-tool=".length));
+      continue;
+    }
+    if (token === "--clear-deny-tools") {
+      clearDenyTools = true;
+      continue;
+    }
+    if (token === "--refresh-public-pins") {
+      refreshPublicPins = true;
+      continue;
+    }
+    if (token?.startsWith("-")) {
+      throw new McpBridgeError(`Unknown mcp update option: ${token}`, 2);
+    }
+    if (!server) {
+      server = token ?? "";
+      validateMcpServerName(server);
+      continue;
+    }
+    throw new McpBridgeError(
+      "Usage: nemoclaw <sandbox> mcp update <server> (--deny-tool TOOL [...] | --clear-deny-tools | --refresh-public-pins)",
+      2,
+    );
+  }
+
+  if (!server || (denyTools.length === 0 && !clearDenyTools && !refreshPublicPins)) {
+    throw new McpBridgeError(
+      "Usage: nemoclaw <sandbox> mcp update <server> (--deny-tool TOOL [...] | --clear-deny-tools | --refresh-public-pins)",
+      2,
+    );
+  }
+  if (refreshPublicPins) {
+    if (denyTools.length > 0 || clearDenyTools) {
+      throw new McpBridgeError(
+        "Choose one update mode: public-pin refresh or denied-tool replacement.",
+        2,
+      );
+    }
+    return { server, refreshPublicPins: true };
+  }
+  if (denyTools.length > 0 && clearDenyTools) {
+    throw new McpBridgeError(
+      "Pass repeated --deny-tool options or --clear-deny-tools, but not both.",
+      2,
+    );
+  }
+
+  return { server, denyTools: clearDenyTools ? [] : normalizeMcpDenyTools(denyTools) };
 }
 
 export function uniqueEnvNames(env: readonly ParsedEnvReference[] | readonly string[]): string[] {
@@ -321,7 +483,7 @@ export function assertAuthenticatedCredentialReference(env: readonly ParsedEnvRe
   validateMcpCredentialEnvName(env[0].name);
 }
 
-export function assertPersistedAuthenticatedBridgeEntry(entry: McpBridgeEntry): void {
+export function assertPersistedAuthenticatedBridgeEntry(entry: McpSourceEntry): void {
   if (!Array.isArray(entry.env) || entry.env.length !== 1 || !entry.providerName) {
     throw new McpBridgeError(
       `MCP server '${entry.server}' has no complete authenticated credential binding. Remove it with --force, then add it again with --env KEY.`,
@@ -331,7 +493,7 @@ export function assertPersistedAuthenticatedBridgeEntry(entry: McpBridgeEntry): 
   validatePersistedMcpCredentialEnvName(entry.env[0]);
 }
 
-export function assertAuthenticatedBridgeEntry(entry: McpBridgeEntry): void {
+export function assertAuthenticatedBridgeEntry(entry: McpSourceEntry): void {
   assertPersistedAuthenticatedBridgeEntry(entry);
   validateMcpCredentialEnvName(entry.env[0]);
 }

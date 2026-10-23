@@ -3,6 +3,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { listChannels } from "../sandbox/channels";
+import { createBuiltInMessagingHookRegistry } from "../messaging/hooks";
 import {
   prepareSandboxMessagingPreflight,
   type SandboxMessagingPreflightDeps,
@@ -22,6 +23,7 @@ function createResult(overrides = {}) {
     hasMessagingTokens: false,
     reusableMessagingProviders: [],
     reusableMessagingChannels: [],
+    missingBridgeChannels: [],
     missingWebSearchCredentialEnv: null,
     ...overrides,
   };
@@ -161,6 +163,25 @@ describe("prepareSandboxMessagingPreflight", () => {
     );
   });
 
+  it("passes the hook registry separately without replacing the sandbox registry", async () => {
+    const guard = vi.fn<
+      NonNullable<SandboxMessagingPreflightDeps["enforceMessagingChannelConflicts"]>
+    >(async () => undefined);
+    const preEnableHookRegistry = createBuiltInMessagingHookRegistry();
+    const deps = {
+      ...createDeps({
+        readMessagingPlanFromEnv: () => createPlan(),
+        enforceMessagingChannelConflicts: guard,
+      }),
+      preEnableHookRegistry,
+    };
+
+    await prepareSandboxMessagingPreflight(baseInput, deps);
+
+    expect(guard.mock.calls[0]?.[0].registry).toBe(deps.registry);
+    expect(guard.mock.calls[0]?.[0].preEnableHookRegistry).toBe(preEnableHookRegistry);
+  });
+
   it("ignores stale env plans for a different sandbox", async () => {
     const enforceMessagingChannelConflicts = vi.fn(async () => undefined);
     const deps = createDeps({
@@ -174,7 +195,7 @@ describe("prepareSandboxMessagingPreflight", () => {
     expect(deps.prepareCreateSandboxMessaging).toHaveBeenCalled();
   });
 
-  it("lets interactive users continue through a matching-token conflict", async () => {
+  it("aborts interactive credential conflicts without prompting (#7808)", async () => {
     const deps = createDeps({
       readMessagingPlanFromEnv: vi.fn(() => createPlan("demo", "telegram", "same")),
       registry: {
@@ -187,36 +208,55 @@ describe("prepareSandboxMessagingPreflight", () => {
       promptYesNoOrDefault: vi.fn(async () => true),
     });
 
-    await prepareSandboxMessagingPreflight(baseInput, deps);
-
-    expect(deps.log).toHaveBeenCalledWith(
-      expect.stringContaining("uses the same telegram credential"),
-    );
-    expect(deps.promptYesNoOrDefault).toHaveBeenCalledWith("  Continue anyway?", null, false);
-    expect(deps.prepareCreateSandboxMessaging).toHaveBeenCalled();
-  });
-
-  it("aborts non-interactive runs when the current plan conflicts", async () => {
-    const deps = createDeps({
-      readMessagingPlanFromEnv: vi.fn(() => createPlan("demo", "discord", undefined)),
-      isNonInteractive: vi.fn(() => true),
-      registry: {
-        listSandboxes: vi.fn(() => ({
-          sandboxes: [
-            { name: "other", messaging: { plan: createPlan("other", "discord", undefined) } },
-          ],
-        })),
-      },
-    });
-
     await expect(prepareSandboxMessagingPreflight(baseInput, deps)).rejects.toMatchObject({
       code: 1,
     });
-    expect(deps.error).toHaveBeenCalledWith(expect.stringContaining("channels stop <channel>"));
+
+    expect(deps.error).toHaveBeenCalledWith(
+      expect.stringContaining("uses the same telegram credential"),
+    );
     expect(deps.promptYesNoOrDefault).not.toHaveBeenCalled();
+    expect(deps.prepareCreateSandboxMessaging).not.toHaveBeenCalled();
   });
 
-  it("aborts a second Slack Socket Mode sandbox on the same gateway", async () => {
+  it.each([
+    { mode: "interactive", nonInteractive: false },
+    { mode: "non-interactive", nonInteractive: true },
+  ])(
+    "aborts an enabled channel with an unavailable credential hash before $mode onboarding (#7808)",
+    async ({ nonInteractive }) => {
+      const planWithoutHash = createPlan("demo", "discord", undefined);
+      const incompletePlan = {
+        ...planWithoutHash,
+        credentialBindings: planWithoutHash.credentialBindings.map((binding) => {
+          const { credentialHash: _credentialHash, ...bindingWithoutHash } = binding;
+          return { ...bindingWithoutHash, credentialAvailable: false };
+        }),
+      };
+      const listSandboxes = vi.fn(() => ({
+        sandboxes: [
+          { name: "other", messaging: { plan: createPlan("other", "discord", "other-hash") } },
+        ],
+      }));
+      const deps = createDeps({
+        readMessagingPlanFromEnv: vi.fn(() => incompletePlan),
+        isNonInteractive: vi.fn(() => nonInteractive),
+        registry: { listSandboxes },
+      });
+
+      await expect(prepareSandboxMessagingPreflight(baseInput, deps)).rejects.toMatchObject({
+        code: 1,
+      });
+      expect(deps.error).toHaveBeenCalledWith(
+        expect.stringContaining("credential hashes are unavailable for discord"),
+      );
+      expect(listSandboxes).not.toHaveBeenCalled();
+      expect(deps.promptYesNoOrDefault).not.toHaveBeenCalled();
+      expect(deps.prepareCreateSandboxMessaging).not.toHaveBeenCalled();
+    },
+  );
+
+  it("aborts a second Slack Socket Mode sandbox on the same gateway (#7808)", async () => {
     let gatewayName = "startup-gateway";
     const deps = createDeps({
       gatewayName: vi.fn(() => gatewayName),
@@ -239,7 +279,7 @@ describe("prepareSandboxMessagingPreflight", () => {
     await expect(prepareSandboxMessagingPreflight(baseInput, deps)).rejects.toMatchObject({
       code: 1,
     });
-    expect(deps.log).toHaveBeenCalledWith(
+    expect(deps.error).toHaveBeenCalledWith(
       expect.stringContaining("Slack Socket Mode is already enabled for sandbox 'other'"),
     );
     expect(deps.error).toHaveBeenCalledWith(
@@ -262,6 +302,21 @@ describe("prepareSandboxMessagingPreflight", () => {
     });
     expect(deps.error).toHaveBeenCalledWith(
       "  Web search is enabled, but BRAVE_API_KEY is not available in this process.",
+    );
+  });
+
+  it("fails before recreate/delete when a selected bridge channel has no usable provider", async () => {
+    const deps = createDeps({
+      prepareCreateSandboxMessaging: vi.fn(() =>
+        createResult({ missingBridgeChannels: ["googlechat"] }),
+      ),
+    });
+
+    await expect(
+      prepareSandboxMessagingPreflight({ ...baseInput, enabledChannels: ["googlechat"] }, deps),
+    ).rejects.toMatchObject({ code: 1 });
+    expect(deps.error).toHaveBeenCalledWith(
+      "  googlechat mints its outbound token gateway-side and needs GOOGLECHAT_SERVICE_ACCOUNT to configure it.",
     );
   });
 

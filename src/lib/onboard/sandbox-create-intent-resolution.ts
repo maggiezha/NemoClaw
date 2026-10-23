@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { NativeLocalProviderAttachment } from "../inference/native-local/contract";
+import type { NativeProviderAttachment } from "../inference/native-provider/contract";
+
 import type { WebSearchConfig } from "../inference/web-search";
+import type { NativeNvidiaProviderAttachment } from "../inference/native-nvidia";
 import type { DockerGpuRoutePlan } from "./docker-gpu-route";
 import type { NamedMessagingChannel } from "./messaging-prep";
 import {
@@ -10,8 +14,13 @@ import {
   resolveSandboxCreateMessagingProviderRequests,
 } from "./sandbox-create-intent";
 import type { SandboxCreateIntent } from "./sandbox-create-intent-types";
+import { getActiveChannelsFromPlan } from "./messaging-plan-session";
 import { resolveSandboxCreatePolicyTier } from "./sandbox-create-plan";
-import { validateSandboxCreateIntentBindings } from "./sandbox-create-plan-materialization";
+import {
+  selectHermesPortableExtraProviderPlan,
+  selectHermesPortableMessagingCapabilities,
+  validateSandboxCreateIntentBindings,
+} from "./sandbox-create-plan-materialization";
 import { buildSandboxGpuCreateArgs, type SandboxGpuCreateConfig } from "./sandbox-gpu-create";
 import {
   prepareSandboxMessagingPreflight,
@@ -21,11 +30,16 @@ import {
 export type CompleteSandboxCreateIntentInput<Agent, ResourceProfile> = {
   sandboxName: string;
   inferenceProvider?: string | null;
+  nativeLocalProviderAttachment?: NativeLocalProviderAttachment;
+  nativeNvidiaProviderAttachment?: NativeNvidiaProviderAttachment;
+  nativeHostedProviderAttachment?: NativeProviderAttachment;
+  hostLocalInferenceRouteOnly?: boolean;
   enabledChannels: readonly string[] | null;
   webSearchConfig: WebSearchConfig | null;
   agent: Agent;
   sandboxGpuConfig: SandboxGpuCreateConfig;
   resourceProfile: ResourceProfile | null;
+  hostMounts?: readonly import("../state/registry/types").SandboxHostMount[];
   hermesToolGateways: readonly string[];
   extraProviders: readonly string[];
   staleExtraProviders: readonly string[];
@@ -40,7 +54,10 @@ export interface SandboxCreateIntentResolverDeps<Agent, ResourceProfile> {
   filterEnabledChannelsByAgent(enabledChannels: string[] | null, agent: Agent): string[] | null;
   defaultPolicyPath: string;
   getAgentPolicyPath(agent: Agent): string | null;
-  resolveGpuPlan(config: SandboxGpuCreateConfig): {
+  resolveGpuPlan(
+    config: SandboxGpuCreateConfig,
+    agent: Agent,
+  ): {
     gpuRoutePlan: DockerGpuRoutePlan;
     logMessage: string | null;
   };
@@ -53,6 +70,22 @@ export function createSandboxCreateIntentResolver<
 >(deps: SandboxCreateIntentResolverDeps<Agent, ResourceProfile>) {
   function filterEnabledChannels(enabledChannels: readonly string[] | null, agent: Agent) {
     return deps.filterEnabledChannelsByAgent(enabledChannels ? [...enabledChannels] : null, agent);
+  }
+
+  function resolveSelectedChannels(
+    input: Pick<
+      CompleteSandboxCreateIntentInput<Agent, ResourceProfile>,
+      "sandboxName" | "enabledChannels" | "agent"
+    >,
+  ): string[] | null {
+    const selected = filterEnabledChannels(input.enabledChannels, input.agent);
+    if (selected !== null) return selected;
+    const stagedPlan = deps.messagingPreflightDeps.readMessagingPlanFromEnv();
+    if (stagedPlan?.sandboxName === input.sandboxName) {
+      return filterEnabledChannels(getActiveChannelsFromPlan(stagedPlan), input.agent) ?? [];
+    }
+    const agentName = input.agent?.name?.trim().toLowerCase();
+    return agentName && agentName !== "openclaw" ? null : [];
   }
 
   async function prepareMessagingCapabilities(
@@ -73,13 +106,12 @@ export function createSandboxCreateIntentResolver<
         ? {
             ...deps.messagingPreflightDeps,
             readMessagingPlanFromEnv: () => null,
-            registerExtraPlaceholderProviders: () => [],
           }
         : deps.messagingPreflightDeps;
     const result = await prepareSandboxMessagingPreflight(
       {
         channels: deps.channels,
-        enabledChannels: filterEnabledChannels(input.enabledChannels, input.agent),
+        enabledChannels: resolveSelectedChannels(input),
         sandboxName: input.sandboxName,
         agentName: input.agent?.name ?? "openclaw",
         requireExactProviderBinding:
@@ -111,6 +143,7 @@ export function createSandboxCreateIntentResolver<
     const messaging = await prepareMessagingCapabilities(input);
     const { gpuRoutePlan, logMessage: sandboxGpuLogMessage } = deps.resolveGpuPlan(
       input.sandboxGpuConfig,
+      input.agent,
     );
     const resourceCreateArgs: string[] = [];
     deps.appendResourceCreateArgs(resourceCreateArgs, input.resourceProfile);
@@ -118,8 +151,12 @@ export function createSandboxCreateIntentResolver<
       basePolicyPath: deps.getAgentPolicyPath(input.agent) || deps.defaultPolicyPath,
       sandboxName: input.sandboxName,
       inferenceProvider: input.inferenceProvider,
+      nativeLocalProviderAttachment: input.nativeLocalProviderAttachment,
+      nativeNvidiaProviderAttachment: input.nativeNvidiaProviderAttachment,
+      nativeHostedProviderAttachment: input.nativeHostedProviderAttachment,
+      hostLocalInferenceRouteOnly: input.hostLocalInferenceRouteOnly === true,
       channels: deps.channels,
-      enabledChannels: filterEnabledChannels(input.enabledChannels, input.agent),
+      enabledChannels: resolveSelectedChannels(input),
       disabledChannelNames: messaging.disabledChannelNames,
       messagingProviderRequests: resolveSandboxCreateMessagingProviderRequests(
         messaging.messagingTokenDefs,
@@ -134,6 +171,7 @@ export function createSandboxCreateIntentResolver<
       sandboxGpuConfig: input.sandboxGpuConfig,
       gpuCreateArgs: buildSandboxGpuCreateArgs(input.sandboxGpuConfig),
       resourceCreateArgs,
+      hostMounts: input.hostMounts,
       gpuRoutePlan,
       sandboxGpuLogMessage,
       extraPlaceholderKeys: messaging.extraPlaceholderKeys,
@@ -142,8 +180,57 @@ export function createSandboxCreateIntentResolver<
     });
   }
 
+  async function resolvePortableLifecycle(
+    input: Omit<
+      CompleteSandboxCreateIntentInput<Agent, ResourceProfile>,
+      "extraProviders" | "staleExtraProviders"
+    >,
+    options: {
+      readonly hermesPortable: boolean;
+      readonly requestedExtraProviders?: readonly string[];
+      readonly resolvedIntent?: SandboxCreateIntent;
+      readonly planOrdinaryExtraProviders: () =>
+        | {
+            readonly extraProviders: readonly string[];
+            readonly staleExtraProviders: readonly string[];
+          }
+        | Promise<{
+            readonly extraProviders: readonly string[];
+            readonly staleExtraProviders: readonly string[];
+          }>;
+    },
+  ) {
+    const ordinaryExtraProviderPlan =
+      !options.hermesPortable && !options.requestedExtraProviders
+        ? await options.planOrdinaryExtraProviders()
+        : null;
+    const extraProviderPlan = selectHermesPortableExtraProviderPlan(
+      options.hermesPortable,
+      options.requestedExtraProviders,
+      () => {
+        if (!ordinaryExtraProviderPlan) {
+          throw new Error("Ordinary extra-provider plan is unavailable.");
+        }
+        return ordinaryExtraProviderPlan;
+      },
+    );
+    const intent =
+      options.resolvedIntent ??
+      (await resolve({
+        ...input,
+        extraProviders: extraProviderPlan.extraProviders,
+        staleExtraProviders: extraProviderPlan.staleExtraProviders,
+      }));
+    const messagingCapabilities = await selectHermesPortableMessagingCapabilities(
+      options.hermesPortable,
+      () => prepareMessagingCapabilities(input, intent),
+    );
+    return { intent, messagingCapabilities };
+  }
+
   return {
     resolve,
+    resolvePortableLifecycle,
     rebind: prepareMessagingCapabilities,
     prepareCredentialProviders: (
       input: Pick<

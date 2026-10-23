@@ -73,7 +73,7 @@ export type TelegramProbeInput = {
   // ISO timestamp captured by the orchestrator when the probe ran.
   probedAt: string;
   // Whether the telegram preset is recorded in the sandbox registry.
-  presetInRegistry: boolean;
+  presetApplied: boolean;
   // Whether the telegram preset's network policy is loaded on the gateway,
   // or null when the gateway could not be reached.
   presetOnGateway: boolean | null;
@@ -103,7 +103,7 @@ function configCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
 }
 
 function policyCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
-  if (input.presetOnGateway === false && input.presetInRegistry) {
+  if (input.presetOnGateway === false && input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -111,12 +111,12 @@ function policyCoverageSignal(input: TelegramProbeInput): DiagnosticSignal {
       hint: "rebuild the sandbox so the preset is reapplied to the OpenShell gateway",
     };
   }
-  if (!input.presetInRegistry) {
+  if (!input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
       detail: "telegram preset is not applied to the sandbox",
-      hint: "run `nemoclaw <sandbox> policy-add telegram` and rebuild the sandbox",
+      hint: "run `nemoclaw <sandbox> policy add telegram` and rebuild the sandbox",
     };
   }
   if (input.presetOnGateway === null) {
@@ -269,6 +269,11 @@ function pickVerdict(signals: DiagnosticSignal[], input: TelegramProbeInput): Te
   }
   if (bc?.startupFailedNetwork) return "unreachable";
   if (bc?.bridgeNotStarted) return "not_started";
+  // A definitive non-auth Bot API startup error (403/429/5xx; 401/404 already
+  // map to token_rejected above) is a runtime failure, not an inconclusive
+  // outcome. Surface it as unreachable so `channels status` exits nonzero
+  // instead of treating the channel as passing.
+  if (bc?.startupHttpError != null) return "unreachable";
   return "unknown";
 }
 
@@ -288,14 +293,14 @@ function buildHints(verdict: TelegramVerdict): string[] {
       ];
     case "unreachable":
       return [
-        "The sandbox could not reach api.telegram.org. Confirm the telegram egress policy is loaded and the corporate network allows Telegram.",
+        "The sandbox could not reach api.telegram.org, or the Telegram Bot API returned an error status. Confirm the telegram egress policy is loaded and the network allows Telegram, and check `nemoclaw <sandbox> logs --follow` for a Bot API HTTP status.",
       ];
     case "not_started":
       return [
         "The telegram poller did not start. Check `nemoclaw <sandbox> logs --follow` and rebuild if needed.",
       ];
     case "policy_gap":
-      return ["Run `nemoclaw <sandbox> policy-add telegram`, then rebuild."];
+      return ["Run `nemoclaw <sandbox> policy add telegram`, then rebuild."];
     case "config_gap":
       return ["Run `nemoclaw <sandbox> channels add telegram` to enable the channel."];
     case "probe_failed":
@@ -382,7 +387,11 @@ export function parseTelegramBreadcrumbs(logLines: readonly string[]): TelegramB
     if (NETWORK_FAIL.test(line)) lastNetworkFail = index;
     if (/bridge did not start within/i.test(line)) lastBridgeNotStarted = index;
     if (/rejected startup probe with HTTP\s+(401|404)/i.test(line)) lastTokenRejected = index;
-    if (/credential placeholder.*(missing|mismatch|unresolved)/i.test(line)) {
+    if (
+      /credential placeholder.*(?:missing|mismatch|unresolved)|runtime TELEGRAM_BOT_TOKEN (?:is an identityless canonical placeholder|placeholder is malformed)|runtime credential available from a non-placeholder source/i.test(
+        line,
+      )
+    ) {
       lastCredentialUnresolved = index;
     }
   });

@@ -1,15 +1,38 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHermesApiPortReservationScope } from "../onboard/hermes-api-port";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+import type {
+  OpenShellSandboxBufferedCommandExecutor,
+  OpenShellSandboxBufferedCommandRequest,
+} from "../adapters/openshell/sandbox-command";
+
+// The ready summary resolves the sandbox's API port from the registry. Stub the
+// lookup so these unit tests never read the developer's real state file.
+const getSandboxMock = vi.hoisted(() =>
+  vi.fn((): { hermesApiPort?: number | null } | null => null),
+);
+vi.mock("../state/registry", () => ({ getSandbox: getSandboxMock }));
+const initializeHermesInferenceRouteMock = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../onboard/hermes/initial-inference-route", () => ({
+  createInitialHermesInferenceRoute: () => initializeHermesInferenceRouteMock,
+}));
+
 import type { AgentDefinition } from "./defs";
 // Import source directly so tests cannot pass against a stale build.
 import {
   collectHermesStartupDiagnostics,
   handleAgentSetup,
+  type OnboardContext,
   printDashboardUi,
   verifyAgentBinaryAvailable,
 } from "./onboard";
+
+type LegacyCapture = (
+  args: string[],
+  options?: { ignoreError?: boolean; includeStderr?: boolean; timeout?: number },
+) => string | null;
 
 function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
@@ -30,9 +53,6 @@ function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
       support: "disabled",
       reason: "test fixture",
     },
-    stateDirs: [],
-    runtimeAuthStateDirs: [],
-    stateFiles: [],
     userManagedFiles: [],
     versionCommand: "agent --version",
     expectedVersion: null,
@@ -42,12 +62,50 @@ function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
     dockerfilePath: null,
     startScriptPath: null,
     policyAdditionsPath: null,
-    policyPermissivePath: null,
     pluginDir: null,
     legacyPaths: null,
     agentDir: "/tmp/agent",
     manifestPath: "/tmp/agent/manifest.yaml",
     ...overrides,
+  };
+}
+
+function requestAsLegacyArgs(request: OpenShellSandboxBufferedCommandRequest): string[] {
+  const targetArgs = request.target.kind === "named" ? ["-g", request.target.gatewayName] : [];
+  const ttyArgs = request.tty === false ? ["--no-tty"] : [];
+  const args = ["sandbox", "exec", "-n", request.sandboxName, ...targetArgs, ...ttyArgs];
+  for (const [key, value] of Object.entries(request.sandboxEnvironment ?? {})) {
+    args.push("--env", `${key}=${value}`);
+  }
+  return [...args, "--", ...request.command];
+}
+
+function legacyBufferedExecutor(
+  capture: LegacyCapture,
+): OpenShellSandboxBufferedCommandExecutor & { runBuffered: ReturnType<typeof vi.fn> } {
+  return {
+    runBuffered: vi.fn(async (request: OpenShellSandboxBufferedCommandRequest) => {
+      const isScript = request.command[0] === "/bin/bash" && request.command[1] === "-s";
+      const output = capture(requestAsLegacyArgs(request), { ignoreError: true });
+      const capturedCompletion =
+        output === null
+          ? {
+              outcome: {
+                kind: "failed" as const,
+                error: { kind: "invocation" as const, message: "unobservable" },
+              },
+              stdout: "",
+              stderr: "",
+            }
+          : {
+              outcome: { kind: "completed" as const, exitCode: 0 },
+              stdout: output,
+              stderr: "",
+            };
+      return isScript
+        ? { outcome: { kind: "completed" as const, exitCode: 0 }, stdout: "", stderr: "" }
+        : capturedCompletion;
+    }),
   };
 }
 
@@ -107,6 +165,9 @@ describe("printDashboardUi with port 8642 outside the chat UI (#2078)", () => {
   beforeEach(() => {
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     noteSpy.mockReset();
+    getSandboxMock.mockReturnValue(null);
+    initializeHermesInferenceRouteMock.mockReset();
+    initializeHermesInferenceRouteMock.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -269,20 +330,38 @@ describe("printDashboardUi with port 8642 outside the chat UI (#2078)", () => {
 });
 
 describe("agent setup session boundaries", () => {
-  function createAgentSetupContext(runCaptureOpenshell = vi.fn(() => "")) {
+  function createAgentSetupContext(
+    runCaptureOpenshell: LegacyCapture = vi.fn(() => ""),
+    timing: Pick<OnboardContext, "now" | "sleepSeconds"> = {},
+    identityBoundary: Pick<OnboardContext, "revalidateSandboxIdentity"> = {},
+  ) {
+    const sandboxCommandExecutor = legacyBufferedExecutor(runCaptureOpenshell);
     return {
       context: {
         step: vi.fn(),
-        runCaptureOpenshell,
-        openshellShellCommand: vi.fn(() => "openshell sandbox connect sandbox-x"),
-        openshellBinary: "/usr/bin/openshell",
+        sandboxCommandExecutor,
         startRecordedStep: vi.fn(async () => undefined),
         recordStepComplete: vi.fn(async () => undefined),
         recordStepFailed: vi.fn(async () => undefined),
         skippedStepMessage: vi.fn(),
+        prepareHermesInferenceForward: vi.fn(async () => undefined),
+        ...timing,
+        ...identityBoundary,
       },
+      runBuffered: sandboxCommandExecutor.runBuffered,
     };
   }
+
+  beforeEach(() => {
+    getSandboxMock.mockReset();
+    getSandboxMock.mockReturnValue(null);
+    initializeHermesInferenceRouteMock.mockReset();
+    initializeHermesInferenceRouteMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   it("records resume success through the supplied completion boundary", async () => {
     const runCaptureOpenshell = vi.fn(() => "ok");
@@ -320,49 +399,462 @@ describe("agent setup session boundaries", () => {
     });
     expect(context.recordStepFailed).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      name: "fresh setup",
+      resume: false,
+      skipped: 0,
+      probe: () => vi.fn(() => "ok").mockReturnValueOnce(""),
+    },
+    {
+      name: "healthy resume",
+      resume: true,
+      skipped: 1,
+      probe: () => vi.fn(() => "ok"),
+    },
+    {
+      name: "unhealthy resume",
+      resume: true,
+      skipped: 0,
+      probe: () =>
+        vi
+          .fn(() => "ok")
+          .mockReturnValueOnce("")
+          .mockReturnValueOnce(""),
+    },
+  ])(
+    "hands off the reserved API port after readiness and before route restart during $name",
+    async ({ resume, skipped, probe }) => {
+      let nowMs = 0;
+      const healthProbe = probe();
+      const revalidateSandboxIdentity = vi.fn();
+      getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+      const runCaptureOpenshell = vi.fn((args: string[]) =>
+        args.includes("curl") ? healthProbe() : "NEMOCLAW_AGENT_BINARY_CHECK:ok",
+      );
+      const { context } = createAgentSetupContext(
+        runCaptureOpenshell,
+        {
+          now: () => nowMs,
+          sleepSeconds: (seconds) => {
+            nowMs += seconds * 1000;
+          },
+        },
+        { revalidateSandboxIdentity },
+      );
+      const reservation = createHermesApiPortReservationScope();
+      const release = vi.fn(async () => undefined);
+      reservation.current = { port: 8643, release };
+      const establishForward = vi.fn();
+      context.prepareHermesInferenceForward.mockImplementationOnce(async () => {
+        expect(healthProbe.mock.results.at(-1)?.value).toBe("ok");
+        await reservation.releaseBeforeForward("hermes", 8643);
+        establishForward();
+      });
+      initializeHermesInferenceRouteMock.mockImplementationOnce(async () => {
+        expect(reservation.current).toBeNull();
+        expect(release).toHaveBeenCalledOnce();
+        expect(establishForward).toHaveBeenCalledOnce();
+        // The native restart must not interrupt the gateway's first startup.
+        expect(healthProbe).toHaveReturnedWith("ok");
+        expect(healthProbe.mock.results.at(-1)?.value).toBe("ok");
+        expect(context.recordStepComplete).not.toHaveBeenCalled();
+      });
+      await handleAgentSetup(
+        "sandbox-x",
+        "model-x",
+        "compatible-endpoint",
+        hermesProbeAgent,
+        resume,
+        null,
+        {
+          ...context,
+          gatewayName: "gateway-x",
+        },
+      );
+      expect(context.prepareHermesInferenceForward).toHaveBeenCalledOnce();
+      expect(context.skippedStepMessage).toHaveBeenCalledTimes(skipped);
+      expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(
+        Array(healthProbe.mock.calls.length).fill("http://localhost:8643/health"),
+      );
+      expect(initializeHermesInferenceRouteMock).toHaveBeenCalledExactlyOnceWith(
+        "sandbox-x",
+        "model-x",
+        "compatible-endpoint",
+        "gateway-x",
+        revalidateSandboxIdentity,
+      );
+      expect(initializeHermesInferenceRouteMock.mock.invocationCallOrder[0]).toBeLessThan(
+        context.recordStepComplete.mock.invocationCallOrder[0],
+      );
+    },
+  );
+
+  it.each([
+    { name: "missing fresh handoff", resume: false, prepare: undefined },
+    { name: "missing resume handoff", resume: true, prepare: undefined },
+    {
+      name: "failed fresh handoff",
+      resume: false,
+      prepare: async () => {
+        throw new Error("API forward handoff failed");
+      },
+    },
+    {
+      name: "failed resume handoff",
+      resume: true,
+      prepare: async () => {
+        throw new Error("API forward handoff failed");
+      },
+    },
+  ])("refuses route initialization and completion after $name", async ({ resume, prepare }) => {
+    const { context } = createAgentSetupContext(
+      vi.fn((args: string[]) => (args.includes("curl") ? "ok" : "NEMOCLAW_AGENT_BINARY_CHECK:ok")),
+    );
+    await expect(
+      handleAgentSetup(
+        "sandbox-x",
+        "model-x",
+        "compatible-endpoint",
+        hermesProbeAgent,
+        resume,
+        null,
+        { ...context, prepareHermesInferenceForward: prepare },
+      ),
+    ).rejects.toThrow(/handoff/);
+    expect(initializeHermesInferenceRouteMock).not.toHaveBeenCalled();
+    expect(context.recordStepComplete).not.toHaveBeenCalled();
+    expect(context.skippedStepMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "does not complete setup when Hermes route initialization fails (resume=%s)",
+    async (resume) => {
+      const { context } = createAgentSetupContext(
+        vi.fn((args: string[]) =>
+          args.includes("curl") ? "ok" : "NEMOCLAW_AGENT_BINARY_CHECK:ok",
+        ),
+      );
+      initializeHermesInferenceRouteMock.mockRejectedValueOnce(
+        new Error("native attachment changed"),
+      );
+      const agent = makeAgent({ name: "hermes" });
+      await expect(
+        handleAgentSetup(
+          "sandbox-x",
+          "model-x",
+          "compatible-endpoint",
+          agent,
+          resume,
+          null,
+          context,
+        ),
+      ).rejects.toThrow("native attachment changed");
+      expect(context.recordStepComplete).not.toHaveBeenCalled();
+      expect(context.skippedStepMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("writes non-default agent configuration through noninteractive sandbox exec", async () => {
+    const runCaptureOpenshell = vi.fn(() => "NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context, runBuffered } = createAgentSetupContext(runCaptureOpenshell);
+    const agent = makeAgent({
+      name: "hermes",
+      healthProbe: { url: "", port: 0, timeout_seconds: 0 },
+    });
+
+    await handleAgentSetup("sandbox-x", "meta-llama", "vllm-local", agent, false, null, context);
+
+    const configRequest = runBuffered.mock.calls
+      .map(([request]) => request)
+      .find((request) => request.command[0] === "/bin/bash" && request.command[1] === "-s");
+    expect(configRequest).toMatchObject({
+      sandboxName: "sandbox-x",
+      target: { kind: "selected" },
+      command: ["/bin/bash", "-s"],
+      tty: false,
+      input: expect.any(String),
+    });
+    expect(configRequest?.input).toContain('"provider": "vllm-local"');
+    expect(configRequest?.input).toContain('"model": "meta-llama"');
+    expect(configRequest?.input).toContain('"agent": "hermes"');
+  });
+
+  it("retries a configured gateway probe through the supplied scheduler", async () => {
+    let nowMs = 0;
+    const sleepSeconds = vi.fn((seconds: number) => {
+      nowMs += seconds * 1000;
+    });
+    const runCaptureOpenshell = vi
+      .fn<LegacyCapture>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok")
+      .mockReturnValueOnce("");
+    const { context } = createAgentSetupContext(runCaptureOpenshell, {
+      now: () => nowMs,
+      sleepSeconds,
+    });
+
+    await handleAgentSetup(
+      "sandbox-x",
+      "model-x",
+      "provider-x",
+      makeAgent({
+        healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 1 },
+      }),
+      false,
+      null,
+      context,
+    );
+
+    expect(runCaptureOpenshell.mock.calls.filter(([args]) => args.includes("curl"))).toHaveLength(
+      2,
+    );
+    expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+    expect(context.recordStepComplete).toHaveBeenCalledWith("agent_setup", {
+      sandboxName: "sandbox-x",
+      provider: "provider-x",
+      model: "model-x",
+    });
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("refuses completion when sandbox identity changes during the gateway wait (#9833)", async () => {
+    let nowMs = 0;
+    const sleepSeconds = vi.fn((seconds: number) => {
+      nowMs += seconds * 1000;
+    });
+    const runCaptureOpenshell = vi
+      .fn<LegacyCapture>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok")
+      .mockReturnValueOnce("");
+    const refuseCompletion = () => {
+      throw new Error("sandbox identity changed");
+    };
+    const policyChecks = new Map([
+      ["record completed agent setup for sandbox 'sandbox-x'", refuseCompletion],
+    ]);
+    const revalidateSandboxIdentity = vi.fn((operation: string) => policyChecks.get(operation)?.());
+    const { context } = createAgentSetupContext(
+      runCaptureOpenshell,
+      { now: () => nowMs, sleepSeconds },
+      { revalidateSandboxIdentity },
+    );
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+    await expect(
+      handleAgentSetup(
+        "sandbox-x",
+        "model-x",
+        "provider-x",
+        makeAgent({
+          healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 1 },
+        }),
+        false,
+        null,
+        context,
+      ),
+    ).rejects.toThrow("sandbox identity changed");
+
+    expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+    expect(context.recordStepComplete).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.flat().join("\n")).not.toContain("gateway is healthy");
+  });
+
+  it.each([
+    { name: "generic fresh setup", agent: makeAgent(), resume: false },
+    {
+      name: "Hermes fresh setup",
+      agent: makeAgent({ name: "hermes" }),
+      resume: false,
+    },
+    {
+      name: "Hermes resume",
+      agent: makeAgent({ name: "hermes" }),
+      resume: true,
+    },
+  ])(
+    "records gateway failure without initializing inference after the deadline for $name",
+    async ({ agent, resume }) => {
+      let nowMs = 0;
+      const sleepSeconds = vi.fn((seconds: number) => {
+        nowMs += seconds * 1000;
+      });
+      const runCaptureOpenshell = vi.fn<LegacyCapture>((args) =>
+        args.includes("curl") ? "" : "NEMOCLAW_AGENT_BINARY_CHECK:ok",
+      );
+      const { context } = createAgentSetupContext(runCaptureOpenshell, {
+        now: () => nowMs,
+        sleepSeconds,
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit:${String(code)}`);
+      }) as typeof process.exit);
+
+      await expect(
+        handleAgentSetup(
+          "sandbox-x",
+          "model-x",
+          "provider-x",
+          makeAgent({
+            ...agent,
+            healthProbe: {
+              url: "http://127.0.0.1:19000/",
+              port: 19000,
+              timeout_seconds: 1,
+            },
+          }),
+          resume,
+          null,
+          context,
+        ),
+      ).rejects.toThrow("process.exit:1");
+
+      expect(
+        runCaptureOpenshell.mock.calls.filter(([args]) => args.includes("curl")).length,
+      ).toBeGreaterThan(1);
+      expect(sleepSeconds).toHaveBeenCalledWith(0.25);
+      expect(context.recordStepFailed).toHaveBeenCalledWith(
+        "agent_setup",
+        "Agent gateway did not respond within 1s",
+      );
+      expect(context.recordStepComplete).not.toHaveBeenCalled();
+      expect(initializeHermesInferenceRouteMock).not.toHaveBeenCalled();
+      expect(context.prepareHermesInferenceForward).not.toHaveBeenCalled();
+    },
+  );
+
+  // The manifest names 8642; a second sandbox is allocated its own port (#9739).
+  const hermesProbeAgent = makeAgent({
+    name: "hermes",
+    displayName: "Hermes Agent",
+    healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 1 },
+  });
+
+  function probeUrlsFrom(runCaptureOpenshell: ReturnType<typeof vi.fn<LegacyCapture>>): string[] {
+    return runCaptureOpenshell.mock.calls
+      .map(([args]) => args)
+      .filter((args) => args.includes("curl"))
+      .map((args) => String(args[args.length - 1]));
+  }
+
+  it("probes the sandbox's own Hermes API port instead of the manifest default (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi
+      .fn<LegacyCapture>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-core-test",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8643/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+    expect(context.recordStepComplete).toHaveBeenCalledWith("agent_setup", {
+      sandboxName: "hermes-core-test",
+      provider: "provider-x",
+      model: "model-x",
+    });
+  });
+
+  it("keeps the manifest probe port for a sandbox that owns the default API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8642 });
+    const runCaptureOpenshell = vi
+      .fn<LegacyCapture>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-first",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8642/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("leaves a non-Hermes probe URL on its manifest port when the registry records a Hermes API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi
+      .fn<LegacyCapture>(() => "ok")
+      .mockReturnValueOnce("NEMOCLAW_AGENT_BINARY_CHECK:ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "not-hermes",
+      "model-x",
+      "provider-x",
+      makeAgent({
+        healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 1 },
+      }),
+      false,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8642/health"]);
+    expect(context.recordStepFailed).not.toHaveBeenCalled();
+  });
+
+  it("retargets the resume health probe at the sandbox's own API port (#9739)", async () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const runCaptureOpenshell = vi.fn<LegacyCapture>(() => "ok");
+    const { context } = createAgentSetupContext(runCaptureOpenshell);
+
+    await handleAgentSetup(
+      "hermes-core-test",
+      "model-x",
+      "provider-x",
+      hermesProbeAgent,
+      true,
+      null,
+      context,
+    );
+
+    expect(probeUrlsFrom(runCaptureOpenshell)).toEqual(["http://localhost:8643/health"]);
+    expect(context.skippedStepMessage).toHaveBeenCalledWith("agent_setup", "hermes-core-test");
+    expect(context.startRecordedStep).not.toHaveBeenCalled();
+  });
 });
 
 describe("handleAgentSetup guards", () => {
-  it("accepts an executable configured binary path when PATH lookup is empty", () => {
-    let script = "";
-    const result = verifyAgentBinaryAvailable(
+  it("accepts an executable configured binary path when PATH lookup is empty", async () => {
+    const executor = legacyBufferedExecutor(
+      () => "openshell noise\nNEMOCLAW_AGENT_BINARY_CHECK:ok",
+    );
+    const result = await verifyAgentBinaryAvailable(
       "alpha",
       makeAgent({ name: "hermes", binary_path: "/usr/local/bin/hermes" }),
-      (args) => {
-        script = String(args[7] || "");
-        return "openshell noise\nNEMOCLAW_AGENT_BINARY_CHECK:ok";
-      },
+      executor,
     );
 
     expect(result).toEqual({ available: true });
+    const script = String(executor.runBuffered.mock.calls[0]?.[0].command.at(-1) ?? "");
     expect(script).toContain("if [ -x '/usr/local/bin/hermes' ]; then");
     expect(script).toContain("NEMOCLAW_AGENT_BINARY_CHECK:ok");
   });
 
-  it("does not reject a configured binary when PATH resolves the symlink target", () => {
-    let script = "";
-    const result = verifyAgentBinaryAvailable(
-      "alpha",
-      makeAgent({ name: "hermes", binary_path: "/usr/local/bin/hermes" }),
-      (args) => {
-        script = String(args[7] || "");
-        return "openshell noise\nNEMOCLAW_AGENT_BINARY_CHECK:ok";
-      },
+  it("reports a configured binary path that exists but is not executable", async () => {
+    const executor = legacyBufferedExecutor(
+      () => "openshell noise\nNEMOCLAW_AGENT_BINARY_CHECK:not_executable",
     );
-
-    expect(result).toEqual({ available: true });
-    expect(script).toContain("NEMOCLAW_AGENT_BINARY_CHECK:ok");
-  });
-
-  it("reports a configured binary path that exists but is not executable", () => {
-    let script = "";
-    const result = verifyAgentBinaryAvailable(
+    const result = await verifyAgentBinaryAvailable(
       "alpha",
       makeAgent({ name: "hermes", binary_path: "/usr/local/bin/hermes" }),
-      (args) => {
-        script = String(args[7] || "");
-        return "openshell noise\nNEMOCLAW_AGENT_BINARY_CHECK:not_executable";
-      },
+      executor,
     );
 
     expect(result).toEqual({
@@ -370,12 +862,77 @@ describe("handleAgentSetup guards", () => {
       reason: "not_executable",
       binaryPath: "/usr/local/bin/hermes",
     });
+    const script = String(executor.runBuffered.mock.calls[0]?.[0].command.at(-1) ?? "");
     expect(script).toContain("[ -e '/usr/local/bin/hermes' ] && [ ! -x '/usr/local/bin/hermes' ]");
+  });
+
+  it("distinguishes an unobservable sandbox exec from a missing binary", async () => {
+    const result = await verifyAgentBinaryAvailable(
+      "alpha",
+      makeAgent({ name: "pi", binary_path: "/usr/local/bin/pi" }),
+      legacyBufferedExecutor(() => null),
+    );
+
+    expect(result).toEqual({
+      available: false,
+      reason: "unobservable",
+      binaryPath: "/usr/local/bin/pi",
+    });
+  });
+
+  it("accepts a marker from a successful buffered OpenShell completion", async () => {
+    await expect(
+      verifyAgentBinaryAvailable(
+        "alpha",
+        makeAgent({ name: "pi", binary_path: "/usr/local/bin/pi" }),
+        legacyBufferedExecutor(() => "NEMOCLAW_AGENT_BINARY_CHECK:ok"),
+      ),
+    ).resolves.toEqual({ available: true });
+  });
+
+  it("rejects marker text when the buffered command exits unsuccessfully", async () => {
+    await expect(
+      verifyAgentBinaryAvailable(
+        "alpha",
+        makeAgent({ name: "pi", binary_path: "/usr/local/bin/pi" }),
+        {
+          runBuffered: async () => ({
+            outcome: { kind: "completed", exitCode: 1 },
+            stdout: "NEMOCLAW_AGENT_BINARY_CHECK:ok",
+            stderr: "",
+          }),
+        },
+      ),
+    ).resolves.toEqual({
+      available: false,
+      reason: "unobservable",
+      binaryPath: "/usr/local/bin/pi",
+      transportStatus: 1,
+    });
+  });
+
+  it("targets the owning gateway and disables TTY allocation for the binary probe", async () => {
+    const executor = legacyBufferedExecutor(() => "NEMOCLAW_AGENT_BINARY_CHECK:ok");
+
+    await expect(
+      verifyAgentBinaryAvailable(
+        "alpha",
+        makeAgent({ name: "pi", binary_path: "/usr/local/bin/pi" }),
+        executor,
+        "nemoclaw",
+      ),
+    ).resolves.toEqual({ available: true });
+    expect(executor.runBuffered).toHaveBeenCalledWith({
+      sandboxName: "alpha",
+      target: { kind: "named", gatewayName: "nemoclaw" },
+      tty: false,
+      command: ["/bin/bash", "-lc", expect.stringContaining("NEMOCLAW_AGENT_BINARY_CHECK")],
+    });
   });
 });
 
 describe("collectHermesStartupDiagnostics", () => {
-  it("includes Tirith marker content and binary state when the marker is present", () => {
+  it("includes Tirith marker content and binary state when the marker is present", async () => {
     const runCapture = vi.fn(() =>
       [
         "tirith marker: download_failed",
@@ -385,21 +942,14 @@ describe("collectHermesStartupDiagnostics", () => {
       ].join("\n"),
     );
 
-    const diagnostics = collectHermesStartupDiagnostics("alpha", runCapture);
+    const executor = legacyBufferedExecutor(runCapture);
+    const diagnostics = await collectHermesStartupDiagnostics("alpha", executor);
 
-    expect(runCapture).toHaveBeenCalledWith(
-      [
-        "sandbox",
-        "exec",
-        "-n",
-        "alpha",
-        "--",
-        "sh",
-        "-lc",
-        expect.stringContaining("/sandbox/.hermes/.tirith-install-failed"),
-      ],
-      { ignoreError: true },
-    );
+    expect(executor.runBuffered).toHaveBeenCalledWith({
+      sandboxName: "alpha",
+      target: { kind: "selected" },
+      command: ["sh", "-lc", expect.stringContaining("/sandbox/.hermes/.tirith-install-failed")],
+    });
     expect(diagnostics.join("\n")).toContain("Hermes startup diagnostics:");
     expect(diagnostics.join("\n")).toContain("tirith marker: download_failed");
     expect(diagnostics.join("\n")).toContain(
@@ -407,13 +957,15 @@ describe("collectHermesStartupDiagnostics", () => {
     );
   });
 
-  it("returns no extra lines when the Tirith marker is absent", () => {
+  it("returns no extra lines when the Tirith marker is absent", async () => {
     const runCapture = vi.fn(() => "tirith marker: absent\n");
 
-    expect(collectHermesStartupDiagnostics("alpha", runCapture)).toEqual([]);
+    await expect(
+      collectHermesStartupDiagnostics("alpha", legacyBufferedExecutor(runCapture)),
+    ).resolves.toEqual([]);
   });
 
-  it("redacts sensitive values from log tails", () => {
+  it("redacts sensitive values from log tails", async () => {
     const slackToken = ["xoxb", "123456789012", "abcdefghijkl"].join("-");
     const runCapture = vi.fn(() =>
       [
@@ -424,9 +976,108 @@ describe("collectHermesStartupDiagnostics", () => {
       ].join("\n"),
     );
 
-    const output = collectHermesStartupDiagnostics("alpha", runCapture).join("\n");
+    const output = (
+      await collectHermesStartupDiagnostics("alpha", legacyBufferedExecutor(runCapture))
+    ).join("\n");
 
     expect(output).toContain("SLACK_BOT_TOKEN=");
     expect(output).not.toContain(slackToken);
+  });
+});
+
+describe("printDashboardUi announces per-sandbox Hermes API ports (#8543)", () => {
+  let logSpy: MockInstance<typeof console.log>;
+  const noteSpy = vi.fn();
+
+  const hermesShipped = makeAgent({
+    name: "hermes",
+    displayName: "Hermes Agent",
+    forwardPort: 18789,
+    forward_ports: [18789, 8642],
+    healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 90 },
+    dashboard: {
+      kind: "ui",
+      label: "Dashboard",
+      path: "/",
+      healthPath: "/api/status",
+      auth: "session",
+    },
+  });
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    noteSpy.mockReset();
+    getSandboxMock.mockReturnValue(null);
+    initializeHermesInferenceRouteMock.mockReset();
+    initializeHermesInferenceRouteMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it("announces the sandbox's own API port instead of the manifest default", () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+
+    printDashboardUi("hermes-clone", null, hermesShipped, {
+      note: noteSpy,
+      effectiveDashboardPort: 18790,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Port 8643 must be forwarded before connecting.");
+    expect(output).toContain("http://127.0.0.1:8643/v1");
+    expect(output).not.toContain("Port 8642 must be forwarded before connecting.");
+  });
+
+  it("announces the sandbox's own API port from an API-kind dashboard", () => {
+    const hermesApiDashboard = makeAgent({
+      name: "hermes",
+      displayName: "Hermes Agent",
+      forwardPort: 18789,
+      forward_ports: [18789, 8642],
+      healthProbe: { url: "http://localhost:8642/health", port: 8642, timeout_seconds: 90 },
+      dashboard: {
+        kind: "api",
+        label: "OpenAI-compatible API",
+        path: "/v1",
+        healthPath: "/health",
+        auth: "none",
+      },
+    });
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8645 });
+
+    printDashboardUi("hermes-api-box", null, hermesApiDashboard, {
+      note: noteSpy,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Hermes Agent OpenAI-compatible API");
+    expect(output).toContain("Port 8645 must be forwarded before connecting.");
+    expect(output).toContain("http://127.0.0.1:8645/");
+    expect(output).not.toContain("http://127.0.0.1:8642/");
+  });
+
+  it("keeps the declared port for an agent that has no per-sandbox API port", () => {
+    getSandboxMock.mockReturnValue({ hermesApiPort: 8643 });
+    const dualAgent = makeAgent({
+      name: "experimental",
+      displayName: "Experimental",
+      forwardPort: 18789,
+      forward_ports: [18789, 9100],
+      healthProbe: { url: "http://localhost:9100/health", port: 9100, timeout_seconds: 30 },
+    });
+
+    printDashboardUi("other-box", null, dualAgent, {
+      note: noteSpy,
+      effectiveDashboardPort: 18790,
+      buildControlUiUrls: buildUrlsLoopback,
+    });
+
+    const output = logSpy.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(output).toContain("Port 9100 must be forwarded before connecting.");
+    expect(output).not.toContain("8643");
   });
 });

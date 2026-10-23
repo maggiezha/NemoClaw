@@ -8,10 +8,10 @@
 // without a real NemoClaw installation.
 //
 // Usage:
-//   node --experimental-strip-types scripts/dev-tier-selector.mts
+//   node scripts/dev-tier-selector.mts
 //
 // This script is intentionally not part of the vitest suite. For automated coverage
-// of this flow see test/policy-tiers-onboard.test.js.
+// of this flow see test/runtime/policy/policy-tiers-onboard.test.ts.
 
 import { createRequire } from "node:module";
 import readline from "node:readline";
@@ -61,7 +61,7 @@ runner.run = () => successfulRunResult;
 runner.runCapture = () => "";
 
 registry.getSandbox = () => ({ name: "test-sb", model: null, provider: null });
-registry.registerSandbox = () => true;
+registry.registerSandbox = (entry) => entry;
 registry.updateSandbox = () => true;
 
 // ── Run ────────────────────────────────────────────────────────────────────

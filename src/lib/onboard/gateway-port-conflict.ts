@@ -3,18 +3,17 @@
 
 import { printPortConflictReport } from "./port-conflict-report";
 import type { CheckPortOpts, PortProbeResult } from "./preflight";
-import { getPortConflictServiceHints } from "./remediation";
 
 type CheckPortAvailable = (port: number, opts?: CheckPortOpts) => Promise<PortProbeResult>;
 type DockerGatewayPortListenerClassifier = (portCheck: PortProbeResult) => boolean;
 
 export interface GatewayPortConflictDeps {
   gatewayPort: number;
+  externallySupervised: boolean;
   checkPortAvailable: CheckPortAvailable;
   getGatewayPortCheckOptions: () => CheckPortOpts;
   isDockerDriverGatewayPortListener: DockerGatewayPortListenerClassifier;
   exitProcess?: (code: number) => void;
-  serviceHints?: string[];
   writeError?: (line: string) => void;
 }
 
@@ -46,13 +45,17 @@ export function couldBeNemoClawGatewayPortListener(
 
 export async function failFastOnForeignGatewayPortConflict({
   gatewayPort,
+  externallySupervised,
   checkPortAvailable,
   getGatewayPortCheckOptions,
   isDockerDriverGatewayPortListener,
   exitProcess = (code) => process.exit(code),
-  serviceHints = getPortConflictServiceHints(),
   writeError,
 }: GatewayPortConflictDeps): Promise<void> {
+  // External ownership was resolved and bound by the caller before reaching
+  // this legacy name heuristic. Defer its arbitrary executable to the exact
+  // downstream supervisor/cgroup/executable/capability/health validation.
+  if (externallySupervised) return;
   const portCheck = await checkPortAvailable(gatewayPort, getGatewayPortCheckOptions());
   if (
     portCheck.ok ||
@@ -67,7 +70,6 @@ export async function failFastOnForeignGatewayPortConflict({
       label: "OpenShell gateway",
       envVar: "NEMOCLAW_GATEWAY_PORT",
       portCheck,
-      serviceHints,
     },
     writeError,
   );

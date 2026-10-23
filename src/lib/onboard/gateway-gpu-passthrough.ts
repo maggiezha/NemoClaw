@@ -28,8 +28,8 @@ export type GatewayGpuReuseReconcileOptions = {
   recreateSandbox: boolean;
   confirmedDockerDriverGateway: boolean;
   stopDashboardForwards: () => void;
-  retireLegacyGatewayForDockerDriverUpgrade: () => void;
-  destroyGatewayRuntimeForGpuReuse: () => boolean;
+  retireLegacyGatewayForDockerDriverUpgrade: () => void | Promise<void>;
+  destroyGatewayRuntimeForGpuReuse: () => boolean | Promise<boolean>;
 };
 
 // Docker-driver/package-managed gateways do not expose reusable GPU state
@@ -118,9 +118,10 @@ function reportUnreadableSandboxRegistryForGpuGatewayReuse(
     "  Fix the registry read error and rerun, or manually verify no sandboxes depend on the gateway before running:",
   );
   error(`    openshell gateway remove ${gatewayName}`);
-  error("    # For OpenShell releases that still expose lifecycle commands:");
-  error(`    openshell gateway destroy -g ${gatewayName}`);
-  error("    sudo pkill -f openshell-gateway  # if a privileged host gateway process remains");
+  error("  If a privileged process remains, do not use a host-wide process match.");
+  error(
+    `  Verify its live owner, gateway name '${gatewayName}', exact port, command line, PID file, runtime marker, and loaded sandbox namespace before stopping it.`,
+  );
   error("    nemoclaw onboard --gpu");
   exit(1);
 }
@@ -134,7 +135,7 @@ function inspectLegacyGatewayDeviceRequests(
   );
 }
 
-export function reconcileGatewayGpuReuseForGpuIntent({
+export async function reconcileGatewayGpuReuseForGpuIntent({
   gatewayReuseState,
   gpuPassthrough,
   gatewayName,
@@ -144,7 +145,7 @@ export function reconcileGatewayGpuReuseForGpuIntent({
   stopDashboardForwards,
   retireLegacyGatewayForDockerDriverUpgrade,
   destroyGatewayRuntimeForGpuReuse,
-}: GatewayGpuReuseReconcileOptions): GatewayReuseState {
+}: GatewayGpuReuseReconcileOptions): Promise<GatewayReuseState> {
   if (
     !shouldInspectLegacyGatewayGpuPassthrough(
       gatewayReuseState,
@@ -195,11 +196,11 @@ export function reconcileGatewayGpuReuseForGpuIntent({
     );
     stopDashboardForwards();
     if (isLinuxDockerDriverGatewayEnabled()) {
-      retireLegacyGatewayForDockerDriverUpgrade();
+      await retireLegacyGatewayForDockerDriverUpgrade();
       gatewayReuseState = "missing";
       console.log("  ✓ Previous CPU-only gateway cleaned up");
     } else {
-      gatewayReuseState = destroyGatewayForReuse(
+      gatewayReuseState = await destroyGatewayForReuse(
         destroyGatewayRuntimeForGpuReuse,
         "  ✓ Previous CPU-only gateway cleaned up",
         "  ! Previous CPU-only gateway cleanup failed; leaving registry state intact.",

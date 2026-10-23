@@ -5,8 +5,11 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import YAML from "yaml";
+import { CLI_ARTIFACT_RESTORE_STEP } from "./cli-artifact-workflow-boundary.mts";
+import { E2E_ACTION_PROVENANCE } from "./workflow-boundary-policy.mts";
 
 /**
  * SOURCE_OF_TRUTH_REVIEW
@@ -20,7 +23,7 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "e2e.yaml");
 const FIXTURE = join(REPO_ROOT, "tools", "e2e", "hermes-gpu-docker-runtime-fixture.sh");
 const JOB_NAME = "hermes-gpu-startup";
-const CHECKOUT = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10";
+const CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
 const SOURCE = "tools/e2e/hermes-gpu-docker-runtime-fixture.sh";
 const SHA = "e273c4baa7fe89546d64517cf56eafec30aeda7b355971263605ab1327fade02";
 const F_PATH =
@@ -37,12 +40,14 @@ const HOSTED_PROVIDER_ENV_NAMES = [
 ] as const;
 const SECRET_REFERENCE_PATTERN = /\bsecrets\.[A-Za-z0-9_]+\b/u;
 const EXPECTED_SELECTOR =
-  "${{ github.repository == 'NVIDIA/NemoClaw' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (contains(format(',{0},', inputs.jobs), ',hermes-gpu-startup,') || contains(format(',{0},', inputs.targets), ',hermes-gpu-startup,')) }}";
+  "${{ contains(fromJSON(needs.generate-matrix.outputs.selected_jobs), 'hermes-gpu-startup') }}";
 
 type WorkflowRecord = Record<string, unknown>;
 type WorkflowStep = WorkflowRecord & {
   name?: string;
   run?: string;
+  uses?: string;
+  with?: WorkflowRecord;
 };
 
 function asRecord(value: unknown): WorkflowRecord {
@@ -59,8 +64,23 @@ function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-// biome-ignore format: Compact declarative shell-proof vocabulary.
-const TOKENS = { "@bash": '/bin/bash "$trusted_fixture" "$@"', "@bin": "/usr/bin", "@daemon": '"$daemon_json"', "@docker": "/etc/docker/daemon.json", "@env": "/usr/bin/sudo -n /usr/bin/env -i", "@fixture": '"$trusted_fixture"', "@gpu": "hermes-gpu-fallback-docker-runtime", "@install": "/usr/bin/sudo /usr/bin/install", "@root": '"$trusted_state_root"', "@run": "run_trusted_fixture", "@sha": '"$TRUSTED_FIXTURE_SHA256"', "@source": '"$trusted_source"', "@state": '"$state_dir"', "@sudo": "/usr/bin/sudo", "@workflow": '"$TRUSTED_WORKFLOW_SHA"' } as const;
+const TOKENS = {
+  "@bash": '/bin/bash "$trusted_fixture" "$@"',
+  "@bin": "/usr/bin",
+  "@daemon": '"$daemon_json"',
+  "@docker": "/etc/docker/daemon.json",
+  "@env": "/usr/bin/sudo -n /usr/bin/env -i",
+  "@fixture": '"$trusted_fixture"',
+  "@gpu": "hermes-gpu-fallback-docker-runtime",
+  "@install": "/usr/bin/sudo /usr/bin/install",
+  "@root": '"$trusted_state_root"',
+  "@run": "run_trusted_fixture",
+  "@sha": '"$TRUSTED_FIXTURE_SHA256"',
+  "@source": '"$trusted_source"',
+  "@state": '"$state_dir"',
+  "@sudo": "/usr/bin/sudo",
+  "@workflow": '"$TRUSTED_WORKFLOW_SHA"',
+} as const;
 
 function proof(spec: string): string[] {
   return spec
@@ -106,8 +126,11 @@ export function validateHermesGpuStartupWorkflow(
   if (job["runs-on"] !== "linux-amd64-gpu-rtxpro6000-latest-1") {
     errors.push(`${JOB_NAME} job must run on the native RTX PRO 6000 GPU runner`);
   }
-  if (job.needs !== "generate-matrix" || job.if !== EXPECTED_SELECTOR) {
-    errors.push(`${JOB_NAME} job must remain explicit-only behind generate-matrix`);
+  if (
+    JSON.stringify(job.needs) !== JSON.stringify(["base-image-publication", "generate-matrix"]) ||
+    job.if !== EXPECTED_SELECTOR
+  ) {
+    errors.push(`${JOB_NAME} job must use the trusted execution plan behind generate-matrix`);
   }
   if (job["timeout-minutes"] !== 90) {
     errors.push(`${JOB_NAME} requires a 90 minute timeout`);
@@ -116,29 +139,36 @@ export function validateHermesGpuStartupWorkflow(
   const matrix = asRecord(strategy.matrix);
   if (
     strategy["fail-fast"] !== false ||
-    strategy["max-parallel"] !== 1 ||
-    JSON.stringify(matrix.include) !==
+    strategy["max-parallel"] !== 2 ||
+    JSON.stringify(matrix.scenario) !==
+      JSON.stringify(["native", "fallback", "compatibility-only"]) ||
+    matrix.runtime_provider !==
+      "${{ fromJSON(needs.generate-matrix.outputs.runtime_providers_by_job)['hermes-gpu-startup'] }}" ||
+    matrix.include !== undefined ||
+    JSON.stringify(matrix.exclude) !==
       JSON.stringify([
-        { scenario: "native" },
-        { scenario: "fallback" },
-        { scenario: "compatibility-only" },
+        { scenario: "fallback", runtime_provider: "podman" },
+        { scenario: "compatibility-only", runtime_provider: "podman" },
       ])
   ) {
-    errors.push(`${JOB_NAME} must serialize GPU scenarios`);
+    errors.push(`${JOB_NAME} must expand reviewed GPU scenarios by supported runtime`);
   }
 
   const jobEnv = asRecord(job.env);
   const requiredEnv = {
     E2E_ARTIFACT_DIR:
-      "${{ github.workspace }}/e2e-artifacts/live/hermes-gpu-startup/${{ matrix.scenario }}",
+      "${{ github.workspace }}/e2e-artifacts/live/hermes-gpu-startup/${{ matrix.scenario }}/${{ matrix.runtime_provider }}",
+    E2E_GATEWAY_RUNTIMES: "docker,podman",
     E2E_HERMES_GPU_STARTUP_SCENARIO: "${{ matrix.scenario }}",
     E2E_JOB: "1",
+    E2E_OBSERVABLE_OUTCOME: "Hermes GPU startup reaches the stable Ready route",
     E2E_TARGET_ID: JOB_NAME,
     NEMOCLAW_AGENT: "hermes",
     NEMOCLAW_E2E_SHARD: "${{ matrix.scenario }}",
+    NEMOCLAW_GATEWAY_RUNTIME: "${{ matrix.runtime_provider }}",
     NEMOCLAW_RUN_LIVE_E2E: "1",
     NEMOCLAW_SANDBOX_GPU: "1",
-    NEMOCLAW_SANDBOX_NAME: "e2e-hermes-gpu-startup-${{ matrix.scenario }}",
+    NEMOCLAW_SANDBOX_NAME: "${{ matrix.scenario }}",
   } as const;
   for (const [name, expected] of Object.entries(requiredEnv)) {
     if (jobEnv[name] !== expected) {
@@ -182,6 +212,22 @@ export function validateHermesGpuStartupWorkflow(
       step.uses === CHECKOUT &&
       asRecord(step.with).ref === "${{ inputs.checkout_sha || github.sha }}",
   );
+  if (
+    prI !== 1 ||
+    !isDeepStrictEqual(steps[0], {
+      name: "Install native Podman host dependencies",
+      if: "${{ matrix.runtime_provider == 'podman' }}",
+      uses: E2E_ACTION_PROVENANCE.hostDependencies.reference,
+      with: {
+        packages:
+          "conmon fuse-overlayfs golang-github-containers-common iptables nftables slirp4netns uidmap",
+      },
+    })
+  ) {
+    errors.push(
+      `${JOB_NAME} must install reviewed Podman host dependencies before candidate checkout`,
+    );
+  }
   const ci = steps.findIndex((step) => step.name === "Checkout trusted Hermes GPU runtime fixture");
   const checkout = steps[ci];
   const ii = steps.findIndex((step) => step.name === "Install trusted Hermes GPU runtime fixture");
@@ -241,18 +287,33 @@ if ! @run restore`;
   }
   const run = stringValue(runStep.run);
   const pi = steps.findIndex((step) => step.name === "Prepare E2E workspace");
+  const restoreI = steps.findIndex((step) => step.name === CLI_ARTIFACT_RESTORE_STEP);
   const ni = steps.findIndex((step) => step.name === "Reassert trusted Node runtime");
   const node = steps[ni];
+  const reviewedNpm = steps[ni + 1];
+  const staleDockerRestore = steps[ni + 2];
+  const nativePodmanRuntime = steps[ni + 3];
   if (
     runStep.shell !== BASH ||
     !trustedEnv(runStep) ||
     pi < 0 ||
-    ni !== pi + 1 ||
-    ni + 1 !== steps.indexOf(runStep) ||
-    node?.uses !== "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e" ||
-    asRecord(node?.with)["node-version"] !== "22" ||
+    restoreI <= pi ||
+    ni !== restoreI + 1 ||
+    ni + 4 !== steps.indexOf(runStep) ||
+    node?.uses !== "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020" ||
     !trustedEnv(node) ||
     asRecord(node?.env).NODE_OPTIONS !== "" ||
+    reviewedNpm?.name !== "Reinstall reviewed npm after Node reassertion" ||
+    reviewedNpm?.uses !== E2E_ACTION_PROVENANCE.reviewedNpmSetup.reference ||
+    staleDockerRestore?.name !== "Recover Docker CLI before native Podman E2E" ||
+    staleDockerRestore?.uses !== E2E_ACTION_PROVENANCE.restoreNativePodmanRuntime.reference ||
+    staleDockerRestore?.if !== "${{ matrix.runtime_provider == 'podman' }}" ||
+    staleDockerRestore?.["continue-on-error"] !== undefined ||
+    !isDeepStrictEqual(asRecord(staleDockerRestore?.with), { enabled: "true" }) ||
+    nativePodmanRuntime?.name !== "Prepare native Podman E2E runtime" ||
+    nativePodmanRuntime?.uses !== E2E_ACTION_PROVENANCE.nativePodmanRuntime.reference ||
+    asRecord(nativePodmanRuntime?.with).enabled !==
+      "${{ matrix.runtime_provider == 'podman' && 'true' || 'false' }}" ||
     run.includes(SOURCE) ||
     !hasProof(
       runStep.run,
@@ -403,8 +464,10 @@ rm -rf -- @state`,
     steps.find((step) => step.name === "Upload Hermes GPU startup artifacts")?.with,
   );
   if (
-    upload.name !== "e2e-hermes-gpu-startup-${{ matrix.scenario }}" ||
-    upload.path !== "e2e-artifacts/live/hermes-gpu-startup/${{ matrix.scenario }}/"
+    upload.name !==
+      "e2e-hermes-gpu-startup-${{ matrix.scenario }}-${{ matrix.runtime_provider }}" ||
+    upload.path !==
+      "e2e-artifacts/live/hermes-gpu-startup/${{ matrix.scenario }}/${{ matrix.runtime_provider }}/"
   ) {
     errors.push(`${JOB_NAME} upload needs a scenario artifact path`);
   }

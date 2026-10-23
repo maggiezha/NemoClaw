@@ -6,7 +6,7 @@ import {
   createRebuildFlowHarness,
   installRebuildFlowTestHooks,
   snapshotEnv,
-} from "../../../../test/helpers/rebuild-flow-test-harness";
+} from "../../../../test/helpers/rebuild-flow-generic-harness";
 import {
   SANDBOX_BASE_RESOLUTION_LABEL,
   type SandboxBaseImageResolutionMetadata,
@@ -42,6 +42,7 @@ describe("rebuildSandbox base-image resolution flow", () => {
       const harness = createRebuildFlowHarness({
         sandboxEntry: {
           agent: "hermes",
+          provider: "nvidia-router",
           imageTag: "nemoclaw-hermes:recorded",
           nemoclawVersion: "0.1.0",
         },

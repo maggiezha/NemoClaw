@@ -8,11 +8,15 @@ import path from "node:path";
 import { GATEWAY_PORT } from "../core/ports";
 import { rejectSymlinksOnPath } from "../state/config-io";
 import { nemoclawStateRoot } from "../state/state-root";
+import { createDockerGpuDiagnosticRedactor } from "./docker-gpu-diagnostic-redaction";
+import { resolveGatewayLogPathForPort } from "./gateway/state-dir";
+import { captureOpenShellDockerSandboxFailureOutput } from "./openshell-docker-sandbox-containers";
 
 const ANSI_RE = /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-_])/g;
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 const MAX_RELEVANT_LOG_LINES = 120;
 const MAX_GATEWAY_TAIL_LINES = 240;
+const SANDBOX_CONTAINER_PRINTED_LINES = 8;
 
 export type SandboxCreateFailureDiagnostics = {
   dir: string;
@@ -23,14 +27,24 @@ export type SandboxCreateFailureDiagnostics = {
   copiedConsoleOutput: string | null;
   gatewayTailPath: string | null;
   backupPath: string | null;
+  sandboxContainerLogPath: string | null;
+  sandboxContainerLines: string[];
   summaryLines: string[];
 };
 
 export type SandboxCreateFailureDiagnosticOptions = {
   homeDir?: string;
+  gatewayPort?: number;
   gatewayLogPath?: string | null;
+  gatewayStateDir?: string;
   backupPath?: string | null;
   now?: Date;
+  /**
+   * Sandbox container output captured before any rollback removed or
+   * replaced the failed container. `null` records that capture found none.
+   * When omitted, the print path captures from the one labeled container.
+   */
+  sandboxContainerOutput?: string | null;
 };
 
 function stripAnsi(value: string): string {
@@ -45,16 +59,17 @@ function timestampForPath(now: Date): string {
   return now.toISOString().replace(/[:.]/g, "-");
 }
 
-function gatewayLogCandidates(homeDir: string): string[] {
+function gatewayLogCandidates(
+  homeDir: string,
+  gatewayPort: number,
+  gatewayStateDir?: string,
+): string[] {
   return [
-    path.join(
-      homeDir,
-      ".local",
-      "state",
-      "nemoclaw",
-      "openshell-docker-gateway",
-      "openshell-gateway.log",
-    ),
+    resolveGatewayLogPathForPort({
+      configured: gatewayStateDir,
+      home: homeDir,
+      port: gatewayPort,
+    }),
     path.join(homeDir, ".local", "state", "openshell", "openshell-gateway.log"),
   ];
 }
@@ -172,7 +187,11 @@ export function collectSandboxCreateFailureDiagnostics(
 
   const gatewayLogPath =
     options.gatewayLogPath ??
-    gatewayLogCandidates(homeDir).find((candidate) => fs.existsSync(candidate)) ??
+    gatewayLogCandidates(
+      homeDir,
+      options.gatewayPort ?? GATEWAY_PORT,
+      options.gatewayStateDir ?? process.env.NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR,
+    ).find((candidate) => fs.existsSync(candidate)) ??
     null;
   const rawLines = gatewayLogPath ? readLogLines(gatewayLogPath) : null;
   const block = rawLines ? findLatestSandboxBlock(rawLines, sandboxName) : [];
@@ -192,6 +211,18 @@ export function collectSandboxCreateFailureDiagnostics(
   );
   const stateEntries = listStateDir(stateDir);
   const backupPath = options.backupPath ?? null;
+  const containerLogRedactor = createDockerGpuDiagnosticRedactor();
+  const sandboxContainerLines = (options.sandboxContainerOutput ?? "")
+    .split(/\r?\n/)
+    .map((line) => containerLogRedactor.redactText(stripAnsi(line)).trimEnd())
+    .filter((line) => line.trim());
+  const sandboxContainerLogPath =
+    sandboxContainerLines.length > 0 ? path.join(dir, "sandbox-container.log") : null;
+  if (sandboxContainerLogPath) {
+    fs.writeFileSync(sandboxContainerLogPath, `${sandboxContainerLines.join("\n")}\n`, {
+      mode: 0o600,
+    });
+  }
 
   if (relevantLines.length > 0) {
     fs.writeFileSync(
@@ -217,6 +248,7 @@ export function collectSandboxCreateFailureDiagnostics(
     `console_output=${consoleOutput ?? "unknown"}`,
     `copied_console_output=${copiedConsoleOutput ?? "not-copied"}`,
     `backup_path=${backupPath ?? "none"}`,
+    `sandbox_container_log=${sandboxContainerLogPath ?? "not-written"}`,
   ];
   if (stateEntries.length > 0) {
     summaryLines.push("state_dir_entries:");
@@ -235,6 +267,8 @@ export function collectSandboxCreateFailureDiagnostics(
     copiedConsoleOutput,
     gatewayTailPath,
     backupPath,
+    sandboxContainerLogPath,
+    sandboxContainerLines: sandboxContainerLines.slice(-SANDBOX_CONTAINER_PRINTED_LINES),
     summaryLines: relevantLines.length > 0 ? relevantLines.slice(-8) : gatewayTailLines.slice(-8),
   };
 }
@@ -243,13 +277,25 @@ export function printSandboxCreateFailureDiagnostics(
   sandboxName: string,
   options: SandboxCreateFailureDiagnosticOptions = {},
 ): SandboxCreateFailureDiagnostics | null {
-  const diagnostics = collectSandboxCreateFailureDiagnostics(sandboxName, options);
+  const diagnostics = collectSandboxCreateFailureDiagnostics(sandboxName, {
+    ...options,
+    sandboxContainerOutput:
+      options.sandboxContainerOutput !== undefined
+        ? options.sandboxContainerOutput
+        : captureOpenShellDockerSandboxFailureOutput(sandboxName, null),
+  });
   if (!diagnostics) return null;
 
   console.error(`  Diagnostics saved: ${diagnostics.dir}`);
   if (diagnostics.summaryLines.length > 0) {
     console.error("  Recent OpenShell gateway failure:");
     for (const line of diagnostics.summaryLines) {
+      console.error(`    ${line}`);
+    }
+  }
+  if (diagnostics.sandboxContainerLines.length > 0) {
+    console.error("  Recent sandbox container output:");
+    for (const line of diagnostics.sandboxContainerLines) {
       console.error(`    ${line}`);
     }
   }

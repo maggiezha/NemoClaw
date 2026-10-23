@@ -9,14 +9,15 @@ import { describe, expect, it } from "vitest";
 import { runWithEnv, writeSandboxRegistry } from "./helpers";
 
 describe("sandbox skill install CLI dispatch", () => {
-  it("shows native skill install help when --help follows install", () => {
+  it("shows sandbox-first skill install usage when --help follows install", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-skill-help-"));
     writeSandboxRegistry(home);
 
-    const r = runWithEnv("alpha skill install --help", { HOME: home });
+    const r = runWithEnv("alpha skill install --help", { HOME: home }, 30_000);
 
     expect(r.code).toBe(0);
-    expect(r.out).toContain("$ nemoclaw sandbox skill install <name> <path>");
+    expect(r.out).toContain("$ nemoclaw alpha skill install <path>");
+    expect(r.out).not.toContain("$ nemoclaw sandbox skill install");
     expect(r.out).toContain("Deploy a skill directory");
     expect(r.out).not.toContain("No SKILL.md found");
   });
@@ -46,7 +47,6 @@ describe("sandbox skill install CLI dispatch", () => {
     expect(r.code).toBe(1);
     expect(r.out).toContain("No SKILL.md found in");
     expect(r.out).toContain("This looks like an OpenClaw plugin");
-    expect(r.out).toContain("nemoclaw onboard --from <Dockerfile>");
   });
 
   it("detects openclaw.plugin.json as a plugin marker", () => {
@@ -64,6 +64,5 @@ describe("sandbox skill install CLI dispatch", () => {
     expect(r.code).toBe(1);
     expect(r.out).toContain("No SKILL.md found in");
     expect(r.out).toContain("This looks like an OpenClaw plugin");
-    expect(r.out).toContain("nemoclaw onboard --from <Dockerfile>");
   });
 });

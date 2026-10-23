@@ -5,7 +5,13 @@
 
 import os from "node:os";
 
-import type { SandboxGatewayBinding } from "../onboard/gateway-binding";
+import { GATEWAY_PORT } from "../core/ports";
+import { resolveGatewayName, type SandboxGatewayBinding } from "../onboard/gateway-binding";
+import { isExternallySupervised } from "../onboard/gateway-ownership";
+import {
+  type GatewayTeardownAuthorityResolver,
+  resolveGatewayTeardownAuthority,
+} from "../onboard/gateway-teardown-authority";
 import {
   type HostGatewayProcessDeps,
   type StopHostGatewayResult,
@@ -31,6 +37,7 @@ export interface ReleaseGatewayPortDeps extends Partial<HostGatewayProcessDeps> 
   now?: () => number;
   sleep?: (ms: number) => void;
   stopHostGatewayProcesses?: typeof stopHostGatewayProcesses;
+  resolveGatewayTeardownAuthority?: GatewayTeardownAuthorityResolver;
   getSandbox?: (name: string) => SandboxGatewayBinding | null;
   probePortFree?: (port: number) => boolean;
 }
@@ -70,6 +77,8 @@ export function releaseManagedGatewayPort(
     depsOverrides.commandExists ??
     ((command: string) => defaultGatewayReleaseCommandExists(command, env));
   const stop = depsOverrides.stopHostGatewayProcesses ?? stopHostGatewayProcesses;
+  const resolveAuthority =
+    depsOverrides.resolveGatewayTeardownAuthority ?? resolveGatewayTeardownAuthority;
   const getSandbox = depsOverrides.getSandbox ?? getRegisteredSandbox;
   const probePortFree = depsOverrides.probePortFree ?? defaultProbePortFree;
 
@@ -78,10 +87,30 @@ export function releaseManagedGatewayPort(
     warn(
       `Skipping gateway port release for sandbox ${JSON.stringify(options.sandboxName)}: ` +
         "no valid gateway binding is registered for it (the entry is missing, " +
-        "invalid, or unreadable). Resolve the registry entry, then re-run stop.",
+        "invalid, or unreadable). The registry is read from the state root that " +
+        `NEMOCLAW_GATEWAY_PORT=${String(GATEWAY_PORT)} selects, so a sandbox onboarded ` +
+        "under a different gateway port is not visible here: rerun stop with that " +
+        "port set. Otherwise resolve the registry entry, then rerun stop.",
     );
     return {
       port: null,
+      released: false,
+      stopped: [],
+      remaining: [],
+      scanned: false,
+      skipped: true,
+    };
+  }
+
+  const gatewayName = resolveGatewayName(port);
+  const owner = resolveAuthority({ gatewayName, gatewayPort: port }, { env });
+  if (isExternallySupervised(owner)) {
+    log(
+      `Keeping externally supervised OpenShell gateway '${gatewayName}' running; ` +
+        "NemoClaw stopped only the selected sandbox.",
+    );
+    return {
+      port,
       released: false,
       stopped: [],
       remaining: [],
@@ -151,7 +180,10 @@ export function releaseManagedGatewayPort(
     warn(
       `NemoClaw gateway port ${port} is still in use after stop ` +
         `(host process ${stopResult.failed.join(", ")} could not be stopped). ` +
-        `Run: sudo kill -9 ${stopResult.failed.join(" ")}`,
+        "Do not signal a PID from this saved output. Before any privileged stop, verify that the " +
+        `live process owner and command line identify the exact gateway on port ${port}, and that ` +
+        "the PID file, runtime marker, and loaded sandbox namespace still match the selected " +
+        "state directory. Then retry the command.",
     );
   }
 

@@ -1,21 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { dispatchMcpBridgeCommand } from "../../lib/actions/sandbox/mcp-bridge";
+import { MCP_BRIDGE_SUBCOMMANDS_USAGE } from "../../lib/actions/sandbox/mcp-bridge/usage";
 import { NemoClawCommand } from "../../lib/cli/nemoclaw-oclif-command";
 
 export default class SandboxMcpCommand extends NemoClawCommand {
   static id = "sandbox:mcp";
+  static customHelp = true;
   static strict = false;
   static summary = "Manage MCP servers for a sandbox";
   static description =
     "Manage OpenShell-enforced MCP Streamable HTTP servers for a sandbox. Credentials are registered as OpenShell providers and appear in sandbox config only as openshell:resolve:env placeholders.";
-  static usage = ["<name> <add|list|status|restart|remove> [args...]"];
+  static usage = [`<name> ${MCP_BRIDGE_SUBCOMMANDS_USAGE} [args...]`];
   static examples = [
     "<%= config.bin %> sandbox mcp alpha list",
     "<%= config.bin %> sandbox mcp alpha add github --url https://api.githubcopilot.com/mcp/ --env GITHUB_MCP_TOKEN",
     "<%= config.bin %> sandbox mcp alpha status github --json",
     "<%= config.bin %> sandbox mcp alpha remove github",
+    "<%= config.bin %> sandbox mcp alpha migrate --apply",
   ];
 
   public async run(): Promise<void> {
@@ -28,11 +30,17 @@ export default class SandboxMcpCommand extends NemoClawCommand {
       sandboxName === "-h"
     ) {
       this.failWithLines(
-        ["Usage: nemoclaw <sandbox> mcp <add|list|status|restart|remove> [args...]"],
+        [`Usage: nemoclaw <sandbox> mcp ${MCP_BRIDGE_SUBCOMMANDS_USAGE} [args...]`],
         2,
       );
       return;
     }
-    await dispatchMcpBridgeCommand(sandboxName, actionArgs);
+    const { dispatchMcpBridgeCommand } = await import("../../lib/actions/sandbox/mcp-bridge");
+    await dispatchMcpBridgeCommand(sandboxName, actionArgs, {
+      rebuildForMigration: async (name) => {
+        const { rebuildSandbox } = await import("../../lib/actions/sandbox/rebuild");
+        await rebuildSandbox(name, { yes: true }, { throwOnError: true });
+      },
+    });
   }
 }

@@ -3,16 +3,27 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Case: the stock Deep Agents Code sandbox resolves the Nemotron 3 Ultra
-# harness profile before later checks intentionally re-onboard to another model.
+# harness profile, and the installed managed resolver supplies the reviewed
+# Ultra template argument, before later checks intentionally rerun onboarding
+# with another model.
 #
-# This is a local runtime contract only. It builds the same pre-resolved
-# ChatOpenAI shape that DCode uses, then inspects the selected built-in profile;
-# it never invokes the model or makes a network request.
+# This runtime contract builds the same pre-resolved ChatOpenAI settings that
+# DCode uses, then inspects the selected built-in profile. It never invokes the
+# model or makes a network request.
+#
+# The config.toml assertions below describe the sandbox configuration, which is
+# not what #7441 broke: the hardened managed resolver never consumes the config
+# params table, so a TOML round-trip passes with or without the fix. The managed
+# resolver contract therefore calls the installed deepagents_code.config
+# function directly, under a socket guard that fails closed on any network use.
 
 set -euo pipefail
 
 SANDBOX_NAME="${SANDBOX_NAME:-${NEMOCLAW_SANDBOX_NAME:-}}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 PREFIX="03-deepagents-code-nemotron-ultra-profile"
+HOSTED_ENDPOINT="${NEMOCLAW_ENDPOINT_URL:-https://inference-api.nvidia.com/v1}"
+HOSTED_ENDPOINT="$(node --no-warnings "${REPO}/test/e2e/e2e-cloud-experimental/normalize-hosted-endpoint.ts" "$HOSTED_ENDPOINT")"
 
 fail() {
   printf '%s: FAIL: %s\n' "$PREFIX" "$1" >&2
@@ -32,6 +43,10 @@ profile_contract_source() {
 import asyncio
 import hashlib
 import importlib.metadata
+import os
+import re
+import socket
+import sys
 from pathlib import Path
 import tomllib
 
@@ -41,15 +56,16 @@ from deepagents.profiles.harness.harness_profiles import (
     _HARNESS_PROFILES,
     _harness_profile_for_model,
 )
+from deepagents_code import config as dcode_config
 from deepagents_code.model_config import ModelConfig
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 CONFIG_PATH = Path("/sandbox/.deepagents/config.toml")
 EXPECTED_VERSIONS = {
     "nemoclaw-deepagents-profile": "0.1.0",
-    "deepagents-code": "0.1.34",
-    "deepagents": "0.7.0a6",
+    "deepagents-code": "0.1.71",
+    "deepagents": "0.7.15",
 }
 MANAGED_MODEL_IDS = (
     "nvidia/nemotron-3-ultra-550b-a55b",
@@ -59,7 +75,7 @@ EXPECTED_EXTRA_BODY = {
     "chat_template_kwargs": {"force_nonempty_content": True},
 }
 EXPECTED_NATIVE_PROFILE_SHA256 = (
-    "c8e8dd2b0182334b54be4f46ff0c7b45fbb95dc13bd9a92c249eb47a14fa13d7"
+    "eec0bfdb27522823f80e5f95a00e03071162c2a96aa71fbffc1c112c5184c01f"
 )
 EXPECTED_BOOTSTRAP_SHA256 = (
     "005a91e7fc4ca6b21220673dd9d02d6686bf63e1e4f1102d124b01f96886efcf"
@@ -79,11 +95,14 @@ EXPECTED_NATIVE_MIDDLEWARE = [
     "FinalAnswerGuardMiddleware",
 ]
 MANAGED_GUARD = "NemoClawExecutePlaceholderGuardMiddleware"
+MANAGED_MESSAGE_COMPATIBILITY = "NemotronPolicyNudgeMiddleware"
 EXPECTED_MIDDLEWARE = [*EXPECTED_NATIVE_MIDDLEWARE, MANAGED_GUARD]
 
 for distribution, expected in EXPECTED_VERSIONS.items():
     actual = importlib.metadata.version(distribution)
     assert actual == expected, (distribution, actual)
+
+assert dcode_config.is_openai_prompt_cache_key_enabled() is False
 
 profile_entry_points = [
     entry_point
@@ -112,8 +131,8 @@ assert configured_model_id in MANAGED_MODEL_IDS, default_model
 
 provider = config["models"]["providers"]["openai"]
 assert provider["models"] == [configured_model_id]
-assert provider["api_key_env"] == "DEEPAGENTS_CODE_OPENAI_API_KEY"
-assert provider["base_url"] == "https://inference.local/v1"
+assert provider["api_key_env"] == "COMPATIBLE_API_KEY"
+assert provider["base_url"] == sys.argv[1]
 assert provider["enabled"] is True
 assert provider["params"] == {
     "use_responses_api": False,
@@ -127,6 +146,111 @@ assert model_kwargs == {
     "use_responses_api": False,
     "extra_body": EXPECTED_EXTRA_BODY,
 }
+
+# Managed resolver contract (#7441). The assertions above cover the sandbox
+# configuration and upstream's config reader; the managed launcher builds its
+# model from the installed resolver below, which deliberately ignores that
+# params table. Only this block verifies the installed patch, so it checks all
+# returned settings rather than one key.
+from deepagents_code.config import (
+    _NEMOCLAW_NEMOTRON_ULTRA_MODEL_IDS,
+    _get_provider_kwargs,
+)
+from deepagents_code._nemoclaw_managed import (
+    managed_inference_base_url,
+    managed_reasoning_effort,
+)
+from deepagents_code.model_config import ModelConfigError
+
+# A mutable allowlist would let a caller widen the shaped set at runtime.
+assert isinstance(_NEMOCLAW_NEMOTRON_ULTRA_MODEL_IDS, frozenset)
+assert set(_NEMOCLAW_NEMOTRON_ULTRA_MODEL_IDS) == set(MANAGED_MODEL_IDS)
+
+MANAGED_BASE_URL = managed_inference_base_url()
+assert MANAGED_BASE_URL == provider["base_url"], MANAGED_BASE_URL
+COMPATIBLE_REFERENCE = os.environ.get("COMPATIBLE_API_KEY", "")
+assert re.fullmatch(
+    r"openshell:resolve:env:(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?COMPATIBLE_API_KEY",
+    COMPATIBLE_REFERENCE,
+), "compatible provider reference is missing or invalid"
+# The resolver passes the issued reference to OpenShell. It never receives the
+# host's raw provider credential.
+OPENAI_CONTRACT = {
+    "api_key": COMPATIBLE_REFERENCE,
+    "base_url": MANAGED_BASE_URL,
+    "use_responses_api": False,
+}
+MANAGED_REASONING_EFFORT = managed_reasoning_effort()
+if MANAGED_REASONING_EFFORT is not None:
+    OPENAI_CONTRACT["extra_body"] = {
+        "reasoning_effort": MANAGED_REASONING_EFFORT,
+    }
+MANAGED_ULTRA_EXTRA_BODY = {
+    **OPENAI_CONTRACT.get("extra_body", {}),
+    **EXPECTED_EXTRA_BODY,
+}
+OPENROUTER_CONTRACT = {
+    "api_key": COMPATIBLE_REFERENCE,
+    "base_url": MANAGED_BASE_URL,
+}
+# Deliberate near miss: a different Nemotron generation must not be shaped.
+UNSHAPED_MODEL_NAMES = ("gpt-4.1-mini", "nvidia/nemotron-4-ultra-550b-a55b", None)
+BLOCKED_PROVIDERS = ("anthropic", "fireworks", "ollama", "nvidia")
+
+
+def blocked_socket(*args, **kwargs):
+    raise AssertionError("managed resolver contract attempted a network connection")
+
+
+real_socket = socket.socket
+socket.socket = blocked_socket
+try:
+    for model_id in MANAGED_MODEL_IDS:
+        assert _get_provider_kwargs("openai", model_name=model_id) == {
+            **OPENAI_CONTRACT,
+            "extra_body": MANAGED_ULTRA_EXTRA_BODY,
+        }, model_id
+        # The reviewed argument belongs to the OpenAI adapter alone; the managed
+        # OpenRouter adapter keeps the unshaped contract for the same model.
+        assert (
+            _get_provider_kwargs("openrouter", model_name=model_id)
+            == OPENROUTER_CONTRACT
+        ), model_id
+
+    for model_name in UNSHAPED_MODEL_NAMES:
+        assert (
+            _get_provider_kwargs("openai", model_name=model_name) == OPENAI_CONTRACT
+        ), model_name
+        assert (
+            _get_provider_kwargs("openrouter", model_name=model_name)
+            == OPENROUTER_CONTRACT
+        ), model_name
+
+    for blocked_provider in BLOCKED_PROVIDERS:
+        try:
+            _get_provider_kwargs(blocked_provider, model_name=MANAGED_MODEL_IDS[0])
+        except ModelConfigError:
+            pass
+        else:
+            raise AssertionError(blocked_provider)
+
+    # Mutation of one result cannot change a later result.
+    tampered = _get_provider_kwargs("openai", model_name=MANAGED_MODEL_IDS[0])
+    tampered["api_key"] = "tampered"
+    tampered["extra_body"]["chat_template_kwargs"]["force_nonempty_content"] = False
+    assert _get_provider_kwargs("openai", model_name=MANAGED_MODEL_IDS[0]) == {
+        **OPENAI_CONTRACT,
+        "extra_body": MANAGED_ULTRA_EXTRA_BODY,
+    }
+finally:
+    socket.socket = real_socket
+
+print(
+    "NEMOCLAW_MANAGED_RESOLVER_CONTRACT_OK:"
+    f"shaped={len(MANAGED_MODEL_IDS)}:"
+    f"unshaped={len(UNSHAPED_MODEL_NAMES)}:"
+    f"blocked={len(BLOCKED_PROVIDERS)}"
+)
 
 
 class ProfileOnlyChatOpenAI(ChatOpenAI):
@@ -194,6 +318,57 @@ guard = next(
     for item in middleware_items(managed_profiles[0])
     if type(item).__name__ == MANAGED_GUARD
 )
+compatibility = next(
+    item
+    for item in middleware_items(managed_profiles[0])
+    if type(item).__name__ == MANAGED_MESSAGE_COMPATIBILITY
+)
+assert compatibility._nemoclaw_internal_name_compatibility is True
+
+
+class ModelRequest:
+    def __init__(self, messages):
+        self.messages = messages
+        self.state = {"messages": messages, "checkpoint": "preserved-checkpoint"}
+        self.tools = [{"name": "read_file"}, {"name": "get_goal"}]
+
+    def override(self, *, messages):
+        result = ModelRequest(messages)
+        result.state = self.state
+        return result
+
+
+internal = HumanMessage(
+    content="managed nudge",
+    name="nemotron_domain_tool_preference",
+)
+named_user = HumanMessage(content="named user", name="user_supplied")
+plain_user = HumanMessage(content="plain user")
+model_request = ModelRequest([internal, named_user, plain_user])
+sync_model_result = compatibility.wrap_model_call(
+    model_request,
+    lambda value: value,
+)
+assert sync_model_result.state is model_request.state
+assert sync_model_result is not model_request
+assert sync_model_result.messages[0].content == "managed nudge"
+assert sync_model_result.messages[0].name is None
+assert sync_model_result.messages[1] is named_user
+assert sync_model_result.messages[2] is plain_user
+assert sync_model_result.messages[-1].name is None
+assert internal.name == "nemotron_domain_tool_preference"
+
+
+async def async_model_handler(value):
+    return value
+
+
+async_model_result = asyncio.run(
+    compatibility.awrap_model_call(model_request, async_model_handler)
+)
+assert async_model_result.state is model_request.state
+assert async_model_result.messages[0].name is None
+assert async_model_result.messages[-1].name is None
 
 
 class GuardRequest:
@@ -284,9 +459,11 @@ sandbox_exec "test -x /opt/venv/bin/python3" >/dev/null || fail "/opt/venv/bin/p
 profile_source="$(profile_contract_source)"
 profile_output="$(
   openshell sandbox exec --name "$SANDBOX_NAME" -- \
-    /opt/venv/bin/python3 -I -c "$profile_source" 2>&1
+    /opt/venv/bin/python3 -I -c "$profile_source" "$HOSTED_ENDPOINT" 2>&1
 )" || fail "Nemotron Ultra harness profile contract failed: $profile_output"
 printf '%s\n' "$profile_output" | grep -Fq "NEMOCLAW_NEMOTRON_ULTRA_PROFILE_OK:" || fail "profile verification marker is missing"
 pass "configured ChatOpenAI resolves the complete Nemotron Ultra profile without inference"
+printf '%s\n' "$profile_output" | grep -Fq "NEMOCLAW_MANAGED_RESOLVER_CONTRACT_OK:" || fail "managed resolver contract marker is missing"
+pass "installed managed resolver matches the tested Ultra, non-Ultra, provider, and network contracts without inference"
 
-printf '%s: 1 passed, 0 failed\n' "$PREFIX"
+printf '%s: 2 passed, 0 failed\n' "$PREFIX"

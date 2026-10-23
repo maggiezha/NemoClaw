@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 
 import { dockerBuild, dockerRmi } from "../../adapters/docker";
 import { fingerprintBuildContext } from "../../adapters/fs/build-context-fingerprint";
@@ -18,7 +19,13 @@ import {
   formatBuildFailureDiagnostics,
   OPENCLAW_SANDBOX_BASE_IMAGE,
   SANDBOX_BASE_TAG,
+  type SandboxBaseImageResolutionMetadata,
 } from "../../sandbox-base-image";
+import {
+  applyReasoningEffortEnv,
+  REASONING_EFFORT_ENV,
+  type ReasoningEffort,
+} from "../../onboard/reasoning-mode";
 import type { ToolDisclosure } from "../../tool-disclosure";
 import { DCODE_AGENT_NAME } from "./rebuild-dcode-target";
 import {
@@ -35,9 +42,11 @@ export type ManagedDcodeRebuildImageInput = {
   provider: string;
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: "true" | "false" | null;
+  compatibleEndpointReasoningEffort: ReasoningEffort | null;
   webSearchConfig: WebSearchConfig | null;
   toolDisclosure: ToolDisclosure;
   dcodeAutoApprovalMode: DcodeAutoApprovalMode;
+  preResolvedBaseImageMetadata: SandboxBaseImageResolutionMetadata;
   sandboxGpuConfig: SandboxGpuConfig;
   gatewayPort?: number;
 };
@@ -80,6 +89,26 @@ function defaultImageTag(): string {
   return `nemoclaw-rebuild-preflight:${String(process.pid)}-${crypto.randomUUID()}`;
 }
 
+function requirePinnedDcodeBaseImage(
+  stagedDockerfile: string,
+  metadata: SandboxBaseImageResolutionMetadata,
+): void {
+  let dockerfile: string;
+  try {
+    dockerfile = fs.readFileSync(stagedDockerfile, "utf8");
+  } catch {
+    throw new Error("managed DCode staged Dockerfile could not be read");
+  }
+  const baseImageRefs = [...dockerfile.matchAll(/^ARG BASE_IMAGE=(\S+)$/gm)].map(
+    (match) => match[1],
+  );
+  if (baseImageRefs.length !== 1 || baseImageRefs[0] !== metadata.ref) {
+    throw new Error(
+      "managed DCode staged base image does not match pinned base-image resolution metadata",
+    );
+  }
+}
+
 /** Confirm that the retained, private build context still matches the prebuilt input. */
 export function verifyPreparedDcodeRebuildImage(prepared: PreparedDcodeRebuildImage): boolean {
   return verifyPreparedBuildContext(prepared);
@@ -110,6 +139,7 @@ export async function prepareManagedDcodeRebuildImage(
   const imageTag = (deps.createImageTag ?? defaultImageTag)();
   const previousDockerGpuPatchNetwork = process.env.NEMOCLAW_DOCKER_GPU_PATCH_NETWORK;
   const previousReasoning = process.env.NEMOCLAW_REASONING;
+  const previousReasoningEffort = process.env[REASONING_EFFORT_ENV];
   let cleanupBuildContext: (() => boolean) | null = null;
   let imageBuilt = false;
   let retainBuildContext = false;
@@ -120,8 +150,10 @@ export async function prepareManagedDcodeRebuildImage(
     delete process.env.NEMOCLAW_DOCKER_GPU_PATCH_NETWORK;
     if (input.provider === "compatible-endpoint") {
       process.env.NEMOCLAW_REASONING = input.compatibleEndpointReasoning ?? "false";
+      applyReasoningEffortEnv(input.compatibleEndpointReasoningEffort);
     } else {
       delete process.env.NEMOCLAW_REASONING;
+      delete process.env[REASONING_EFFORT_ENV];
     }
 
     const staged = stage({
@@ -137,6 +169,7 @@ export async function prepareManagedDcodeRebuildImage(
       },
     });
     cleanupBuildContext = createIdempotentBuildContextCleanup(staged.cleanupBuildCtx);
+    requirePinnedDcodeBaseImage(staged.stagedDockerfile, input.preResolvedBaseImageMetadata);
 
     const { buildId, dashboardRemoteBindPrepared } = await preparePatch({
       agent: input.agent,
@@ -151,6 +184,7 @@ export async function prepareManagedDcodeRebuildImage(
       webSearchConfig: input.webSearchConfig,
       toolDisclosure: input.toolDisclosure,
       dcodeAutoApprovalMode: input.dcodeAutoApprovalMode,
+      preResolvedBaseImageMetadata: input.preResolvedBaseImageMetadata,
       hermesToolGateways: [],
       sandboxGpuConfig: input.sandboxGpuConfig,
       gatewayPort: input.gatewayPort ?? GATEWAY_PORT,
@@ -218,5 +252,7 @@ export async function prepareManagedDcodeRebuildImage(
     }
     if (previousReasoning === undefined) delete process.env.NEMOCLAW_REASONING;
     else process.env.NEMOCLAW_REASONING = previousReasoning;
+    if (previousReasoningEffort === undefined) delete process.env[REASONING_EFFORT_ENV];
+    else process.env[REASONING_EFFORT_ENV] = previousReasoningEffort;
   }
 }

@@ -2,11 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { randomBytes } from "node:crypto";
+import { DEFAULT_CLOUD_MODEL } from "../../../src/lib/inference/config.ts";
+import { nativeHostedAuthHeaderScript } from "../../../src/lib/inference/native-provider/contract.ts";
+import {
+  NATIVE_NVIDIA_AUTH_HEADER_SCRIPT,
+  NVIDIA_HOSTED_LOGICAL_PROVIDER,
+  NVIDIA_HOSTED_NATIVE_ENDPOINT,
+} from "../../../src/lib/inference/native-nvidia/contract.ts";
 
 import type { ArtifactSink } from "./artifacts.ts";
 import { buildAvailabilityProbeEnv } from "./availability-env.ts";
 import { type ProviderClient, trustedProviderEndpoint } from "./clients/provider.ts";
 import {
+  type FakeOpenAiCompatibleRequest,
   type FakeOpenAiCompatibleServer,
   startFakeOpenAiCompatibleServer,
 } from "./fake-openai-compatible.ts";
@@ -19,15 +27,17 @@ import {
   type HostedInferenceSecrets,
   requireHostedInferenceConfig,
 } from "./hosted-inference.ts";
+import type { TestProgress, TestProgressCapability } from "./progress.ts";
 
 /**
  * Gives E2E suites one inference contract across three execution modes.
  * `mock` exposes an authenticated local compatible endpoint and stages only
  * `COMPATIBLE_API_KEY`; `internal-nvidia` stages the internal NVIDIA endpoint
  * as compatible inference and rejects endpoint overrides outside its static
- * allowlist; `public-nvidia` uses the public NVIDIA provider and stages only
- * `NVIDIA_INFERENCE_API_KEY`. Every mode registers its credential for artifact
- * redaction and removes credentials owned by the other modes.
+ * allowlist; `public-nvidia` reads the public `NVIDIA_API_KEY` credential and
+ * stages it only under the runtime's `NVIDIA_INFERENCE_API_KEY` input. Every
+ * mode registers its credential for artifact redaction and removes credentials
+ * owned by the other modes.
  *
  * Tests normally consume the `inference` fixture from `e2e-test.ts`, pass
  * `inference.env()` to install/onboard commands, use its model and provider
@@ -41,6 +51,9 @@ import {
 export const E2E_INFERENCE_MODE_VALUES = ["mock", "internal-nvidia", "public-nvidia"] as const;
 export type E2EInferenceMode = (typeof E2E_INFERENCE_MODE_VALUES)[number];
 
+/** Non-secret marker used to prove fixture content reached the local mock inference boundary. */
+export const E2E_MOCK_REQUEST_CANARY = "NEMOCLAW_E2E_REQUEST_CANARY_K9X2";
+
 export interface E2EInferenceAdapter {
   readonly mode: E2EInferenceMode;
   readonly model: string;
@@ -51,6 +64,8 @@ export interface E2EInferenceAdapter {
   readonly contractLabel: string;
   env(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
   redactionValues(): string[];
+  /** Privacy-safe mock request metadata; unavailable when inference is hosted. */
+  requestSummaries(): readonly FakeOpenAiCompatibleRequest[] | undefined;
   probeModels(artifactName: string): Promise<unknown>;
   directChat(
     prompt: string,
@@ -63,19 +78,21 @@ export interface E2EInferenceAdapterOptions {
   readonly artifacts: ArtifactSink;
   readonly env?: NodeJS.ProcessEnv;
   readonly provider: Pick<ProviderClient, "requestJson">;
+  readonly progress: Pick<TestProgress, "activity" | "event" | "onOutput"> & TestProgressCapability;
   readonly secrets: HostedInferenceSecrets;
 }
 
 const DEFAULT_MOCK_MODEL = "nvidia/nvidia/nemotron-3-ultra";
 const DEFAULT_PUBLIC_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_PUBLIC_NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b";
+const DEFAULT_PUBLIC_NVIDIA_MODEL = DEFAULT_CLOUD_MODEL;
+const PUBLIC_NVIDIA_SECRET = "NVIDIA_API_KEY";
 const DIRECT_CHAT_TIMEOUT_MS = 120_000;
 const INTERNAL_NVIDIA_ALLOWED_HOSTS = ["inference-api.nvidia.com"] as const;
 const MODEL_PROBE_TIMEOUT_MS = 30_000;
 const PUBLIC_NVIDIA_ALLOWED_HOSTS = ["integrate.api.nvidia.com"] as const;
 const SANDBOX_HOST_ALIAS = "host.openshell.internal";
 
-function normalizeMode(env: NodeJS.ProcessEnv): E2EInferenceMode {
+export function normalizeMode(env: NodeJS.ProcessEnv): E2EInferenceMode {
   const raw = env.NEMOCLAW_E2E_INFERENCE_MODE?.trim().toLowerCase();
   if (!raw) return "mock";
   if (raw === "mock" || raw === "internal-nvidia" || raw === "public-nvidia") return raw;
@@ -86,7 +103,7 @@ function normalizeMode(env: NodeJS.ProcessEnv): E2EInferenceMode {
 
 export function requirePublicNvidiaInferenceKey(value: string): string {
   if (!value.startsWith("nvapi-")) {
-    throw new Error(`${HOSTED_INFERENCE_SECRET} must start with nvapi- for public NVIDIA mode`);
+    throw new Error(`${PUBLIC_NVIDIA_SECRET} must start with nvapi- for public NVIDIA mode`);
   }
   return value;
 }
@@ -198,6 +215,7 @@ class OpenAiCompatibleInferenceAdapter implements E2EInferenceAdapter {
 
   env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     const sanitizedExtra = { ...extra };
+    delete sanitizedExtra[PUBLIC_NVIDIA_SECRET];
     delete sanitizedExtra[HOSTED_INFERENCE_SECRET];
     delete sanitizedExtra.NEMOCLAW_E2E_USE_HOSTED_INFERENCE;
     return {
@@ -217,6 +235,10 @@ class OpenAiCompatibleInferenceAdapter implements E2EInferenceAdapter {
     return [this.apiKey];
   }
 
+  requestSummaries(): readonly FakeOpenAiCompatibleRequest[] | undefined {
+    return this.fake?.requests();
+  }
+
   async probeModels(artifactName: string): Promise<unknown> {
     if (this.providerClient) {
       return requestViaProvider(this.providerClient, {
@@ -234,7 +256,13 @@ class OpenAiCompatibleInferenceAdapter implements E2EInferenceAdapter {
       signal: AbortSignal.timeout(MODEL_PROBE_TIMEOUT_MS),
     });
     const json = await responseJsonOrThrow(response, "model probe");
-    await this.artifacts.writeJson(`${artifactName}.json`, json);
+    // The mock reply is asserted by the caller. Keep a success marker in the
+    // artifact without copying network-controlled response content to disk.
+    await this.artifacts.writeJson(`${artifactName}.json`, {
+      mode: "mock",
+      probe: "models",
+      responseReceived: true,
+    });
     return json;
   }
 
@@ -266,10 +294,11 @@ class OpenAiCompatibleInferenceAdapter implements E2EInferenceAdapter {
       signal: AbortSignal.timeout(DIRECT_CHAT_TIMEOUT_MS),
     });
     const json = await responseJsonOrThrow(response, "direct chat");
-    await this.artifacts.writeJson(
-      `${options.artifactName ?? "direct-compatible-chat"}.json`,
-      json,
-    );
+    await this.artifacts.writeJson(`${options.artifactName ?? "direct-compatible-chat"}.json`, {
+      mode: "mock",
+      probe: "direct-chat",
+      responseReceived: true,
+    });
     return json;
   }
 
@@ -309,6 +338,7 @@ class PublicNvidiaInferenceAdapter implements E2EInferenceAdapter {
 
   env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     const sanitizedExtra = { ...extra };
+    delete sanitizedExtra[PUBLIC_NVIDIA_SECRET];
     delete sanitizedExtra[HOSTED_INFERENCE_CREDENTIAL_ENV];
     delete sanitizedExtra.NEMOCLAW_E2E_USE_HOSTED_INFERENCE;
     return {
@@ -322,6 +352,10 @@ class PublicNvidiaInferenceAdapter implements E2EInferenceAdapter {
 
   redactionValues(): string[] {
     return [this.apiKey];
+  }
+
+  requestSummaries(): undefined {
+    return undefined;
   }
 
   async probeModels(artifactName: string): Promise<unknown> {
@@ -368,12 +402,16 @@ export async function createE2EInferenceAdapter(
     const fake = await startFakeOpenAiCompatibleServer({
       apiKey,
       chatContent: "PONG",
+      // The fake stores only presence metadata, never request bodies or the canary value.
+      requestCanaryMarker: E2E_MOCK_REQUEST_CANARY,
       // A Docker network namespace cannot reach host loopback through the host
       // alias, so listen on the bridge-facing interfaces. The workflow uses an
       // ephemeral ubuntu-latest VM, an OS-assigned port, and a per-run credential.
       host: "0.0.0.0",
+      replyFromPrompt: true,
       model,
       publicHost: SANDBOX_HOST_ALIAS,
+      progress: options.progress,
       requireAuth: true,
       responseText: "PONG",
     });
@@ -414,7 +452,7 @@ export async function createE2EInferenceAdapter(
       artifacts: options.artifacts,
     });
   }
-  const apiKey = requirePublicNvidiaInferenceKey(options.secrets.required(HOSTED_INFERENCE_SECRET));
+  const apiKey = requirePublicNvidiaInferenceKey(options.secrets.required(PUBLIC_NVIDIA_SECRET));
   const model = env.NEMOCLAW_MODEL || DEFAULT_PUBLIC_NVIDIA_MODEL;
   return new PublicNvidiaInferenceAdapter({
     apiKey,
@@ -425,3 +463,39 @@ export async function createE2EInferenceAdapter(
 }
 
 export { DEFAULT_HOSTED_INFERENCE_MODEL as DEFAULT_INTERNAL_NVIDIA_MODEL };
+
+/** Build the in-sandbox chat request without exposing a host credential. */
+export function buildSandboxInferenceChatCommand(
+  requestBody: string,
+  logicalProvider: string,
+  endpointUrl?: string,
+): [string, ...string[]] {
+  const nativeCustom = logicalProvider === "compatible-endpoint" && endpointUrl;
+  if (logicalProvider === NVIDIA_HOSTED_LOGICAL_PROVIDER || nativeCustom) {
+    const auth = nativeCustom
+      ? nativeHostedAuthHeaderScript({
+          credentialEnv: "COMPATIBLE_API_KEY",
+          api: "openai-completions",
+        })
+      : NATIVE_NVIDIA_AUTH_HEADER_SCRIPT;
+    return [
+      "bash",
+      "-c",
+      `${auth}; exec curl -fsS --max-time 90 "$1" -H 'Content-Type: application/json' -H "$AUTH_HEADER" --data-raw "$2"`,
+      "full-e2e-native-inference",
+      `${(nativeCustom ? endpointUrl : NVIDIA_HOSTED_NATIVE_ENDPOINT).replace(/\/+$/u, "")}/chat/completions`,
+      requestBody,
+    ];
+  }
+  return [
+    "curl",
+    "-fsS",
+    "--max-time",
+    "90",
+    "https://inference.local/v1/chat/completions",
+    "-H",
+    "Content-Type: application/json",
+    "--data-raw",
+    requestBody,
+  ];
+}

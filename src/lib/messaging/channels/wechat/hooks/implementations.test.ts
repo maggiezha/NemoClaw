@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 
 import { MessagingHookRegistry, runMessagingHook } from "../../../hooks";
 import { wechatManifest } from "../manifest";
+import { runWechatHostQrLogin } from "../login";
+import type { FetchLike } from "../qr";
 import { createWechatHealthCheckHook, WECHAT_HEALTH_CHECK_HOOK_ID } from "./health-check";
 import { createWechatIlinkLoginHook, WECHAT_ILINK_LOGIN_HOOK_ID } from "./ilink-login";
 import {
@@ -92,13 +94,16 @@ describe("WeChat hook implementations", () => {
     });
   });
 
-  it("rejects invalid iLink baseUrl values before writing QR credentials", async () => {
-    for (const baseUrl of [
-      "http://ilinkai.wechat.com",
-      "https://example.com",
-      "https://ilinkai.wechat.com/path",
-      "https://ilinkai.wechat.com\nEVIL=1",
-    ] as const) {
+  it.each([
+    "http://ilinkai.wechat.com",
+    "https://example.com",
+    "https://idc-3.weixin.qq.com:443",
+    "https://idc-3.weixin.qq.com:8443",
+    "https://ilinkai.wechat.com/path",
+    "https://ilinkai.wechat.com\nEVIL=1",
+  ] as const)(
+    "rejects invalid iLink baseUrl values before writing QR credentials [case %#]",
+    async (baseUrl) => {
       const env: NodeJS.ProcessEnv = {};
       const saved: Array<{ readonly key: string; readonly value: string }> = [];
       const registry = new MessagingHookRegistry([
@@ -134,8 +139,8 @@ describe("WeChat hook implementations", () => {
       ).rejects.toThrow(/WeChat baseUrl/);
       expect(saved).toEqual([]);
       expect(env).toEqual({});
-    }
-  });
+    },
+  );
 
   it("turns QR failures into hook failures without writing credentials", async () => {
     const env: NodeJS.ProcessEnv = {};
@@ -164,23 +169,65 @@ describe("WeChat hook implementations", () => {
     expect(env.WECHAT_BOT_TOKEN).toBeUndefined();
   });
 
-  it("rejects unsafe WeChat account ids before using them as build-file names", () => {
-    for (const accountId of ["../../openclaw", "nested/account", "control\u0001id"]) {
+  it("omits provider response details from host QR hook failures", async () => {
+    const sensitiveBody = "bot_token=secret-value qrcode=session-value";
+    const logs: string[] = [];
+    const saved: Array<{ readonly key: string; readonly value: string }> = [];
+    const fetch: FetchLike = async () => ({
+      ok: false,
+      status: 401,
+      text: async () => sensitiveBody,
+    });
+    const registry = new MessagingHookRegistry([
+      {
+        id: WECHAT_ILINK_LOGIN_HOOK_ID,
+        handler: createWechatIlinkLoginHook({
+          log: (message) => logs.push(message),
+          saveCredential: (key, value) => saved.push({ key, value }),
+          runLogin: () =>
+            runWechatHostQrLogin({
+              fetch,
+              renderQr: () => {},
+              log: () => {},
+              sleep: async () => {},
+            }),
+        }),
+      },
+    ]);
+    const hook = wechatManifest.hooks.find((entry) => entry.id === "wechat-host-qr");
+    expect(hook).toBeDefined();
+
+    const error = await runMessagingHook(hook!, registry, { channelId: "wechat" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(String(error)).toContain("http: WeChat QR init returned 401");
+    expect(String(error)).not.toContain(sensitiveBody);
+    expect(logs.join("\n")).not.toContain(sensitiveBody);
+    expect(saved).toEqual([]);
+  });
+
+  it.each(["../../openclaw", "nested/account", "control\u0001id"])(
+    "rejects unsafe WeChat account ids before using them as build-file names [case %#]",
+    (accountId) => {
       expect(() =>
         buildWechatSeedOpenClawAccountOutputs({
           "wechatConfig.accountId": accountId,
         }),
       ).toThrow("unsafe filename characters");
-    }
-  });
+    },
+  );
 
-  it("rejects invalid iLink baseUrl values before writing OpenClaw seed files", () => {
-    for (const baseUrl of [
-      "http://ilinkai.wechat.com",
-      "https://example.com",
-      "https://ilinkai.wechat.com/path",
-      "https://ilinkai.wechat.com\nEVIL=1",
-    ] as const) {
+  it.each([
+    "http://ilinkai.wechat.com",
+    "https://example.com",
+    "https://idc-3.weixin.qq.com:443",
+    "https://idc-3.weixin.qq.com:8443",
+    "https://ilinkai.wechat.com/path",
+    "https://ilinkai.wechat.com\nEVIL=1",
+  ] as const)(
+    "rejects invalid iLink baseUrl values before writing OpenClaw seed files [case %#]",
+    (baseUrl) => {
       expect(() =>
         buildWechatSeedOpenClawAccountOutputs({
           "wechatConfig.accountId": "wechat-account",
@@ -188,8 +235,8 @@ describe("WeChat hook implementations", () => {
           "credential.wechatBotToken.placeholder": "openshell:resolve:env:WECHAT_BOT_TOKEN",
         }),
       ).toThrow(/WeChat baseUrl/);
-    }
-  });
+    },
+  );
 
   it("declares a health-check hook that requires captured account metadata", async () => {
     const hook = wechatManifest.hooks.find((entry) => entry.id === "wechat-health-check");
@@ -263,14 +310,15 @@ describe("WeChat hook implementations", () => {
           value: {
             merge: {
               plugins: {
-                installs: {
+                entries: {
                   "openclaw-weixin": {
-                    spec: "@tencent-weixin/openclaw-weixin@2.4.3",
+                    enabled: true,
                   },
                 },
               },
               channels: {
                 "openclaw-weixin": {
+                  enabled: true,
                   channelConfigUpdatedAt: "2026-05-25T00:00:00.000Z",
                   accounts: {
                     "wechat-account": {

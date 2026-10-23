@@ -68,7 +68,13 @@ Agents may recommend labels, assignments, Project field changes, comments, merge
 - A PR daily version label activates daily release work; it is not a readiness claim.
 - Release inclusion requires a PR to be both merged and carrying the relevant daily version label at release cutoff.
 - Issue daily version labels are tracking or coordination signals only.
-- Before tag confirmation, freeze the candidate SHA and review every E2E test declared by `.github/workflows/e2e.yaml` at that commit. Each test needs green evidence for that SHA or an explicit itemized maintainer exception.
+- Before tag confirmation, show the newest identifiable full manual E2E result, compare its commit
+  with the candidate, and let the maintainer run focused tests, run the full suite, or proceed with
+  the displayed status.
+- Record the E2E decision and any plain-language exception reason in the signed Markdown release
+  brief. General E2E does not authorize or reject the tag.
+- A later merge does not invalidate the planned candidate while that candidate remains on `main`
+  and its required documentation and image evidence remains valid.
 - Open PRs and issues that miss a tagged release carry forward by automatically moving from the released version label to the next patch label after the tag and `latest` are verified.
 - After carry-forward leaves no open item on the released label, delete that repository label. Never rename or reuse it.
 - Durable release history belongs in releases, release notes, or manifests, not in long-lived labels.

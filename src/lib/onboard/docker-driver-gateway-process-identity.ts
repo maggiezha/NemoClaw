@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-
+import { readGatewayProcessEnvironment } from "./gateway/process-environment";
+import { readGatewayProcEntry } from "./gateway/process-proc-entry";
 import { resolveGatewayName } from "./gateway-binding";
+import {
+  NEMOCLAW_EXTERNAL_COMPONENT_GATEWAY_IDENTITY_ENV,
+  NO_EXTERNAL_COMPONENT_GATEWAY_IDENTITY,
+} from "./docker-driver-gateway-config";
 import {
   gatewayProcessCmdlineMatches,
   OPENSHELL_GATEWAY_PROCESS_NAMES,
@@ -15,16 +19,46 @@ export function readDockerDriverGatewayProcessIdentity(
   pid: number,
   captureProcessArgs: (pid: number) => string,
 ): string {
-  const procCmdlinePath = `/proc/${pid}/cmdline`;
-  try {
-    if (fs.existsSync(procCmdlinePath)) {
-      const identity = fs.readFileSync(procCmdlinePath, "utf-8").replace(/\0/g, " ").trim();
-      if (identity) return identity;
-    }
-  } catch {
-    // Fall through to ps on hosts without readable procfs.
+  const identity = (readGatewayProcEntry(pid, "cmdline") ?? "").replace(/\0/g, " ").trim();
+  return identity || captureProcessArgs(pid);
+}
+
+export function readDockerDriverGatewayProcessEnvironment(
+  pid: number,
+): Record<string, string> | null {
+  const env = readGatewayProcessEnvironment(pid);
+  if (!env) return null;
+  if (env[NEMOCLAW_EXTERNAL_COMPONENT_GATEWAY_IDENTITY_ENV] === undefined) {
+    env[NEMOCLAW_EXTERNAL_COMPONENT_GATEWAY_IDENTITY_ENV] = NO_EXTERNAL_COMPONENT_GATEWAY_IDENTITY;
   }
-  return captureProcessArgs(pid);
+  return env;
+}
+
+export function hasDockerDriverGatewayEnvironment(
+  env: Readonly<Record<string, string>> | null,
+  expectedEndpoint: string,
+): boolean {
+  if (!env) return false;
+  return (
+    Boolean(env.OPENSHELL_DRIVERS?.trim()) ||
+    Boolean(env.OPENSHELL_DOCKER_SUPERVISOR_IMAGE) ||
+    env.OPENSHELL_GRPC_ENDPOINT === expectedEndpoint
+  );
+}
+
+/** Apply the shared positive identity decision used by runtime and readiness scans. */
+export function isDockerDriverGatewayProcessIdentity(input: {
+  pid: number;
+  gatewayBin?: string | null;
+  captureProcessArgs(pid: number): string;
+  processIdentityMatchesGatewayBinary(identity: string, gatewayBin?: string | null): boolean;
+  requireDockerDriverEnv: boolean;
+  hasDockerDriverGatewayEnv(pid: number): boolean;
+}): boolean {
+  const identity = readDockerDriverGatewayProcessIdentity(input.pid, input.captureProcessArgs);
+  if (!identity) return false;
+  if (!input.processIdentityMatchesGatewayBinary(identity, input.gatewayBin)) return false;
+  return !input.requireDockerDriverEnv || input.hasDockerDriverGatewayEnv(input.pid);
 }
 
 export function getDockerDriverGatewayTargetIdentityDrift(input: {

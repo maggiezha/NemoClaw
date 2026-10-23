@@ -5,11 +5,9 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
-import { target } from "../registry/builder.ts";
 import { listTargets } from "../registry/registry.ts";
 import { buildLiveTargetMatrix } from "../registry/run.ts";
 import { resolveRunnerForTarget } from "../registry/runner-routing.ts";
-import { liveTargetSupport } from "../registry/runtime-support.ts";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
 const RUN_TARGETS = path.join(REPO_ROOT, "test/e2e/registry/run.ts");
@@ -23,101 +21,54 @@ function runEmitLiveMatrix(args: string[] = []) {
   });
 }
 
-function requireUnsupportedTarget() {
-  const unsupported = listTargets().find((entry) => !liveTargetSupport(entry).supported);
-  expect(unsupported, "expected at least one unsupported live E2E target").toBeDefined();
-  return unsupported!;
+function expectExecutableTypedTargetCoverage(): void {
+  for (const row of buildLiveTargetMatrix()) {
+    expect(row.agentRuntime).not.toBe("unresolved");
+    expect(row.observableOutcome).not.toBe("unresolved");
+    expect(row.environmentOrInferenceEndpoint).not.toBe("unresolved");
+    expect(row.unresolvedReason).toBe("");
+  }
 }
 
 describe("live E2E target matrix", () => {
-  it("honors an explicit runs-on:<label> requirement override", () => {
-    const custom = target("test-runs-on-override")
-      .description("test fixture")
-      .manifest("test/e2e/manifests/openclaw-nvidia.yaml")
-      .environment({
-        platform: "ubuntu-local",
-        install: "repo-current",
-        runtime: "docker-running",
-        onboarding: "cloud-openclaw",
-      })
-      .expectedState("cloud-openclaw-ready")
-      .onboardingAssertions(["base-installed"])
-      .suites(["smoke"])
-      .runnerRequirements(["runs-on:custom-self-hosted"])
-      .build();
-    expect(resolveRunnerForTarget(custom).runner).toBe("custom-self-hosted");
-  });
-
-  it("rejects empty runs-on requirement overrides", () => {
-    const broken = target("test-empty-runs-on-override")
-      .description("test fixture")
-      .manifest("test/e2e/manifests/openclaw-nvidia.yaml")
-      .environment({
-        platform: "ubuntu-local",
-        install: "repo-current",
-        runtime: "docker-running",
-        onboarding: "cloud-openclaw",
-      })
-      .expectedState("cloud-openclaw-ready")
-      .onboardingAssertions(["base-installed"])
-      .suites(["smoke"])
-      .runnerRequirements(["runs-on:   "])
-      .build();
-    expect(() => resolveRunnerForTarget(broken)).toThrow(/empty runs-on override/);
-  });
-
+  // source-shape-contract: compatibility -- Matrix generation must reject platforms without a reviewed GitHub Actions runner route
   it("fails loudly when a platform has no default runner mapping", () => {
-    const broken = target("test-unknown-platform")
-      .description("test fixture")
-      .manifest("test/e2e/manifests/openclaw-nvidia.yaml")
-      .environment({
-        platform: "made-up-platform",
-        install: "repo-current",
-        runtime: "docker-running",
-        onboarding: "cloud-openclaw",
-      })
-      .expectedState("cloud-openclaw-ready")
-      .onboardingAssertions(["base-installed"])
-      .suites(["smoke"])
-      .build();
-    expect(() => resolveRunnerForTarget(broken)).toThrow(/no default for platform/);
+    const target = listTargets()[0];
+    const broken = {
+      ...target,
+      environment: { ...target.environment, platform: "made-up-platform" },
+    };
+    expect(() => resolveRunnerForTarget(broken)).toThrow(/no executable route for platform/);
   });
 
-  // source-shape-contract: compatibility -- Default live matrix output must cover every fixture-supported registered target once
-  it("builds the default live matrix from every fixture-supported target", () => {
-    const targets = listTargets();
-    const supportedTargets = targets.filter((entry) => liveTargetSupport(entry).supported);
-    const matrix = buildLiveTargetMatrix();
-
-    expect(matrix).not.toHaveLength(0);
-    expect(matrix.map((entry) => entry.id)).toEqual(supportedTargets.map((entry) => entry.id));
-    expect(new Set(matrix.map((entry) => entry.id)).size).toBe(matrix.length);
-    for (const entry of matrix) {
-      const registered = supportedTargets.find((target) => target.id === entry.id);
-      expect(
-        registered,
-        `matrix entry '${entry.id}' must resolve to a supported target`,
-      ).toBeDefined();
-      expect(entry).toMatchObject({
-        runner: resolveRunnerForTarget(registered!).runner,
-        supported: true,
-        supportReasons: [],
-        pendingRuntimeSuites: registered!.suiteIds ?? [],
-      });
-    }
+  it("rejects a removed placeholder instead of emitting an empty matrix row (#11407)", () => {
+    expect(() => buildLiveTargetMatrix(["ubuntu-repo-cloud-hermes"])).toThrow(
+      "Unknown target 'ubuntu-repo-cloud-hermes'",
+    );
   });
 
-  it("keeps explicitly selected unsupported live targets in the matrix with skip reasons", () => {
-    const unsupported = requireUnsupportedTarget();
-    const support = liveTargetSupport(unsupported);
+  it("exposes execution coverage for every executable typed target (#9167)", () => {
+    expect(buildLiveTargetMatrix()).toEqual(buildLiveTargetMatrix([], ["docker"]));
+    expect(buildLiveTargetMatrix()).toHaveLength(3);
+    expectExecutableTypedTargetCoverage();
+  });
 
-    expect(buildLiveTargetMatrix([unsupported.id])).toEqual([
-      expect.objectContaining({
-        id: unsupported.id,
-        supported: false,
-        supportReasons: support.reasons,
-      }),
+  it("includes managed-runtime typed fixtures in the native Podman matrix", () => {
+    expect(buildLiveTargetMatrix([], ["podman"]).map((row) => row.id)).toEqual([
+      "ubuntu-policy-custom-missing-presets-negative",
+      "ubuntu-repo-cloud-langchain-deepagents-code",
+      "ubuntu-repo-cloud-openclaw",
     ]);
+  });
+
+  it("includes ordered Deep Agents and automatic config-export budgets", () => {
+    expect(
+      Object.fromEntries(buildLiveTargetMatrix().map((row) => [row.id, row.timeout_minutes])),
+    ).toEqual({
+      "ubuntu-policy-custom-missing-presets-negative": 63,
+      "ubuntu-repo-cloud-langchain-deepagents-code": 163,
+      "ubuntu-repo-cloud-openclaw": 63,
+    });
   });
 
   it("prints a single-line JSON array of supported live E2E targets for --emit-live-matrix", () => {
@@ -130,11 +81,19 @@ describe("live E2E target matrix", () => {
   });
 
   it("honors explicit target selections for --emit-live-matrix", () => {
-    const unsupported = requireUnsupportedTarget();
-    const result = runEmitLiveMatrix(["--targets", unsupported.id]);
+    const selected = "ubuntu-repo-cloud-openclaw";
+    const result = runEmitLiveMatrix(["--targets", selected]);
     expect(result.status, result.stderr).toBe(0);
     const parsed = JSON.parse(result.stdout.trim());
-    expect(parsed).toEqual(buildLiveTargetMatrix([unsupported.id]));
+    expect(parsed).toEqual(buildLiveTargetMatrix([selected]));
+  });
+
+  it("rejects removed target selections for --emit-live-matrix (#11407)", () => {
+    const result = runEmitLiveMatrix(["--targets", "ubuntu-repo-cloud-hermes"]);
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      "Unknown target 'ubuntu-repo-cloud-hermes'",
+    );
   });
 
   it("rejects retired typed-shell runner flags", () => {

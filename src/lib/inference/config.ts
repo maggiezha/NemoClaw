@@ -2,18 +2,72 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Inference provider selection config, model resolution, and gateway
- * inference output parsing. All functions are pure.
+ * Inference provider selection, model resolution, and route reconciliation.
+ * All functions are pure.
  */
 
+import { nativeLocalCredentialReference } from "./native-local/agent-config";
+import {
+  usesNativeLocalInference,
+  usesNativeLocalInferenceForAgent,
+} from "./native-local/contract";
 import { isSafeModelId, shouldSkipResponsesProbe } from "../validation";
-import { DEFAULT_OLLAMA_MODEL } from "./local";
+import {
+  isSafeLlamaCppServedModelAlias,
+  LLAMA_CPP_CREDENTIAL_ENV,
+  LLAMA_CPP_HOST_OPENAI_BASE_URL,
+  LLAMA_CPP_PROVIDER_NAME,
+} from "./llama-cpp/contract";
+import { hostedNativeProvider, usesNativeHermesEndpoint } from "./native-provider/hosted";
+import { isCustomHostedProvider, resolveCustomNativeApi } from "./native-provider/hosted";
+import {
+  isBedrockRuntimeEndpoint,
+  BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL,
+} from "./bedrock-runtime";
+import { getCompatibleAnthropicOpenAiSurfaceBaseUrl } from "./anthropic/openai-surface";
+import { nativeOpenClawProviderKey } from "./native-provider/fixed";
+import { NVIDIA_HOSTED_NATIVE_ENDPOINT } from "./native-nvidia";
+import type { ManagedLlamaCppOwnership } from "./llama-cpp/managed-state";
+import { DEFAULT_OLLAMA_MODEL_TAG as DEFAULT_OLLAMA_MODEL } from "./ollama-model-registry";
+import { OLLAMA_LOCAL_CREDENTIAL_ENV } from "./ollama/contract";
 import { OPENROUTER_CREDENTIAL_ENV, OPENROUTER_PROVIDER_NAME } from "./openrouter";
+import { VLLM_LOCAL_CREDENTIAL_ENV } from "./serving/vllm-credential-contract";
+
+export {
+  isSafeModelId,
+  nativeLocalCredentialReference,
+  usesNativeLocalInference,
+  usesNativeLocalInferenceForAgent,
+};
+export {
+  isPersistedPiSharedLocalInferenceRoute,
+  normalizeNativeLocalProviderAttachment,
+} from "./native-local/contract";
+export { hasLegacySharedLocalInferenceRoute } from "./selection";
+export type { NativeLocalProviderAttachment } from "./native-local/contract";
+export { OLLAMA_LOCAL_CREDENTIAL_ENV };
+export { managedInferenceApiKey, NVIDIA_INFERENCE_PLACEHOLDER } from "../inference-credential";
+export {
+  detachNativeNvidiaProvider,
+  ensureNativeNvidiaProvider,
+  ensureNativeNvidiaProviderAttached,
+  isNativeNvidiaProvider,
+  NVIDIA_HOSTED_CREDENTIAL_ENV,
+  NVIDIA_HOSTED_NATIVE_ENDPOINT,
+  normalizeNativeNvidiaProviderAttachment,
+  persistNativeNvidiaProviderAuthority,
+  resolveGatewayNativeNvidiaProviderAuthority,
+} from "./native-nvidia";
+export type { NativeNvidiaProviderAttachment } from "./native-nvidia";
 
 export const INFERENCE_ROUTE_URL = "https://inference.local/v1";
 export const NOUS_RECOMMENDED_MODELS_URL =
   "https://portal.nousresearch.com/api/nous/recommended-models";
-export const DEFAULT_CLOUD_MODEL = "nvidia/nemotron-3-super-120b-a12b";
+export const DEFAULT_CLOUD_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b";
+export const DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl";
+export const OPENROUTER_FEATURED_MODEL_ID_ALIASES: ReadonlyMap<string, string> = new Map([
+  ["nvidia/nemotron-3.5-super-vl-120b-a12b", DEFAULT_OPENROUTER_MODEL],
+]);
 // Fallback context window used when no per-model value is known. Cloud providers
 // have no per-model context metadata today (CLOUD_MODEL_OPTIONS carries only
 // id/label), so they fall back to this; matches the onboarding build default in
@@ -56,6 +110,13 @@ export const DEFAULT_HERMES_PROVIDER_MODEL = HERMES_PROVIDER_MODEL_OPTIONS[0];
 export const CLOUD_MODEL_OPTIONS = [
   { id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron 3 Ultra 550B" },
   { id: "nvidia/nemotron-3-super-120b-a12b", label: "Nemotron 3 Super 120B" },
+  { id: "nvidia/nemotron-3.5-super-vl-120b-a12b", label: "Nemotron 3.5 Super VL 120B" },
+];
+// Brev extracts literal entries from each provider array; keep these entries explicit.
+export const OPENROUTER_CLOUD_MODEL_OPTIONS = [
+  { id: "nvidia/nemotron-3-ultra-550b-a55b", label: "Nemotron 3 Ultra 550B" },
+  { id: "nvidia/nemotron-3-super-120b-a12b", label: "Nemotron 3 Super 120B" },
+  { id: "nvidia/nemotron-3.5-super-vl", label: "Nemotron 3.5 Super VL 120B" },
   { id: "minimaxai/minimax-m3", label: "Minimax M3" },
 ];
 export const DEFAULT_ROUTE_PROFILE = "inference-local";
@@ -63,8 +124,8 @@ export const DEFAULT_ROUTE_CREDENTIAL_ENV = "OPENAI_API_KEY";
 // Dedicated credential env names for local inference. Decoupled from
 // OPENAI_API_KEY so the sandbox-side OpenClaw and the host-side gateway
 // never read the user's host OpenAI key for local providers. See GH #2519.
-export const OLLAMA_LOCAL_CREDENTIAL_ENV = "NEMOCLAW_OLLAMA_PROXY_TOKEN";
-export const VLLM_LOCAL_CREDENTIAL_ENV = "NEMOCLAW_VLLM_LOCAL_TOKEN";
+export { VLLM_LOCAL_CREDENTIAL_ENV };
+export const LLAMA_CPP_LOCAL_CREDENTIAL_ENV = LLAMA_CPP_CREDENTIAL_ENV;
 export const MANAGED_PROVIDER_ID = "inference";
 export { DEFAULT_OLLAMA_MODEL };
 
@@ -93,6 +154,64 @@ export interface GatewayInference {
   model: string | null;
 }
 
+export type LlamaCppRouteDetails =
+  | { kind: "attached"; endpointUrl: typeof LLAMA_CPP_HOST_OPENAI_BASE_URL }
+  | { kind: "managed" }
+  | {
+      kind: "unavailable";
+      diagnostic: "Managed llama.cpp ownership state is unavailable.";
+      recovery: string;
+    };
+
+type LlamaCppRouteSelection = {
+  name: string;
+  provider?: string | null;
+  endpointUrl?: string | null;
+  gatewayPort?: number | null;
+  servingProfileProvenance?: { recipe?: { backend?: string } };
+  hostLocalInferenceProvenance?: unknown;
+};
+
+export type InspectManagedLlamaCppOwnership = (
+  sandboxName: string,
+  gatewayPort?: number,
+) => ManagedLlamaCppOwnership;
+
+/**
+ * Describe durable llama.cpp ownership without reading the runtime credential.
+ *
+ * An attached route exposes only the fixed, credential-free loopback endpoint.
+ *
+ * This module's other exports are pure; `inspectOwnership` is required (no
+ * default) so this file never itself performs filesystem I/O. Callers pass
+ * `inspectManagedLlamaCppOwnership` from `./llama-cpp/managed-state`.
+ */
+export function getLlamaCppRouteDetails(
+  route: LlamaCppRouteSelection | null | undefined,
+  inspectOwnership: InspectManagedLlamaCppOwnership,
+): LlamaCppRouteDetails | null {
+  if (!route || route.provider !== LLAMA_CPP_PROVIDER_NAME) return null;
+  const ownership = inspectOwnership(route.name, route.gatewayPort ?? undefined);
+  if (ownership === "owned") return { kind: "managed" };
+  if (ownership === "unknown") {
+    return {
+      kind: "unavailable",
+      diagnostic: "Managed llama.cpp ownership state is unavailable.",
+      recovery: `Run nemoclaw ${route.name} doctor. Rerun onboarding for that sandbox if the managed llama.cpp runtime check fails.`,
+    };
+  }
+  if (
+    route.servingProfileProvenance?.recipe?.backend === "install-llama-cpp" ||
+    route.hostLocalInferenceProvenance
+  ) {
+    return { kind: "managed" };
+  }
+  if (route.endpointUrl === LLAMA_CPP_HOST_OPENAI_BASE_URL) {
+    return { kind: "attached", endpointUrl: LLAMA_CPP_HOST_OPENAI_BASE_URL };
+  }
+  return null;
+}
+
 export interface SandboxInferenceConfig {
   providerKey: string;
   primaryModelRef: string;
@@ -118,18 +237,7 @@ export function resolveAgentInferenceApi(
     : preferredInferenceApi;
 }
 
-/**
- * Return the OpenAI-compatible base used when a custom Anthropic endpoint is
- * routed through the managed Chat Completions frontend. Anthropic endpoint
- * normalization intentionally strips a trailing `/v1`; OpenShell's OpenAI
- * provider appends `/chat/completions`, so restore `/v1` exactly once here.
- */
-export function getCompatibleAnthropicOpenAiSurfaceBaseUrl(
-  endpointUrl: string | null | undefined,
-): string {
-  const trimmed = String(endpointUrl ?? "").replace(/\/+$/, "");
-  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
-}
+export { getCompatibleAnthropicOpenAiSurfaceBaseUrl } from "./anthropic/openai-surface";
 
 export function getProviderSelectionConfig(
   provider: string,
@@ -137,7 +245,7 @@ export function getProviderSelectionConfig(
 ): ProviderSelectionConfig | null {
   const base: Omit<ProviderSelectionConfig, "model" | "credentialEnv" | "providerLabel"> = {
     endpointType: "custom",
-    endpointUrl: INFERENCE_ROUTE_URL,
+    endpointUrl: hostedNativeProvider(provider)?.endpoint ?? INFERENCE_ROUTE_URL,
     ncpPartner: null,
     profile: DEFAULT_ROUTE_PROFILE,
     provider,
@@ -145,6 +253,13 @@ export function getProviderSelectionConfig(
 
   switch (provider) {
     case "nvidia-prod":
+      return {
+        ...base,
+        endpointUrl: NVIDIA_HOSTED_NATIVE_ENDPOINT,
+        model: model || DEFAULT_CLOUD_MODEL,
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        providerLabel: "NVIDIA Endpoints",
+      };
     case "nvidia-nim":
       return {
         ...base,
@@ -162,7 +277,7 @@ export function getProviderSelectionConfig(
     case OPENROUTER_PROVIDER_NAME:
       return {
         ...base,
-        model: model || DEFAULT_CLOUD_MODEL,
+        model: model || DEFAULT_OPENROUTER_MODEL,
         credentialEnv: OPENROUTER_CREDENTIAL_ENV,
         providerLabel: "OpenRouter",
       };
@@ -183,7 +298,7 @@ export function getProviderSelectionConfig(
     case "gemini-api":
       return {
         ...base,
-        model: model || "gemini-2.5-flash",
+        model: model || "gemini-3.6-flash",
         credentialEnv: "GEMINI_API_KEY",
         providerLabel: "Google Gemini",
       };
@@ -215,14 +330,24 @@ export function getProviderSelectionConfig(
         credentialEnv: OLLAMA_LOCAL_CREDENTIAL_ENV,
         providerLabel: "Local Ollama",
       };
+    case "llama-cpp-local":
+      if (!model || !isSafeLlamaCppServedModelAlias(model)) return null;
+      return {
+        ...base,
+        model,
+        credentialEnv: LLAMA_CPP_LOCAL_CREDENTIAL_ENV,
+        providerLabel: "Local llama.cpp",
+      };
     default:
       return null;
   }
 }
 
 export function getOpenClawPrimaryModel(provider: string, model?: string): string {
+  const defaultCloudModel =
+    provider === OPENROUTER_PROVIDER_NAME ? DEFAULT_OPENROUTER_MODEL : DEFAULT_CLOUD_MODEL;
   const resolvedModel =
-    model || (provider === "ollama-local" ? DEFAULT_OLLAMA_MODEL : DEFAULT_CLOUD_MODEL);
+    model || (provider === "ollama-local" ? DEFAULT_OLLAMA_MODEL : defaultCloudModel);
   return getSandboxInferenceConfig(resolvedModel, provider).primaryModelRef;
 }
 
@@ -230,11 +355,35 @@ export function getSandboxInferenceConfig(
   model: string,
   provider: string | null = null,
   preferredInferenceApi: string | null = null,
+  nativeProvider?: boolean,
+  nativeEndpointUrl?: string | null,
+  agentName?: string | null,
 ): SandboxInferenceConfig {
-  let providerKey: string;
+  const nativeCustom =
+    nativeProvider === true &&
+    isCustomHostedProvider(provider) &&
+    !usesNativeLocalInference(provider, nativeEndpointUrl) &&
+    !usesNativeLocalInferenceForAgent(agentName, provider, nativeEndpointUrl);
+  const selectedApi = resolveCustomNativeApi(provider, preferredInferenceApi, nativeCustom);
+  let providerKey: string = nativeOpenClawProviderKey(provider, selectedApi) ?? MANAGED_PROVIDER_ID;
   let primaryModelRef: string;
-  let inferenceBaseUrl = INFERENCE_ROUTE_URL;
-  let inferenceApi = preferredInferenceApi || "openai-completions";
+  const useNativeProvider =
+    nativeProvider ??
+    (provider !== "hermes-provider" || usesNativeHermesEndpoint(nativeEndpointUrl));
+  const hostedNative = useNativeProvider
+    ? hostedNativeProvider(provider, nativeEndpointUrl)
+    : undefined;
+  let customEndpoint = nativeCustom ? nativeEndpointUrl : undefined;
+  if (nativeCustom && !customEndpoint)
+    throw new Error("Native custom inference is missing its recorded endpoint");
+  if (customEndpoint && provider === "compatible-anthropic-endpoint")
+    customEndpoint = isBedrockRuntimeEndpoint(customEndpoint)
+      ? BEDROCK_RUNTIME_ADAPTER_OPENAI_BASE_URL
+      : selectedApi && selectedApi !== "anthropic-messages"
+        ? getCompatibleAnthropicOpenAiSurfaceBaseUrl(customEndpoint)
+        : customEndpoint;
+  let inferenceBaseUrl = customEndpoint ?? hostedNative?.endpoint ?? INFERENCE_ROUTE_URL;
+  let inferenceApi = selectedApi || "openai-completions";
   // Providers without a /v1/responses endpoint must never be configured with the
   // Responses API. On a provider switch the runtime API resolves to null and the
   // caller falls back to the persisted (shared "inference") provider api, which
@@ -248,12 +397,15 @@ export function getSandboxInferenceConfig(
 
   switch (provider) {
     case "openai-api":
-      providerKey = "openai";
       primaryModelRef = `openai/${model}`;
       break;
     case "anthropic-prod":
     case "compatible-anthropic-endpoint":
-      if (provider === "compatible-anthropic-endpoint" && inferenceApi === "openai-completions") {
+      if (
+        provider === "compatible-anthropic-endpoint" &&
+        (inferenceApi === "openai-completions" ||
+          (nativeCustom && inferenceApi === "openai-responses"))
+      ) {
         providerKey = MANAGED_PROVIDER_ID;
         primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
         inferenceCompat = {
@@ -263,19 +415,19 @@ export function getSandboxInferenceConfig(
       }
       providerKey = "anthropic";
       primaryModelRef = `anthropic/${model}`;
-      inferenceBaseUrl = "https://inference.local";
+      inferenceBaseUrl = customEndpoint ?? hostedNative?.endpoint ?? "https://inference.local";
       inferenceApi = "anthropic-messages";
       break;
     case "gemini-api":
     case OPENROUTER_PROVIDER_NAME:
     case "hermes-provider":
-      providerKey = MANAGED_PROVIDER_ID;
       primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
       inferenceCompat = {
         supportsStore: false,
       };
       break;
     case "compatible-endpoint":
+    case "llama-cpp-local":
       providerKey = MANAGED_PROVIDER_ID;
       primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
       inferenceCompat = {
@@ -301,6 +453,13 @@ export function getSandboxInferenceConfig(
       primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
       break;
     case "nvidia-prod":
+      primaryModelRef = `${MANAGED_PROVIDER_ID}/${model}`;
+      inferenceBaseUrl = NVIDIA_HOSTED_NATIVE_ENDPOINT;
+      inferenceApi = "openai-completions";
+      inferenceCompat = {
+        supportsStore: false,
+      };
+      break;
     case "nvidia-nim":
     default:
       providerKey = MANAGED_PROVIDER_ID;
@@ -308,6 +467,15 @@ export function getSandboxInferenceConfig(
       break;
   }
 
+  if (
+    useNativeProvider &&
+    nativeEndpointUrl &&
+    usesNativeLocalInferenceForAgent(agentName, provider, nativeEndpointUrl) &&
+    nativeLocalCredentialReference(provider, nativeEndpointUrl, agentName)
+  ) {
+    inferenceBaseUrl = nativeEndpointUrl;
+    inferenceApi = "openai-completions";
+  }
   return { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat };
 }
 
@@ -342,33 +510,6 @@ export function resolveAgentProviderInferenceApi(
     provider,
     coerceAgentInferenceApi(agent, preferredInferenceApi),
   );
-}
-
-export function parseGatewayInference(output: string | null | undefined): GatewayInference | null {
-  if (!output) return null;
-  const stripped = output.replace(/\u001b\[[0-9;]*m/g, "");
-  const lines = stripped.split("\n");
-  let inGateway = false;
-  let provider: string | null = null;
-  let model: string | null = null;
-  for (const line of lines) {
-    if (/^Gateway inference:\s*$/i.test(line)) {
-      inGateway = true;
-      continue;
-    }
-    if (inGateway && /^\S.*:$/.test(line)) {
-      break;
-    }
-    if (inGateway) {
-      const trimmed = line.trim();
-      const p = trimmed.match(/^Provider:\s*(.+)/);
-      const m = trimmed.match(/^Model:\s*(.+)/);
-      if (p) provider = p[1].trim();
-      if (m) model = m[1].trim();
-    }
-  }
-  if (!provider && !model) return null;
-  return { provider, model };
 }
 
 export interface RecordedInferenceRoute {

@@ -1,138 +1,121 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
-import { resultText } from "../fixtures/clients/index.ts";
-import { expect, test } from "../fixtures/e2e-test.ts";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { resolveOpenshell } from "../../../src/lib/adapters/openshell/resolve.ts";
 import {
-  assertBraveConfig,
-  assertBraveResponse,
-  assertDockerAvailable,
-  assertOptionalBraveEnv,
-  assertRawConfigHasNoSecret,
-  cleanupBraveNemoClawSandbox,
-  cleanupBraveState,
-  commandEnv,
-  extractOpenClawAgentText,
-  onboardBrave,
-  SANDBOX_NAME,
-  sandboxShell,
-  uploadSecretForLeakCheck,
-} from "./brave-search-helpers.ts";
+  BRAVE_TEST_KEY,
+  startBraveBackend,
+  writeBraveEgressPreload,
+} from "../fixtures/brave-backend.ts";
+import { testTimeout } from "../../helpers/timeouts.ts";
+import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import { resultText } from "../fixtures/clients/command.ts";
+import { trustedSandboxShellScript } from "../fixtures/clients/sandbox.ts";
+import { expect, test } from "../fixtures/e2e-test.ts";
+import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
+import { prepareOwnedSandboxForOnboard } from "../fixtures/owned-sandbox-cleanup.ts";
+import { BRAVE_AGENT_BOUNDARY, BRAVE_SHELL_BOUNDARY } from "./brave-search-helpers.ts";
 
-const LIVE_TIMEOUT_MS = 35 * 60_000;
+const SANDBOX_NAME = "e2e-brave-search";
 
-test("Brave search preset wires policy/config, hides the real key, and performs real searches (#2687)", {
-  timeout: LIVE_TIMEOUT_MS,
-  meta: {
-    e2ePhases: [
-      "check Brave search prerequisites",
-      "onboard Brave-enabled OpenClaw sandbox",
-      "validate Brave policy and secret isolation",
-      "run Brave-backed OpenClaw search",
-      "query Brave API through credential resolver",
-    ],
+test(
+  "Brave credentials stay outside the running OpenClaw process and login shell (#7425)",
+  {
+    timeout: testTimeout(35 * 60_000),
+    meta: {
+      e2ePhases: [
+        "onboard Brave-enabled OpenClaw sandbox with synthetic credentials",
+        "inspect OpenClaw agent command credential isolation",
+        "inspect fresh login shell credential isolation",
+      ],
+    },
   },
-}, async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
-  const braveKey = secrets.required("BRAVE_API_KEY");
-  const inferenceKey = secrets.required("NVIDIA_INFERENCE_API_KEY");
-  const redactionValues = [braveKey, inferenceKey];
+  async ({ artifacts, cleanup, host, progress, runtimeProvider, sandbox, secrets }) => {
+    await artifacts.target.declare({
+      id: "brave-search",
+      boundary:
+        "real OpenShell Brave provider attachment, agent /proc environment, and fresh login shell; mocked Brave HTTP",
+      sandboxName: SANDBOX_NAME,
+      contracts: [
+        "production onboarding attaches Brave using a synthetic credential",
+        "BRAVE_API_KEY is absent or an OpenShell placeholder in the OpenClaw agent command",
+        "BRAVE_API_KEY is absent or an OpenShell placeholder in a fresh login shell",
+      ],
+    });
+    await runtimeProvider.requireAvailable({
+      artifactName: "runtime-info",
+      scenarioLabel: "Brave credential isolation",
+    });
+    const inference = requireHostedInferenceConfig(secrets);
+    const env = {
+      ...buildAvailabilityProbeEnv(),
+      ...inference.env,
+      NEMOCLAW_SANDBOX_NAME: SANDBOX_NAME,
+      NEMOCLAW_AGENT: "openclaw",
+      NEMOCLAW_NON_INTERACTIVE: "1",
+      NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
+      NEMOCLAW_WEB_SEARCH_PROVIDER: "brave",
+      BRAVE_API_KEY: BRAVE_TEST_KEY,
+      TAVILY_API_KEY: "",
+      OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
+    };
+    const openshell = resolveOpenshell();
+    assert(openshell, "OpenShell is required for Brave credential isolation");
+    const backend = await startBraveBackend(200, true);
+    cleanup.trackDisposable("remove Brave mock transport", backend.close);
+    await prepareOwnedSandboxForOnboard(host, sandbox, cleanup, SANDBOX_NAME);
+    const preload = writeBraveEgressPreload(backend.directory, openshell);
+    const redactionValues = [BRAVE_TEST_KEY, inference.apiKey];
 
-  await artifacts.target.declare({
-    id: "brave-search",
-    boundary: "source CLI onboard + OpenShell policy/config + in-sandbox OpenClaw/Brave API calls",
-    sandboxName: SANDBOX_NAME,
-    contracts: [
-      "onboard succeeds with BRAVE_API_KEY present",
-      "the brave network policy preset includes api.search.brave.com",
-      "OpenClaw web search config is enabled and selects provider=brave",
-      "the real BRAVE_API_KEY is absent from openclaw.json and sandbox shell env",
-      "OpenClaw agent can perform a Brave-backed web search",
-      "curl from inside the sandbox can query Brave using the placeholder token header",
-    ],
-  });
+    progress.phase("onboard Brave-enabled OpenClaw sandbox with synthetic credentials");
+    const onboard = await host.nemoclaw(
+      ["onboard", "--fresh", "--non-interactive", "--yes-i-accept-third-party-software"],
+      {
+        artifactName: "onboard-synthetic-brave",
+        env: {
+          ...env,
+          ...backend.env,
+          NEMOCLAW_OPENSHELL_BIN: openshell,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${JSON.stringify(preload)}`,
+        },
+        redactionValues,
+        timeoutMs: 25 * 60_000,
+      },
+    );
+    expect(onboard.exitCode, resultText(onboard)).toBe(0);
+    // These are fixture preconditions: a silently disabled provider cannot count
+    // as isolation evidence. The optional egress probe runs only after a real
+    // Brave-enabled config with a credential placeholder has been read back.
+    expect(await backend.requests()).toEqual([
+      { method: "GET", path: "/res/v1/web/search", query: "ping", count: "1", authenticated: true },
+    ]);
+    expect(fs.readFileSync(path.join(backend.directory, "brave-egress-blocked"), "utf8")).toBe(
+      "blocked\n",
+    );
 
-  const dockerInfo = await host.command("docker", ["info"], {
-    artifactName: "phase-0-docker-info",
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
-  });
-  assertDockerAvailable(dockerInfo, skip);
-
-  cleanup.trackDisposable(`delete Brave search OpenShell sandbox ${SANDBOX_NAME}`, () =>
-    sandbox.cleanupSandbox(SANDBOX_NAME, {
-      artifactName: "cleanup-openshell-delete-brave-search",
-      env: commandEnv(),
-      timeoutMs: 60_000,
-    }),
-  );
-  cleanup.trackDisposable(`destroy Brave search sandbox ${SANDBOX_NAME}`, () =>
-    cleanupBraveNemoClawSandbox(host),
-  );
-  await cleanupBraveState(host, sandbox);
-
-  progress.phase("onboard Brave-enabled OpenClaw sandbox");
-  const onboard = await onboardBrave(host, braveKey, inferenceKey);
-  expect(onboard.exitCode, resultText(onboard)).toBe(0);
-
-  progress.phase("validate Brave policy and secret isolation");
-  const policy = await sandbox.openshell(["policy", "get", "--full", SANDBOX_NAME], {
-    artifactName: "phase-2-brave-policy",
-    env: commandEnv(),
-    timeoutMs: 60_000,
-  });
-  expect(policy.exitCode, resultText(policy)).toBe(0);
-  expect(resultText(policy)).toContain("api.search.brave.com");
-
-  const config = await sandbox.exec(SANDBOX_NAME, ["cat", "/sandbox/.openclaw/openclaw.json"], {
-    artifactName: "phase-2-openclaw-config",
-    env: commandEnv(),
-    redactionValues,
-    timeoutMs: 60_000,
-  });
-  expect(config.exitCode, resultText(config)).toBe(0);
-
-  const remoteSecretFile = await uploadSecretForLeakCheck(
-    sandbox,
-    cleanup,
-    braveKey,
-    redactionValues,
-  );
-  await assertRawConfigHasNoSecret(sandbox, remoteSecretFile);
-  const placeholder = assertBraveConfig(config.stdout);
-
-  const envCheck = await sandbox.exec(
-    SANDBOX_NAME,
-    ["sh", "-lc", "printenv BRAVE_API_KEY || true"],
-    {
-      artifactName: "phase-3-sandbox-brave-env",
-      env: commandEnv(),
+    progress.phase("inspect OpenClaw agent command credential isolation");
+    const agent = await sandbox.exec(SANDBOX_NAME, ["python3", "-c", BRAVE_AGENT_BOUNDARY], {
+      artifactName: "openclaw-agent-brave-isolation",
+      env,
       redactionValues,
       timeoutMs: 30_000,
-    },
-  );
-  expect(envCheck.exitCode, resultText(envCheck)).toBe(0);
-  assertOptionalBraveEnv(envCheck.stdout, braveKey);
+    });
+    expect(agent.exitCode, resultText(agent)).toBe(0);
 
-  progress.phase("run Brave-backed OpenClaw search");
-  const agent = await sandboxShell(
-    sandbox,
-    `openclaw agent --agent main --json --session-id e2e-brave-agent-$$ -m 'Use the web search tool to find one result for the query: NVIDIA. Reply with only the title of the top result.'`,
-    { artifactName: "phase-4a-agent-web-search", timeoutMs: 150_000, redactionValues },
-  );
-  expect(resultText(agent)).not.toMatch(
-    /SsrFBlockedError|Blocked hostname|ECONNREFUSED|EAI_AGAIN|gateway unavailable|network connection error/i,
-  );
-  expect(agent.exitCode, resultText(agent)).toBe(0);
-  expect(extractOpenClawAgentText(agent.stdout), resultText(agent)).toMatch(
-    /nvidia|geforce|cuda|gpu/i,
-  );
-
-  progress.phase("query Brave API through credential resolver");
-  const curl = await sandboxShell(
-    sandbox,
-    `curl -sS --max-time 20 -G 'https://api.search.brave.com/res/v1/web/search' --data-urlencode 'q=NVIDIA' --data-urlencode 'count=1' -H 'X-Subscription-Token: ${placeholder}' -w '\nHTTP_STATUS:%{http_code}\n'`,
-    { artifactName: "phase-4b-direct-brave-curl", timeoutMs: 60_000, redactionValues },
-  );
-  assertBraveResponse(resultText(curl));
-});
+    progress.phase("inspect fresh login shell credential isolation");
+    const shell = await sandbox.execShell(
+      SANDBOX_NAME,
+      trustedSandboxShellScript(BRAVE_SHELL_BOUNDARY),
+      {
+        artifactName: "login-shell-brave-isolation",
+        env,
+        redactionValues,
+        timeoutMs: 60_000,
+      },
+    );
+    expect(shell.exitCode, resultText(shell)).toBe(0);
+  },
+);

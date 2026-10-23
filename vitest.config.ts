@@ -7,30 +7,82 @@ import path from "node:path";
 import { defineConfig, defineProject } from "vitest/config";
 
 import pluginVitestProjectOptions from "./nemoclaw/vitest.project";
-import {
-  shouldRunBranchValidationE2E,
-  shouldRunLiveE2E,
-} from "./test/e2e/fixtures/live-project-gate.ts";
+import { shouldRunLiveE2E } from "./test/e2e/fixtures/live-project-gate.ts";
 import { CliCoverageSequencer } from "./test/helpers/cli-coverage-sequencer";
-import { resolveIntegrationProjectScheduling } from "./test/helpers/integration-project-scheduling";
+import {
+  sourceCoverageExternal,
+  sourceCoveragePlugin,
+} from "./test/helpers/source-coverage-plugin";
+import {
+  resolveCliCoverageShardScheduling,
+  resolveIntegrationProjectScheduling,
+} from "./test/helpers/integration-project-scheduling";
 import { sourceLoaderNodeOptions } from "./test/helpers/source-loader-options";
 import { testTimeout } from "./test/helpers/timeouts";
 import { resolveVitestCoverageThresholds } from "./test/helpers/vitest-coverage-thresholds";
 import { resolveVitestFeedback } from "./test/helpers/vitest-feedback";
+import { installMalformedSourceMapCompatibility } from "./test/helpers/vitest-malformed-source-map-compat";
 import { vitestStateIsolation } from "./test/helpers/vitest-state-isolation";
 import { vitestWatchTriggerPatterns } from "./test/helpers/vitest-watch-triggers";
+
+installMalformedSourceMapCompatibility();
 
 const { isCi, silent } = resolveVitestFeedback();
 const LIVE_E2E_PROJECT_TIMEOUT_MS = 30 * 60 * 1000;
 const runLiveE2E = shouldRunLiveE2E();
-const runBranchValidationE2E = shouldRunBranchValidationE2E();
+const canonicalBannerBoundary = path.resolve("nemoclaw/src/shared/banner-boundary.cts");
+const canonicalCredentialFilterBoundary = path.resolve(
+  "nemoclaw/src/shared/credential-filter-boundary.cts",
+);
+const canonicalOpenShellExternalTargetBoundary = path.resolve(
+  "nemoclaw/src/shared/openshell-external-target-boundary.cts",
+);
+const canonicalOpenShellObservationBoundary = path.resolve(
+  "nemoclaw/src/shared/openshell-observation-boundary.cts",
+);
 const canonicalOpenShellPolicyBoundary = path.resolve(
   "nemoclaw/src/shared/openshell-policy-boundary.cts",
 );
-const canonicalOpenShellPolicyAlias = [
+const canonicalPortBoundary = path.resolve("nemoclaw/src/shared/port-boundary.cts");
+const canonicalPrivateNetworksBoundary = path.resolve(
+  "nemoclaw/src/shared/private-networks-boundary.cts",
+);
+const canonicalSandboxName = path.resolve("nemoclaw/src/shared/sandbox-name.cts");
+// Map the generated shared .cjs specifiers back to their .cts source so
+// source-mode test projects exercise the single source of truth rather than a
+// possibly-stale build artifact.
+const canonicalSourceAliases = [
+  {
+    find: /^.*banner-boundary\.cjs$/,
+    replacement: canonicalBannerBoundary,
+  },
+  {
+    find: /^.*credential-filter-boundary\.cjs$/,
+    replacement: canonicalCredentialFilterBoundary,
+  },
+  {
+    find: /^.*openshell-external-target-boundary\.cjs$/,
+    replacement: canonicalOpenShellExternalTargetBoundary,
+  },
+  {
+    find: /^.*openshell-observation-boundary\.cjs$/,
+    replacement: canonicalOpenShellObservationBoundary,
+  },
   {
     find: /^.*openshell-policy-boundary\.cjs$/,
     replacement: canonicalOpenShellPolicyBoundary,
+  },
+  {
+    find: /^.*port-boundary\.cjs$/,
+    replacement: canonicalPortBoundary,
+  },
+  {
+    find: /^.*private-networks-boundary\.cjs$/,
+    replacement: canonicalPrivateNetworksBoundary,
+  },
+  {
+    find: /^.*sandbox-name\.cjs$/,
+    replacement: canonicalSandboxName,
   },
 ];
 const e2ePhaseCollectionAlias =
@@ -47,6 +99,7 @@ const e2ePhaseCollectionAlias =
       ]
     : [];
 const typedSourceTransform = {
+  plugins: [sourceCoveragePlugin()],
   oxc: {
     include: /\.(?:[cm]?ts|[jt]sx)$/,
   },
@@ -63,7 +116,20 @@ const controlledNonLiveEnv = {
 // intentionally excluded below and keep their own stricter umask handling. See
 // test/helpers/normalize-fixture-umask.ts (#6448).
 const fixtureUmaskSetup = "test/helpers/normalize-fixture-umask.ts";
-const pluginVitestProject = defineProject(pluginVitestProjectOptions);
+const isolatedTestStateSetup = "test/helpers/isolate-test-state.ts";
+const pluginVitestProject = defineProject({
+  ...pluginVitestProjectOptions,
+  plugins: [sourceCoveragePlugin()],
+});
+// Pull-request jobs execute the base branch's trusted composite action, so an
+// action change in a PR cannot constrain that PR's own Vitest workers. Apply a
+// bounded cap from the validated shard environment instead; this is shared by the
+// trusted PR action and the main-branch action.
+const cliCoverageShardScheduling = resolveCliCoverageShardScheduling({
+  isCi,
+  cliShard: process.env.CLI_SHARD,
+  cliShardCount: process.env.CLI_SHARD_COUNT,
+});
 const integrationProjectScheduling = resolveIntegrationProjectScheduling({
   isCi,
   npmLifecycleEvent: process.env.npm_lifecycle_event,
@@ -73,6 +139,8 @@ const integrationProjectScheduling = resolveIntegrationProjectScheduling({
 
 export default defineConfig({
   test: {
+    server: { deps: { external: [sourceCoverageExternal] } },
+    ...cliCoverageShardScheduling,
     globalSetup: "test/helpers/vitest-temp-root.ts",
     tags: [
       {
@@ -93,10 +161,14 @@ export default defineConfig({
         test: {
           ...vitestStateIsolation,
           name: "cli",
-          alias: canonicalOpenShellPolicyAlias,
+          alias: canonicalSourceAliases,
           env: controlledNonLiveEnv,
           testTimeout: testTimeout(),
-          setupFiles: [fixtureUmaskSetup, "test/helpers/onboard-script-mocks.cjs"],
+          setupFiles: [
+            fixtureUmaskSetup,
+            isolatedTestStateSetup,
+            "test/helpers/onboard-script-mocks.cjs",
+          ],
           include: ["src/**/*.test.ts"],
           exclude: ["**/node_modules/**", "**/.claude/**"],
         },
@@ -106,24 +178,23 @@ export default defineConfig({
         test: {
           ...vitestStateIsolation,
           name: "integration",
-          alias: canonicalOpenShellPolicyAlias,
+          alias: canonicalSourceAliases,
           // Source-backed process fixtures can exceed the unit-test budget
           // when several coverage shards transpile and spawn them concurrently.
           testTimeout: testTimeout(15_000),
-          setupFiles: [fixtureUmaskSetup, "test/helpers/onboard-script-mocks.cjs"],
+          setupFiles: [
+            fixtureUmaskSetup,
+            isolatedTestStateSetup,
+            "test/helpers/onboard-script-mocks.cjs",
+          ],
           // Integration fixtures often spawn short Node programs. Coverage
-          // stays serial because concurrent source-loader forks exhaust the
-          // 7 GiB CI runner. The canonical local full suite instead runs this
-          // project as a bounded four-worker phase after the other projects.
+          // stays serial and runs after source projects because concurrent
+          // source-loader forks exhaust the 7 GiB CI runner. The canonical
+          // local full suite uses a bounded four-worker integration phase.
           ...integrationProjectScheduling,
           env: {
             ...controlledNonLiveEnv,
             NODE_OPTIONS: sourceNodeOptions,
-            // Integration fixtures exercise onboarding against controlled fake
-            // Docker state. Keep a base-image Dockerfile change in the PR from
-            // redirecting those fixtures into the real local-build guard.
-            NEMOCLAW_SANDBOX_BASE_IMAGE_REF:
-              "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           },
           include: ["test/**/*.test.{js,ts}"],
           exclude: [
@@ -133,17 +204,7 @@ export default defineConfig({
             "test/e2e/live/**",
             "test/e2e/support/**",
             "test/package-contract/**",
-            "test/install-express-prompt.test.ts",
-            "test/install-build-dependency-preflight.test.ts",
-            "test/install-clone-ref.test.ts",
-            "test/install-preflight.test.ts",
-            "test/install-preflight-docker-bootstrap.test.ts",
-            "test/install-station-dgx-os.test.ts",
-            "test/install-station-docker-repository.test.ts",
-            "test/install-station-host-preparation.test.ts",
-            "test/install-station-package-state.test.ts",
-            "test/install-station-package-transaction.test.ts",
-            "test/install-openshell-version-check.test.ts",
+            "test/installer-integration/**",
           ],
         },
       },
@@ -152,22 +213,14 @@ export default defineConfig({
         test: {
           ...vitestStateIsolation,
           name: "installer-integration",
-          alias: canonicalOpenShellPolicyAlias,
+          alias: canonicalSourceAliases,
+          // Installer fixtures spawn nested shell, Node, Python, and SSH
+          // processes. Serialize them in CI to reduce worker-pressure spawn
+          // failures. A fixture still fails when process creation fails.
+          ...integrationProjectScheduling,
           env: controlledNonLiveEnv,
-          setupFiles: [fixtureUmaskSetup],
-          include: [
-            "test/install-express-prompt.test.ts",
-            "test/install-build-dependency-preflight.test.ts",
-            "test/install-clone-ref.test.ts",
-            "test/install-preflight.test.ts",
-            "test/install-preflight-docker-bootstrap.test.ts",
-            "test/install-station-dgx-os.test.ts",
-            "test/install-station-docker-repository.test.ts",
-            "test/install-station-host-preparation.test.ts",
-            "test/install-station-package-state.test.ts",
-            "test/install-station-package-transaction.test.ts",
-            "test/install-openshell-version-check.test.ts",
-          ],
+          setupFiles: [fixtureUmaskSetup, isolatedTestStateSetup],
+          include: ["test/installer-integration/**/*.test.ts"],
           // Slow tests that spawn real bash install.sh processes. Explicit
           // project selection keeps them out of the fast source-test command.
         },
@@ -177,9 +230,9 @@ export default defineConfig({
         test: {
           ...vitestStateIsolation,
           name: "package-contract",
-          alias: canonicalOpenShellPolicyAlias,
+          alias: canonicalSourceAliases,
           env: controlledNonLiveEnv,
-          setupFiles: [fixtureUmaskSetup],
+          setupFiles: [fixtureUmaskSetup, isolatedTestStateSetup],
           include: ["test/package-contract/**/*.test.ts"],
         },
       },
@@ -191,10 +244,14 @@ export default defineConfig({
           // Fast tests for the E2E fixture/support layer. Vitest remains the
           // only harness; this project does not define a separate runner.
           name: "e2e-support",
-          alias: canonicalOpenShellPolicyAlias,
+          alias: canonicalSourceAliases,
           env: controlledNonLiveEnv,
           testTimeout: testTimeout(),
-          setupFiles: [fixtureUmaskSetup, "test/helpers/onboard-script-mocks.cjs"],
+          setupFiles: [
+            fixtureUmaskSetup,
+            isolatedTestStateSetup,
+            "test/helpers/onboard-script-mocks.cjs",
+          ],
           include: ["test/e2e/support/**/*.test.ts"],
         },
       },
@@ -202,7 +259,7 @@ export default defineConfig({
         ...typedSourceTransform,
         test: {
           name: "e2e-live",
-          alias: [...canonicalOpenShellPolicyAlias, ...e2ePhaseCollectionAlias],
+          alias: [...canonicalSourceAliases, ...e2ePhaseCollectionAlias],
           // Register the typed-source require hook in the worker so live suites
           // can import source modules that resolve siblings via a runtime
           // `require("../module")` (e.g. inference/ollama-runtime-context.ts).
@@ -210,9 +267,9 @@ export default defineConfig({
           // and never leaks `--require` into the real CLI subprocesses under
           // test. Mirrors the `cli` project.
           //
-          // Intentionally excludes the fixture-umask setup: live E2E has no
-          // guard-fixture suites and handles real credentials, so it must keep
-          // the caller's umask (and sets its own strict `umask 077` inline).
+          // Intentionally excludes the fixture-umask setup: live E2E keeps the
+          // caller's umask. Each target that writes credential-bearing files
+          // must set `umask 077` before creating those files.
           setupFiles: ["test/helpers/onboard-script-mocks.cjs"],
           testTimeout: testTimeout(LIVE_E2E_PROJECT_TIMEOUT_MS),
           // Live targets mutate host, Docker, gateway, and sandbox state. A
@@ -227,35 +284,10 @@ export default defineConfig({
           //   NEMOCLAW_RUN_LIVE_E2E=1 npx vitest run --project e2e-live
         },
       },
-      {
-        ...typedSourceTransform,
-        test: {
-          name: "e2e-branch-validation",
-          alias: canonicalOpenShellPolicyAlias,
-          // A branch-validation retry must provision a fresh remote instance.
-          // Retrying a stateful target inside one VM can overlap a timed-out
-          // installer that still legitimately owns the onboarding lock.
-          retry: 0,
-          include: runBranchValidationE2E ? ["test/e2e/brev-e2e.test.ts"] : [],
-          // Branch validation E2E: bootstraps a generic Brev instance, rsyncs
-          // the selected source revision, and runs the selected test suites.
-          // It does not exercise a published NemoClaw Launchable image.
-          // Only run when explicitly enabled:
-          //   NEMOCLAW_RUN_BRANCH_VALIDATION_E2E=1 npx vitest run --project e2e-branch-validation
-          //
-          // The reusable workflow passes `--silent=false --reporter=default`:
-          // diagnostic output from createBrevInstance / waitForSsh /
-          // waitForBootstrapReady is essential for debugging provisioning
-          // timing, and the suite has no routine test chatter to suppress.
-          // Gate on a workflow-owned sentinel or Brev auth env. Historically
-          // this used BREV_API_TOKEN (short-lived refresh token); newer
-          // workflows authenticate with BREV_API_KEY + BREV_ORG_ID before
-          // invoking Vitest.
-        },
-      },
     ],
     coverage: {
-      provider: "v8",
+      provider: "custom",
+      customProviderModule: "./test/helpers/source-coverage-provider.mts",
       include: ["src/**/*.ts", "bin/**/*.js", "nemoclaw/src/**/*.ts", "nemoclaw/src/**/*.cts"],
       exclude: ["**/*.test.ts", "dist/**"],
       reporter: ["text-summary", "json-summary"],

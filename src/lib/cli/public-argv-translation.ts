@@ -5,7 +5,7 @@ import {
   getRegisteredOclifCommandMetadata,
   getRegisteredOclifCommandsMetadata,
 } from "./oclif-metadata";
-import { globalRouteTokenVariants, sandboxRouteTokens } from "./public-route-metadata";
+import { globalRouteTokenVariants, sandboxRouteTokenVariants } from "./public-route-metadata";
 
 export type NativeArgvTranslation = {
   kind: "nativeArgv";
@@ -52,10 +52,9 @@ function sandboxRoutes(): SandboxRoute[] {
   return [...commandIds]
     .filter((commandId) => commandId.startsWith("sandbox:"))
     .filter((commandId) => !hasChildCommand(commandId, commandIds))
-    .map((commandId) => ({
-      commandId,
-      publicTokens: sandboxRouteTokens(commandId) ?? [],
-    }))
+    .flatMap((commandId) =>
+      sandboxRouteTokenVariants(commandId).map((publicTokens) => ({ commandId, publicTokens })),
+    )
     .filter((route) => route.publicTokens.length > 0)
     .sort((a, b) => b.publicTokens.length - a.publicTokens.length);
 }
@@ -78,6 +77,20 @@ function globalRoutes(): GlobalRoute[] {
 
 function startsWithTokens(tokens: readonly string[], prefix: readonly string[]): boolean {
   return prefix.every((token, index) => tokens[index] === token);
+}
+
+function matchRegisteredSandboxRoute(tokens: readonly string[]): SandboxRoute | null {
+  return sandboxRoutes().find((route) => startsWithTokens(tokens, route.publicTokens)) ?? null;
+}
+
+/**
+ * Return the longest registered sandbox route that prefixes the public input.
+ *
+ * Diagnostics use these registered tokens so untrusted action arguments never
+ * reach terminal or log output (#10212).
+ */
+export function matchSandboxRoute(tokens: readonly string[]): string[] | null {
+  return matchRegisteredSandboxRoute(tokens)?.publicTokens ?? null;
 }
 
 function nativeArgv(commandId: string, args: string[], argv?: string[]): NativeArgvTranslation {
@@ -105,14 +118,26 @@ function isHelpToken(token: string | undefined): boolean {
   return token === "help" || token === "--help" || token === "-h";
 }
 
-function nativeGlobalParentArgv(cmd: string, args: string[]): NativeArgvTranslation {
+/**
+ * Dispatch help only to a registered parent; otherwise return registered action names.
+ * Untrusted action arguments must not appear in usage diagnostics.
+ */
+function nativeGlobalParentArgv(
+  cmd: string,
+  args: string[],
+  subcommands: string[],
+): PublicTranslationResult {
   const subcommand = args[0];
-  if (!subcommand || isHelpToken(subcommand)) {
+  if ((!subcommand || isHelpToken(subcommand)) && getRegisteredOclifCommandMetadata(cmd) !== null) {
     return nativeArgv(cmd, ["--help"], [cmd, "--help"]);
   }
-  return nativeArgv(`${cmd}:${subcommand}`, args.slice(1), [cmd, ...args]);
+  return {
+    kind: "publicUsageError",
+    lines: [`${cmd} <subcommand>`, "Subcommands:", ...subcommands],
+  };
 }
 
+/** Preserve sandbox parent passthrough and help semantics independently of global usage errors. */
 function nativeSandboxParentArgv(
   sandboxName: string,
   action: string,
@@ -135,20 +160,27 @@ function nativeSandboxParentArgv(
   );
 }
 
+/** Derive dispatch and parent usage from the same registered public routes. */
 export function translatePublicGlobalArgv(cmd: string, args: string[]): PublicTranslationResult {
   const inputTokens = [cmd, ...args];
+  const subcommands: string[] = [];
   for (const route of globalRoutes()) {
-    if (!startsWithTokens(inputTokens, route.tokens)) continue;
-    return nativeArgv(route.commandId, inputTokens.slice(route.tokens.length));
+    if (startsWithTokens(inputTokens, route.tokens)) {
+      return nativeArgv(route.commandId, inputTokens.slice(route.tokens.length));
+    }
+    if (route.tokens[0] === cmd && route.tokens.length > 1) {
+      subcommands.push(route.tokens.slice(1).join(" "));
+    }
   }
 
-  if (cmd === "agents" || cmd === "tunnel" || cmd === "inference" || cmd === "credentials") {
-    return nativeGlobalParentArgv(cmd, args);
+  if (subcommands.length > 0) {
+    return nativeGlobalParentArgv(cmd, args, subcommands);
   }
 
   return { kind: "publicUsageError", lines: [] };
 }
 
+/** Resolve sandbox aliases and registered routes while retaining the sandbox name in native arguments. */
 export function translatePublicSandboxArgv(
   sandboxName: string,
   action: string,
@@ -163,8 +195,8 @@ export function translatePublicSandboxArgv(
   }
 
   const inputTokens = [action, ...actionArgs];
-  for (const route of sandboxRoutes()) {
-    if (!startsWithTokens(inputTokens, route.publicTokens)) continue;
+  const route = matchRegisteredSandboxRoute(inputTokens);
+  if (route) {
     const remainingArgs = inputTokens.slice(route.publicTokens.length);
     return nativeArgv(route.commandId, [sandboxName, ...remainingArgs]);
   }

@@ -4,7 +4,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { assertNoPerAgentMaxSpawnDepth } from "../extra-agents-validation";
 import { isObjectRecord } from "../core/json-types";
+
+// Keep the onboarding command on this existing manifest facade. Importing the
+// shared validator there directly would exceed command.ts's fan-out budget.
+export { assertNoPerAgentMaxSpawnDepthJson } from "../extra-agents-validation";
 
 // Load YAML lazily via require to match the rest of the onboard pipeline
 // (see src/lib/sandbox/config.ts and src/lib/policy/index.ts). Importing
@@ -103,15 +108,6 @@ export interface AgentsManifestPayload {
   main?: unknown;
 }
 
-/**
- * Load and shallow-shape-check the agents manifest YAML. Heavy validation
- * (shape of each agent entry, model-ref/provider match, allowlists) lives
- * at the build-time validator in scripts/generate-openclaw-config.mts so
- * the build is the single source of truth for structured errors. We only
- * surface obvious early errors (missing file, top-level shape) and
- * auto-fill canonical workspace/agentDir paths from the agent id so the
- * caller can write a terse YAML.
- */
 export function loadAgentsManifest(filePath: string): AgentsManifestPayload {
   const resolved = path.resolve(filePath);
   let raw: string;
@@ -169,18 +165,29 @@ export function loadAgentsManifest(filePath: string): AgentsManifestPayload {
     out.main = parsed.main;
   }
   assertNoCredentialFields(out, "agents-manifest");
+  assertNoPerAgentMaxSpawnDepth(out);
   return out;
 }
 
-/**
- * Read the manifest at `filePath` and set `NEMOCLAW_EXTRA_AGENTS_JSON` so
- * the downstream Dockerfile patcher can base64-encode and bake it. The
- * patcher does not parse or shape-check the payload (that is the build
- * validator's job), so structured errors raised here would mask the
- * authoritative build-time errors; we keep host-side checks light.
- */
-export function applyAgentsManifestEnv(filePath: string): AgentsManifestPayload {
+// Only a freshly validated operator selection establishes model source. Retained
+// rebuild environment data must not create a new selection receipt.
+const selectedManifests = new WeakMap<NodeJS.ProcessEnv, AgentsManifestPayload>();
+
+export function takeSelectedAgentsManifest(
+  env: NodeJS.ProcessEnv = process.env,
+): AgentsManifestPayload | null {
+  const payload = selectedManifests.get(env) ?? null;
+  selectedManifests.delete(env);
+  return payload;
+}
+
+export function applyAgentsManifestEnv(
+  filePath: string,
+  env: NodeJS.ProcessEnv = process.env,
+): AgentsManifestPayload {
+  selectedManifests.delete(env);
   const payload = loadAgentsManifest(filePath);
-  process.env.NEMOCLAW_EXTRA_AGENTS_JSON = JSON.stringify(payload);
+  env.NEMOCLAW_EXTRA_AGENTS_JSON = JSON.stringify(payload);
+  selectedManifests.set(env, payload);
   return payload;
 }

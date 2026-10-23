@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { D, R } from "../../cli/terminal-style";
+import { unsafeEndpointUrlViolation } from "../../core/endpoint-url-safety";
+import { OLLAMA_LOCAL_CREDENTIAL_ENV } from "../../inference/ollama/contract";
 import type { InferenceSelection } from "../../inference/selection";
+import {
+  isLegacyRecordedLoopbackNoAuthCompatibleEndpointUrl,
+  isLoopbackNoAuthCompatibleEndpointUrl,
+} from "../../onboard/inference-providers/compatible-endpoint-gateway-route";
 import type { RegistryInferenceRoute } from "../../onboard/rebuild-route-handoff";
 import { isRecoveredProviderCredentialReuseSelectionKey } from "../../onboard/recovered-provider-reuse";
 import {
@@ -77,8 +83,17 @@ function providerRecordedCredentialEnv(
 export function getRebuildCredentialEnvFromRegistry(
   provider: string | null | undefined,
   recordedCredentialEnv?: string | null,
+  recordedEndpointUrl?: string | null,
 ): string | null {
   if (!provider || isLocalInferenceProvider(provider)) return null;
+  if (
+    provider === "compatible-endpoint" &&
+    recordedCredentialEnv === OLLAMA_LOCAL_CREDENTIAL_ENV &&
+    (isLoopbackNoAuthCompatibleEndpointUrl(provider, recordedEndpointUrl) ||
+      isLegacyRecordedLoopbackNoAuthCompatibleEndpointUrl(provider, recordedEndpointUrl))
+  ) {
+    return OLLAMA_LOCAL_CREDENTIAL_ENV;
+  }
   const remoteConfig = canonicalRemoteProviderConfig(provider);
   if (remoteConfig?.credentialEnv) return remoteConfig.credentialEnv;
   return providerRecordedCredentialEnv(provider, recordedCredentialEnv);
@@ -97,13 +112,13 @@ const SESSION_ONLY_ENDPOINT_PROVIDER_NAMES = new Set(
 
 export function canonicalCustomEndpointUrl(value: string | null | undefined): string | null {
   const raw = typeof value === "string" ? value.trim() : "";
+  // #9106/#9301: reject unsafe endpoint metadata instead of stripping or
+  // forwarding it, matching onboarding intake.
+  if (unsafeEndpointUrlViolation(value)) return null;
   try {
     const url = new URL(raw);
     const supportedProtocol = url.protocol === "http:" || url.protocol === "https:";
-    const hasUserInfo = Boolean(url.username || url.password);
-    if (!supportedProtocol || hasUserInfo) return null;
-    url.search = "";
-    url.hash = "";
+    if (!supportedProtocol) return null;
     const pathname = url.pathname.replace(/\/+$/, "");
     url.pathname = pathname || "/";
     return url.pathname === "/" ? url.origin : `${url.origin}${url.pathname}`;
@@ -195,7 +210,7 @@ export function assessRebuildAmbientEnv(
   return ambient;
 }
 
-/** Compute the credential, endpoint, and durable route inputs for rebuild preflight. */
+/** Compute endpoint and durable route inputs before final credential resolution. */
 export function assessRebuildInferencePreflight(options: {
   sandboxName: string;
   sessionMatchesSandbox: boolean;
@@ -203,7 +218,6 @@ export function assessRebuildInferencePreflight(options: {
   trustedSelection: InferenceSelection;
   env?: NodeJS.ProcessEnv;
 }): {
-  credentialEnv: string | null;
   rebuildEndpoint: RebuildEndpoint;
   explicitTargetEndpoint: string | null;
   registryInferenceRoute: RegistryInferenceRoute | null;
@@ -222,10 +236,6 @@ export function assessRebuildInferencePreflight(options: {
         )
       : null;
   return {
-    credentialEnv: getRebuildCredentialEnvFromRegistry(
-      options.trustedSelection.provider,
-      options.trustedSelection.credentialEnv,
-    ),
     rebuildEndpoint,
     explicitTargetEndpoint,
     registryInferenceRoute: getRegistryInferenceRoute(options.registrySelection, rebuildEndpoint),

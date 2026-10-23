@@ -1,31 +1,57 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import type { NativeProviderAttachment } from "../inference/native-provider/contract";
+import { isNativeHostedProviderName } from "../inference/native-provider/hosted-attachment";
+import { buildNativeHostedSandboxPolicy } from "../inference/native-provider/network-policy";
+
 import fs from "node:fs";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import YAML from "yaml";
 
 import { isObjectRecord } from "../core/json-types";
+import { NVIDIA_HOSTED_NATIVE_PROVIDER } from "../inference/native-nvidia/contract";
+import { buildNativeNvidiaSandboxPolicy } from "../inference/native-nvidia/network-policy";
 import { getMessagingPolicyKeysByChannel } from "../messaging/channels";
+import type { MessagingChannelConfig } from "../messaging-channel-config";
 import * as policies from "../policy";
+import {
+  collectPlatformIdentity,
+  type PlatformIdentity,
+} from "../readiness/platform-qualification";
+import {
+  isQualifiedStationProfile,
+  isQualifiedStationRuntime,
+  isStationGb300PciDevice,
+  isStationGb300ProductName,
+  type StationProfile,
+} from "../readiness/station-qualification";
 import {
   allMessagingChannelPolicyPresets,
   requiredMessagingChannelPolicyPresets,
 } from "./messaging-policy-presets";
 import { requiredOpenclawOtelPolicyPresets } from "./openclaw-otel-policy-presets";
 import { filterSuppressedAgentRequiredPresets } from "./policy-tier-suppression";
-import { cleanupTempDir, secureTempFile } from "./temp-files";
+import { cleanupTempDir, createExactTempFileCleanup, secureTempFile } from "./temp-files";
+import { isPortableExperimentalProfile } from "./experimental/portable-profile";
 
 export type InitialSandboxPolicy = {
   policyPath: string;
   appliedPresets: string[];
+  /** Exact provider names referenced by credential-bound endpoints in this policy. */
+  credentialBindingProviders?: string[];
+  sourceBytes?: Buffer;
   cleanup?: () => boolean;
+  cleanupExact?: () => boolean;
 };
 
 export function discloseInitialSandboxPolicy(policy: InitialSandboxPolicy): void {
   if (policy.appliedPresets.length === 0) return;
   console.log("  Including policy preset(s) at sandbox boot:", policy.appliedPresets.join(", "));
-  policies.logPresetScope(fs.readFileSync(policy.policyPath, "utf8"));
+  policies.logPresetScope(
+    policy.sourceBytes?.toString("utf8") ?? fs.readFileSync(policy.policyPath, "utf8"),
+  );
 }
 
 const HERMES_MESSAGING_POLICY_KEYS = getMessagingPolicyKeysByChannel({ agent: "hermes" });
@@ -33,10 +59,7 @@ const HERMES_MESSAGING_POLICY_KEYS = getMessagingPolicyKeysByChannel({ agent: "h
 const PROC_PATH = "/proc";
 const PROC_COMM_READ_WRITE_PATHS = ["/proc/self/comm", "/proc/self/task/*/comm"];
 const SYSFS_PATH = "/sys";
-const DMI_PRODUCT_NAME_PATH = "/sys/class/dmi/id/product_name";
 const PCI_BDF_PATTERN = /^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/iu;
-const NVIDIA_PCI_VENDOR = "0x10de";
-const DISPLAY_PCI_CLASS_PATTERN = /^0x03[0-9a-f]{4}$/iu;
 const STATION_GB300_SHARED_SYSFS_RELATIVE_PATHS = [
   "devices/system/cpu",
   "devices/system/memory",
@@ -67,9 +90,7 @@ type DirectGpuPolicyOptions = {
   sysfsReadOnlyPaths?: readonly string[];
 };
 
-export function isStationGb300ProductName(productName: string): boolean {
-  return /(?:^|[^A-Za-z0-9])Station[\s_-]+GB300(?:$|[^A-Za-z0-9])/iu.test(productName.trim());
-}
+export { isStationGb300ProductName };
 
 function readTrimmedFile(filePath: string): string | null {
   try {
@@ -82,8 +103,14 @@ function readTrimmedFile(filePath: string): string | null {
 export function discoverStationGb300SysfsReadOnlyPaths(
   productName: string,
   sysfsRoot = SYSFS_PATH,
+  stationProfile?: StationProfile | null,
 ): string[] {
   if (!isStationGb300ProductName(productName)) return [];
+  if (stationProfile !== undefined && !isQualifiedStationProfile(stationProfile)) {
+    throw new Error(
+      "Cannot prepare Station GB300 direct GPU sandbox policy; the Station software profile is unsupported or unknown.",
+    );
+  }
 
   const readOnlyPaths: string[] = [];
   const pciDevicesRoot = path.join(sysfsRoot, "bus", "pci", "devices");
@@ -93,18 +120,24 @@ export function discoverStationGb300SysfsReadOnlyPaths(
   } catch {
     // A Station image without PCI sysfs cannot use the scoped GPU exception.
   }
+  if (pciDeviceNames.length > 256) {
+    throw new Error(
+      `Cannot prepare Station GB300 direct GPU sandbox policy; more than 256 PCI entries were found under ${pciDevicesRoot}.`,
+    );
+  }
   for (const pciDeviceName of pciDeviceNames) {
     if (!PCI_BDF_PATTERN.test(pciDeviceName)) continue;
     const pciDeviceRoot = path.join(pciDevicesRoot, pciDeviceName);
     const vendor = readTrimmedFile(path.join(pciDeviceRoot, "vendor"))?.toLowerCase();
+    const device = readTrimmedFile(path.join(pciDeviceRoot, "device"))?.toLowerCase();
     const pciClass = readTrimmedFile(path.join(pciDeviceRoot, "class"));
-    if (vendor === NVIDIA_PCI_VENDOR && pciClass && DISPLAY_PCI_CLASS_PATTERN.test(pciClass)) {
+    if (isStationGb300PciDevice(vendor, device, pciClass)) {
       readOnlyPaths.push(`${SYSFS_PATH}/bus/pci/devices/${pciDeviceName}`);
     }
   }
   if (readOnlyPaths.length === 0) {
     throw new Error(
-      `Cannot prepare Station GB300 direct GPU sandbox policy; no NVIDIA display-class PCI device was found under ${pciDevicesRoot}.`,
+      `Cannot prepare Station GB300 direct GPU sandbox policy; no exact NVIDIA GB300 PCI device was found under ${pciDevicesRoot}.`,
     );
   }
 
@@ -116,10 +149,48 @@ export function discoverStationGb300SysfsReadOnlyPaths(
   return readOnlyPaths;
 }
 
-function discoverHostStationGb300SysfsReadOnlyPaths(): string[] {
-  if (process.platform !== "linux") return [];
-  const productName = readTrimmedFile(DMI_PRODUCT_NAME_PATH);
-  return productName ? discoverStationGb300SysfsReadOnlyPaths(productName) : [];
+export function discoverHostStationGb300SysfsReadOnlyPaths(
+  options: {
+    platform?: string;
+    architecture?: string;
+    hasNvidiaGpu?: boolean;
+    identity?: PlatformIdentity;
+    sysfsRoot?: string;
+  } = {},
+): string[] {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "linux") return [];
+  const identity = options.identity ?? collectPlatformIdentity();
+  if (identity.nvidiaPlatform !== "station") return [];
+  const stationFirmwareProduct = identity.stationFirmwareProduct ?? identity.productName;
+  if (!stationFirmwareProduct || !isStationGb300ProductName(stationFirmwareProduct)) {
+    throw new Error(
+      "Cannot prepare Station GB300 direct GPU sandbox policy; the detected Station product is not a qualified GB300 system.",
+    );
+  }
+  if (!isQualifiedStationProfile(identity.stationProfile)) {
+    throw new Error(
+      "Cannot prepare Station GB300 direct GPU sandbox policy; the Station software profile is unsupported or unknown.",
+    );
+  }
+  if (
+    !isQualifiedStationRuntime({
+      platform,
+      architecture: options.architecture ?? process.arch,
+      osId: identity.osId,
+      osVersionId: identity.osVersionId,
+      hasNvidiaGpu: options.hasNvidiaGpu ?? identity.stationGb300PciGpu === true,
+    })
+  ) {
+    throw new Error(
+      "Cannot prepare Station GB300 direct GPU sandbox policy; Linux ARM64, Ubuntu 24.04, and an available GB300 GPU are required.",
+    );
+  }
+  return discoverStationGb300SysfsReadOnlyPaths(
+    stationFirmwareProduct,
+    options.sysfsRoot ?? SYSFS_PATH,
+    identity.stationProfile,
+  );
 }
 
 export function buildDirectGpuPolicyYaml(
@@ -220,24 +291,26 @@ export type DirectSandboxGpuProofCommand = {
 
 export function buildDirectSandboxGpuProofCommands(
   sandboxName: string,
+  gatewayName?: string,
 ): DirectSandboxGpuProofCommand[] {
+  const exec = ["sandbox", "exec", ...(gatewayName ? ["-g", gatewayName] : []), "-n", sandboxName];
   return [
     {
       id: "nvidia-smi",
       label: "nvidia-smi when available",
-      args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", NVIDIA_SMI_OPTIONAL_PROBE],
+      args: [...exec, "--", "sh", "-lc", NVIDIA_SMI_OPTIONAL_PROBE],
     },
     {
       id: "proc-comm-write",
       label: "/proc/<pid>/task/<tid>/comm write",
       optional: true,
-      args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", PROC_COMM_WRITE_PROBE],
+      args: [...exec, "--", "sh", "-lc", PROC_COMM_WRITE_PROBE],
     },
     {
       id: "cuda-init",
       label: "cuInit(0) via libcuda.so.1",
       optional: true,
-      args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", CUDA_INIT_PROBE],
+      args: [...exec, "--", "sh", "-lc", CUDA_INIT_PROBE],
     },
   ];
 }
@@ -253,26 +326,38 @@ function createPolicyTempCleanup(policyPath: string, expectedPrefix: string): ()
   };
 }
 
-function prepareDirectGpuSandboxPolicy(
-  basePolicyPath: string,
-  options: DirectGpuPolicyOptions = {},
-): InitialSandboxPolicy {
-  const basePolicy = fs.readFileSync(basePolicyPath, "utf-8");
-  const policyPath = secureTempFile("nemoclaw-gpu-policy", ".yaml");
-  const cleanup = createPolicyTempCleanup(policyPath, "nemoclaw-gpu-policy");
-  try {
-    fs.writeFileSync(policyPath, buildDirectGpuPolicyYaml(basePolicy, options), {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-  } catch (error) {
-    cleanup();
-    throw error;
-  }
-  return {
-    policyPath,
-    appliedPresets: [],
-    cleanup,
+type InitialPolicyOptions = {
+  inferenceProvider?: string | null;
+  nativeHostedProviderAttachment?: NativeProviderAttachment;
+  directGpu?: boolean;
+  dockerGpuPatch?: boolean;
+  hostGpuAvailable?: boolean;
+  stationGb300SysfsReadOnlyPaths?: readonly string[];
+  additionalPresets?: string[];
+  agentName?: string | null;
+  sandboxName?: string;
+  policyTier?: string | null;
+  messagingConfig?: MessagingChannelConfig | null;
+};
+
+type PolicyMaterializer = (content: string, prefix: string) => InitialSandboxPolicy;
+
+function createTempPolicyMaterializer(exactCleanup: boolean): PolicyMaterializer {
+  return (content, prefix) => {
+    const policyPath = secureTempFile(prefix, ".yaml");
+    const cleanup = createPolicyTempCleanup(policyPath, prefix);
+    try {
+      fs.writeFileSync(policyPath, content, { encoding: "utf-8", mode: 0o600 });
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+    return {
+      policyPath,
+      appliedPresets: [],
+      cleanup,
+      ...(exactCleanup ? { cleanupExact: createExactTempFileCleanup(policyPath, prefix) } : {}),
+    };
   };
 }
 
@@ -287,6 +372,32 @@ export function getNetworkPolicyNames(policyContent: string): Set<string> | null
   } catch {
     return null;
   }
+}
+
+export function getCredentialBindingProviders(policyContent: string): string[] {
+  const parsed = YAML.parse(policyContent);
+  if (!isObjectRecord(parsed) || !isObjectRecord(parsed.network_policies)) return [];
+
+  const providers = new Set<string>();
+  for (const policy of Object.values(parsed.network_policies)) {
+    if (!isObjectRecord(policy) || !Array.isArray(policy.endpoints)) continue;
+    for (const endpoint of policy.endpoints) {
+      if (!isObjectRecord(endpoint) || endpoint.credential_binding === undefined) continue;
+      const binding = endpoint.credential_binding;
+      if (
+        !isObjectRecord(binding) ||
+        typeof binding.provider !== "string" ||
+        binding.provider.length === 0 ||
+        binding.provider.trim() !== binding.provider
+      ) {
+        throw new Error(
+          "Cannot prepare sandbox create policy; a credential binding has no exact provider name.",
+        );
+      }
+      providers.add(binding.provider);
+    }
+  }
+  return [...providers];
 }
 
 function filterHermesInactiveMessagingPolicies(
@@ -321,29 +432,67 @@ function isHermesPolicyPath(policyPath: string): boolean {
   return /(^|\/)agents\/hermes\/policy-additions\.yaml$/.test(normalized);
 }
 
-export function prepareInitialSandboxCreatePolicy(
+function resolveInitialSandboxCreatePolicy(
   basePolicyPath: string,
   activeMessagingChannels: string[],
-  options: {
-    directGpu?: boolean;
-    dockerGpuPatch?: boolean;
-    stationGb300SysfsReadOnlyPaths?: readonly string[];
-    additionalPresets?: string[];
-    agentName?: string | null;
-    policyTier?: string | null;
-  } = {},
+  options: InitialPolicyOptions,
+  resolution: {
+    readonly materialize: PolicyMaterializer;
+    readonly exactCleanup: boolean;
+    readonly includeSourceBytes: boolean;
+    readonly initialContent?: string;
+  },
 ): InitialSandboxPolicy {
-  const directGpuPolicy = options.directGpu
-    ? prepareDirectGpuSandboxPolicy(basePolicyPath, {
+  const { materialize, exactCleanup, includeSourceBytes, initialContent } = resolution;
+  let basePolicy = initialContent ?? fs.readFileSync(basePolicyPath, "utf-8");
+  let effectivePolicy: InitialSandboxPolicy = {
+    policyPath: basePolicyPath,
+    appliedPresets: [],
+    ...(includeSourceBytes ? { sourceBytes: Buffer.from(basePolicy) } : {}),
+  };
+  const cleanupFns: Array<() => boolean> = [];
+  const exactCleanupFns: Array<() => boolean> = [];
+  const adoptPolicy = (content: string, prefix: string): void => {
+    const next = materialize(content, prefix);
+    if (next.cleanup) cleanupFns.push(next.cleanup);
+    if (next.cleanupExact) exactCleanupFns.push(next.cleanupExact);
+    effectivePolicy = next;
+    basePolicy = content;
+  };
+  if (options.directGpu) {
+    adoptPolicy(
+      buildDirectGpuPolicyYaml(basePolicy, {
         procReadWrite: options.dockerGpuPatch === true,
         sysfsReadOnlyPaths:
-          options.stationGb300SysfsReadOnlyPaths ?? discoverHostStationGb300SysfsReadOnlyPaths(),
-      })
-    : null;
-  let effectiveBasePolicyPath = directGpuPolicy?.policyPath || basePolicyPath;
-  const cleanupFns = directGpuPolicy?.cleanup ? [directGpuPolicy.cleanup] : [];
+          options.stationGb300SysfsReadOnlyPaths ??
+          discoverHostStationGb300SysfsReadOnlyPaths({
+            hasNvidiaGpu: options.hostGpuAvailable,
+          }),
+      }),
+      "nemoclaw-gpu-policy",
+    );
+  }
   const buildCleanup = () =>
     cleanupFns.length > 0 ? () => cleanupFns.map((cleanup) => cleanup()).every(Boolean) : undefined;
+  const buildExactCleanup = () =>
+    exactCleanupFns.length > 0
+      ? () =>
+          [...exactCleanupFns]
+            .reverse()
+            .map((cleanup) => cleanup())
+            .every(Boolean)
+      : undefined;
+  const exactCleanupResult = () => (exactCleanup ? { cleanupExact: buildExactCleanup() } : {});
+  const result = (appliedPresets: string[]): InitialSandboxPolicy => {
+    const credentialBindingProviders = getCredentialBindingProviders(basePolicy);
+    return {
+      ...effectivePolicy,
+      appliedPresets,
+      ...(credentialBindingProviders.length > 0 ? { credentialBindingProviders } : {}),
+      cleanup: buildCleanup(),
+      ...exactCleanupResult(),
+    };
+  };
   const cleanupOnError = () => {
     for (const cleanup of [...cleanupFns].reverse()) {
       try {
@@ -354,6 +503,19 @@ export function prepareInitialSandboxCreatePolicy(
     }
   };
   try {
+    if (options.inferenceProvider === NVIDIA_HOSTED_NATIVE_PROVIDER) {
+      adoptPolicy(buildNativeNvidiaSandboxPolicy(basePolicy), "nemoclaw-native-inference-policy");
+    }
+    if (options.inferenceProvider && isNativeHostedProviderName(options.inferenceProvider)) {
+      adoptPolicy(
+        buildNativeHostedSandboxPolicy(
+          basePolicy,
+          options.inferenceProvider,
+          options.nativeHostedProviderAttachment,
+        ),
+        "nemoclaw-native-hosted-inference-policy",
+      );
+    }
     // Fail closed: the OpenClaw OTEL preset is added at create time only when the
     // selected policy tier is known and is not Restricted. When the tier is null
     // (interactive flow that selects later) the preset is deferred to the
@@ -385,54 +547,41 @@ export function prepareInitialSandboxCreatePolicy(
     );
     const dedupe = (values: string[]) => [...new Set(values.filter(Boolean))];
 
-    let basePolicy = fs.readFileSync(effectiveBasePolicyPath, "utf-8");
     if (isHermesPolicy) {
       const filtered = filterHermesInactiveMessagingPolicies(basePolicy, activeMessagingChannels);
       if (filtered.changed) {
-        const policyPath = secureTempFile("nemoclaw-agent-policy", ".yaml");
-        cleanupFns.push(createPolicyTempCleanup(policyPath, "nemoclaw-agent-policy"));
-        fs.writeFileSync(policyPath, filtered.content, { encoding: "utf-8", mode: 0o600 });
-        effectiveBasePolicyPath = policyPath;
-        basePolicy = filtered.content;
+        adoptPolicy(filtered.content, "nemoclaw-agent-policy");
       }
     }
 
     const basePolicyNames = getNetworkPolicyNames(basePolicy);
     if (basePolicyNames === null) {
-      return {
-        policyPath: effectiveBasePolicyPath,
-        appliedPresets: [],
-        cleanup: buildCleanup(),
-      };
+      return result([]);
     }
     const existingChannelPresets = activeMessagingChannels.filter((channel) =>
       basePolicyNames.has(channel),
     );
 
     if (requestedCreateTimePresets.length === 0) {
-      return {
-        policyPath: effectiveBasePolicyPath,
-        appliedPresets: dedupe(existingChannelPresets),
-        cleanup: buildCleanup(),
-      };
+      return result(dedupe(existingChannelPresets));
     }
 
-    const existingCreateTimePresets = requestedCreateTimePresets.filter((preset) =>
-      basePolicyNames.has(preset),
+    const messagingPresets = new Set(messagingCreateTimePresets);
+    const existingCreateTimePresets = requestedCreateTimePresets.filter(
+      (preset) => !messagingPresets.has(preset) && basePolicyNames.has(preset),
     );
     const createTimePresets = requestedCreateTimePresets.filter(
-      (preset) => !basePolicyNames.has(preset),
+      (preset) => messagingPresets.has(preset) || !basePolicyNames.has(preset),
     );
     if (createTimePresets.length === 0) {
-      return {
-        policyPath: effectiveBasePolicyPath,
-        appliedPresets: dedupe([...existingChannelPresets, ...existingCreateTimePresets]),
-        cleanup: buildCleanup(),
-      };
+      return result(dedupe([...existingChannelPresets, ...existingCreateTimePresets]));
     }
 
     const mergedPolicy = policies.mergePresetNamesIntoPolicy(basePolicy, createTimePresets, {
       agent: policyAgent,
+      sandboxName: options.sandboxName,
+      credentialBoundMessagingChannels: activeMessagingChannels,
+      messagingConfig: options.messagingConfig,
     });
     if (mergedPolicy.missingPresets.length > 0) {
       throw new Error(
@@ -440,21 +589,147 @@ export function prepareInitialSandboxCreatePolicy(
       );
     }
 
-    const policyPath = secureTempFile("nemoclaw-initial-policy", ".yaml");
-    cleanupFns.push(createPolicyTempCleanup(policyPath, "nemoclaw-initial-policy"));
-    fs.writeFileSync(policyPath, mergedPolicy.policy, { encoding: "utf-8", mode: 0o600 });
-
-    return {
-      policyPath,
-      appliedPresets: dedupe([
+    adoptPolicy(mergedPolicy.policy, "nemoclaw-initial-policy");
+    return result(
+      dedupe([
         ...existingChannelPresets,
         ...existingCreateTimePresets,
         ...mergedPolicy.appliedPresets,
       ]),
-      cleanup: buildCleanup(),
-    };
+    );
   } catch (error) {
     cleanupOnError();
     throw error;
   }
+}
+
+export function prepareInitialSandboxCreatePolicy(
+  basePolicyPath: string,
+  activeMessagingChannels: string[],
+  options: InitialPolicyOptions = {},
+): InitialSandboxPolicy {
+  const exactCleanup = options.agentName === "hermes" && isPortableExperimentalProfile();
+  return resolveInitialSandboxCreatePolicy(basePolicyPath, activeMessagingChannels, options, {
+    materialize: createTempPolicyMaterializer(exactCleanup),
+    exactCleanup,
+    includeSourceBytes: false,
+  });
+}
+
+function hasSafeHermesPortablePolicySourceMode(
+  stat: { readonly gid: bigint; readonly mode: bigint; readonly uid: bigint },
+  uid: number,
+  gid: number,
+  hostedInstallerMode: bigint,
+): boolean {
+  const permissions = stat.mode & 0o777n;
+  if ((permissions & 0o002n) !== 0n) return false;
+  if ((permissions & 0o020n) === 0n) return true;
+  return (
+    (stat.mode & 0o7777n) === hostedInstallerMode &&
+    stat.uid === BigInt(uid) &&
+    stat.gid === BigInt(gid)
+  );
+}
+
+/** Read one policy source while holding exact current-user file authority. */
+export function readHermesPortableInitialPolicySource(basePolicyPath: string): string {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (uid === undefined || gid === undefined) {
+    throw new Error("Hermes portable policy source has no current-user authority.");
+  }
+  const parentPath = path.dirname(basePolicyPath);
+  const parentBefore = fs.lstatSync(parentPath, { bigint: true });
+  if (
+    !parentBefore.isDirectory() ||
+    parentBefore.isSymbolicLink() ||
+    (parentBefore.uid !== 0n && parentBefore.uid !== BigInt(uid)) ||
+    !hasSafeHermesPortablePolicySourceMode(parentBefore, uid, gid, 0o775n)
+  ) {
+    throw new Error("Hermes portable policy source authority is unsafe.");
+  }
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(
+      basePolicyPath,
+      fs.constants.O_RDONLY |
+        fs.constants.O_NOFOLLOW |
+        (typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0),
+    );
+  } catch {
+    throw new Error("Hermes portable policy source authority is unsafe.");
+  }
+  try {
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.nlink !== 1n ||
+      (before.uid !== 0n && before.uid !== BigInt(uid)) ||
+      !hasSafeHermesPortablePolicySourceMode(before, uid, gid, 0o664n) ||
+      before.size < 1n ||
+      before.size > 256n * 1024n
+    ) {
+      throw new Error("Hermes portable policy source authority is unsafe.");
+    }
+    const bytes = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const finalNamed = fs.lstatSync(basePolicyPath, { bigint: true });
+    const parentAfter = fs.lstatSync(parentPath, { bigint: true });
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.mode !== after.mode ||
+      before.uid !== after.uid ||
+      before.gid !== after.gid ||
+      before.nlink !== after.nlink ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      finalNamed.dev !== after.dev ||
+      finalNamed.ino !== after.ino ||
+      parentBefore.dev !== parentAfter.dev ||
+      parentBefore.ino !== parentAfter.ino ||
+      parentBefore.mode !== parentAfter.mode ||
+      parentBefore.uid !== parentAfter.uid ||
+      parentBefore.gid !== parentAfter.gid ||
+      parentBefore.mtimeNs !== parentAfter.mtimeNs ||
+      parentBefore.ctimeNs !== parentAfter.ctimeNs ||
+      BigInt(bytes.byteLength) !== after.size
+    ) {
+      throw new Error("Hermes portable policy source authority changed while reading.");
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      throw new Error("Hermes portable policy source must not include a UTF-8 byte-order mark.");
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error("Hermes portable policy source is not strict UTF-8.");
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+/** Plan exact schema-5 policy bytes without creating temporary files. */
+export function planHermesPortableInitialSandboxPolicy(
+  basePolicyPath: string,
+  activeMessagingChannels: string[],
+  options: InitialPolicyOptions,
+): InitialSandboxPolicy {
+  if (options.agentName !== "hermes" || !isPortableExperimentalProfile()) {
+    throw new Error("Hermes portable policy planning requires the schema-5 profile.");
+  }
+  return resolveInitialSandboxCreatePolicy(basePolicyPath, activeMessagingChannels, options, {
+    materialize: (content) => ({
+      policyPath: basePolicyPath,
+      sourceBytes: Buffer.from(content),
+      appliedPresets: [],
+    }),
+    exactCleanup: false,
+    includeSourceBytes: true,
+    initialContent: readHermesPortableInitialPolicySource(basePolicyPath),
+  });
 }

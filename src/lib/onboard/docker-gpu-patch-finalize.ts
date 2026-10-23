@@ -9,19 +9,22 @@
 // that natively accepts NVIDIA GPU access would remove the need for the
 // post-create container recreation NemoClaw performs here. Until OpenShell
 // supports that natively, NemoClaw recreates the container with GPU access
-// and uses this module to either confirm the new container or restore the
-// pre-patch backup. Regression coverage:
+// and uses this module to either restore the pre-patch backup before commit or
+// complete the OpenShell stop / exact remove / OpenShell start handoff and
+// require OpenShell's final Ready acknowledgement. Removing the old container
+// is the irreversible commit point: later failures require a sandbox rebuild
+// rather than automatic rollback. Regression coverage:
 //   * src/lib/onboard/docker-gpu-patch-finalize.test.ts — direct unit tests
-//     for finalize success / rollback / no-op / rollback failure outcomes.
+//     for exact final handoff, terminal phase, rollback, and failure outcomes.
 //   * src/lib/onboard/docker-gpu-patch-rollback.test.ts — composed
 //     recreate-with-rollback scenarios.
-//   * src/lib/onboard/docker-gpu-sandbox-create.test.ts — composed create
+//   * src/lib/onboard/docker-gpu-sandbox-create-lifecycle.test.ts — composed create
 //     flow driving maybeApplyDuringCreate → waitForSupervisorReconnect →
 //     finalizeBackup.
 // Removal condition: when OpenShell supports native Docker-driver GPU
 // creation/reconnect, drop the NemoClaw post-create container recreation
-// and delete this module along with its callers in docker-gpu-patch.ts and
-// docker-gpu-sandbox-create.ts.
+// and delete this module along with its direct callers in
+// docker-gpu-patch-recreate.ts and docker-gpu-sandbox-create.ts.
 
 import { hasZeroDockerExitStatus } from "./docker-command-result";
 import { DOCKER_GPU_PATCH_TIMEOUT_MS } from "./docker-gpu-patch-constants";
@@ -30,26 +33,68 @@ import {
   rollbackToBackupContainer,
 } from "./docker-gpu-patch-rollback";
 import type { DockerGpuPatchDeps, DockerGpuPatchResult } from "./docker-gpu-patch-types";
+import { waitForOpenShellFinalHandoff } from "./docker-gpu-supervisor-reconnect";
+import { isExactOpenShellDockerSandboxReplacement } from "./openshell-docker-sandbox-containers";
 
 export {
   restoreDockerGpuPatchBackupAfterRecreateFailure as rollbackDockerGpuPatchOnRecreateFailure,
   rollbackToBackupContainer,
 } from "./docker-gpu-patch-rollback";
 
-export type DockerGpuPatchFinalizeOptions = {
-  result: DockerGpuPatchResult;
-  supervisorReady: boolean;
-};
+export type DockerGpuPatchFinalizeOptions =
+  | {
+      result: DockerGpuPatchResult;
+      supervisorReady: false;
+    }
+  | {
+      result: DockerGpuPatchResult;
+      supervisorReady: true;
+      sandboxName: string;
+      finalHandoffTimeoutSecs: number;
+    };
 
 export type DockerGpuPatchFinalizeOutcome = {
+  /** True once the old container has crossed the irreversible removal boundary. */
   backupRemoved: boolean;
   rolledBack: boolean;
+  replacementStoppedForCommit?: boolean;
+  replacementRestarted?: boolean;
+  lifecycleStopAcknowledged?: boolean;
+  finalHandoffAcknowledged?: boolean;
+  lastSandboxPhase?: string | null;
+  replacementStopConfirmed?: boolean;
+  replacementRemovalConfirmed?: boolean;
+  replacementPresence?: "absent" | "present" | "unknown";
 };
 
-export function finalizeDockerGpuPatchBackup(
+const PROCESS_TREE_BOUNDED_OPENSHELL_OPTIONS = {
+  killProcessTreeOnTimeout: true,
+  killSignal: "SIGKILL",
+} as const;
+
+function runOpenShellLifecycleCommand(
+  runOpenshell: NonNullable<DockerGpuPatchDeps["runOpenshell"]>,
+  args: string[],
+  timeoutSecs: number,
+): boolean {
+  try {
+    return hasZeroDockerExitStatus(
+      runOpenshell(args, {
+        ignoreError: true,
+        ...PROCESS_TREE_BOUNDED_OPENSHELL_OPTIONS,
+        suppressOutput: true,
+        timeout: Math.max(1, Math.round(timeoutSecs * 1000)),
+      }),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function finalizeDockerGpuPatchBackup(
   options: DockerGpuPatchFinalizeOptions,
   deps: DockerGpuPatchDeps = {},
-): DockerGpuPatchFinalizeOutcome {
+): Promise<DockerGpuPatchFinalizeOutcome> {
   const resolved = resolveDockerGpuPatchRollbackDeps(deps);
   const containerOpts = {
     ignoreError: true,
@@ -60,15 +105,129 @@ export function finalizeDockerGpuPatchBackup(
     return { backupRemoved: true, rolledBack: false };
   }
   if (options.supervisorReady) {
-    // Backup removal is best-effort: the supervisor probe already confirmed
-    // the new GPU container is reachable, so the backup is no longer needed
-    // even if `docker rm` cannot delete it (e.g. concurrent admin action,
-    // daemon timeout). Reflect the actual rm status in the outcome so
-    // diagnostics can flag a leaked backup container.
-    const rmResult = resolved.dockerRm(options.result.backupContainerName, containerOpts);
-    return { backupRemoved: hasZeroDockerExitStatus(rmResult), rolledBack: false };
+    // Move the durable OpenShell row to Stopped before touching the exact
+    // containers. OpenShell 0.0.106 keeps Stopped stable while the Docker
+    // driver's duplicate-ID snapshot catches up with removal of the rollback
+    // container. Starting through OpenShell then owns the lifecycle fence and
+    // prevents the stopped replacement snapshot from regressing the row to
+    // Error or sticky Deleting. Backup removal remains the irreversible commit
+    // point; failures after it require a sandbox rebuild. Success is withheld
+    // until OpenShell reports Ready and Docker still proves the exact
+    // replacement is the sole running labeled container (#9531, #10153).
+    if (!deps.commandExecutor || !deps.runOpenshell || !deps.runCaptureOpenshell) {
+      return {
+        backupRemoved: false,
+        rolledBack: false,
+        replacementStoppedForCommit: false,
+        lifecycleStopAcknowledged: false,
+        finalHandoffAcknowledged: false,
+        lastSandboxPhase: null,
+      };
+    }
+    console.log(
+      `  Stopping the replacement through OpenShell for the final handoff (up to ${options.finalHandoffTimeoutSecs}s)...`,
+    );
+    const lifecycleStopAcknowledged = runOpenShellLifecycleCommand(
+      deps.runOpenshell,
+      ["sandbox", "stop", options.sandboxName],
+      options.finalHandoffTimeoutSecs,
+    );
+    if (!lifecycleStopAcknowledged) {
+      return {
+        backupRemoved: false,
+        rolledBack: false,
+        replacementStoppedForCommit: false,
+        lifecycleStopAcknowledged: false,
+        finalHandoffAcknowledged: false,
+        lastSandboxPhase: null,
+      };
+    }
+    const stopResult = resolved.dockerStop(options.result.newContainerId, containerOpts);
+    if (!hasZeroDockerExitStatus(stopResult)) {
+      const replacementRestarted = runOpenShellLifecycleCommand(
+        deps.runOpenshell,
+        ["sandbox", "start", options.sandboxName],
+        options.finalHandoffTimeoutSecs,
+      );
+      return {
+        backupRemoved: false,
+        rolledBack: false,
+        replacementStoppedForCommit: false,
+        replacementRestarted,
+        lifecycleStopAcknowledged: true,
+      };
+    }
+    const rmResult = resolved.dockerRm(options.result.oldContainerId, containerOpts);
+    const backupRemoved = hasZeroDockerExitStatus(rmResult);
+    if (!backupRemoved) {
+      const replacementRestarted = runOpenShellLifecycleCommand(
+        deps.runOpenshell,
+        ["sandbox", "start", options.sandboxName],
+        options.finalHandoffTimeoutSecs,
+      );
+      return {
+        backupRemoved: false,
+        rolledBack: false,
+        replacementStoppedForCommit: true,
+        replacementRestarted,
+        lifecycleStopAcknowledged: true,
+        finalHandoffAcknowledged: false,
+        lastSandboxPhase: null,
+      };
+    }
+    const now = deps.now ?? (() => new Date());
+    const finalHandoffDeadlineMs =
+      now().getTime() + Math.max(1, options.finalHandoffTimeoutSecs * 1000);
+    console.log(
+      `  Starting the exact replacement through OpenShell to complete the final handoff (up to ${options.finalHandoffTimeoutSecs}s)...`,
+    );
+    const remainingBeforeStartMs = finalHandoffDeadlineMs - now().getTime();
+    const lifecycleStartAcknowledged =
+      remainingBeforeStartMs > 0
+        ? runOpenShellLifecycleCommand(
+            deps.runOpenshell,
+            ["sandbox", "start", options.sandboxName],
+            remainingBeforeStartMs / 1000,
+          )
+        : false;
+    // OpenShell can return nonzero after applying the start mutation when its
+    // internal Ready deadline expires. Reconcile that ambiguous result through
+    // the identity-bound handoff waiter, which rejects absent, foreign, and
+    // terminal replacement state. Both operations share one deadline so this
+    // reconciliation cannot double the configured handoff interval.
+    const remainingHandoffTimeoutMs = Math.max(0, finalHandoffDeadlineMs - now().getTime());
+    console.log(
+      `  Waiting for OpenShell to confirm the final replacement handoff (up to ${Math.ceil(remainingHandoffTimeoutMs / 1000)}s)...`,
+    );
+    const acknowledgement =
+      remainingHandoffTimeoutMs > 0
+        ? await waitForOpenShellFinalHandoff(options.sandboxName, finalHandoffDeadlineMs, {
+            commandExecutor: deps.commandExecutor,
+            runCaptureOpenshell: deps.runCaptureOpenshell,
+            sleep: deps.sleep,
+            now,
+            replacementIsExactAndRunning: (remainingMs) =>
+              isExactOpenShellDockerSandboxReplacement(
+                options.sandboxName,
+                options.result.newContainerId,
+                true,
+                { dockerRun: resolved.dockerRun },
+                remainingMs,
+                now,
+              ),
+          })
+        : { acknowledged: false, lastSandboxPhase: null };
+    return {
+      backupRemoved: true,
+      rolledBack: false,
+      replacementStoppedForCommit: true,
+      replacementRestarted: lifecycleStartAcknowledged || acknowledgement.acknowledged,
+      lifecycleStopAcknowledged: true,
+      finalHandoffAcknowledged: acknowledgement.acknowledged,
+      lastSandboxPhase: acknowledgement.lastSandboxPhase,
+    };
   }
-  const rolledBack = rollbackToBackupContainer(
+  const rollback = rollbackToBackupContainer(
     {
       newContainerId: options.result.newContainerId,
       backupContainerName: options.result.backupContainerName,
@@ -76,41 +235,5 @@ export function finalizeDockerGpuPatchBackup(
     },
     resolved,
   );
-  return { backupRemoved: false, rolledBack };
-}
-
-export type SupervisorReconnectOutcome =
-  | { execReady: true; backupRemoved: boolean }
-  | { execReady: false; rolledBack: boolean; error: Error };
-
-export function reconcileSupervisorReconnect(
-  execReady: boolean,
-  refs: { newContainerId: string; backupContainerName: string; originalName: string },
-  deps: DockerGpuPatchDeps,
-): SupervisorReconnectOutcome {
-  const resolved = resolveDockerGpuPatchRollbackDeps(deps);
-  const containerOpts = {
-    ignoreError: true,
-    suppressOutput: true,
-    timeout: DOCKER_GPU_PATCH_TIMEOUT_MS,
-  };
-  if (execReady) {
-    // Backup removal is best-effort here too: the supervisor probe already
-    // confirmed the new container is reachable, so a failed rm leaves a
-    // leaked backup container but the user-visible sandbox is healthy.
-    // Surface the actual rm status so callers can fold it into diagnostics
-    // alongside the deferred-finalize path in `finalizeDockerGpuPatchBackup`.
-    const rmResult = resolved.dockerRm(refs.backupContainerName, containerOpts);
-    return { execReady: true, backupRemoved: hasZeroDockerExitStatus(rmResult) };
-  }
-  const rolledBack = rollbackToBackupContainer(refs, resolved);
-  return {
-    execReady: false,
-    rolledBack,
-    error: new Error(
-      rolledBack
-        ? "OpenShell supervisor did not reconnect to the GPU-enabled container; pre-patch sandbox restored."
-        : "OpenShell supervisor did not reconnect to the GPU-enabled container and rollback failed; pre-patch sandbox was NOT restored.",
-    ),
-  };
+  return { backupRemoved: false, ...rollback };
 }

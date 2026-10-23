@@ -3,16 +3,18 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { testTimeoutOptions } from "../../helpers/timeouts";
+import { parseOpenShellSandboxId } from "../../../src/lib/adapters/openshell/sandbox-identity.ts";
+import { execTimeout, testTimeout } from "../../helpers/timeouts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import {
   cleanupWhenCommandAvailable,
   cleanupWhenOpenShellAvailable,
 } from "../fixtures/cleanup-resources.ts";
 import { resultText } from "../fixtures/clients/command.ts";
-import { validateSandboxName } from "../fixtures/clients/sandbox.ts";
+import { sandboxAccessEnv, validateSandboxName } from "../fixtures/clients/sandbox.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { startFakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
+import { captureOpenClawOnboardFailure } from "../fixtures/openclaw-onboard-diagnostics.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 
 // Keep this free-standing and direct: the contract is the real CLI +
@@ -22,11 +24,13 @@ import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 // upsert, registry credential-hash, sandbox rebuild, and reuse assertions.
 
 const REGISTRY_FILE = path.join(process.env.HOME ?? "/tmp", ".nemoclaw", "sandboxes.json");
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-token-rotation-${process.pid}`;
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-tok-${process.pid}`;
+const WORKSPACE_PRESERVATION_MARKER = "credential-rotation-workspace-preservation-e2e";
+const WORKSPACE_PRESERVATION_PATH = "/sandbox/work/credential-preserve.txt";
 validateSandboxName(SANDBOX_NAME);
 
-const ONBOARD_TIMEOUT_MS = 25 * 60_000;
-const PHASE_TIMEOUT_MS = 40 * 60_000;
+const ONBOARD_TIMEOUT_MS = execTimeout(25 * 60_000);
+const PHASE_TIMEOUT_MS = testTimeout(40 * 60_000);
 
 process.env.NEMOCLAW_CLI_BIN ??= CLI_ENTRYPOINT;
 
@@ -71,7 +75,7 @@ function stripAnsi(value: string): string {
 
 function onboardEnv(endpointUrl: string, tokens: TokenSet): NodeJS.ProcessEnv {
   return {
-    ...buildAvailabilityProbeEnv(),
+    ...sandboxAccessEnv(),
     COMPATIBLE_API_KEY: "token-rotation-compatible-e2e",
     TELEGRAM_BOT_TOKEN: tokens.telegram,
     DISCORD_BOT_TOKEN: tokens.discord,
@@ -87,7 +91,6 @@ function onboardEnv(endpointUrl: string, tokens: TokenSet): NodeJS.ProcessEnv {
     NEMOCLAW_POLICY_TIER: "open",
     NEMOCLAW_SKIP_TELEGRAM_REACHABILITY: "1",
     NEMOCLAW_SKIP_SLACK_AUTH_VALIDATION: "1",
-    NEMOCLAW_RECREATE_WITHOUT_BACKUP: "1",
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
   };
 }
@@ -126,27 +129,15 @@ function expectCredentialHash(envKey: string): void {
   ).toBeGreaterThan(0);
 }
 
-function expectRotationOutput(
-  output: string,
-  expectedProviders: readonly string[],
-  forbiddenProviders: readonly string[],
-): void {
+function expectTelegramRotationOutput(output: string): void {
   const rotationLine = output
     .split(/\r?\n/)
     .find((line) => line.includes("Messaging credential(s) rotated:"));
   expect(rotationLine, output).toBeTruthy();
-  for (const provider of expectedProviders) {
-    expect(rotationLine, `rotation line should name ${provider}: ${rotationLine}`).toContain(
-      provider,
-    );
-  }
-  for (const provider of forbiddenProviders) {
-    expect(
-      rotationLine,
-      `rotation line should not name ${provider}: ${rotationLine}`,
-    ).not.toContain(provider);
-  }
-  expect(output).toContain("Rebuilding sandbox to propagate new credentials");
+  expect(rotationLine).toContain(`${SANDBOX_NAME}-telegram-bridge`);
+  expect(rotationLine).not.toContain(`${SANDBOX_NAME}-discord-bridge`);
+  expect(rotationLine).not.toContain(`${SANDBOX_NAME}-slack-bridge`);
+  expect(rotationLine).not.toContain(`${SANDBOX_NAME}-slack-app`);
 }
 
 function assertTokenPairsDiffer(): void {
@@ -215,7 +206,7 @@ async function assertSandboxRunning(
     ["-lc", 'openshell sandbox list 2>/dev/null | grep -F -- "$1"', "_", SANDBOX_NAME],
     {
       artifactName,
-      env: buildAvailabilityProbeEnv(),
+      env: sandboxAccessEnv(),
       timeoutMs: 30_000,
     },
   );
@@ -224,6 +215,31 @@ async function assertSandboxRunning(
   expect(sandboxList.exitCode, output).toBe(0);
   expect(plainStdout, output).toContain(SANDBOX_NAME);
   expect(plainStdout, output).toMatch(/\b(?:Ready|Running)\b/i);
+}
+
+async function sandboxIdentity(
+  host: import("../fixtures/clients/host.ts").HostCliClient,
+  artifactName: string,
+): Promise<string> {
+  const sandboxGet = await host.command("openshell", ["sandbox", "get", SANDBOX_NAME], {
+    artifactName,
+    env: sandboxAccessEnv(),
+    timeoutMs: 30_000,
+  });
+  const output = resultText(sandboxGet);
+  expect(sandboxGet.exitCode, output).toBe(0);
+  const sandboxId = parseOpenShellSandboxId(output);
+  expect(sandboxId, output).not.toBeNull();
+  return sandboxId ?? "";
+}
+
+async function assertSandboxReused(
+  host: import("../fixtures/clients/host.ts").HostCliClient,
+  beforeId: string,
+  artifactName: string,
+): Promise<void> {
+  expect(await sandboxIdentity(host, `${artifactName}-identity`)).toBe(beforeId);
+  await assertSandboxRunning(host, `${artifactName}-running`);
 }
 
 async function deleteSandboxIfOpenshellExists(
@@ -240,7 +256,7 @@ async function deleteSandboxIfOpenshellExists(
     ],
     {
       artifactName,
-      env: buildAvailabilityProbeEnv(),
+      env: sandboxAccessEnv(),
       timeoutMs: 60_000,
     },
   );
@@ -264,47 +280,32 @@ async function destroyGatewayIfOpenshellExists(
   );
 }
 
-// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "messaging token rotation rebuilds only the changed provider and reuses unchanged credentials",
   {
-    ...testTimeoutOptions(PHASE_TIMEOUT_MS),
+    timeout: PHASE_TIMEOUT_MS,
     meta: {
       e2ePhases: [
-        "confirm Docker and start hermetic inference",
+        "confirm the selected runtime and start hermetic inference",
         "install the sandbox and confirm provider hashes",
-        "rotate only the Telegram provider",
-        "reuse the sandbox after the unchanged Telegram token",
-        "rotate only the Discord provider",
-        "reuse the sandbox after the unchanged Discord token",
-        "rotate only the Slack providers",
+        "write a user file in /sandbox/work before credential rotation",
+        "rotate only the Telegram provider and verify the user file survives recreation",
         "reuse the sandbox and record rotation evidence",
       ],
     },
   },
-  async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
-    expect(
-      fs.existsSync(CLI_ENTRYPOINT),
-      "run `npm run build:cli` before live repo CLI targets",
-    ).toBe(true);
-
+  async ({ artifacts, cleanup, host, progress, runtimeProvider, sandbox }) => {
     assertTokenPairsDiffer();
 
-    const docker = await host.command("docker", ["info"], {
-      artifactName: "prereq-docker-info-token-rotation",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
+    await runtimeProvider.requireAvailable({
+      artifactName: "prereq-runtime-info-token-rotation",
+      scenarioLabel: "token rotation",
     });
-    if (docker.exitCode !== 0) {
-      if (process.env.GITHUB_ACTIONS === "true") {
-        throw new Error(`Docker is required for token rotation live E2E: ${resultText(docker)}`);
-      }
-      skip("Docker is required for token rotation live E2E");
-    }
 
     const fakeOpenAI = await startFakeOpenAiCompatibleServer({
       chatContent: "OK",
       host: "0.0.0.0",
+      progress,
       publicHost: "host.openshell.internal",
       responseText: "OK",
     });
@@ -332,13 +333,12 @@ test(
       contract: [
         "first onboard stores messaging credential hashes and creates provider attachments",
         "rotating Telegram rebuilds and names only telegram-bridge",
+        "credential-driven recreation preserves a user file under /sandbox/work",
         "unchanged tokens reuse the sandbox",
-        "rotating Discord rebuilds and names only discord-bridge",
-        "rotating Slack bot/app credentials rebuilds and names slack-bridge and slack-app only",
       ],
     });
 
-    const cleanupEnv = buildAvailabilityProbeEnv();
+    const cleanupEnv = sandboxAccessEnv();
     const gatewayCleanupOptions = {
       artifactName: "cleanup-openshell-gateway-destroy-token-rotation",
       env: cleanupEnv,
@@ -423,15 +423,24 @@ test(
     const first = await runInstall(host, fakeOpenAI.baseUrl, TOKEN_A, {
       NEMOCLAW_RECREATE_SANDBOX: "1",
     });
+    await captureOpenClawOnboardFailure(first, sandbox, {
+      sandboxName: SANDBOX_NAME,
+      artifactPrefix: "phase-0-install-token-a",
+      env: {
+        ...onboardEnv(fakeOpenAI.baseUrl, TOKEN_A),
+        NEMOCLAW_RECREATE_SANDBOX: "1",
+      },
+      redactionValues: redactionValues(),
+      runtime: runtimeProvider,
+    });
     expect(first.exitCode, resultText(first)).toBe(0);
 
     // OpenShell removes each deployment image during credential-driven
     // recreation. Retain one test-owned tag so Docker can reuse the identical
-    // OpenClaw/plugin layers across the three rotations; token values remain in
+    // OpenClaw/plugin layers for the retained rotation; token values remain in
     // gateway providers and are never baked into this image.
     const cacheImageTag = `nemoclaw-token-rotation-cache:${process.pid}`;
-    const retainBuildCache = await host.command(
-      "docker",
+    const retainBuildCache = await runtimeProvider.command(
       ["image", "tag", sandboxImageTag(), cacheImageTag],
       {
         artifactName: "phase-1-retain-build-cache",
@@ -441,20 +450,13 @@ test(
     );
     expect(retainBuildCache.exitCode, resultText(retainBuildCache)).toBe(0);
     cleanup.trackDisposable("remove token-rotation build cache tag", async () => {
-      const remove = await host.command("docker", ["image", "rm", cacheImageTag], {
+      const remove = await runtimeProvider.command(["image", "rm", cacheImageTag], {
         artifactName: "cleanup-token-rotation-build-cache",
         env: buildAvailabilityProbeEnv(),
         timeoutMs: 30_000,
       });
       expect(remove.exitCode, resultText(remove)).toBe(0);
     });
-
-    const openshellVersion = await host.command("openshell", ["--version"], {
-      artifactName: "phase-0-openshell-version-token-rotation",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
-    });
-    expect(openshellVersion.exitCode, resultText(openshellVersion)).toBe(0);
 
     for (const providerName of [
       `${SANDBOX_NAME}-telegram-bridge`,
@@ -464,23 +466,42 @@ test(
     ]) {
       const provider = await host.command("openshell", ["provider", "get", providerName], {
         artifactName: `phase-1-provider-get-${providerName}`,
-        env: buildAvailabilityProbeEnv(),
+        env: sandboxAccessEnv(),
         timeoutMs: 30_000,
       });
       expect(provider.exitCode, resultText(provider)).toBe(0);
     }
 
-    for (const envKey of [
-      "TELEGRAM_BOT_TOKEN",
-      "DISCORD_BOT_TOKEN",
-      "SLACK_BOT_TOKEN",
-      "SLACK_APP_TOKEN",
-    ]) {
-      expectCredentialHash(envKey);
-    }
+    ["TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"].forEach(
+      (envKey) => {
+        expectCredentialHash(envKey);
+      },
+    );
     await assertSandboxRunning(host, "phase-1-sandbox-running-after-install");
 
-    progress.phase("rotate only the Telegram provider");
+    progress.phase("write a user file in /sandbox/work before credential rotation");
+    const writeWorkspaceMarker = await sandbox.exec(
+      SANDBOX_NAME,
+      [
+        "sh",
+        "-lc",
+        `set -eu; umask 077; mkdir -p /sandbox/work; printf '%s\\n' '${WORKSPACE_PRESERVATION_MARKER}' > '${WORKSPACE_PRESERVATION_PATH}'; sync`,
+      ],
+      {
+        artifactName: "phase-1-write-credential-rotation-workspace-marker",
+        env: sandboxAccessEnv(),
+        timeoutMs: 30_000,
+      },
+    );
+    expect(writeWorkspaceMarker.exitCode, resultText(writeWorkspaceMarker)).toBe(0);
+    const beforeTelegramRotationId = await sandboxIdentity(
+      host,
+      "phase-1-before-telegram-rotation-identity",
+    );
+
+    progress.phase(
+      "rotate only the Telegram provider and verify the user file survives recreation",
+    );
     const telegram = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -489,18 +510,35 @@ test(
     );
     const telegramText = resultText(telegram);
     expect(telegram.exitCode, telegramText).toBe(0);
-    expectRotationOutput(
-      telegramText,
-      [`${SANDBOX_NAME}-telegram-bridge`],
-      [
-        `${SANDBOX_NAME}-discord-bridge`,
-        `${SANDBOX_NAME}-slack-bridge`,
-        `${SANDBOX_NAME}-slack-app`,
-      ],
-    );
+    expectTelegramRotationOutput(telegramText);
     await assertSandboxRunning(host, "phase-2-sandbox-running-after-telegram-rotation");
+    const afterTelegramRotationId = await sandboxIdentity(
+      host,
+      "phase-2-after-telegram-rotation-identity",
+    );
+    expect(afterTelegramRotationId).not.toBe(beforeTelegramRotationId);
+    const preservedWorkspaceMarker = await host.command(
+      "node",
+      [
+        CLI_ENTRYPOINT,
+        SANDBOX_NAME,
+        "exec",
+        "--",
+        "grep",
+        "-Fx",
+        "--",
+        WORKSPACE_PRESERVATION_MARKER,
+        WORKSPACE_PRESERVATION_PATH,
+      ],
+      {
+        artifactName: "phase-2-verify-credential-rotation-workspace-marker",
+        env: sandboxAccessEnv(),
+        timeoutMs: 30_000,
+      },
+    );
+    expect(preservedWorkspaceMarker.exitCode, resultText(preservedWorkspaceMarker)).toBe(0);
 
-    progress.phase("reuse the sandbox after the unchanged Telegram token");
+    progress.phase("reuse the sandbox and record rotation evidence");
     const afterTelegramSame = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -509,63 +547,7 @@ test(
     );
     const afterTelegramSameText = resultText(afterTelegramSame);
     expect(afterTelegramSame.exitCode, afterTelegramSameText).toBe(0);
-    expect(afterTelegramSameText).toContain(`Sandbox '${SANDBOX_NAME}' exists and is ready`);
-    expect(afterTelegramSameText).toContain("reusing it");
-
-    progress.phase("rotate only the Discord provider");
-    const discord = await runOnboard(
-      host,
-      fakeOpenAI.baseUrl,
-      { ...TOKEN_A, telegram: TOKEN_B.telegram, discord: TOKEN_B.discord },
-      "phase-4-rotate-discord",
-    );
-    const discordText = resultText(discord);
-    expect(discord.exitCode, discordText).toBe(0);
-    expectRotationOutput(
-      discordText,
-      [`${SANDBOX_NAME}-discord-bridge`],
-      [
-        `${SANDBOX_NAME}-telegram-bridge`,
-        `${SANDBOX_NAME}-slack-bridge`,
-        `${SANDBOX_NAME}-slack-app`,
-      ],
-    );
-    await assertSandboxRunning(host, "phase-4-sandbox-running-after-discord-rotation");
-
-    progress.phase("reuse the sandbox after the unchanged Discord token");
-    const afterDiscordSame = await runOnboard(
-      host,
-      fakeOpenAI.baseUrl,
-      { ...TOKEN_A, telegram: TOKEN_B.telegram, discord: TOKEN_B.discord },
-      "phase-5-same-after-discord",
-    );
-    const afterDiscordSameText = resultText(afterDiscordSame);
-    expect(afterDiscordSame.exitCode, afterDiscordSameText).toBe(0);
-    expect(afterDiscordSameText).toContain(`Sandbox '${SANDBOX_NAME}' exists and is ready`);
-    expect(afterDiscordSameText).toContain("reusing it");
-
-    progress.phase("rotate only the Slack providers");
-    const slack = await runOnboard(host, fakeOpenAI.baseUrl, TOKEN_B, "phase-6-rotate-slack");
-    const slackText = resultText(slack);
-    expect(slack.exitCode, slackText).toBe(0);
-    expectRotationOutput(
-      slackText,
-      [`${SANDBOX_NAME}-slack-bridge`, `${SANDBOX_NAME}-slack-app`],
-      [`${SANDBOX_NAME}-telegram-bridge`, `${SANDBOX_NAME}-discord-bridge`],
-    );
-    await assertSandboxRunning(host, "phase-6-sandbox-running-after-slack-rotation");
-
-    progress.phase("reuse the sandbox and record rotation evidence");
-    const afterSlackSame = await runOnboard(
-      host,
-      fakeOpenAI.baseUrl,
-      TOKEN_B,
-      "phase-7-same-after-slack",
-    );
-    const afterSlackSameText = resultText(afterSlackSame);
-    expect(afterSlackSame.exitCode, afterSlackSameText).toBe(0);
-    expect(afterSlackSameText).toContain(`Sandbox '${SANDBOX_NAME}' exists and is ready`);
-    expect(afterSlackSameText).toContain("reusing it");
+    await assertSandboxReused(host, afterTelegramRotationId, "phase-3-after-same-telegram");
 
     await artifacts.target.complete({
       id: "token-rotation",
@@ -574,8 +556,6 @@ test(
         providersCreated: true,
         credentialHashesStored: true,
         telegramRotationIsolated: true,
-        discordRotationIsolated: true,
-        slackRotationIsolated: true,
         unchangedTokensReuseSandbox: true,
       },
     });

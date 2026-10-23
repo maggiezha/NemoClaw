@@ -6,11 +6,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { vi } from "vitest";
+import YAML from "yaml";
+import { HOSTED_NATIVE_PROVIDERS } from "../../src/lib/inference/native-provider/hosted";
 import {
   createGatewayScopedOpenshellRunner,
   type SetupInference,
   type SetupInferenceDeps,
 } from "../../src/lib/onboard/setup-inference.js";
+import { usesNativeLocalInference } from "../../src/lib/inference/native-local/contract";
+import {
+  createNativeLocalSetupHarness,
+  withNativePolicyFixture,
+} from "./native-local-setup-harness";
+import { redact } from "../../src/lib/security/redact.js";
 
 const onboardProviderHelpers = require("../../src/lib/onboard/providers") as {
   upsertProvider: (
@@ -20,8 +28,8 @@ const onboardProviderHelpers = require("../../src/lib/onboard/providers") as {
     baseUrl: string | null,
     env: Record<string, string | undefined>,
     runOpenshell: DirectRunOpenshell,
-  ) => { ok: boolean; status?: number; message?: string };
-  providerExistsInGateway: (name: string, runOpenshell: DirectRunOpenshell) => boolean;
+  ) => Promise<{ ok: boolean; status?: number; message?: string }>;
+  providerExistsInGateway: (name: string, runOpenshell: DirectRunOpenshell) => Promise<boolean>;
 };
 const localInferenceModule =
   require("../../src/lib/inference/local") as typeof import("../../src/lib/inference/local.js");
@@ -44,6 +52,8 @@ export type DirectRunStubResult = {
 };
 
 export type DirectSetupHarnessOptions = {
+  /** Exercise an existing custom sandbox's shared inference route. */
+  legacyCustomRoute?: boolean;
   runOpenshell?: (
     args: string[],
     options: DirectRunOptions,
@@ -51,6 +61,53 @@ export type DirectSetupHarnessOptions = {
   ) => DirectRunStubResult | undefined;
   overrides?: Partial<SetupInferenceDeps>;
 };
+
+/** Model stale Anthropic registration removal without bypassing provider parsing or recovery. */
+export function createStaleAnthropicProviderRunner(
+  provider: string,
+  credentialEnv: string,
+  attachedSandboxes: readonly string[] = [],
+): (args: string[]) => DirectRunStubResult | undefined {
+  let exists = true;
+  let attached = attachedSandboxes;
+  return (args) => {
+    const isProviderOperation =
+      (args[0] === "provider" && ["get", "delete"].includes(args[1])) ||
+      (args[0] === "sandbox" && args[1] === "provider" && args[2] === "detach");
+    if (isProviderOperation && (!exists || args.at(-1) !== provider)) {
+      return { status: 1, stderr: `provider '${args.at(-1)}' not found` };
+    }
+    if (args[0] === "provider" && args[1] === "get") {
+      return {
+        status: 0,
+        stdout: `Name: ${provider}\nType: anthropic\nCredential keys: ${credentialEnv}\nConfig keys: ANTHROPIC_BASE_URL`,
+      };
+    }
+    if (args[0] === "provider" && args[1] === "delete") {
+      if (attached.length > 0) {
+        return {
+          status: 1,
+          stderr: `provider '${provider}' is attached to sandbox(es): ${attached.join(", ")}`,
+        };
+      }
+      exists = false;
+      return { status: 0 };
+    }
+    if (args[0] === "sandbox" && args[1] === "provider" && args.includes("detach")) {
+      attached = attached.filter((sandbox) => !args.includes(sandbox));
+      return { status: 0 };
+    }
+    return undefined;
+  };
+}
+
+const OPENAI_ENDPOINTLESS_PROFILE = JSON.stringify({
+  id: "openai",
+  credentials: [],
+  endpoints: [],
+  binaries: [],
+  inference_capable: true,
+});
 
 type DirectCommandRoute = {
   name: string;
@@ -86,6 +143,7 @@ export function runProductionSetupInferenceCredentialBoundary(options: {
   model: string;
   provider: string;
   timeoutMs?: number;
+  gatewayName?: string;
 }): ProductionSetupInferenceBoundaryResult {
   const parentCredentialBefore = process.env[options.credentialEnv];
   const repoRoot = path.join(import.meta.dirname, "..", "..");
@@ -97,6 +155,33 @@ export function runProductionSetupInferenceCredentialBoundary(options: {
   const childScriptPath = path.join(tmpDir, "setup-inference-boundary.js");
   const onboardPath = path.join(repoRoot, "src", "lib", "onboard.ts");
   const sourceHookPath = path.join(repoRoot, "test", "helpers", "onboard-script-mocks.cjs");
+  const nativeDefinition = HOSTED_NATIVE_PROVIDERS.find(
+    (entry) => entry.logicalProvider === options.provider,
+  );
+  const nativeProfile = nativeDefinition
+    ? YAML.parse(
+        fs.readFileSync(
+          path.join(
+            repoRoot,
+            "managed-inference",
+            "provider-profiles",
+            nativeDefinition.profileId + ".yaml",
+          ),
+          "utf8",
+        ),
+      )
+    : null;
+  const nativeMetadata = nativeDefinition
+    ? [
+        "Id: native-fixture",
+        "Name: " + nativeDefinition.providerName,
+        "Type: " + nativeDefinition.profileId,
+        "Resource version: 1",
+        "Credential keys: " + nativeDefinition.credentialEnv,
+        "Config keys: <none>",
+        "",
+      ].join("\n")
+    : "";
 
   try {
     fs.mkdirSync(fakeBin, { recursive: true });
@@ -105,10 +190,40 @@ export function runProductionSetupInferenceCredentialBoundary(options: {
       `#!${process.execPath}
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
+const nativeProfile = ${JSON.stringify(nativeProfile)};
+const created = ${JSON.stringify(path.join(tmpDir, "native-created"))};
 fs.appendFileSync(${JSON.stringify(commandLogPath)}, JSON.stringify({ argv, env: process.env }) + "\\n");
+if (nativeProfile) {
+  if (argv[0] === "provider" && argv[1] === "profile" && argv.includes("export")) {
+    process.stdout.write(JSON.stringify(nativeProfile)); process.exit(0);
+  }
+  if (argv[0] === "settings" && argv[1] === "get") {
+    process.stdout.write(JSON.stringify({ scope: "global", settings: { providers_v2_enabled: "true" } })); process.exit(0);
+  }
+  if (argv[0] === "provider" && argv[1] === "create") {
+    fs.writeFileSync(created, "created"); process.exit(0);
+  }
+  if (argv[0] === "provider" && argv[1] === "get") {
+    if (!fs.existsSync(created)) {
+      process.stderr.write(${JSON.stringify("provider '" + nativeDefinition?.providerName + "' not found")}); process.exit(1);
+    }
+    process.stdout.write(${JSON.stringify(nativeMetadata)}); process.exit(0);
+  }
+}
 if (argv[0] === "inference" && argv[1] === "get") {
   process.stdout.write(${JSON.stringify(
     `Gateway inference:\n  Provider: ${options.provider}\n  Model: ${options.model}\n`,
+  )});
+}
+if (argv[0] === "provider" && argv[1] === "get") {
+  process.stdout.write(${JSON.stringify(
+    [
+      `Name: ${options.provider}`,
+      `Type: ${options.provider === "nvidia-prod" ? "nvidia" : "openai"}`,
+      `Credential keys: ${options.credentialEnv}`,
+      `Config keys: ${options.provider === "nvidia-prod" ? "<none>" : "OPENAI_BASE_URL"}`,
+      "",
+    ].join("\n"),
   )});
 }
 process.exit(0);
@@ -128,6 +243,9 @@ const setupCredentialBefore = process.env[credentialEnv] || null;
     ${JSON.stringify(options.provider)},
     ${JSON.stringify(options.endpointUrl ?? null)},
     credentialEnv,
+    null,
+    [],
+    ${JSON.stringify(options.gatewayName ? { gatewayName: options.gatewayName } : {})},
   );
   fs.writeFileSync(
     ${JSON.stringify(setupResultPath)},
@@ -267,10 +385,12 @@ export function createDirectSetupInferenceHarnessFactory(
   createSetupInference: CreateSetupInference,
 ) {
   return function createDirectSetupInferenceHarness(options: DirectSetupHarnessOptions = {}) {
+    let legacySandbox: ReturnType<NonNullable<SetupInferenceDeps["getSandbox"]>> = null;
     const commands: DirectCommandEntry[] = [];
     const errors: string[] = [];
     const logs: string[] = [];
     const updateSandbox = vi.fn(() => true);
+    const unloadOllamaModels = vi.fn();
     const verifyInferenceRoute = vi.fn();
     const verifyOnboardInferenceSmoke = vi.fn();
     const runOpenshell: DirectRunOpenshell = (args, runOptions = {}) => {
@@ -279,14 +399,85 @@ export function createDirectSetupInferenceHarnessFactory(
         env: runOptions.env,
         ignoreError: runOptions.ignoreError,
       });
-      return directRunResult(options.runOpenshell?.(args, runOptions, commands));
+      const routed = options.runOpenshell?.(args, runOptions, commands);
+      if (routed !== undefined) {
+        if (args[0] === "provider" && args[1] === "get") {
+          const providerName = args.at(-1) ?? "provider";
+          if (routed.status === 1 && !routed.stdout && !routed.stderr) {
+            return directRunResult({
+              ...routed,
+              stderr: `provider '${providerName}' not found`,
+            });
+          }
+        }
+        return directRunResult(routed);
+      }
+      if (
+        args[0] === "provider" &&
+        args[1] === "profile" &&
+        args.includes("export") &&
+        args.includes("openai")
+      ) {
+        return directRunResult({ status: 0, stdout: OPENAI_ENDPOINTLESS_PROFILE });
+      }
+      if (args[0] === "provider" && args[1] === "get") {
+        const providerName = args.at(-1) ?? "provider";
+        return directRunResult({
+          status: 1,
+          stderr: `provider '${providerName}' not found`,
+        });
+      }
+      return directRunResult();
     };
-    const setupInference = createSetupInference({
+    const harnessDeps: Partial<SetupInferenceDeps> = {
       checkGatewayRouteCompatibility: () => ({ ok: true }),
+      withGatewayRouteMutationLock: async <T>(
+        _gatewayName: string,
+        operation: () => Promise<T> | T,
+      ) => await operation(),
+      withModelRouterPortLifecycleLock: async <T>(_port: number, operation: () => Promise<T> | T) =>
+        await operation(),
+      withSandboxMutationLock: async <T>(_sandboxName: string, operation: () => Promise<T> | T) =>
+        await operation(),
       step: () => {},
       getGatewayName: () => "nemoclaw",
       runOpenshell,
-      upsertProvider: (
+      inferenceRouteMutator: {
+        async setInferenceRoute(request) {
+          const args = ["inference", "set", "-g", request.target.gatewayName];
+          if (request.verification === "skip") args.push("--no-verify");
+          args.push("--provider", request.route.provider, "--model", request.route.model);
+          if (request.verificationTimeoutSeconds !== undefined) {
+            args.push("--timeout", String(request.verificationTimeoutSeconds));
+          }
+          const result = runOpenshell(args, { ignoreError: true });
+          const diagnostic = redact(
+            String(result.stderr || result.stdout || "route update failed"),
+          );
+          return result.status === 0
+            ? { ok: true as const }
+            : {
+                ok: false as const,
+                ambiguous: result.status === null,
+                error: {
+                  kind: "command" as const,
+                  reason: result.status === null ? ("indeterminate" as const) : ("failed" as const),
+                  exitCode: result.status,
+                  message:
+                    result.status === null
+                      ? "OpenShell inference route update returned an inconclusive result."
+                      : diagnostic,
+                },
+              };
+        },
+      },
+      inferenceRouteObserver: {
+        observeInferenceRoute: async () => ({
+          ok: true as const,
+          value: { state: "unconfigured" as const },
+        }),
+      },
+      upsertProvider: async (
         name: string,
         type: string,
         credentialEnv: string,
@@ -294,7 +485,7 @@ export function createDirectSetupInferenceHarnessFactory(
         env: Record<string, string | undefined> | undefined,
         gatewayName: string,
       ) =>
-        onboardProviderHelpers.upsertProvider(
+        await onboardProviderHelpers.upsertProvider(
           name,
           type,
           credentialEnv,
@@ -335,6 +526,9 @@ export function createDirectSetupInferenceHarnessFactory(
           ? "http://host.openshell.internal:11435/v1"
           : "http://host.openshell.internal:8000/v1",
       applyLocalInferenceRoute: async () => false,
+      // Let setupInference bind provider recovery to this harness's
+      // gateway-scoped runner instead of the production process adapter.
+      providerAdapter: undefined,
       run: () => directRunResult(),
       shouldFrontOllamaWithProxy: () => false,
       ensureOllamaAuthProxy: () => {},
@@ -350,14 +544,66 @@ export function createDirectSetupInferenceHarnessFactory(
       exitProcess: (code: number): never => {
         throw Object.assign(new Error(`EXIT_CALLED:${code}`), { code });
       },
+      // #9110: neutralize the GPU-release seams so harness consumers backed by
+      // the production defaults never read the developer's real registry or
+      // curl a live Ollama daemon.
+      getSandbox: () => legacySandbox,
+      listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
+      unloadOllamaModels,
+      withOllamaModelOwnershipLock: (operation) => operation(),
+      ...options.overrides,
+    };
+    const setupInferenceWithoutPolicyAuthority = createSetupInference(harnessDeps);
+    const native = createNativeLocalSetupHarness();
+    const setupNativeInference = createSetupInference({
+      ...harnessDeps,
+      providerAdapter: native.adapter,
+      getNativeLocalProviderAuthority: native.getNativeLocalProviderAuthority,
+      setNativeLocalProviderAuthority: native.setNativeLocalProviderAuthority,
+      clearNativeLocalProviderAuthority: native.clearNativeLocalProviderAuthority,
       ...options.overrides,
     });
+    const revalidateSandboxIdentity = vi.fn();
+    const setupInference: SetupInference = (
+      sandboxName,
+      model,
+      provider,
+      endpointUrl,
+      credentialEnv,
+      hermesAuthMethod,
+      hermesToolGateways,
+      inferenceOptions = {},
+    ) => {
+      if (options.legacyCustomRoute && sandboxName) {
+        legacySandbox = { name: sandboxName, provider, model, endpointUrl, credentialEnv };
+      }
+      const nativeLocal = usesNativeLocalInference(provider, endpointUrl);
+      const operation = () =>
+        (nativeLocal ? setupNativeInference : setupInferenceWithoutPolicyAuthority)(
+          sandboxName,
+          model,
+          provider,
+          endpointUrl,
+          credentialEnv,
+          hermesAuthMethod,
+          hermesToolGateways,
+          {
+            ...inferenceOptions,
+            revalidateSandboxIdentity:
+              inferenceOptions.revalidateSandboxIdentity ?? revalidateSandboxIdentity,
+          },
+        );
+      return nativeLocal ? withNativePolicyFixture(operation) : operation();
+    };
     return {
+      native,
       commands,
       errors,
       logs,
       runOpenshell,
       setupInference,
+      revalidateSandboxIdentity,
+      unloadOllamaModels,
       updateSandbox,
       verifyInferenceRoute,
       verifyOnboardInferenceSmoke,

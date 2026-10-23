@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { flushMock, handleMock, loadMock, runCommandMock, runMock } = vi.hoisted(() => ({
@@ -11,16 +15,21 @@ const { flushMock, handleMock, loadMock, runCommandMock, runMock } = vi.hoisted(
   runMock: vi.fn(),
 }));
 
-vi.mock("@oclif/core", () => ({
-  Config: {
-    load: loadMock,
-  },
-  flush: flushMock,
-  handle: handleMock,
-  run: runMock,
-}));
+vi.mock("@oclif/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@oclif/core")>();
+  return {
+    ...actual,
+    Config: { load: loadMock },
+    flush: flushMock,
+    handle: handleMock,
+    run: runMock,
+  };
+});
 
+import * as receiptAuthority from "../onboard/experimental/hermes-portable-receipt";
+import { NemoClawCommand } from "./nemoclaw-oclif-command";
 import { runOclifArgv, runOclifCommandById } from "./oclif-runner";
+import { PUBLIC_HELP_SANDBOX_NAME_PROPERTY } from "./public-help";
 
 function makeConfig() {
   const rootPlugin = {
@@ -45,6 +54,89 @@ class NonExistentFlagsError extends Error {
 class UnexpectedArgsError extends Error {
   oclif = { exit: 2 };
 }
+
+class RunnerUnsupportedCommand extends NemoClawCommand {
+  static id = "sandbox:destroy";
+  static ran = false;
+
+  public async run(): Promise<void> {
+    RunnerUnsupportedCommand.ran = true;
+  }
+}
+
+function useHermesPortableAuthority(): void {
+  const authority = {
+    kind: "hermes",
+    snapshot: { receipt: { phase: "active" } } as never,
+  } as const;
+  vi.spyOn(receiptAuthority, "inspectPortableAgentReceiptAuthority").mockReturnValue(authority);
+  vi.spyOn(
+    receiptAuthority,
+    "inspectPortableAgentReceiptAuthorityForClassification",
+  ).mockReturnValue(authority);
+}
+
+describe("Hermes portable command admission through both oclif runners", () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-oclif-runner-"));
+    vi.stubEnv("NEMOCLAW_TEST_STATE_DIR", stateDir);
+    flushMock.mockReset();
+    handleMock.mockReset();
+    loadMock.mockReset();
+    runCommandMock.mockReset();
+    runMock.mockReset();
+    loadMock.mockResolvedValue(makeConfig());
+    RunnerUnsupportedCommand.ran = false;
+    process.exitCode = undefined;
+  });
+
+  afterEach(() => {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    process.exitCode = undefined;
+  });
+
+  it("rejects direct command-id execution before the raw action body (#9203)", async () => {
+    useHermesPortableAuthority();
+    runCommandMock.mockImplementation(() => RunnerUnsupportedCommand.run(["alpha"], process.cwd()));
+
+    await expect(
+      runOclifCommandById("sandbox:destroy", ["alpha"], { rootDir: "/repo" }),
+    ).rejects.toThrow("not supported for an experimental Hermes portable sandbox");
+    expect(RunnerUnsupportedCommand.ran).toBe(false);
+  });
+
+  it("rejects native argv execution before the raw action body (#9203)", async () => {
+    useHermesPortableAuthority();
+    runMock.mockImplementation(() => RunnerUnsupportedCommand.run(["alpha"], process.cwd()));
+
+    await runOclifArgv(["sandbox", "destroy", "alpha"], { rootDir: "/repo" });
+
+    expect(RunnerUnsupportedCommand.ran).toBe(false);
+    expect(handleMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringContaining(
+          "not supported for an experimental Hermes portable sandbox",
+        ),
+      }),
+    );
+  });
+
+  it("preserves native raw-argv help without action admission (#9203)", async () => {
+    useHermesPortableAuthority();
+    runMock.mockImplementation(() =>
+      RunnerUnsupportedCommand.run(["alpha", "--help"], process.cwd()),
+    );
+
+    await runOclifArgv(["sandbox", "destroy", "alpha", "--help"], { rootDir: "/repo" });
+
+    expect(RunnerUnsupportedCommand.ran).toBe(true);
+    expect(handleMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("runOclifArgv", () => {
   let originalArgv: string[];
@@ -80,7 +172,10 @@ describe("runOclifArgv", () => {
       ]);
     });
 
-    await runOclifArgv(["sandbox", "channels", "start", "--help"], { rootDir: "/repo" });
+    await runOclifArgv(["sandbox", "channels", "start", "--help"], {
+      rootDir: "/repo",
+      publicSandboxName: "alpha",
+    });
 
     expect(process.argv).toEqual(["/usr/bin/node", "/repo/bin/nemoclaw.js", "alpha", "status"]);
 
@@ -94,6 +189,14 @@ describe("runOclifArgv", () => {
     expect(config.pjson.oclif.bin).toBe("nemoclaw");
     expect(config.options.pjson.oclif.bin).toBe("nemoclaw");
     expect(config.plugins.get("root")?.pjson.oclif.bin).toBe("nemoclaw");
+    expect((config.pjson.oclif as Record<string, unknown>)[PUBLIC_HELP_SANDBOX_NAME_PROPERTY]).toBe(
+      "alpha",
+    );
+    expect(
+      (config.plugins.get("root")?.pjson.oclif as Record<string, unknown>)[
+        PUBLIC_HELP_SANDBOX_NAME_PROPERTY
+      ],
+    ).toBe("alpha");
   });
 
   it("delegates ordinary native-route failures to oclif's handler and restores argv", async () => {
@@ -158,7 +261,7 @@ describe("runOclifArgv", () => {
     // delegate to oclif's handler, which performs the graceful exit 0.
     // This mocks handleOclif to assert delegation; the runtime counterpart
     // (real `nemoclaw sandbox --help` → exit 0 through the actual binary) is
-    // locked by test/exit-code-user-error-surfaces.test.ts
+    // locked by test/cli/exit-code-user-error-surfaces.test.ts
     // ("a native-route --help stays a clean exit 0").
     class ExitError extends Error {
       oclif = { exit: 0 };
@@ -204,7 +307,10 @@ describe("runOclifCommandById", () => {
       expect(process.argv).toEqual(["/usr/bin/node", "/repo/bin/nemoclaw.js", "list", "--json"]);
     });
 
-    await runOclifCommandById("list", ["--json"], { rootDir: "/repo" });
+    await runOclifCommandById("list", ["--json"], {
+      rootDir: "/repo",
+      publicSandboxName: "alpha",
+    });
 
     expect(process.argv).toEqual(["/usr/bin/node", "/repo/bin/nemoclaw.js", "alpha", "status"]);
     expect(loadMock).toHaveBeenCalledWith("/repo");
@@ -213,6 +319,14 @@ describe("runOclifCommandById", () => {
     expect(config.pjson.oclif.bin).toBe("nemoclaw");
     expect(config.options.pjson.oclif.bin).toBe("nemoclaw");
     expect(config.plugins.get("root")?.pjson.oclif.bin).toBe("nemoclaw");
+    expect((config.pjson.oclif as Record<string, unknown>)[PUBLIC_HELP_SANDBOX_NAME_PROPERTY]).toBe(
+      "alpha",
+    );
+    expect(
+      (config.plugins.get("root")?.pjson.oclif as Record<string, unknown>)[
+        PUBLIC_HELP_SANDBOX_NAME_PROPERTY
+      ],
+    ).toBe("alpha");
   });
 
   it("formats oclif flag parse errors and exits with the oclif exit code", async () => {
@@ -244,6 +358,97 @@ describe("runOclifCommandById", () => {
 
     expect(errorLine).toHaveBeenCalledWith("  Unexpected argument: extra");
     expect(exit).toHaveBeenCalledWith(2);
+  });
+
+  it("formats an invalid enum flag value instead of rethrowing it (#8123)", async () => {
+    class FlagInvalidOptionError extends Error {
+      oclif = { exit: 2 };
+      parse = {};
+      showHelp = false;
+    }
+    runCommandMock.mockRejectedValue(
+      new FlagInvalidOptionError(
+        "Expected --reasoning-effort=ultra to be one of: low, medium, high, default\nSee more help with --help",
+      ),
+    );
+    const errorLine = vi.fn();
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(
+      runOclifCommandById("inference:set", ["--reasoning-effort", "ultra"], {
+        rootDir: "/repo",
+        error: errorLine,
+        exit,
+      }),
+    ).rejects.toThrow("exit:2");
+
+    expect(errorLine).toHaveBeenCalledWith(
+      "  Expected --reasoning-effort=ultra to be one of: low, medium, high, default\nSee more help with --help",
+    );
+    expect(exit).toHaveBeenCalledWith(2);
+  });
+
+  it("formats an invalid enum argument value instead of rethrowing it (#8123)", async () => {
+    class ArgInvalidOptionError extends Error {
+      oclif = { exit: 2 };
+      parse = {};
+      showHelp = false;
+    }
+    runCommandMock.mockRejectedValue(
+      new ArgInvalidOptionError("Expected powershell to be one of: bash, zsh, fish"),
+    );
+    const errorLine = vi.fn();
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(
+      runOclifCommandById("completion", ["powershell"], {
+        rootDir: "/repo",
+        error: errorLine,
+        exit,
+      }),
+    ).rejects.toThrow("exit:2");
+
+    expect(errorLine).toHaveBeenCalledWith("  Expected powershell to be one of: bash, zsh, fish");
+    expect(exit).toHaveBeenCalledWith(2);
+  });
+
+  it("recognizes a parse error by shape when its class name is unknown (#8123)", async () => {
+    class SomeLaterParserError extends Error {
+      oclif = { exit: 2 };
+      parse = {};
+      showHelp = true;
+    }
+    runCommandMock.mockRejectedValue(new SomeLaterParserError("A parser rule rejected the input"));
+    const errorLine = vi.fn();
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+
+    await expect(
+      runOclifCommandById("list", ["--json"], { rootDir: "/repo", error: errorLine, exit }),
+    ).rejects.toThrow("exit:2");
+
+    expect(errorLine).toHaveBeenCalledWith("  A parser rule rejected the input");
+    expect(exit).toHaveBeenCalledWith(2);
+  });
+
+  it("keeps rethrowing a command failure that carries an unrelated parse property (#8123)", async () => {
+    class CommandFailure extends Error {
+      oclif = { exit: 2 };
+      parse = { source: "sandboxes.json" };
+    }
+    const error = new CommandFailure("Could not read the sandbox registry");
+    runCommandMock.mockRejectedValue(error);
+    const errorLine = vi.fn();
+
+    await expect(
+      runOclifCommandById("list", [], { rootDir: "/repo", error: errorLine }),
+    ).rejects.toBe(error);
+    expect(errorLine).not.toHaveBeenCalled();
   });
 
   it("treats oclif graceful ExitError(0) as silent success", async () => {

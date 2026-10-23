@@ -12,9 +12,8 @@ vi.mock("node:dns", () => ({
   promises: { lookup: (...args: unknown[]) => mockLookup(...(args as [string, { all: true }])) },
 }));
 
-const { isPrivateIp, safeEndpointUrlForDownstream, validateEndpointUrl } = await import(
-  "./ssrf.js"
-);
+const { isPrivateIp, safeEndpointUrlForDownstream, validateEndpointUrl } =
+  await import("./ssrf.js");
 
 // ── isPrivateIp ─────────────────────────────────────────────────
 
@@ -406,12 +405,73 @@ describe("validateEndpointUrl – URL parsing edge cases", () => {
     expect(() => safeEndpointUrlForDownstream(result)).toThrow(/DNS-backed HTTPS endpoint/);
   });
 
-  it("parses URL with userinfo/basic auth but does not mark DNS-backed HTTPS downstream-safe", async () => {
-    mockPublicDns();
-    // URL parser extracts hostname correctly even with userinfo.
-    const url = "https://user:pass@api.example.com/v1";
-    const result = await validateEndpointUrl(url);
-    expect(result.url).toBe(url);
-    expect(() => safeEndpointUrlForDownstream(result)).toThrow(/DNS-backed HTTPS endpoint/);
+  it.each(
+    [
+      {
+        url: "https://alice:s3cret-token@api.example.com/v1",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      {
+        url: "http://alice:s3cret-token@api.example.com/v1",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      { url: "https://only-alice@api.example.com/v1", secrets: ["only-alice"] },
+      { url: "https://:only-s3cret@api.example.com/v1", secrets: ["only-s3cret"] },
+    ].flatMap(({ url, secrets }, caseIndex) =>
+      secrets.map((secret, secretIndex) => ({
+        caseName: `credential URL ${caseIndex + 1}`,
+        secret,
+        secretName: `credential part ${secretIndex + 1}`,
+        url,
+      })),
+    ),
+  )("rejects $caseName without exposing $secretName", async ({ url, secret }) => {
+    mockLookup.mockClear();
+    let thrown: unknown;
+    try {
+      await validateEndpointUrl(url);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = thrown instanceof Error ? thrown.message : String(thrown);
+    expect(message).toMatch(/must not contain credentials/);
+    expect(message).not.toContain(secret);
+    expect(mockLookup).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    [
+      {
+        url: "https://alice:s3cret-token@",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      {
+        url: "https://alice:s3cret-token@/",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      { url: "https://:only-s3cret@", secrets: ["only-s3cret"] },
+      { url: "https://only-alice@", secrets: ["only-alice"] },
+    ].flatMap(({ url, secrets }, caseIndex) =>
+      secrets.map((secret, secretIndex) => ({
+        caseName: `malformed credential URL ${caseIndex + 1}`,
+        secret,
+        secretName: `credential part ${secretIndex + 1}`,
+        url,
+      })),
+    ),
+  )("does not expose $secretName from $caseName", async ({ url, secret }) => {
+    mockLookup.mockClear();
+    let thrown: unknown;
+    try {
+      await validateEndpointUrl(url);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const message = thrown instanceof Error ? thrown.message : String(thrown);
+    expect(message).toMatch(/No hostname found in URL/);
+    expect(message).not.toContain(secret);
+    expect(mockLookup).not.toHaveBeenCalled();
   });
 });

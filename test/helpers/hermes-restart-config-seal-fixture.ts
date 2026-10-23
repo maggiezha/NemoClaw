@@ -19,6 +19,44 @@ export const RUNTIME_CONFIG_GUARD = path.join(
 
 const HERMES_GUARD_TIMEOUT_MS = 90_000;
 
+/**
+ * Provides the narrow GatewayConfig surface that the host-side guard fixtures need.
+ * The production guard imports Hermes' bundled gateway.config module from the image.
+ */
+function writeGatewayConfigStub(root: string): void {
+  const pythonRoot = path.join(root, "python");
+  const gatewayDir = path.join(pythonRoot, "gateway");
+  fs.mkdirSync(gatewayDir, { recursive: true });
+  fs.writeFileSync(path.join(gatewayDir, "__init__.py"), "", { mode: 0o600 });
+  fs.writeFileSync(
+    path.join(gatewayDir, "config.py"),
+    [
+      "class GatewayConfig:",
+      "    @classmethod",
+      "    def from_dict(cls, value):",
+      "        if not isinstance(value, dict):",
+      "            raise TypeError('Hermes configuration must be a mapping')",
+      "        platforms = value.get('platforms')",
+      "        if not isinstance(platforms, dict):",
+      "            return cls()",
+      "        teams = platforms.get('teams')",
+      "        if not isinstance(teams, dict):",
+      "            return cls()",
+      "        home_channel = teams.get('home_channel')",
+      "        if isinstance(home_channel, dict) and 'platform' not in home_channel:",
+      "            raise KeyError('platform')",
+      "        return cls()",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+}
+
+export function gatewayConfigStubRoot(root: string): string {
+  writeGatewayConfigStub(root);
+  return path.join(root, "python");
+}
+
 export interface RestartFixture {
   root: string;
   sandboxDir: string;
@@ -82,6 +120,7 @@ export function createRestartFixture(): RestartFixture {
   const hash = hashInputs(configPath, envPath);
   fs.writeFileSync(hashPath, hash, { mode: 0o600 });
   fs.writeFileSync(compatHashPath, hash, { mode: 0o600 });
+  writeGatewayConfigStub(root);
 
   return {
     root,
@@ -110,11 +149,28 @@ export function allowRestartFixturePeerTraversal(fixture: RestartFixture): () =>
   return () => fs.chmodSync(testTempRoot, testTempRootMode);
 }
 
-export function runWriteConfig(fixture: RestartFixture, expectedDigest: string, content: string) {
+export function runWriteConfig(
+  fixture: RestartFixture,
+  expectedDigest: string,
+  content: string,
+  options: { env?: NodeJS.ProcessEnv } = {},
+) {
+  const wrapper = String.raw`
+import sys
+
+source_path = sys.argv[1]
+sys.path.insert(0, sys.argv[2])
+sys.argv = [source_path, *sys.argv[3:]]
+with open(source_path, "rb") as source:
+    exec(compile(source.read(), source_path, "exec"), {"__name__": "__main__", "__file__": source_path})
+`;
   return spawnSync(
     "python3",
     [
+      "-c",
+      wrapper,
       RUNTIME_CONFIG_GUARD,
+      gatewayConfigStubRoot(fixture.root),
       "write-config",
       "--hermes-dir",
       fixture.hermesDir,
@@ -125,7 +181,12 @@ export function runWriteConfig(fixture: RestartFixture, expectedDigest: string, 
       "--expected-config-sha256",
       expectedDigest,
     ],
-    { encoding: "utf-8", input: content, timeout: HERMES_GUARD_TIMEOUT_MS },
+    {
+      encoding: "utf-8",
+      input: content,
+      timeout: HERMES_GUARD_TIMEOUT_MS,
+      env: options.env,
+    },
   );
 }
 
@@ -161,84 +222,6 @@ export function runGuard(action: "seal-restart" | "unseal-restart", fixture: Res
   });
 }
 
-export function runShieldsTransition(fixture: RestartFixture, shieldsMode: "locked" | "mutable") {
-  const begun = runShieldsTransactionAction(fixture, "begin-shields-transition", {
-    mode: shieldsMode,
-  });
-  switch (begun.status) {
-    case 0:
-      break;
-    default:
-      return begun;
-  }
-  const token = shieldsTransactionToken(begun.stdout);
-  switch (token) {
-    case undefined:
-      throw new Error("Expected begin-shields-transition to emit a token");
-    default:
-      break;
-  }
-  switch (shieldsMode) {
-    case "locked":
-      // The production host restores 0755 only after the recursive state guard's
-      // independent verification pass. This focused top-guard fixture has no
-      // recursive state, so model that successful handoff explicitly.
-      fs.chmodSync(fixture.hermesDir, 0o755);
-      break;
-    case "mutable":
-      break;
-  }
-  const applied = runShieldsTransactionAction(fixture, "apply-shields-transition", {
-    token,
-  });
-  switch (applied.status) {
-    case 0:
-      break;
-    default:
-      return applied;
-  }
-  return runShieldsTransactionAction(fixture, "finish-shields-transition", {
-    token,
-  });
-}
-
-export function runShieldsTransactionAction(
-  fixture: RestartFixture,
-  action:
-    | "begin-shields-transition"
-    | "apply-shields-transition"
-    | "finish-shields-transition"
-    | "prepare-shields-abort"
-    | "abort-shields-transition"
-    | "inspect-mutation-owner",
-  options: {
-    mode?: "locked" | "mutable";
-    rollbackMode?: "locked" | "mutable";
-    token?: string;
-  } = {},
-) {
-  const args = [
-    RUNTIME_CONFIG_GUARD,
-    action,
-    "--hermes-dir",
-    fixture.hermesDir,
-    "--state-file",
-    fixture.statePath,
-  ];
-  args.push(
-    ...(action === "begin-shields-transition" || action === "finish-shields-transition"
-      ? ["--hash-file", fixture.hashPath]
-      : []),
-    ...(options.mode ? ["--shields-mode", options.mode] : []),
-    ...(options.rollbackMode ? ["--rollback-shields-mode", options.rollbackMode] : []),
-    ...(options.token ? ["--lock-token", options.token] : []),
-  );
-  return spawnSync("python3", args, {
-    encoding: "utf-8",
-    timeout: HERMES_GUARD_TIMEOUT_MS,
-  });
-}
-
 export function strictHashIsValid(fixture: RestartFixture): boolean {
   return (
     spawnSync("sha256sum", ["-c", fixture.hashPath, "--status"], {
@@ -246,10 +229,6 @@ export function strictHashIsValid(fixture: RestartFixture): boolean {
       timeout: 5000,
     }).status === 0
   );
-}
-
-export function shieldsTransactionToken(output: string): string | undefined {
-  return /^lock_token=([0-9a-f]{64}) original_locked=[01]\s*$/.exec(output)?.[1];
 }
 
 export function overwriteThroughOldFd(fd: number, originalSize: number, byte: string): void {

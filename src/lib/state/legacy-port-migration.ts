@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -15,12 +16,27 @@ import {
   readGatewayRegistryFile,
   registryEntryGatewayPort,
 } from "./gateway-registry";
+import {
+  listRetainedSandboxRecoveryRecords,
+  retainedSandboxRecoveryDocument as retainedRecoveryDocument,
+  retainedSandboxRecoveryFile,
+  retainedRebuildSessionFileName,
+  readRetainedRebuildSession,
+  type RetainedSandboxRecoveryRecord,
+} from "./onboard-session/retained-sandbox-recovery";
+import {
+  acquireProcessBoundLockAt,
+  releaseProcessBoundLock,
+  type ProcessBoundLockHandle,
+} from "./registry/lock";
 import { nemoclawStateRoot, resolveHome } from "./state-root";
 
-const MIGRATION_LOCK = ".gateway-state-migration.lock";
+export const GATEWAY_STATE_MIGRATION_LOCK = ".gateway-state-migration.lock";
 const MIGRATION_INTENT = ".gateway-state-migration";
 const MIGRATION_INTENT_METADATA = "intent.json";
+const MIGRATION_INTENT_REMAINING_RECOVERY = "remaining-retained-sandbox-recovery.json";
 const MIGRATION_INTENT_SELECTED_REGISTRY = "selected-registry.json";
+const MIGRATION_INTENT_SELECTED_RECOVERY = "selected-retained-sandbox-recovery.json";
 const MIGRATION_INTENT_REMAINING_REGISTRY = "remaining-registry.json";
 const MIGRATION_INTENT_VERSION = 1;
 const MIGRATION_LOCK_STALE_MS = 10_000;
@@ -34,6 +50,7 @@ const LEGACY_BUNDLE_ENTRIES = [
   "model-router-venv",
   "mounts",
   "ollama-auth-proxy.pid",
+  "ollama-proxy-port",
   "ollama-proxy-token",
   "onboard-failures",
   "openrouter-runtime-adapter.pid",
@@ -41,13 +58,60 @@ const LEGACY_BUNDLE_ENTRIES = [
   "usage-notice.json",
 ] as const;
 const SESSION_BOUND_ENTRIES = ["credentials.json"] as const;
-type LegacyBundleEntry = (typeof LEGACY_BUNDLE_ENTRIES)[number];
-const LEGACY_BUNDLE_ENTRY_SET: ReadonlySet<string> = new Set(LEGACY_BUNDLE_ENTRIES);
+const HOST_SHARED_BUNDLE_ENTRIES = [
+  "ollama-auth-proxy.pid",
+  "ollama-proxy-port",
+  "ollama-proxy-token",
+] as const;
+type LegacyBundleEntry =
+  | (typeof LEGACY_BUNDLE_ENTRIES)[number]
+  | ReturnType<typeof retainedRebuildSessionFileName>;
+const HOST_SHARED_BUNDLE_ENTRY_SET: ReadonlySet<string> = new Set(HOST_SHARED_BUNDLE_ENTRIES);
+const MIGRATABLE_BUNDLE_ENTRIES: readonly LegacyBundleEntry[] = LEGACY_BUNDLE_ENTRIES.filter(
+  (entry) => !HOST_SHARED_BUNDLE_ENTRY_SET.has(entry),
+);
 
 export interface LegacyPortMigrationResult {
   migratedSandboxNames: string[];
   migratedSession: boolean;
   warnings: string[];
+}
+
+interface FileIdentity {
+  device: bigint;
+  inode: bigint;
+}
+
+interface DirectoryLockGeneration extends FileIdentity {
+  entries: readonly string[];
+  home: string;
+  lockPath: string;
+  mtimeMs: number;
+  owner: string | null;
+  ownerIdentity: FileIdentity | null;
+}
+
+export interface GatewayStateMigrationLockHandle extends DirectoryLockGeneration {}
+
+/** Read-only collision check used before deciding whether public argv needs migration. */
+export function hasMigratableLegacySandbox(
+  sandboxName: string,
+  options: { gatewayPort?: number; home?: string } = {},
+): boolean {
+  const gatewayPort = options.gatewayPort ?? GATEWAY_PORT;
+  if (gatewayPort === DEFAULT_GATEWAY_PORT) return false;
+  const home = path.resolve(options.home || resolveHome());
+  const sharedRoot = nemoclawStateRoot(home, DEFAULT_GATEWAY_PORT);
+  const pendingIntent = readMigrationIntent(home, sharedRoot);
+  if (
+    pendingIntent?.metadata.gatewayPort === gatewayPort &&
+    pendingIntent.metadata.selectedSandboxNames.includes(sandboxName)
+  ) {
+    return true;
+  }
+  const legacyRegistry = readGatewayRegistryFile(home, path.join(sharedRoot, "sandboxes.json"));
+  const entry = legacyRegistry?.sandboxes[sandboxName];
+  return entry ? registryEntryGatewayPort(entry) === gatewayPort : false;
 }
 
 interface LegacyPortMigrationIntentMetadata {
@@ -66,10 +130,45 @@ interface LegacyPortMigrationIntent {
   metadata: LegacyPortMigrationIntentMetadata;
   selectedRegistry: GatewayRegistryDocument;
   remainingRegistry: GatewayRegistryDocument | null;
+  selectedRecovery: RetainedRecoveryDocument | null;
+  remainingRecovery: RetainedRecoveryDocument | null;
 }
+
+type RetainedRecoveryDocument = ReturnType<typeof retainedRecoveryDocument>;
 
 function migrationError(message: string): Error {
   return new Error(`Cannot safely migrate legacy NemoClaw state for this gateway port: ${message}`);
+}
+
+function retainedRebuildSessionEntry(sandboxName: string): LegacyBundleEntry {
+  try {
+    return retainedRebuildSessionFileName(sandboxName);
+  } catch {
+    throw migrationError(`sandbox ${JSON.stringify(sandboxName)} has an unsupported name`);
+  }
+}
+
+function validateRetainedRebuildMoves(
+  sharedRoot: string,
+  selectedRoot: string,
+  gatewayPort: number,
+  sandboxNames: readonly string[],
+  bundleEntries: readonly LegacyBundleEntry[],
+): void {
+  for (const sandboxName of sandboxNames) {
+    if (!bundleEntries.includes(retainedRebuildSessionEntry(sandboxName))) continue;
+    try {
+      const source = readRetainedRebuildSession(sharedRoot, sandboxName, gatewayPort);
+      const destination = readRetainedRebuildSession(selectedRoot, sandboxName, gatewayPort);
+      if (Boolean(source) === Boolean(destination)) {
+        throw new Error(
+          `retained rebuild recovery for '${sandboxName}' must exist in exactly one state root`,
+        );
+      }
+    } catch (error) {
+      throw migrationError(error instanceof Error ? error.message : String(error));
+    }
+  }
 }
 
 function ensureRealDirectory(home: string, dir: string): void {
@@ -152,6 +251,38 @@ function readJsonNoFollow(home: string, filePath: string): unknown | null {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function readRetainedRecoveryDocument(
+  home: string,
+  filePath: string,
+): RetainedRecoveryDocument | null {
+  if (!lstatNoFollow(home, filePath)) return null;
+  let records: readonly RetainedSandboxRecoveryRecord[];
+  try {
+    records = listRetainedSandboxRecoveryRecords(filePath);
+  } catch (error) {
+    throw migrationError(
+      `${filePath} is not valid retained sandbox recovery state: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  for (const record of records) {
+    const gatewayPort = resolveGatewayPortFromName(record.gatewayName);
+    if (gatewayPort === null || gatewayPort !== record.gatewayPort) {
+      throw migrationError(
+        `${filePath} record ${record.recordId} has conflicting gateway identity`,
+      );
+    }
+  }
+  return retainedRecoveryDocument(records);
+}
+
+function removeRetainedRecoveryFile(home: string, filePath: string): void {
+  const stat = lstatNoFollow(home, filePath);
+  if (!stat) return;
+  if (!stat.isFile()) throw migrationError(`${filePath} is not a regular file`);
+  fs.rmSync(filePath);
+  fsyncDirectory(path.dirname(filePath));
 }
 
 function firstSandboxName(sandboxes: Record<string, GatewayRegistryEntry>): string | null {
@@ -360,15 +491,28 @@ function readMigrationIntent(home: string, sharedRoot: string): LegacyPortMigrat
     rawMetadata.bundleEntries,
     "migration intent bundleEntries",
   );
+  const selectedRecovery = readRetainedRecoveryDocument(
+    home,
+    path.join(intentDir, MIGRATION_INTENT_SELECTED_RECOVERY),
+  );
+  const remainingRecovery = readRetainedRecoveryDocument(
+    home,
+    path.join(intentDir, MIGRATION_INTENT_REMAINING_RECOVERY),
+  );
   if (
     rawMetadata.rewriteLegacyRegistry !== selectedSandboxNames.length > 0 ||
     (rawMetadata.moveSession && rawMetadata.warnAmbiguousSession) ||
-    (selectedSandboxNames.length === 0 && !rawMetadata.moveSession)
+    (selectedSandboxNames.length === 0 && !rawMetadata.moveSession && !selectedRecovery) ||
+    (selectedRecovery === null) !== (remainingRecovery === null)
   ) {
     throw migrationError("migration intent has inconsistent ownership metadata");
   }
+  const allowedBundleEntries: ReadonlySet<string> = new Set([
+    ...LEGACY_BUNDLE_ENTRIES,
+    ...selectedSandboxNames.map(retainedRebuildSessionEntry),
+  ]);
   for (const entry of rawBundleEntries) {
-    if (!LEGACY_BUNDLE_ENTRY_SET.has(entry)) {
+    if (!allowedBundleEntries.has(entry)) {
       throw migrationError(`migration intent contains unsupported bundle entry ${entry}`);
     }
   }
@@ -377,6 +521,13 @@ function readMigrationIntent(home: string, sharedRoot: string): LegacyPortMigrat
     if (!selectedNameSet.has(sandboxName)) {
       throw migrationError(`migration intent backup ${sandboxName} is not a selected sandbox`);
     }
+  }
+  if (
+    selectedRecovery?.unresolved.length === 0 ||
+    selectedRecovery?.unresolved.some((record) => record.gatewayPort !== gatewayPort) ||
+    remainingRecovery?.unresolved.some((record) => record.gatewayPort === gatewayPort)
+  ) {
+    throw migrationError("migration intent has inconsistent retained recovery ownership");
   }
 
   const selectedRegistryFile = path.join(intentDir, MIGRATION_INTENT_SELECTED_REGISTRY);
@@ -411,6 +562,16 @@ function readMigrationIntent(home: string, sharedRoot: string): LegacyPortMigrat
       }
     }
   }
+  if (
+    selectedRecovery === null &&
+    readRetainedRecoveryDocument(home, retainedSandboxRecoveryFile(sharedRoot))?.unresolved.some(
+      (record) => record.gatewayPort === gatewayPort,
+    )
+  ) {
+    throw migrationError(
+      "published migration intent predates retained recovery partitioning; retained recovery remains safely in the shared root",
+    );
+  }
 
   return {
     intentDir,
@@ -426,6 +587,8 @@ function readMigrationIntent(home: string, sharedRoot: string): LegacyPortMigrat
     },
     selectedRegistry,
     remainingRegistry,
+    selectedRecovery,
+    remainingRecovery,
   };
 }
 
@@ -435,6 +598,8 @@ function createMigrationIntent(
   metadata: LegacyPortMigrationIntentMetadata,
   selectedRegistry: GatewayRegistryDocument,
   remainingRegistry: GatewayRegistryDocument | null,
+  selectedRecovery: RetainedRecoveryDocument | null,
+  remainingRecovery: RetainedRecoveryDocument | null,
 ): LegacyPortMigrationIntent {
   const intentDir = path.join(sharedRoot, MIGRATION_INTENT);
   if (lstatNoFollow(home, intentDir)) {
@@ -444,6 +609,9 @@ function createMigrationIntent(
   }
   if (metadata.rewriteLegacyRegistry && !remainingRegistry) {
     throw migrationError("migration intent is missing its remaining legacy registry");
+  }
+  if ((selectedRecovery === null) !== (remainingRecovery === null)) {
+    throw migrationError("migration intent is missing its retained recovery partition");
   }
 
   ensureRealDirectory(home, sharedRoot);
@@ -462,6 +630,18 @@ function createMigrationIntent(
         home,
         path.join(preparingDir, MIGRATION_INTENT_REMAINING_REGISTRY),
         remainingRegistry,
+      );
+    }
+    if (selectedRecovery && remainingRecovery) {
+      writeJsonAtomic(
+        home,
+        path.join(preparingDir, MIGRATION_INTENT_SELECTED_RECOVERY),
+        selectedRecovery,
+      );
+      writeJsonAtomic(
+        home,
+        path.join(preparingDir, MIGRATION_INTENT_REMAINING_RECOVERY),
+        remainingRecovery,
       );
     }
     fsyncDirectory(preparingDir);
@@ -516,6 +696,13 @@ function applyMigrationIntent(
   selectedRegistryFile: string,
   intent: LegacyPortMigrationIntent,
 ): LegacyPortMigrationResult {
+  validateRetainedRebuildMoves(
+    sharedRoot,
+    selectedRoot,
+    intent.metadata.gatewayPort,
+    intent.metadata.selectedSandboxNames,
+    intent.metadata.bundleEntries,
+  );
   const result: LegacyPortMigrationResult = {
     migratedSandboxNames: [...intent.metadata.selectedSandboxNames],
     migratedSession: intent.metadata.moveSession,
@@ -529,6 +716,14 @@ function applyMigrationIntent(
     writeJsonAtomic(home, legacyRegistryFile, intent.remainingRegistry);
   }
 
+  if (intent.selectedRecovery && intent.remainingRecovery) {
+    writeJsonAtomic(home, retainedSandboxRecoveryFile(selectedRoot), intent.selectedRecovery);
+    if (intent.remainingRecovery.unresolved.length > 0) {
+      writeJsonAtomic(home, retainedSandboxRecoveryFile(sharedRoot), intent.remainingRecovery);
+    } else {
+      removeRetainedRecoveryFile(home, retainedSandboxRecoveryFile(sharedRoot));
+    }
+  }
   migrateSandboxBackups(home, sharedRoot, selectedRoot, intent.metadata.sandboxBackupNames);
   if (intent.metadata.moveSession) {
     resumeMovePath(
@@ -547,7 +742,7 @@ function applyMigrationIntent(
   }
 
   const movedEntries = new Set<LegacyBundleEntry>(intent.metadata.bundleEntries);
-  const entriesLeftAmbiguous = LEGACY_BUNDLE_ENTRIES.filter(
+  const entriesLeftAmbiguous = MIGRATABLE_BUNDLE_ENTRIES.filter(
     (entry) => !movedEntries.has(entry) && lstatNoFollow(home, path.join(sharedRoot, entry)),
   );
   if (intent.metadata.selectedSandboxNames.length > 0 && entriesLeftAmbiguous.length > 0) {
@@ -570,52 +765,278 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function existingLockIsStale(home: string, lock: string): boolean {
-  const stat = lstatNoFollow(home, lock);
-  if (!stat) return true;
-  if (!stat.isDirectory()) throw migrationError(`${lock} is not a directory`);
-
-  let ownerPid: number | null = null;
-  try {
-    const ownerFile = path.join(lock, "owner");
-    const ownerStat = lstatNoFollow(home, ownerFile);
-    if (ownerStat?.isFile()) {
-      const parsed = Number.parseInt(fs.readFileSync(ownerFile, "utf8").trim(), 10);
-      ownerPid = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-    }
-  } catch (error) {
-    if (!isErrnoException(error) || error.code !== "ENOENT") throw error;
-  }
-  if (ownerPid !== null) return !isProcessAlive(ownerPid);
-  return Date.now() - stat.mtimeMs > MIGRATION_LOCK_STALE_MS;
+function sameFileIdentity(left: FileIdentity | null, right: FileIdentity | null): boolean {
+  return left?.device === right?.device && left?.inode === right?.inode;
 }
 
-function acquireDirectoryLock(home: string, lock: string): string {
+function lockFileIdentity(target: string): FileIdentity | null {
+  try {
+    const stat = fs.lstatSync(target, { bigint: true });
+    return { device: stat.dev, inode: stat.ino };
+  } catch (error) {
+    if (isErrnoException(error) && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function readDirectoryLockOwner(
+  home: string,
+  ownerPath: string,
+): { identity: FileIdentity; value: string } | null {
+  assertGatewayStatePathSafe(home, ownerPath);
+  const noFollow = process.platform === "win32" ? 0 : fs.constants.O_NOFOLLOW;
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(ownerPath, fs.constants.O_RDONLY | noFollow);
+    const before = fs.fstatSync(descriptor, { bigint: true });
+    const pathBefore = fs.lstatSync(ownerPath, { bigint: true });
+    if (
+      !before.isFile() ||
+      pathBefore.isSymbolicLink() ||
+      !sameFileIdentity(
+        { device: before.dev, inode: before.ino },
+        { device: pathBefore.dev, inode: pathBefore.ino },
+      ) ||
+      before.nlink !== 1n ||
+      before.size < 1n ||
+      before.size > 32n ||
+      (typeof process.getuid === "function" &&
+        (before.uid !== BigInt(process.getuid()) || (before.mode & 0o777n) !== 0o600n))
+    ) {
+      throw migrationError(`${ownerPath} is not a stable owner file`);
+    }
+    const bytes = Buffer.alloc(Number(before.size));
+    const bytesRead = fs.readSync(descriptor, bytes, 0, bytes.length, 0);
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(ownerPath, { bigint: true });
+    if (
+      bytesRead !== bytes.length ||
+      !sameFileIdentity(
+        { device: before.dev, inode: before.ino },
+        { device: after.dev, inode: after.ino },
+      ) ||
+      !sameFileIdentity(
+        { device: before.dev, inode: before.ino },
+        { device: pathAfter.dev, inode: pathAfter.ino },
+      )
+    ) {
+      throw migrationError(`${ownerPath} changed while it was inspected`);
+    }
+    return {
+      identity: { device: before.dev, inode: before.ino },
+      value: bytes.toString("utf8"),
+    };
+  } catch (error) {
+    if (isErrnoException(error) && error.code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+  }
+}
+
+function readDirectoryLockGeneration(
+  home: string,
+  lockPath: string,
+): DirectoryLockGeneration | null {
+  assertGatewayStatePathSafe(home, lockPath);
+  let before: fs.BigIntStats;
+  try {
+    before = fs.lstatSync(lockPath, { bigint: true });
+  } catch (error) {
+    if (isErrnoException(error) && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw migrationError(`${lockPath} is not a real directory`);
+  }
+  if (
+    typeof process.getuid === "function" &&
+    (before.uid !== BigInt(process.getuid()) || (before.mode & 0o077n) !== 0n)
+  ) {
+    throw migrationError(`${lockPath} is not private to the current user`);
+  }
+  const entries = fs.readdirSync(lockPath).sort();
+  if (entries.some((entry) => entry !== "owner")) {
+    throw migrationError(`${lockPath} contains unexpected state`);
+  }
+  const owner = readDirectoryLockOwner(home, path.join(lockPath, "owner"));
+  const after = fs.lstatSync(lockPath, { bigint: true });
+  if (
+    !after.isDirectory() ||
+    after.isSymbolicLink() ||
+    !sameFileIdentity(
+      { device: before.dev, inode: before.ino },
+      { device: after.dev, inode: after.ino },
+    )
+  ) {
+    throw migrationError(`${lockPath} changed while it was inspected`);
+  }
+  return {
+    device: after.dev,
+    entries,
+    home,
+    inode: after.ino,
+    lockPath,
+    mtimeMs: Number(after.mtimeMs),
+    owner: owner?.value ?? null,
+    ownerIdentity: owner?.identity ?? null,
+  };
+}
+
+function sameDirectoryLockGeneration(
+  left: DirectoryLockGeneration,
+  right: DirectoryLockGeneration,
+): boolean {
+  return (
+    sameFileIdentity(left, right) &&
+    left.owner === right.owner &&
+    sameFileIdentity(left.ownerIdentity, right.ownerIdentity) &&
+    JSON.stringify(left.entries) === JSON.stringify(right.entries)
+  );
+}
+
+function restoreQuarantinedDirectoryLock(
+  generation: DirectoryLockGeneration,
+  quarantine: string,
+): void {
+  try {
+    fs.mkdirSync(generation.lockPath, { mode: 0o700 });
+  } catch (error) {
+    if (isErrnoException(error) && error.code === "EEXIST") return;
+    throw error;
+  }
+  try {
+    fs.renameSync(quarantine, generation.lockPath);
+  } catch (error) {
+    const placeholder = readDirectoryLockGeneration(generation.home, generation.lockPath);
+    if (placeholder?.owner === null && placeholder.entries.length === 0) {
+      fs.rmdirSync(generation.lockPath);
+    }
+    throw error;
+  }
+}
+
+function removeDirectoryLockGeneration(generation: DirectoryLockGeneration): boolean {
+  const quarantine = `${generation.lockPath}.quarantine.${String(process.pid)}.${randomUUID()}`;
+  assertGatewayStatePathSafe(generation.home, quarantine);
+  try {
+    fs.renameSync(generation.lockPath, quarantine);
+  } catch (error) {
+    if (isErrnoException(error) && error.code === "ENOENT") return false;
+    throw error;
+  }
+  let detached: DirectoryLockGeneration | null;
+  try {
+    detached = readDirectoryLockGeneration(generation.home, quarantine);
+  } catch (error) {
+    restoreQuarantinedDirectoryLock(generation, quarantine);
+    throw error;
+  }
+  if (!detached || !sameDirectoryLockGeneration(generation, detached)) {
+    restoreQuarantinedDirectoryLock(generation, quarantine);
+    return false;
+  }
+  fs.rmSync(quarantine, { recursive: true });
+  return true;
+}
+
+function existingLockIsStale(generation: DirectoryLockGeneration): boolean {
+  const owner = generation.owner?.trim() ?? "";
+  const ownerPid = /^[1-9][0-9]{0,15}$/u.test(owner) ? Number(owner) : null;
+  if (ownerPid !== null && Number.isSafeInteger(ownerPid)) return !isProcessAlive(ownerPid);
+  return Date.now() - generation.mtimeMs > MIGRATION_LOCK_STALE_MS;
+}
+
+function releaseDirectoryLock(generation: DirectoryLockGeneration): void {
+  if (!removeDirectoryLockGeneration(generation)) {
+    throw migrationError(`${generation.lockPath} changed ownership before release`);
+  }
+}
+
+function acquireDirectoryLock(home: string, lock: string): DirectoryLockGeneration {
   const parent = path.dirname(lock);
   ensureRealDirectory(home, parent);
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    let createdDirectory: DirectoryLockGeneration | null = null;
+    let createdOwnerIdentity: FileIdentity | null = null;
     try {
       fs.mkdirSync(lock, { mode: 0o700 });
       try {
-        fs.writeFileSync(path.join(lock, "owner"), String(process.pid), { mode: 0o600 });
+        createdDirectory = readDirectoryLockGeneration(home, lock);
+        if (!createdDirectory) throw migrationError(`failed to create ${lock}`);
+        fs.writeFileSync(path.join(lock, "owner"), String(process.pid), {
+          flag: "wx",
+          mode: 0o600,
+        });
+        createdOwnerIdentity = lockFileIdentity(path.join(lock, "owner"));
         fsyncDirectory(lock);
         fsyncDirectory(parent);
-        return lock;
+        const created = readDirectoryLockGeneration(home, lock);
+        if (
+          !created ||
+          !sameFileIdentity(created, createdDirectory) ||
+          !sameFileIdentity(created.ownerIdentity, createdOwnerIdentity) ||
+          created.owner !== String(process.pid)
+        ) {
+          throw migrationError(`${lock} changed ownership during acquisition`);
+        }
+        return created;
       } catch (error) {
-        fs.rmSync(lock, { recursive: true, force: true });
+        const observed = readDirectoryLockGeneration(home, lock);
+        const expected = createdDirectory && {
+          ...createdDirectory,
+          entries: createdOwnerIdentity ? ["owner"] : [],
+          owner: createdOwnerIdentity ? String(process.pid) : null,
+          ownerIdentity: createdOwnerIdentity,
+        };
+        if (observed && expected && sameDirectoryLockGeneration(expected, observed)) {
+          try {
+            removeDirectoryLockGeneration(expected);
+          } catch {
+            // An ambiguous generation is intentionally preserved.
+          }
+        }
         throw error;
       }
     } catch (error) {
       if (!isErrnoException(error) || error.code !== "EEXIST") throw error;
-      if (attempt === 0 && existingLockIsStale(home, lock)) {
-        fs.rmSync(lock, { recursive: true, force: true });
-        fsyncDirectory(parent);
-        continue;
+      const existing = readDirectoryLockGeneration(home, lock);
+      if (attempt === 0 && existing && existingLockIsStale(existing)) {
+        if (removeDirectoryLockGeneration(existing)) continue;
       }
       throw migrationError(`another state operation owns ${lock}; retry after it completes`);
     }
   }
   throw migrationError(`could not acquire ${lock}`);
+}
+
+function acquireMigrationRegistryLock(lockPath: string): ProcessBoundLockHandle {
+  return acquireProcessBoundLockAt(lockPath, {
+    maxRetries: 2,
+    wait: () => undefined,
+  });
+}
+
+/** Hold the host-wide fence that every onboarding writer checks before mutating gateway state. */
+export function acquireGatewayStateMigrationLock(home: string): GatewayStateMigrationLockHandle {
+  const resolvedHome = path.resolve(home);
+  const sharedRoot = nemoclawStateRoot(resolvedHome, DEFAULT_GATEWAY_PORT);
+  return acquireDirectoryLock(resolvedHome, path.join(sharedRoot, GATEWAY_STATE_MIGRATION_LOCK));
+}
+
+export function releaseGatewayStateMigrationLock(handle: GatewayStateMigrationLockHandle): void {
+  releaseDirectoryLock(handle);
+}
+
+function assertOnboardStateUnlocked(home: string, stateRoots: readonly string[]): void {
+  for (const stateRoot of stateRoots) {
+    const activeLock = path.join(stateRoot, "onboard.lock");
+    if (lstatNoFollow(home, activeLock)) {
+      throw migrationError(
+        `onboarding lock ${activeLock} is present; confirm that no NemoClaw onboarding process in any environment sharing this state root is active, then remove only ${activeLock} and retry; migration will not remove it automatically`,
+      );
+    }
+  }
 }
 
 /**
@@ -636,7 +1057,7 @@ export function migrateLegacyPortState(
   };
   const sharedRoot = nemoclawStateRoot(home, DEFAULT_GATEWAY_PORT);
   const legacyRegistryFile = path.join(sharedRoot, "sandboxes.json");
-  const migrationLock = path.join(sharedRoot, MIGRATION_LOCK);
+  const migrationLock = path.join(sharedRoot, GATEWAY_STATE_MIGRATION_LOCK);
   const pendingBeforeLock = readMigrationIntent(home, sharedRoot);
   const staleIntentDirectoriesExist = staleMigrationIntentNames(home, sharedRoot).length > 0;
 
@@ -647,21 +1068,16 @@ export function migrateLegacyPortState(
       );
     }
     if (lstatNoFollow(home, migrationLock)) {
-      if (existingLockIsStale(home, migrationLock)) {
-        fs.rmSync(migrationLock, { recursive: true, force: true });
-        fsyncDirectory(sharedRoot);
-      } else {
-        throw migrationError(
-          "another gateway-state migration is in progress; retry after it completes",
-        );
-      }
+      const staleFence = acquireDirectoryLock(home, migrationLock);
+      releaseDirectoryLock(staleFence);
     }
     if (staleIntentDirectoriesExist) {
       const lock = acquireDirectoryLock(home, migrationLock);
       try {
+        assertOnboardStateUnlocked(home, [sharedRoot]);
         removeStaleMigrationIntentDirectories(home, sharedRoot);
       } finally {
-        fs.rmSync(lock, { recursive: true, force: true });
+        releaseDirectoryLock(lock);
       }
     }
     return result;
@@ -672,20 +1088,28 @@ export function migrateLegacyPortState(
   const legacyRegistry = readGatewayRegistryFile(home, legacyRegistryFile);
   const legacySessionFile = path.join(sharedRoot, "onboard-session.json");
   const legacySession = readJsonNoFollow(home, legacySessionFile);
+  const legacyRecoveryFile = retainedSandboxRecoveryFile(sharedRoot);
+  const legacyRecoveryExists = lstatNoFollow(home, legacyRecoveryFile) !== null;
   if (
     !pendingBeforeLock &&
     !legacyRegistry &&
     legacySession === null &&
+    !legacyRecoveryExists &&
     !staleIntentDirectoriesExist
   ) {
     return result;
   }
 
   const lock = acquireDirectoryLock(home, migrationLock);
-  const registryLocks: string[] = [];
+  const registryLocks: ProcessBoundLockHandle[] = [];
+  let migrationFailed = false;
   try {
+    // Onboard writers recheck the migration lock after claiming onboard.lock.
+    // Checking both roots while this lock is held closes the opposite side of
+    // the handshake and serializes session/recovery state with partitioning.
+    assertOnboardStateUnlocked(home, [sharedRoot, selectedRoot]);
     removeStaleMigrationIntentDirectories(home, sharedRoot);
-    registryLocks.push(acquireDirectoryLock(home, `${legacyRegistryFile}.lock`));
+    registryLocks.push(acquireMigrationRegistryLock(`${legacyRegistryFile}.lock`));
     const pendingIntent = readMigrationIntent(home, sharedRoot);
     if (pendingIntent) {
       if (pendingIntent.metadata.gatewayPort !== gatewayPort) {
@@ -693,7 +1117,7 @@ export function migrateLegacyPortState(
           `a recoverable migration for gateway port ${String(pendingIntent.metadata.gatewayPort)} is pending; rerun with NEMOCLAW_GATEWAY_PORT=${String(pendingIntent.metadata.gatewayPort)}`,
         );
       }
-      registryLocks.push(acquireDirectoryLock(home, `${selectedRegistryFile}.lock`));
+      registryLocks.push(acquireMigrationRegistryLock(`${selectedRegistryFile}.lock`));
       return applyMigrationIntent(
         home,
         sharedRoot,
@@ -717,6 +1141,16 @@ export function migrateLegacyPortState(
     }
 
     const session = readJsonNoFollow(home, legacySessionFile);
+    const recovery = readRetainedRecoveryDocument(home, legacyRecoveryFile);
+    const selectedRecoveryRecords =
+      recovery?.unresolved.filter((record) => record.gatewayPort === gatewayPort) ?? [];
+    const remainingRecoveryRecords =
+      recovery?.unresolved.filter((record) => record.gatewayPort !== gatewayPort) ?? [];
+    const selectedRecovery =
+      selectedRecoveryRecords.length > 0 ? retainedRecoveryDocument(selectedRecoveryRecords) : null;
+    const remainingRecovery = selectedRecovery
+      ? retainedRecoveryDocument(remainingRecoveryRecords)
+      : null;
     const recordedSessionPort =
       session === null ? null : sessionGatewayPort(session, registryPortsByName);
     const selectedNames = Object.keys(selectedEntries).sort();
@@ -726,21 +1160,18 @@ export function migrateLegacyPortState(
       Object.keys(remainingEntries).length === 0 &&
       (session === null || sessionBelongsToSelected);
 
-    if (selectedNames.length === 0 && !sessionBelongsToSelected) return result;
+    if (selectedNames.length === 0 && !sessionBelongsToSelected && !selectedRecovery) return result;
 
-    const entriesToMove: readonly LegacyBundleEntry[] = wholeLegacyBundleBelongsToSelected
-      ? LEGACY_BUNDLE_ENTRIES
-      : sessionBelongsToSelected
-        ? SESSION_BOUND_ENTRIES
-        : [];
+    const entriesToMove: readonly LegacyBundleEntry[] = [
+      ...(wholeLegacyBundleBelongsToSelected
+        ? MIGRATABLE_BUNDLE_ENTRIES
+        : sessionBelongsToSelected
+          ? SESSION_BOUND_ENTRIES
+          : []),
+      ...selectedNames.map(retainedRebuildSessionFileName),
+    ];
     let moveSession = false;
     if (sessionBelongsToSelected) {
-      const activeLock = path.join(sharedRoot, "onboard.lock");
-      if (lstatNoFollow(home, activeLock)) {
-        throw migrationError(
-          `legacy onboarding lock ${activeLock} is present; finish or stop that run first`,
-        );
-      }
       moveSession = preflightMovePath(
         home,
         legacySessionFile,
@@ -759,8 +1190,19 @@ export function migrateLegacyPortState(
         bundleEntries.push(entry);
       }
     }
+    if (selectedRecovery) {
+      preflightMovePath(home, legacyRecoveryFile, retainedSandboxRecoveryFile(selectedRoot));
+    }
 
-    registryLocks.push(acquireDirectoryLock(home, `${selectedRegistryFile}.lock`));
+    validateRetainedRebuildMoves(
+      sharedRoot,
+      selectedRoot,
+      gatewayPort,
+      selectedNames,
+      bundleEntries,
+    );
+
+    registryLocks.push(acquireMigrationRegistryLock(`${selectedRegistryFile}.lock`));
     const existingSelected = readGatewayRegistryFile(home, selectedRegistryFile);
     const selectedRegistry = mergeSelectedRegistry(
       currentLegacy,
@@ -788,6 +1230,8 @@ export function migrateLegacyPortState(
       },
       selectedRegistry,
       remainingRegistry,
+      selectedRecovery,
+      remainingRecovery,
     );
     return applyMigrationIntent(
       home,
@@ -797,10 +1241,24 @@ export function migrateLegacyPortState(
       selectedRegistryFile,
       intent,
     );
+  } catch (error) {
+    migrationFailed = true;
+    throw error;
   } finally {
+    let releaseFailed = false;
+    let firstReleaseError: unknown;
+    const attemptRelease = (release: () => void): void => {
+      try {
+        release();
+      } catch (error) {
+        if (!releaseFailed) firstReleaseError = error;
+        releaseFailed = true;
+      }
+    };
     for (const registryLock of registryLocks.reverse()) {
-      fs.rmSync(registryLock, { recursive: true, force: true });
+      attemptRelease(() => releaseProcessBoundLock(registryLock));
     }
-    fs.rmSync(lock, { recursive: true, force: true });
+    attemptRelease(() => releaseDirectoryLock(lock));
+    if (!migrationFailed && releaseFailed) throw firstReleaseError;
   }
 }

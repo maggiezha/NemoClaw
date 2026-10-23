@@ -1,6 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { isNonInteractiveEnv } from "../core/non-interactive";
+import { getNameValidationGuidance } from "../name-validation";
+export { enforceRemovedImmutabilityMigrationBoundary } from "../state/migrations/removed-immutability";
+import { beginAuthoritativeRebuildRuntimeSelectionScope } from "./authoritative-rebuild-target";
+import { cliDisplayName } from "./branding";
+import {
+  canonicalPlaceholderKeys,
+  EXTRA_PLACEHOLDER_KEYS_ENV,
+  parseExtraPlaceholderKeys,
+} from "./extra-placeholder-keys";
+import { RESERVED_SANDBOX_NAMES } from "./sandbox-agent";
+import { parseExactExternalImageReference } from "./workload/external-image";
+import type { OnboardOptions } from "./types";
 import {
   requireStationExpressResumeIntent,
   type StationExpressSessionLike,
@@ -12,7 +25,9 @@ export interface OnboardEntryOptionsInput {
     resume?: boolean;
     fresh?: boolean;
     fromDockerfile?: string | null;
+    fromImage?: string | null;
     sandboxName?: string | null;
+    experimentalProfile?: import("./docker-driver-platform").ExperimentalOnboardProfile | null;
   };
   env: NodeJS.ProcessEnv | Record<string, string | undefined>;
   stdinIsTty: boolean;
@@ -25,6 +40,9 @@ export interface OnboardEntryOptionsInput {
    * flag-only behavior for callers that don't load the session.
    */
   persistedSessionStatus?: string | null;
+  persistedRecoverySandboxName?: string | null;
+  persistedSessionSandboxName?: string | null;
+  retainedRecoverySandboxNames?: readonly string[];
 }
 
 export interface OnboardEntryOptionsDeps {
@@ -45,12 +63,242 @@ export interface ResolvedOnboardEntryOptions {
   resume: boolean;
   fresh: boolean;
   requestedFromDockerfile: string | null;
+  requestedFromImage?: string | null;
   requestedSandboxName: string | null;
   cannotPrompt: boolean;
 }
 
+type PersistedOnboardEntrySession = {
+  readonly status: string;
+  readonly sandboxName?: string | null;
+  readonly cancellationRecovery?: { readonly sandboxName: string } | null;
+};
+
+interface DefaultRunEntryState {
+  loadSession(): PersistedOnboardEntrySession | null;
+  listRetainedSandboxRecoveryRecords(): readonly { readonly sandboxName: string }[];
+}
+
+type PendingCreateRecoverySession = {
+  readonly sessionId?: string;
+  readonly status: string;
+  readonly cancellationRecovery?: { readonly sandboxName: string } | null;
+};
+
+type PendingCreateRecoveryEntry = {
+  readonly name: string;
+  readonly pendingCreateIdentity?: unknown;
+  readonly reservationSessionId?: string;
+};
+
+/** Restore missing independent recovery before a new session can replace its owner. */
+export function reconstructUnownedPendingCreateRecoveries<Entry extends PendingCreateRecoveryEntry>(
+  options: Pick<OnboardEntryOptionsInput["opts"], "fresh" | "resume">,
+  persistedSession: PendingCreateRecoverySession | null,
+  entries: readonly Entry[],
+  reconstruct: (entry: Entry) => unknown,
+): void {
+  const preservesPendingCreateSession =
+    options.resume === true ||
+    (options.fresh !== true && persistedSession?.status === "in_progress");
+  for (const entry of entries) {
+    if (!entry.pendingCreateIdentity) continue;
+    const matchingSessionId =
+      entry.reservationSessionId !== undefined &&
+      entry.reservationSessionId === persistedSession?.sessionId;
+    const sessionAlreadyOwnsRecovery =
+      matchingSessionId && entry.name === persistedSession?.cancellationRecovery?.sandboxName;
+    if (sessionAlreadyOwnsRecovery || (preservesPendingCreateSession && matchingSessionId)) {
+      continue;
+    }
+    reconstruct(entry);
+  }
+}
+
+/** Restore orphaned create authority before onboarding can replace its session owner. */
+export function resolveEntryOptions<Entry extends PendingCreateRecoveryEntry>(
+  options: OnboardOptions,
+  validateSandboxName: OnboardEntryOptionsDeps["validateName"],
+  state: DefaultRunEntryState & {
+    reconstructRetainedSandboxRecoveryFromPendingCreate(entry: Entry): unknown;
+  },
+  registryState: { listSandboxes(): { sandboxes: readonly Entry[] } },
+) {
+  const persistedSession = state.loadSession();
+  const entryOptions = readOptions(options, validateSandboxName, state);
+  const targetSandboxName =
+    entryOptions.requestedSandboxName ?? persistedSession?.sandboxName?.trim();
+  reconstructUnownedPendingCreateRecoveries(
+    options,
+    persistedSession,
+    registryState
+      .listSandboxes()
+      .sandboxes.filter((entry) => !targetSandboxName || entry.name === targetSandboxName),
+    state.reconstructRetainedSandboxRecoveryFromPendingCreate,
+  );
+  return readOptions(options, validateSandboxName, state);
+}
+
 type NonInteractiveEntryOptions = { nonInteractive?: boolean };
-type ResumableEntryOptions = NonInteractiveEntryOptions & { resume?: boolean; fresh?: boolean };
+type ResumableEntryOptions = Pick<
+  OnboardOptions,
+  | "apfInterceptorRequested"
+  | "authoritativeResumeConfig"
+  | "fresh"
+  | "nonInteractive"
+  | "onboardLockAlreadyHeld"
+  | "recreateSandbox"
+  | "resume"
+  | "runtimeSelection"
+  | "targetGatewayName"
+  | "targetGatewayPort"
+>;
+
+const PROVIDER_INTENT_ENV_KEYS = [
+  "NEMOCLAW_PROVIDER",
+  "NEMOCLAW_MODEL",
+  "NEMOCLAW_PROVIDER_MODEL",
+  "NEMOCLAW_SERVING_PRESET",
+  "NEMOCLAW_MESSAGING_PLAN_B64",
+] as const;
+
+const PROVIDERLESS_WEB_SEARCH_ENV_VALUES = new Set(["", "none", "off", "disabled", "no", "0"]);
+
+/** Reject ambient provider intent before onboarding records or external effects. */
+export function assertProviderlessInterceptorEnvironment(
+  interceptorRequested: boolean,
+  env: NodeJS.ProcessEnv,
+): void {
+  if (!interceptorRequested) return;
+  const hasProviderIntent =
+    PROVIDER_INTENT_ENV_KEYS.some((key) => String(env[key] ?? "").trim().length > 0) ||
+    parseExtraPlaceholderKeys(env[EXTRA_PLACEHOLDER_KEYS_ENV], canonicalPlaceholderKeys()).keys
+      .length > 0 ||
+    !PROVIDERLESS_WEB_SEARCH_ENV_VALUES.has(
+      String(env.NEMOCLAW_WEB_SEARCH_PROVIDER ?? "")
+        .trim()
+        .toLowerCase(),
+    );
+  if (!hasProviderIntent) return;
+  throw new Error(
+    "Interceptor onboarding supports providerless sandbox creation only. No sandbox or provider was created.",
+  );
+}
+
+export function resolveOnboardRunOptions(
+  options: OnboardEntryOptionsInput["opts"] & { autoYes?: boolean; nonInteractive?: boolean },
+  env: NodeJS.ProcessEnv,
+  persistedSessionStatus: string | null,
+  isNonInteractiveEnv: () => boolean,
+  terminal: { stdinIsTty: boolean; stdoutIsTty: boolean } = {
+    stdinIsTty: Boolean(process.stdin?.isTTY),
+    stdoutIsTty: Boolean(process.stdout?.isTTY),
+  },
+  persistedRecoverySandboxName: string | null = null,
+  persistedSessionSandboxName: string | null = null,
+  retainedRecoverySandboxNames: readonly string[] = [],
+) {
+  const resume =
+    options.resume === true || (options.fresh !== true && persistedSessionStatus === "in_progress");
+  const nonInteractive =
+    options.nonInteractive === true ||
+    ((options.autoYes === true || env.NEMOCLAW_YES === "1") && resume && !terminal.stdinIsTty) ||
+    isNonInteractiveEnv();
+  return {
+    resume,
+    nonInteractive,
+    entryOptionsInput: {
+      opts: options,
+      env,
+      ...terminal,
+      persistedSessionStatus,
+      persistedRecoverySandboxName,
+      persistedSessionSandboxName,
+      retainedRecoverySandboxNames,
+    },
+  };
+}
+
+export function resolveOnboardRunEntryOptions(
+  options: OnboardEntryOptionsInput["opts"] & { autoYes?: boolean; nonInteractive?: boolean },
+  env: NodeJS.ProcessEnv,
+  persistedSessionStatus: string | null,
+  isNonInteractiveEnv: () => boolean,
+  deps: Omit<OnboardEntryOptionsDeps, "isNonInteractive">,
+  persistedRecoverySandboxName: string | null = null,
+  persistedSessionSandboxName: string | null = null,
+  retainedRecoverySandboxNames: readonly string[] = [],
+) {
+  const context = resolveOnboardRunOptions(
+    options,
+    env,
+    persistedSessionStatus,
+    isNonInteractiveEnv,
+    undefined,
+    persistedRecoverySandboxName,
+    persistedSessionSandboxName,
+    retainedRecoverySandboxNames,
+  );
+  return {
+    ...context,
+    ...resolveOnboardEntryOptions(context.entryOptionsInput, {
+      ...deps,
+      isNonInteractive: () => context.nonInteractive,
+    }),
+  };
+}
+
+export function resolveDefaultRunEntryOptions(
+  options: OnboardEntryOptionsInput["opts"] & { autoYes?: boolean; nonInteractive?: boolean },
+  persistedSession: PersistedOnboardEntrySession | null,
+  validateSandboxName: OnboardEntryOptionsDeps["validateName"],
+  env: NodeJS.ProcessEnv = process.env,
+  retainedRecoverySandboxNames: readonly string[] = [],
+) {
+  return resolveOnboardRunEntryOptions(
+    options,
+    env,
+    persistedSession?.status ?? null,
+    isNonInteractiveEnv,
+    {
+      validateName: validateSandboxName,
+      reservedSandboxNames: RESERVED_SANDBOX_NAMES,
+      cliDisplayName,
+      getNameValidationGuidance,
+      error: (message) => console.error(message),
+      exitProcess: (code) => process.exit(code),
+    },
+    persistedSession?.cancellationRecovery?.sandboxName ?? null,
+    persistedSession?.sandboxName ?? null,
+    retainedRecoverySandboxNames,
+  );
+}
+
+export function resolveDefaultRunEntryOptionsFromState(
+  options: OnboardEntryOptionsInput["opts"] & { autoYes?: boolean; nonInteractive?: boolean },
+  validateSandboxName: OnboardEntryOptionsDeps["validateName"],
+  state: DefaultRunEntryState,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  return resolveDefaultRunEntryOptions(
+    options,
+    state.loadSession(),
+    validateSandboxName,
+    env,
+    state.listRetainedSandboxRecoveryRecords().map((record) => record.sandboxName),
+  );
+}
+
+export const readOptions = resolveDefaultRunEntryOptionsFromState;
+
+export function assertDefaultSandboxNameAllowed(sandboxName: string): void {
+  if (!RESERVED_SANDBOX_NAMES.has(sandboxName)) return;
+  console.error(
+    `  Reserved name in resumed session: '${sandboxName}' is a ${cliDisplayName()} CLI command.`,
+  );
+  console.error("  Start a fresh onboard with --name <sandbox> to choose a different name.");
+  process.exit(1);
+}
 interface StationExpressSessionLifecycle {
   loadSession(): StationExpressSessionLike | null;
   reconcileStationExpressReceiptRetirement(generation: string): void;
@@ -79,8 +327,20 @@ export function wrapOnboard<Options extends ResumableEntryOptions>(
   run: (options?: Options) => Promise<void>,
   session: StationExpressSessionLifecycle,
 ): (options?: Options) => Promise<void> {
+  const guardProviderlessInput = async (options?: Options): Promise<void> => {
+    assertProviderlessInterceptorEnvironment(
+      options?.apfInterceptorRequested === true,
+      process.env,
+    );
+    const restoreRuntimeSelection = beginAuthoritativeRebuildRuntimeSelectionScope(options ?? {});
+    try {
+      await run(options);
+    } finally {
+      restoreRuntimeSelection();
+    }
+  };
   return wrapStationExpressOnboard(
-    withNonInteractiveEnvironment(run),
+    withNonInteractiveEnvironment(guardProviderlessInput),
     session.loadSession,
     session.reconcileStationExpressReceiptRetirement,
   );
@@ -104,7 +364,7 @@ export function resolveOnboardEntryOptions(
   deps: OnboardEntryOptionsDeps,
 ): ResolvedOnboardEntryOptions {
   const explicitResume = input.opts.resume === true;
-  const fresh = input.opts.fresh === true;
+  let fresh = input.opts.fresh === true;
   // The mutual-exclusion error applies only to the explicit flags — a leftover
   // in_progress session combined with an explicit `--fresh` is not a conflict
   // (fresh wins, see below), so it must not trip this guard.
@@ -122,6 +382,28 @@ export function resolveOnboardEntryOptions(
   const requestedFromDockerfile =
     input.opts.fromDockerfile ||
     (deps.isNonInteractive() ? input.env.NEMOCLAW_FROM_DOCKERFILE || null : null);
+  const rawRequestedFromImage =
+    input.opts.fromImage ||
+    (deps.isNonInteractive() ? input.env.NEMOCLAW_FROM_IMAGE || null : null);
+  let requestedFromImage: string | null = null;
+  if (rawRequestedFromImage) {
+    try {
+      requestedFromImage = parseExactExternalImageReference(rawRequestedFromImage);
+    } catch (error) {
+      deps.error(`  ${error instanceof Error ? error.message : String(error)}`);
+      deps.exitProcess(1);
+    }
+  }
+  if (input.opts.experimentalProfile === "portable" && requestedFromImage) {
+    deps.error("  --from-image cannot be used with the Portable profile.");
+    deps.exitProcess(1);
+  }
+  if (requestedFromDockerfile && requestedFromImage) {
+    deps.error(
+      "  A Dockerfile source and an external image source cannot both be selected. Use only --from/NEMOCLAW_FROM_DOCKERFILE or --from-image/NEMOCLAW_FROM_IMAGE.",
+    );
+    deps.exitProcess(1);
+  }
   const cannotPrompt = deps.isNonInteractive() || !input.stdinIsTty || !input.stdoutIsTty;
   let requestedSandboxName: string | null =
     typeof input.opts.sandboxName === "string" && input.opts.sandboxName.length > 0
@@ -159,9 +441,83 @@ export function resolveOnboardEntryOptions(
     }
     requestedSandboxName = validated;
   }
-  if (cannotPrompt && !resume && requestedFromDockerfile && !requestedSandboxName) {
+  const retainedRecoverySandboxNames = new Set(
+    (input.retainedRecoverySandboxNames ?? []).map((name) => name.trim()).filter(Boolean),
+  );
+  const recoveryEntryName =
+    requestedSandboxName ?? input.persistedSessionSandboxName?.trim() ?? null;
+  if (retainedRecoverySandboxNames.size > 0) {
+    if (!recoveryEntryName) {
+      deps.error(
+        "  Onboarding cannot continue while a retained sandbox recovery record is unresolved without an explicit different sandbox name.",
+      );
+      deps.error("  Use --name <new-name>; the retained sandbox recovery record stays unresolved.");
+      deps.exitProcess(1);
+    }
+    if (retainedRecoverySandboxNames.has(recoveryEntryName)) {
+      deps.error(
+        `  Onboarding cannot use retained sandbox '${recoveryEntryName}' while its identity-bound recovery record is unresolved.`,
+      );
+      deps.error(
+        `  Run the destroy command for retained sandbox '${recoveryEntryName}' to remove the verified failed attempt; resume, reuse, recreation, and same-name fresh onboarding remain disabled until destroy completes.`,
+      );
+      deps.exitProcess(1);
+    }
+  }
+  if (input.persistedSessionStatus === "recovery_required") {
+    const recoverySandboxName = input.persistedRecoverySandboxName?.trim() || null;
+    const canStartDifferentSandbox =
+      !explicitResume &&
+      recoverySandboxName !== null &&
+      requestedSandboxName !== null &&
+      requestedSandboxName !== recoverySandboxName &&
+      retainedRecoverySandboxNames.has(recoverySandboxName);
+    if (!fresh && canStartDifferentSandbox) fresh = true;
+    if (!fresh) {
+      deps.error(
+        `  Onboarding cannot continue because cancellation preserved sandbox '${recoverySandboxName ?? "unknown"}' in recovery-only state.`,
+      );
+      deps.error(
+        "  Automatic and explicit resume, reuse, and recreation are disabled to protect the retained sandbox.",
+      );
+      deps.error(
+        "  Use --name <new-name> to start another sandbox. The retained sandbox recovery record stays unresolved.",
+      );
+      deps.exitProcess(1);
+    }
+    if (
+      !recoverySandboxName ||
+      !requestedSandboxName ||
+      requestedSandboxName === recoverySandboxName
+    ) {
+      deps.error(
+        "  Recovery-only onboarding state requires --fresh with an explicit sandbox name different from the retained sandbox.",
+      );
+      deps.error(
+        "  The retained sandbox recovery record stays unresolved when onboarding starts with another name.",
+      );
+      deps.exitProcess(1);
+    }
+    if (!retainedRecoverySandboxNames.has(recoverySandboxName)) {
+      deps.error(
+        "  Onboarding cannot replace the recovery-only session because its independent retained sandbox recovery record is unavailable.",
+      );
+      deps.error(
+        "  Preserve the session, registry state, and terminal output. Do not delete the sandbox by mutable name.",
+      );
+      deps.exitProcess(1);
+    }
+  }
+  if (
+    cannotPrompt &&
+    !resume &&
+    (requestedFromDockerfile || requestedFromImage) &&
+    !requestedSandboxName
+  ) {
     deps.error(
-      "  --from <Dockerfile> requires --name <sandbox> (or NEMOCLAW_SANDBOX_NAME) when running without a TTY or with --non-interactive.",
+      requestedFromDockerfile
+        ? "  --from <Dockerfile> requires --name <sandbox> (or NEMOCLAW_SANDBOX_NAME) when running without a TTY or with --non-interactive."
+        : "  --from-image <repository@sha256:digest> requires --name <sandbox> (or NEMOCLAW_SANDBOX_NAME) when running without a TTY or with --non-interactive.",
     );
     deps.error("  A sandbox name cannot be prompted for in this context.");
     deps.exitProcess(1);
@@ -171,6 +527,7 @@ export function resolveOnboardEntryOptions(
     resume,
     fresh,
     requestedFromDockerfile,
+    ...(requestedFromImage ? { requestedFromImage } : {}),
     requestedSandboxName,
     cannotPrompt,
   };

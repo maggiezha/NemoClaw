@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
+import type { OpenShellGpuDiagnostics } from "../adapters/openshell/gpu-diagnostics";
 import {
   buildDockerGpuMode,
   collectDockerGpuPatchDiagnostics,
@@ -90,9 +91,19 @@ describe("Docker GPU diagnostic redaction", () => {
       ["sandbox list", `alpha Error useful list context ${canaries.openshellList}\n`],
       ["doctor logs", `useful gateway log context ${canaries.openshellLogs}\n`],
     ]);
-    const runCaptureOpenshell = vi.fn(
-      (args: string[]) => openshellResponses.get(`${args[0] ?? ""} ${args[1] ?? ""}`) ?? "",
-    );
+    const openShellGpuDiagnostics: OpenShellGpuDiagnostics = {
+      collect: vi.fn((request) =>
+        [
+          ["openshell-sandbox-get.txt", "sandbox get"],
+          ["openshell-sandbox-list.txt", "sandbox list"],
+          ["openshell-logs.txt", "doctor logs"],
+        ].map(([name, command]) => ({
+          name: name as "openshell-sandbox-get.txt",
+          content: request.redact(openshellResponses.get(command) ?? ""),
+          outcome: { kind: "completed" as const, exitCode: 0 },
+        })),
+      ),
+    };
     const writeFileSpy = vi.spyOn(fs, "writeFileSync");
 
     try {
@@ -132,7 +143,7 @@ describe("Docker GPU diagnostic redaction", () => {
           ),
           homedir: () => tmpDir,
           now: () => new Date("2026-07-02T00:00:00Z"),
-          runCaptureOpenshell,
+          openShellGpuDiagnostics,
         },
       );
 
@@ -155,7 +166,7 @@ describe("Docker GPU diagnostic redaction", () => {
         ]),
       );
       const published = `${diagnostics?.summaryLines.join("\n")}\n${Object.values(contents).join("\n")}`;
-      for (const canary of Object.values(canaries)) expect(published).not.toContain(canary);
+      expect(Object.values(canaries).every((canary) => !published.includes(canary))).toBe(true);
       expect(published).not.toContain(suffixCanary);
 
       expect(contents["summary.txt"]).toContain("failure_kind=patched_container_failed");

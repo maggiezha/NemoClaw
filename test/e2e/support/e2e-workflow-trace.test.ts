@@ -12,7 +12,7 @@ import { validateE2eWorkflowBoundary } from "../../../tools/e2e/workflow-boundar
 import { readWorkflow } from "../../helpers/e2e-workflow-contract";
 
 type E2eWorkflow = {
-  jobs: Record<string, { steps: Array<Record<string, unknown>> }>;
+  jobs: Record<string, { name?: string; steps: Array<Record<string, unknown>> }>;
 };
 
 function validateMutatedWorkflow(mutator: (workflow: E2eWorkflow) => void): string[] {
@@ -34,7 +34,15 @@ function liveStep(workflow: E2eWorkflow, name: string): Record<string, unknown> 
   return step!;
 }
 
-describe("e2e workflow live trace boundary", () => {
+describe("e2e workflow live job boundary", () => {
+  it("rejects a live job that hides the semantic matrix label (#9167)", () => {
+    const errors = validateMutatedWorkflow((workflow) => {
+      workflow.jobs.live.name = "Live E2E";
+    });
+
+    expect(errors).toContain("live job name must expose the semantic matrix label");
+  });
+
   it.each([
     "Configure live E2E trace directory",
     "Build trusted live E2E timing summary",
@@ -138,6 +146,7 @@ const TRACE_SOURCE_ASSIGNMENT =
   'expected_trace_dir="${RUNNER_TEMP}/nemoclaw-e2e-traces/${TARGET_ID}"\n';
 const TRACE_SOURCE_GUARD =
   'if [ -z "${RUNNER_TEMP}" ] || [ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]; then\n' +
-  '  echo "::error::Refusing to sanitize unexpected raw trace path" >&2\n' +
+  '  echo "::error title=E2E trace sanitization refused::NEMOCLAW_TRACE_DIR does not match its workflow-owned RUNNER_TEMP path. No raw traces were read or uploaded. Correct the trace path configuration before rerunning." >&2\n' +
+  "  printf 'Expected trace path: %s\\n' \"${expected_trace_dir}\" >&2\n" +
   "  exit 1\n" +
   "fi\n";

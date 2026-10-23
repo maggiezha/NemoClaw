@@ -12,6 +12,8 @@ import {
 } from "./docker-driver-gateway-compat";
 import {
   buildDockerDriverGatewayConfigToml,
+  hasStateScopedSandboxNamespace,
+  NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
   prepareDockerDriverGatewayConfigEnv,
 } from "./docker-driver-gateway-config";
 import {
@@ -23,6 +25,7 @@ import {
   ensureDockerDriverGatewayLocalTlsBundle,
 } from "./docker-driver-gateway-local-tls";
 import { buildOwnedHostGatewayArgv0 } from "./gateway-process-identity";
+import type { RuntimeProviderGatewayHostRuntime } from "./runtime-provider/contract";
 
 export {
   compareDottedVersions,
@@ -33,7 +36,7 @@ export {
   requiredGlibcVersionsForBinary,
   shouldUseContainerizedGateway,
 } from "./docker-driver-gateway-compat";
-export { buildDockerDriverGatewayConfigToml };
+export { buildDockerDriverGatewayConfigToml, hasStateScopedSandboxNamespace };
 
 export type DockerDriverGatewayLaunch = {
   command: string;
@@ -53,16 +56,27 @@ export type DockerDriverGatewayRuntimeIdentity = {
   identityGatewayBin: string | null;
 };
 
+export type DockerDriverGatewayLog = {
+  fd: number;
+  startOffset: number;
+};
+
 export function openDockerDriverGatewayLog(
   logPath: string,
-  options: { exitOnFailure?: boolean } = {},
-): number {
+  options: { exitOnFailure?: boolean; printError?: (message: string) => void } = {},
+): DockerDriverGatewayLog {
   const appendNoFollow =
     fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW;
   try {
-    return fs.openSync(logPath, appendNoFollow, 0o600);
+    const fd = fs.openSync(logPath, appendNoFollow, 0o600);
+    try {
+      return { fd, startOffset: fs.fstatSync(fd).size };
+    } catch (error) {
+      fs.closeSync(fd);
+      throw error;
+    }
   } catch (error) {
-    console.error(
+    (options.printError ?? console.error)(
       `  Failed to open OpenShell Docker-driver gateway log '${logPath}': ${String(error)}`,
     );
     if (options.exitOnFailure) process.exit(1);
@@ -96,6 +110,8 @@ type BuildGatewayLaunchOptions = {
   hostGlibcVersion?: string | null;
   requiredGlibcVersions?: string[];
   ensureLocalTlsBundle?: boolean;
+  /** Exact provider projection when the caller already resolved gateway authority. */
+  gatewayHostRuntime?: RuntimeProviderGatewayHostRuntime;
   // Multi-gateway callers pass the selected name. The hardened config derives
   // its JWT gateway identity from the already gateway-scoped state directory.
   gatewayName?: string;
@@ -114,15 +130,20 @@ function buildGatewayProcessEnv(
   if (!("OPENSHELL_DISABLE_GATEWAY_AUTH" in gatewayEnv)) {
     delete env.OPENSHELL_DISABLE_GATEWAY_AUTH;
   }
+  if (!(NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV in gatewayEnv)) {
+    delete env[NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV];
+  }
   return env;
 }
 
 export function buildDockerDriverGatewayLaunch(
   options: BuildGatewayLaunchOptions,
 ): DockerDriverGatewayLaunch {
+  const baseEnv = options.env ?? process.env;
   const gatewayEnv = { ...options.gatewayEnv };
   if (options.ensureLocalTlsBundle) {
     ensureDockerDriverGatewayLocalTlsBundle({
+      env: baseEnv,
       gatewayBin: options.gatewayBin,
       stateDir: options.stateDir,
     });
@@ -133,14 +154,29 @@ export function buildDockerDriverGatewayLaunch(
   if (options.sandboxBin && !gatewayEnv.OPENSHELL_DOCKER_SUPERVISOR_BIN) {
     gatewayEnv.OPENSHELL_DOCKER_SUPERVISOR_BIN = options.sandboxBin;
   }
-  assertDockerDriverGatewayBindAddressSafe(gatewayEnv);
+  const platform = options.platform ?? process.platform;
+  assertDockerDriverGatewayBindAddressSafe(
+    gatewayEnv,
+    baseEnv,
+    platform,
+    options.gatewayHostRuntime,
+  );
   prepareDockerDriverGatewayConfigEnv(
     gatewayEnv,
     options.stateDir,
     options.sandboxBin || gatewayEnv.OPENSHELL_DOCKER_SUPERVISOR_BIN,
+    {
+      allowOpenShell0044PreAuthDatabase:
+        process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE === "1",
+      ...(options.gatewayHostRuntime ? { gatewayRuntime: options.gatewayHostRuntime } : {}),
+    },
   );
-  assertDockerDriverGatewayAuthConfigSafe(gatewayEnv);
-  const baseEnv = options.env ?? process.env;
+  assertDockerDriverGatewayAuthConfigSafe(
+    gatewayEnv,
+    baseEnv,
+    platform,
+    options.gatewayHostRuntime,
+  );
   const compat = shouldUseContainerizedGateway(options);
   if (!compat.useContainer) {
     const env = buildGatewayProcessEnv(baseEnv, gatewayEnv);
@@ -177,6 +213,7 @@ export function buildDockerDriverGatewayRuntimeIdentity(
     ...Object.keys(options.gatewayEnv),
     "OPENSHELL_DOCKER_SUPERVISOR_BIN",
     "OPENSHELL_GATEWAY_CONFIG",
+    NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
   ]);
   const desiredEnv = Object.fromEntries(
     Object.entries(launch.env).filter(

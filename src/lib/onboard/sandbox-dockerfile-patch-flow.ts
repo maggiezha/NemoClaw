@@ -41,6 +41,8 @@ export type PrepareSandboxDockerfilePatchInput = {
   chatUiUrl: string;
   provider: string | null;
   endpointUrl?: string | null;
+  nativeProvider?: boolean;
+  compatibleEndpointReasoning?: "true" | "false";
   preferredInferenceApi: string | null;
   webSearchConfig: WebSearchConfig | null;
   toolDisclosure?: ToolDisclosure;
@@ -96,6 +98,12 @@ function enforceDockerGpuPatchPreserveNetwork(
   return impl(...args);
 }
 
+function reverifySandboxBridgeGatewayReachability(port?: number): Promise<void> {
+  const { verifySandboxBridgeGatewayReachableOrExit } =
+    require("./gateway-sandbox-reachability") as typeof import("./gateway-sandbox-reachability");
+  return verifySandboxBridgeGatewayReachableOrExit(true, { skip: false, port });
+}
+
 function patchStagedDockerfile(
   ...args: Parameters<PatchStagedDockerfile>
 ): ReturnType<PatchStagedDockerfile> {
@@ -114,6 +122,8 @@ export async function prepareSandboxDockerfilePatch({
   chatUiUrl,
   provider,
   endpointUrl = null,
+  nativeProvider,
+  compatibleEndpointReasoning,
   preferredInferenceApi,
   webSearchConfig,
   toolDisclosure = DEFAULT_TOOL_DISCLOSURE,
@@ -176,6 +186,7 @@ export async function prepareSandboxDockerfilePatch({
       selectedRoute: selectedGpuRoute,
       gatewayPort,
       log,
+      reverifyBridgeReachability: () => reverifySandboxBridgeGatewayReachability(gatewayPort),
     },
   );
   const darwinVmCompat = false;
@@ -204,6 +215,8 @@ export async function prepareSandboxDockerfilePatch({
     (() => {
       const metadata = fromDockerfile ? null : (resolved?.metadata ?? preResolvedBaseImageMetadata);
       return {
+        agentName: managedAgentName,
+        nativeProvider,
         buildIdPolicy,
         toolDisclosure,
         ...(!fromDockerfile ? { trustedManagedDockerfile: true } : {}),
@@ -211,6 +224,7 @@ export async function prepareSandboxDockerfilePatch({
           ? { wslDashboardExposure: managedOpenClawWslExposure }
           : {}),
         ...(endpointUrl ? { upstreamEndpointUrl: endpointUrl } : {}),
+        ...(compatibleEndpointReasoning ? { compatibleEndpointReasoning } : {}),
         ...(dcodeAutoApprovalMode ? { dcodeAutoApprovalMode } : {}),
         requireToolDisclosureContract: Boolean(fromDockerfile),
         ...(metadata ? { baseImageResolutionMetadata: metadata } : {}),

@@ -14,13 +14,85 @@ export type GitHubRequestOptions = {
   signal?: AbortSignal;
 };
 
-export async function githubRest<T>(apiPath: string, token: string): Promise<T> {
+export type GitHubApiResponse<T> = {
+  data: T;
+  status: number;
+  requestId?: string;
+};
+
+export type GitHubApiFailureKind = "http" | "decode";
+
+const MAX_GITHUB_RESPONSE_EXCERPT_CHARS = 512;
+const GITHUB_REQUEST_ID_PATTERN = /^[A-Za-z0-9:-]{1,128}$/u;
+
+export function isValidGithubRequestId(value: unknown): value is string {
+  return typeof value === "string" && GITHUB_REQUEST_ID_PATTERN.test(value);
+}
+
+function responseExcerpt(text: string): string {
+  const singleLine = text
+    .replace(/[\r\n\t]+/gu, " ")
+    .replace(/\s{2,}/gu, " ")
+    .trim();
+  return singleLine.length > MAX_GITHUB_RESPONSE_EXCERPT_CHARS
+    ? `${singleLine.slice(0, MAX_GITHUB_RESPONSE_EXCERPT_CHARS - 3)}...`
+    : singleLine;
+}
+
+function responseRequestId(response: Response): string | undefined {
+  const headers = response.headers as Headers | undefined;
+  const requestId =
+    headers && typeof headers.get === "function"
+      ? headers.get("x-github-request-id")?.trim()
+      : undefined;
+  return isValidGithubRequestId(requestId) ? requestId : undefined;
+}
+
+export class GitHubApiError extends Error {
+  readonly kind: GitHubApiFailureKind;
+  readonly method: string;
+  readonly apiPath: string;
+  readonly status: number;
+  readonly requestId?: string;
+  readonly responseExcerpt: string;
+
+  constructor(options: {
+    kind: GitHubApiFailureKind;
+    method: string;
+    apiPath: string;
+    status: number;
+    requestId?: string;
+    responseText: string;
+    cause?: unknown;
+  }) {
+    const excerpt = responseExcerpt(options.responseText);
+    const message =
+      options.kind === "http"
+        ? `GitHub API ${options.apiPath} failed: ${options.status}${excerpt ? ` ${excerpt}` : ""}`
+        : `GitHub API ${options.apiPath} returned invalid JSON: ${options.status}`;
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "GitHubApiError";
+    this.kind = options.kind;
+    this.method = options.method;
+    this.apiPath = options.apiPath;
+    this.status = options.status;
+    this.requestId = options.requestId;
+    this.responseExcerpt = excerpt;
+  }
+}
+
+export async function githubRest<T>(
+  apiPath: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch(`https://api.github.com/${apiPath}`, {
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
     },
+    signal,
   });
   if (!response.ok)
     throw new Error(`GitHub REST ${apiPath} failed: ${response.status} ${await response.text()}`);
@@ -30,17 +102,20 @@ export async function githubRest<T>(apiPath: string, token: string): Promise<T> 
 export async function githubRestPaginated<T>(
   apiPath: string,
   token: string,
-  limit: number,
+  limit?: number,
+  signal?: AbortSignal,
 ): Promise<T[]> {
   const results: T[] = [];
-  for (let page = 1; results.length < limit; page += 1) {
+  for (let page = 1; limit === undefined || results.length < limit; page += 1) {
     const separator = apiPath.includes("?") ? "&" : "?";
+    const pageSize = limit === undefined ? 100 : Math.min(100, limit - results.length);
     const items = await githubRest<T[]>(
-      `${apiPath}${separator}per_page=${Math.min(100, limit - results.length)}&page=${page}`,
+      `${apiPath}${separator}per_page=${pageSize}&page=${page}`,
       token,
+      signal,
     );
     results.push(...items);
-    if (items.length < 100) break;
+    if (items.length < pageSize) break;
   }
   return results;
 }
@@ -77,16 +152,17 @@ export async function githubGraphql(
   return payload;
 }
 
-export async function githubApi<T>(
+export async function githubApiWithResponse<T>(
   apiPath: string,
   token: string,
   options: GitHubRequestOptions = {},
-): Promise<T> {
+): Promise<GitHubApiResponse<T>> {
   // lgtm[js/file-access-to-http] Advisor workflows intentionally send normalized
   // artifact summaries and strictly validated dispatch inputs to GitHub APIs.
   // Callers construct apiPath from fixed workflow/comment endpoints, not PR text.
+  const method = options.method || "GET";
   const response = await fetch(`https://api.github.com/${apiPath}`, {
-    method: options.method || "GET",
+    method,
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
@@ -97,11 +173,46 @@ export async function githubApi<T>(
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: options.signal,
   });
+  const requestId = responseRequestId(response);
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`GitHub API ${apiPath} failed: ${response.status} ${text}`);
+    throw new GitHubApiError({
+      kind: "http",
+      method,
+      apiPath,
+      status: response.status,
+      requestId,
+      responseText: text,
+    });
   }
-  return (text ? JSON.parse(text) : undefined) as T;
+  if (!text) {
+    return { data: undefined as T, status: response.status, requestId };
+  }
+  try {
+    return {
+      data: JSON.parse(text) as T,
+      status: response.status,
+      requestId,
+    };
+  } catch (error) {
+    throw new GitHubApiError({
+      kind: "decode",
+      method,
+      apiPath,
+      status: response.status,
+      requestId,
+      responseText: text,
+      cause: error,
+    });
+  }
+}
+
+export async function githubApi<T>(
+  apiPath: string,
+  token: string,
+  options: GitHubRequestOptions = {},
+): Promise<T> {
+  return (await githubApiWithResponse<T>(apiPath, token, options)).data;
 }
 
 export async function upsertStickyComment({

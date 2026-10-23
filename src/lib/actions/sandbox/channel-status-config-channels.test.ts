@@ -2,12 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
+import type { DiagnosticSignal } from "../../messaging/channels/channel-health";
 import {
   type ExecResult,
   entry,
-  makeDeps,
+  makeDeps as makeSyncDeps,
   showSandboxChannelStatus,
 } from "./channel-status.test-helpers";
+
+function makeDeps(options: Parameters<typeof makeSyncDeps>[0]) {
+  const result = makeSyncDeps(options);
+  const execSandbox = result.deps.execSandbox;
+  return {
+    ...result,
+    deps: {
+      ...result.deps,
+      execSandbox: async (...args: Parameters<typeof execSandbox>) => execSandbox(...args),
+    },
+  };
+}
+
+function wrappedSignalsOf(result: unknown): DiagnosticSignal[] {
+  expect(result).toHaveProperty("report");
+  return (result as { report: { signals: DiagnosticSignal[] } }).report.signals;
+}
 
 describe("showSandboxChannelStatus channel config parsers", () => {
   it("compares Discord guild-derived render values", async () => {
@@ -138,9 +156,10 @@ describe("showSandboxChannelStatus channel config parsers", () => {
     const result = await showSandboxChannelStatus("alpha", {
       deps,
       channel: "slack",
+      asJson: true,
     });
 
-    const signals = result && "signals" in result ? result.signals : [];
+    const signals = wrappedSignalsOf(result);
     expect(
       signals.find(
         (signal) =>
@@ -203,9 +222,10 @@ describe("showSandboxChannelStatus channel config parsers", () => {
     const result = await showSandboxChannelStatus("alpha", {
       deps,
       channel: "slack",
+      asJson: true,
     });
 
-    const signals = result && "signals" in result ? result.signals : [];
+    const signals = wrappedSignalsOf(result);
     expect(
       signals.find(
         (signal) =>
@@ -332,53 +352,50 @@ describe("showSandboxChannelStatus channel config parsers", () => {
     ).toBeUndefined();
   });
 
-  it.each([
-    "../x",
-    "a/b",
-    "bad'quote",
-    'bad"quote',
-    "bad\nline",
-  ])("does not read derived WeChat account files for unsafe accountId %j", async (accountId) => {
-    const commands: string[] = [];
-    const { deps } = makeDeps({
-      exec: (_sandbox, command) => {
-        commands.push(command);
-        return command.includes("/sandbox/.openclaw/openclaw.json")
-          ? {
-              status: 0,
-              stdout: JSON.stringify({
-                channels: {
-                  "openclaw-weixin": {
-                    accounts: {},
+  it.each(["../x", "a/b", "bad'quote", 'bad"quote', "bad\nline"])(
+    "does not read derived WeChat account files for unsafe accountId %j",
+    async (accountId) => {
+      const commands: string[] = [];
+      const { deps } = makeDeps({
+        exec: (_sandbox, command) => {
+          commands.push(command);
+          return command.includes("/sandbox/.openclaw/openclaw.json")
+            ? {
+                status: 0,
+                stdout: JSON.stringify({
+                  channels: {
+                    "openclaw-weixin": {
+                      accounts: {},
+                    },
                   },
-                },
-              }),
-              stderr: "",
-            }
-          : { status: 1, stdout: "", stderr: "" };
-      },
-      sandbox: entry(["wechat"], [], {
-        wechat: [
-          {
-            channelId: "wechat",
-            inputId: "accountId",
-            kind: "config",
-            required: true,
-            sourceEnv: "WECHAT_ACCOUNT_ID",
-            statePath: "wechatConfig.accountId",
-            value: accountId,
-          },
-        ],
-      }),
-      appliedPresets: ["wechat"],
-    });
-    await showSandboxChannelStatus("alpha", {
-      deps,
-      channel: "wechat",
-    });
+                }),
+                stderr: "",
+              }
+            : { status: 1, stdout: "", stderr: "" };
+        },
+        sandbox: entry(["wechat"], [], {
+          wechat: [
+            {
+              channelId: "wechat",
+              inputId: "accountId",
+              kind: "config",
+              required: true,
+              sourceEnv: "WECHAT_ACCOUNT_ID",
+              statePath: "wechatConfig.accountId",
+              value: accountId,
+            },
+          ],
+        }),
+        appliedPresets: ["wechat"],
+      });
+      await showSandboxChannelStatus("alpha", {
+        deps,
+        channel: "wechat",
+      });
 
-    expect(commands).toEqual(["head -c 65537 '/sandbox/.openclaw/openclaw.json'"]);
-  });
+      expect(commands).toEqual(["head -c 65537 '/sandbox/.openclaw/openclaw.json'"]);
+    },
+  );
 
   it("compares Hermes WeChat values through rendered WEIXIN env keys", async () => {
     const { deps } = makeDeps({

@@ -21,4 +21,46 @@ describe("toSessionUpdates", () => {
       model: "nemotron-ultra",
     });
   });
+
+  it("carries the recorded compatible-endpoint model and reasoning selections (#7940)", () => {
+    const modelSelectionProvenance = {
+      schemaVersion: 1 as const,
+      model: "mock/deepseek-compatible",
+      provider: "compatible-endpoint",
+      providerProfile: "compatible-endpoint" as const,
+      modelSource: "custom" as const,
+      apiFamily: "openai-completions" as const,
+    };
+    const updates = toSessionUpdates({
+      provider: "compatible-endpoint",
+      model: "mock/deepseek-compatible",
+      modelSelectionProvenance,
+      compatibleEndpointReasoning: "true",
+      compatibleEndpointReasoningEffort: "high",
+    });
+
+    expect(updates.compatibleEndpointReasoningEffort).toBe("high");
+    expect(filterSafeUpdates(updates)).toMatchObject({
+      modelSelectionProvenance,
+      compatibleEndpointReasoning: "true",
+      compatibleEndpointReasoningEffort: "high",
+    });
+  });
+
+  it.each([
+    { label: "an explicit clear", value: null, expected: null },
+    { label: "an unrecognized effort", value: "extreme", expected: null },
+  ])("clears the recorded reasoning effort for $label", ({ value, expected }) => {
+    expect(
+      toSessionUpdates({ compatibleEndpointReasoningEffort: value })
+        .compatibleEndpointReasoningEffort,
+    ).toBe(expected);
+  });
+
+  it("leaves the recorded reasoning effort unchanged when the caller omits it", () => {
+    const updates = toSessionUpdates({ provider: "compatible-endpoint" });
+
+    expect("compatibleEndpointReasoningEffort" in updates).toBe(false);
+    expect(filterSafeUpdates(updates)).toEqual({ provider: "compatible-endpoint" });
+  });
 });

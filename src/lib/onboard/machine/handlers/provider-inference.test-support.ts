@@ -14,6 +14,11 @@ import type {
 } from "../../../inference/gateway-route-compatibility";
 import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
 import {
+  normalizeReasoningEffort,
+  REASONING_EFFORT_ENV,
+  resolveReasoningEffortRequest,
+} from "../../reasoning-mode";
+import {
   createProviderRecoveryReceiptLedger,
   mintProviderRecoveryReceipt,
   type ProviderRecoveryReceipt,
@@ -33,6 +38,7 @@ export const baseSelection: ProviderSelectionResult = {
   hermesToolGateways: [],
   preferredInferenceApi: "openai-responses",
   compatibleEndpointReasoning: null,
+  compatibleEndpointReasoningEffort: null,
   nimContainer: null,
 };
 
@@ -92,9 +98,15 @@ export function createDeps(
       requiredInferenceApi: null,
     })),
     setupNim: vi.fn(async () => ({ ...baseSelection })),
-    setupInference: vi.fn(async () => ({ ok: true as const })),
+    setupInference: vi.fn<
+      ProviderInferenceStateOptions<Gpu, Agent, Host>["deps"]["setupInference"]
+    >(async () => ({ ok: true as const })),
+    resolveHostLocalInferenceStartupSelection: vi.fn(() => null),
     startStep: vi.fn(async () => undefined),
-    complete: vi.fn(async () => createSession()),
+    complete: vi.fn<ProviderInferenceStateOptions<Gpu, Agent, Host>["deps"]["recordStepComplete"]>(
+      async () => createSession(),
+    ),
+    rejected: vi.fn(async () => createSession()),
     skipped: vi.fn(),
     recoverProvider: vi.fn(
       async (
@@ -106,6 +118,12 @@ export function createDeps(
         credentialEnv: credentialEnv ?? null,
       }),
     ),
+    recoverManagedLlamaCpp: vi.fn(async () => false),
+    probeLlamaCppSandboxReachability: vi.fn(async () => ({
+      ok: true as const,
+      reason: "ok" as const,
+      networkName: "openshell",
+    })),
     surfaceReady: vi.fn(() => true),
     recordSkip: vi.fn(async () => createSession()),
     repairEvent: vi.fn(async () => createSession()),
@@ -117,7 +135,7 @@ export function createDeps(
       (
         _gatewayName: string,
         _provider: string,
-        endpointUrl: string | null,
+        _endpointUrl: string | null,
         _credentialEnv: string | null,
       ) => ({
         ok: true as const,
@@ -125,9 +143,12 @@ export function createDeps(
       }),
     ),
     reserveRoute: vi.fn(() => true),
+    hasSandboxLifecycleAuthority: vi.fn(() => false),
     updateSandbox: vi.fn(),
+    checkpointSandboxIdentity: vi.fn(async () => undefined),
+    prepareLocalProviderForInference: vi.fn(async () => null),
     promptName: vi.fn(async () => "my-assistant"),
-    promptYesNo: vi.fn(async () => true),
+    prompt: vi.fn(async () => "1"),
     log: vi.fn(),
     error: vi.fn(),
     exit: vi.fn((code: number): never => {
@@ -141,18 +162,27 @@ export function createDeps(
       checkGatewayRouteCompatibility: calls.checkGatewayRouteCompatibility,
       preflightGatewayRouteDiscovery: calls.preflightGatewayRouteDiscovery,
       getSandboxRecoveryAuthority: (): "missing" => "missing",
+      withSandboxMutationLock: async <T>(_sandboxName: string, operation: () => Promise<T> | T) =>
+        await operation(),
       withGatewayRouteMutationLock: async <T>(
         _gatewayName: string,
         operation: () => Promise<T> | T,
       ) => await operation(),
+      withModelRouterPortLifecycleLock: async <T>(_port: number, operation: () => Promise<T> | T) =>
+        await operation(),
+      getModelRouterPort: () => 4000,
       normalizeHermesAuthMethod: (value: string | null | undefined) =>
         value === "oauth" || value === "api_key" ? value : null,
       setupNim: calls.setupNim,
       setupInference: calls.setupInference,
+      resolveHostLocalInferenceStartupSelection: calls.resolveHostLocalInferenceStartupSelection,
       startRecordedStep: calls.startStep,
       recordStepComplete: calls.complete,
+      recordStepRejected: calls.rejected,
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
       skippedStepMessage: calls.skipped,
+      ensureManagedLlamaCppResumeReady: calls.recoverManagedLlamaCpp,
+      probeLlamaCppSandboxReachability: calls.probeLlamaCppSandboxReachability,
       ensureResumeProviderReady: calls.recoverProvider,
       isResumeProviderSurfaceReady: calls.surfaceReady,
       recordStateSkipped: calls.recordSkip,
@@ -161,6 +191,22 @@ export function createDeps(
       configureCompatibleEndpointReasoning: async (value?: string | null) =>
         value === "true" ? "true" : "false",
       clearCompatibleEndpointReasoning: () => null,
+      configureCompatibleEndpointReasoningEffort: async (
+        value?: unknown,
+        env: NodeJS.ProcessEnv = process.env,
+        allowRequestFallback = true,
+      ) => {
+        const configured =
+          normalizeReasoningEffort(value) ??
+          (allowRequestFallback ? resolveReasoningEffortRequest(null, env).effort : null);
+        if (configured) {
+          env[REASONING_EFFORT_ENV] = configured;
+        } else {
+          delete env[REASONING_EFFORT_ENV];
+        }
+        return configured;
+      },
+      clearCompatibleEndpointReasoningEffort: () => null,
       repairLocalInferenceSystemdOverrideOrExit: calls.repair,
       isNonInteractive: () => true,
       getOpenshellBinary: () => "/usr/bin/openshell",
@@ -170,7 +216,10 @@ export function createDeps(
       reconcileModelRouter: calls.reconcileRouter,
       reupsertRoutedProvider: calls.reupsertRoutedProvider,
       reserveSandboxInferenceRoute: calls.reserveRoute,
+      hasSandboxLifecycleAuthority: calls.hasSandboxLifecycleAuthority,
       registryUpdateSandbox: calls.updateSandbox,
+      checkpointSandboxIdentity: calls.checkpointSandboxIdentity,
+      prepareLocalProviderForInference: calls.prepareLocalProviderForInference,
       promptValidatedSandboxName: calls.promptName,
       assessHost: () => ({ cpus: 8 }),
       formatSandboxBuildEstimateNote: () => "estimate",
@@ -179,7 +228,7 @@ export function createDeps(
         model: string;
         sandboxName: string;
       }) => `summary:${options.provider}/${options.model}/${options.sandboxName}`,
-      promptYesNoOrDefault: calls.promptYesNo,
+      prompt: calls.prompt,
       cliName: () => "nemoclaw",
       log: calls.log,
       error: calls.error,
@@ -200,17 +249,20 @@ export function baseOptions(
     fresh: false,
     session,
     gpu: { type: "nvidia" },
+    gpuPassthrough: true,
     sandboxName: null,
     agent: null,
     initial: {
       model: session?.model ?? null,
       provider: session?.provider ?? null,
       endpointUrl: session?.endpointUrl ?? null,
+      endpointSource: null,
       credentialEnv: session?.credentialEnv ?? null,
       hermesAuthMethod: session?.hermesAuthMethod ?? null,
       hermesToolGateways: session?.hermesToolGateways ?? [],
       preferredInferenceApi: session?.preferredInferenceApi ?? null,
       compatibleEndpointReasoning: session?.compatibleEndpointReasoning ?? null,
+      compatibleEndpointReasoningEffort: session?.compatibleEndpointReasoningEffort ?? null,
       nimContainer: session?.nimContainer ?? null,
       webSearchConfig: session?.webSearchConfig ?? null,
     },

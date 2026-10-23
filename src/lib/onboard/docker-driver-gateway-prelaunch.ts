@@ -47,6 +47,7 @@ export interface ReapHostGatewayBeforeLaunchOptions {
   gatewayBin: string | null;
   /** Extra candidate PIDs to reap (e.g. the current port listener). */
   extraPids?: Array<number | null | undefined>;
+  printError?: (message: string) => void;
 }
 
 // A `stopHostGatewayProcesses` result with nothing stopped — returned when there
@@ -107,13 +108,12 @@ export function reapHostGatewayBeforeLaunch(
  */
 export function prelaunchReapFailureMessage(result: StopHostGatewayResult): string | null {
   if (result.failed.length === 0) return null;
-  // Recommend killing exactly the PIDs we matched, not a host-wide
-  // `pkill -f openshell-gateway`: this path is deliberately scoped to this port
-  // (usePgrepFallback:false), so a host-wide kill could take down another
-  // worktree's gateway.
   return (
     "Refusing to start a second OpenShell gateway: existing host gateway process " +
-    `${result.failed.join(", ")} could not be stopped. Run: sudo kill -9 ${result.failed.join(" ")}`
+    `${result.failed.join(", ")} could not be stopped. Do not signal a PID from this saved output. ` +
+    "Before any privileged stop, verify that the live process owner and command line identify " +
+    "the exact gateway name and port, and that the PID file, runtime marker, and loaded sandbox " +
+    "namespace still match the selected state directory. Then retry onboarding."
   );
 }
 
@@ -132,7 +132,7 @@ export function reapHostGatewayBeforeLaunchOrFail(
   const result = reapHostGatewayBeforeLaunch(options, deps, stop);
   const failure = prelaunchReapFailureMessage(result);
   if (failure) {
-    console.error(`  ${failure}`);
+    (options.printError ?? console.error)(`  ${failure}`);
     if (options.exitOnFailure) exit(1);
     throw new Error(failure);
   }
@@ -184,11 +184,12 @@ export function reapDuplicateHostGatewaysExceptOrFail(
   deps: Partial<HostGatewayProcessDeps> = {},
   stop: typeof stopHostGatewayProcesses = stopHostGatewayProcesses,
   exit: (code: number) => never = (code) => process.exit(code) as never,
+  printError: (message: string) => void = console.error,
 ): StopHostGatewayResult {
   const result = reapDuplicateHostGatewaysExcept(keepPid, gatewayBin, candidatePids, deps, stop);
   const failure = prelaunchReapFailureMessage(result);
   if (failure) {
-    console.error(`  ${failure}`);
+    printError(`  ${failure}`);
     if (exitOnFailure) exit(1);
     throw new Error(failure);
   }

@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Session } from "../state/onboard-session";
+import { isPortableExperimentalProfile } from "./experimental/portable-profile";
 import { printOnboardResumeHint } from "./resume-hint";
 
 export interface ExitStepFailureSessionDeps {
   loadSession(): Pick<Session, "lastStepStarted"> | null;
-  finalizeIncompleteOnboardStep(stepName: string, message?: string | null): Session | null;
+  releaseOnboardLock?(): void;
+  finalizeIncompleteOnboardStep(
+    stepName: string,
+    message?: string | null,
+    interrupted?: boolean,
+  ): Session | null;
 }
 
 export interface OnboardExitFailureProcessLike {
@@ -22,6 +28,7 @@ type OnboardInterruptSignal = "SIGINT" | "SIGTERM";
 export function markLastStartedStepFailed(
   deps: ExitStepFailureSessionDeps,
   message: string,
+  interrupted = false,
 ): Session | null {
   // Repairs the invalid state where onboard/rebuild exits nonzero after a step
   // starts but before normal completion handlers can run. Routes through the
@@ -31,7 +38,7 @@ export function markLastStartedStepFailed(
   // Covered by exit-step-failure, rebuild-flow, and onboard-exit-handler tests.
   const failedStep = deps.loadSession()?.lastStepStarted;
   if (!failedStep) return null;
-  return deps.finalizeIncompleteOnboardStep(failedStep, message);
+  return deps.finalizeIncompleteOnboardStep(failedStep, message, interrupted);
 }
 
 export function registerIncompleteOnboardExitFailureHandler(
@@ -39,15 +46,19 @@ export function registerIncompleteOnboardExitFailureHandler(
   isComplete: () => boolean,
   message: string,
   processLike: OnboardExitFailureProcessLike = process,
+  portable = isPortableExperimentalProfile(),
 ): void {
-  const failIncompleteStep = (): void => {
-    if (isComplete()) return;
-    // A non-null return means a step was in progress, so the session records a
-    // resumable point — surface `--resume` for exit paths that don't print
-    // their own recovery guidance (#6003). When an explicit cancel has already
-    // cleared the session (or no step started), this is null and stays silent;
+  const failIncompleteStep = (force = false): void => {
+    if (!force && isComplete()) return;
+    // A non-null return means a step was in progress, so surface the
+    // profile-appropriate recovery command for exit paths that don't print
+    // their own guidance (#6003, #8873). When an explicit cancel has already
+    // cleared the session (or no step started), this is null and stays silent.
     // printOnboardResumeHint also self-dedupes against tailored hints.
-    if (markLastStartedStepFailed(deps, message)) printOnboardResumeHint();
+    const interrupted = markLastStartedStepFailed(deps, message, true);
+    if (!interrupted) return;
+    if (interrupted.status === "recovery_required") return;
+    printOnboardResumeHint(portable, undefined, interrupted.sandboxName);
   };
 
   processLike.once("exit", (code) => {
@@ -71,8 +82,15 @@ export function registerIncompleteOnboardExitFailureHandler(
     setImmediate(() => {
       removeListener("SIGINT", onSigint);
       removeListener("SIGTERM", onSigterm);
-      failIncompleteStep();
-      kill(pid, signal);
+      try {
+        failIncompleteStep(true);
+      } finally {
+        try {
+          deps.releaseOnboardLock?.();
+        } finally {
+          kill(pid, signal);
+        }
+      }
     });
   };
   const onSigint = (): void => handleSignal("SIGINT");

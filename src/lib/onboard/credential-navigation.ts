@@ -67,13 +67,17 @@ export async function replaceNamedCredential({
   label,
   helpUrl = null,
   validator = null,
+  allowEmpty = false,
   exitOnboardFromPrompt,
+  revalidateSandboxIdentity,
 }: {
   envName: string;
   label: string;
   helpUrl?: string | null;
   validator?: ((value: string) => string | null) | null;
+  allowEmpty?: boolean;
   exitOnboardFromPrompt: () => never;
+  revalidateSandboxIdentity?: (operation: string) => void;
 }): Promise<string | BackToSelection> {
   if (helpUrl) {
     console.log("");
@@ -85,6 +89,7 @@ export async function replaceNamedCredential({
     const key = await readCredentialValue(`  ${label}: `, exitOnboardFromPrompt);
     if (isBackToSelection(key)) return key;
     if (!key) {
+      if (allowEmpty) return "";
       console.error(`  ${label} is required.`);
       continue;
     }
@@ -93,6 +98,7 @@ export async function replaceNamedCredential({
       console.error(validationError);
       continue;
     }
+    revalidateSandboxIdentity?.(`save ${label}`);
     credentials.saveCredential(envName, key);
     process.env[envName] = key;
     console.log("");
@@ -107,13 +113,17 @@ export async function ensureNamedCredential({
   label,
   helpUrl = null,
   validator = null,
+  allowEmpty = false,
   exitOnboardFromPrompt,
+  revalidateSandboxIdentity,
 }: {
   envName: string | null;
   label: string;
   helpUrl?: string | null;
   validator?: ((value: string) => string | null) | null;
+  allowEmpty?: boolean;
   exitOnboardFromPrompt: () => never;
+  revalidateSandboxIdentity?: (operation: string) => void;
 }): Promise<string | BackToSelection> {
   if (!envName) {
     console.error(`  Missing credential target for ${label}.`);
@@ -128,7 +138,15 @@ export async function ensureNamedCredential({
     }
     console.error(validationError);
   }
-  return replaceNamedCredential({ envName, label, helpUrl, validator, exitOnboardFromPrompt });
+  return replaceNamedCredential({
+    envName,
+    label,
+    helpUrl,
+    validator,
+    allowEmpty,
+    exitOnboardFromPrompt,
+    revalidateSandboxIdentity,
+  });
 }
 
 export function createCredentialPromptHelpers(exitOnboardFromPrompt: () => never): {
@@ -138,22 +156,53 @@ export function createCredentialPromptHelpers(exitOnboardFromPrompt: () => never
     label: string,
     helpUrl?: string | null,
     validator?: ((value: string) => string | null) | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<string | BackToSelection>;
   ensureNamedCredential: (
     envName: string | null,
     label: string,
     helpUrl?: string | null,
     validator?: ((value: string) => string | null) | null,
+    allowEmpty?: boolean,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<string | BackToSelection>;
   shouldReturnToProviderSelection: (result: unknown) => boolean;
   returningToProviderSelection: (result: unknown) => result is BackNavigationResult;
 } {
   return {
     readValue: (question) => readCredentialValue(question, exitOnboardFromPrompt),
-    replaceNamedCredential: (envName, label, helpUrl = null, validator = null) =>
-      replaceNamedCredential({ envName, label, helpUrl, validator, exitOnboardFromPrompt }),
-    ensureNamedCredential: (envName, label, helpUrl = null, validator = null) =>
-      ensureNamedCredential({ envName, label, helpUrl, validator, exitOnboardFromPrompt }),
+    replaceNamedCredential: (
+      envName,
+      label,
+      helpUrl = null,
+      validator = null,
+      revalidateSandboxIdentity,
+    ) =>
+      replaceNamedCredential({
+        envName,
+        label,
+        helpUrl,
+        validator,
+        exitOnboardFromPrompt,
+        revalidateSandboxIdentity,
+      }),
+    ensureNamedCredential: (
+      envName,
+      label,
+      helpUrl = null,
+      validator = null,
+      allowEmpty = false,
+      revalidateSandboxIdentity,
+    ) =>
+      ensureNamedCredential({
+        envName,
+        label,
+        helpUrl,
+        validator,
+        allowEmpty,
+        exitOnboardFromPrompt,
+        revalidateSandboxIdentity,
+      }),
     shouldReturnToProviderSelection: (result) =>
       shouldReturnToProviderSelection(result, exitOnboardFromPrompt),
     returningToProviderSelection: (result) =>

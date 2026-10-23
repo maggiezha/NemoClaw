@@ -203,6 +203,36 @@ describe("buildRebuildRecreateOnboardOpts", () => {
     expect(opts.toolDisclosure).toBe("direct");
   });
 
+  it("carries the exact publisher-owned image reference into inner onboard", () => {
+    const fromImage = `ghcr.io/example/openclaw@sha256:${"a".repeat(64)}`;
+    const opts = buildRebuildRecreateOnboardOpts({
+      ...baseArgs,
+      storedFromImage: fromImage,
+      sb: dashboard,
+    });
+
+    expect(opts.fromImage).toBe(fromImage);
+    expect(opts.fromDockerfile).toBeNull();
+  });
+
+  it("carries durable read-only host mounts into authoritative recreation", () => {
+    const hostMounts = [
+      { source: process.cwd(), target: "/sandbox/project", readOnly: true as const },
+    ];
+    const opts = buildRebuildRecreateOnboardOpts({
+      ...baseArgs,
+      sb: { ...dashboard, hostMounts },
+    });
+
+    expect(opts.hostMounts).toEqual([
+      {
+        ...hostMounts[0],
+        sourceIdentity: { device: expect.any(String), inode: expect.any(String) },
+      },
+    ]);
+    expect(opts.hostMounts).not.toBe(hostMounts);
+  });
+
   it("preserves only recognized endpoint provenance across authoritative rebuild", () => {
     const onboard = buildRebuildRecreateOnboardOpts({
       ...baseArgs,
@@ -233,41 +263,33 @@ describe("buildRebuildRecreateOnboardOpts", () => {
     expect(legacy.observabilityEnabled).toBe(false);
   });
 
-  it("carries the authoritative restricted tier with observability into inner onboard", () => {
+  it("carries observability into inner onboard without policy shadow state", () => {
     const opts = buildRebuildRecreateOnboardOpts({
       ...baseArgs,
       rebuildAgent: "langchain-deepagents-code",
       sb: {
         observabilityEnabled: true,
-        policyTier: "restricted",
       },
     });
 
-    expect(opts.policyTier).toBe("restricted");
+    expect(opts).not.toHaveProperty("policyTier");
     expect(opts.observabilityEnabled).toBe(true);
   });
 
-  it("rejects an invalid recorded policy tier before destructive recreate work", () => {
-    expect(() =>
-      buildRebuildRecreateOnboardOpts({
-        ...baseArgs,
-        sb: { ...dashboard, policyTier: "unknown-tier" },
-      }),
-    ).toThrow("Invalid recorded policy tier 'unknown-tier'.");
-  });
-
-  it.each([
-    "openclaw",
-    "hermes",
-  ])("rejects malformed %s observability state before recreate onboarding", (rebuildAgent) => {
-    expect(() =>
-      buildRebuildRecreateOnboardOpts({
-        ...baseArgs,
-        rebuildAgent,
-        sb: { ...dashboard, observabilityEnabled: true },
-      }),
-    ).toThrow("Recorded observability state is valid only for agent 'langchain-deepagents-code'.");
-  });
+  it.each(["openclaw", "hermes"])(
+    "rejects malformed %s observability state before recreate onboarding",
+    (rebuildAgent) => {
+      expect(() =>
+        buildRebuildRecreateOnboardOpts({
+          ...baseArgs,
+          rebuildAgent,
+          sb: { ...dashboard, observabilityEnabled: true },
+        }),
+      ).toThrow(
+        "Recorded observability state is valid only for agent 'langchain-deepagents-code'.",
+      );
+    },
+  );
 
   it("forwards noGpu:true for legacy entries with gpuEnabled:false and no sandboxGpuMode", () => {
     const opts = buildRebuildRecreateOnboardOpts({

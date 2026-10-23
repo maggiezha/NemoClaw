@@ -87,23 +87,24 @@ const SKIP_DIRS = new Set([
   "nemoclaw/dist",
   "nemoclaw/node_modules",
   "node_modules",
+  "worktrees",
 ]);
 
 function normalizePathText(text: string): string {
   return text.replaceAll("\\", "/");
 }
 
-function isSkippedPath(absPath: string): boolean {
+export function isSourceShapePathSkipped(absPath: string): boolean {
   const rel = normalizePathText(relative(REPO_ROOT, absPath));
   return [...SKIP_DIRS].some((dir) => rel === dir || rel.startsWith(`${dir}/`));
 }
 
 function* walkFiles(dir: string): Generator<string> {
-  if (!existsSync(dir) || isSkippedPath(dir)) return;
+  if (!existsSync(dir) || isSourceShapePathSkipped(dir)) return;
 
   for (const entry of readdirSync(dir)) {
     const abs = join(dir, entry);
-    if (isSkippedPath(abs)) continue;
+    if (isSourceShapePathSkipped(abs)) continue;
 
     const stats = statSync(abs);
     if (stats.isDirectory()) {
@@ -203,6 +204,9 @@ function hasDirectProductionPathHint(text: string): boolean {
       text,
     ) ||
     /["'`](?:\.\.\/)*(?:package\.json|install\.sh|\.pre-commit-config\.yaml)["'`]/.test(text) ||
+    /["'`](?:\.\.\/)*tools\/mcp-tool-discovery-runtime\/reviewed-runtime-bundle(?:\/|["'`])/.test(
+      text,
+    ) ||
     /["'`](?:\.\.\/)+Dockerfile(?:\.base)?["'`]/.test(text) ||
     /["'`](?:\.\.\/)+bin\//.test(text) ||
     /["'`](?:\.\.\/)+agents\//.test(text) ||
@@ -297,8 +301,8 @@ function isDynamicFunctionConstructorFactory(expression: ts.Expression): boolean
   const candidate = prototypeCall.arguments[0];
   return Boolean(
     candidate &&
-      (ts.isArrowFunction(candidate) || ts.isFunctionExpression(candidate)) &&
-      candidate.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword),
+    (ts.isArrowFunction(candidate) || ts.isFunctionExpression(candidate)) &&
+    candidate.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword),
   );
 }
 
@@ -1487,9 +1491,9 @@ function assertionFromAssertCall(
   const firstRoot = firstArgument ? rootIdentifier(firstArgument) : null;
   const firstIsBehavior = Boolean(
     firstArgument &&
-      (isProductionBehaviorDerivation(firstArgument, productionConsumerNames) ||
-        isExecutionResultDerivation(sourceFile, firstArgument) ||
-        (firstRoot && executionResultVars.has(firstRoot))),
+    (isProductionBehaviorDerivation(firstArgument, productionConsumerNames) ||
+      isExecutionResultDerivation(sourceFile, firstArgument) ||
+      (firstRoot && executionResultVars.has(firstRoot))),
   );
   const argumentCount = ASSERT_TWO_ARGUMENT_MATCHERS.has(method) && !firstIsBehavior ? 2 : 1;
   for (const argument of node.arguments.slice(0, argumentCount)) {
@@ -1819,6 +1823,7 @@ function scanSourceTextReport(fileName: string, relPath: string, text: string): 
         const productionConsumerNames = collectProductionConsumerNames(scopedImports);
         const declarativeImports = collectDeclarativeImports(scopedImports);
         const rawConfigAccessors = collectRawConfigAccessors(scopedImports);
+        for (const name of rawConfigAccessors.keys()) productionConsumerNames.delete(name);
         const variables = [
           ...scopedVariableDecls(sourceFile, allVariables, node, body),
           ...collectSetupHookAssignments(sourceFile, node),
@@ -1967,35 +1972,41 @@ function scan(): Report {
   };
 }
 
-function printMetrics(report: Report): void {
-  for (const [name, value] of Object.entries(report.summary)) {
-    console.log(`METRIC ${name}=${value}`);
-  }
+export function renderSourceShapeMetrics(report: Report): string {
+  return Object.entries(report.summary)
+    .map(([name, value]) => `METRIC ${name}=${value}`)
+    .join("\n");
 }
 
-function printHuman(report: Report): void {
+export function renderSourceShapeHuman(report: Report): string {
+  const lines: string[] = [];
   if (report.cases.length === 0) {
-    console.log("No source-shape tests detected.");
+    lines.push("No source-shape tests detected.");
   } else {
-    console.log(`Detected ${report.summary.source_shape_cases} source-shape test cases:`);
+    lines.push(`Detected ${report.summary.source_shape_cases} source-shape test cases:`);
     for (const testCase of report.cases) {
-      console.log(`- ${testCase.file}:${testCase.line}:${testCase.column} ${testCase.name}`);
+      lines.push(`- ${testCase.file}:${testCase.line}:${testCase.column} ${testCase.name}`);
       for (const assertion of testCase.assertions) {
-        console.log(
+        lines.push(
           `  - ${assertion.line}:${assertion.column} ${assertion.matcher} on ${assertion.subject}`,
         );
       }
     }
   }
   for (const exception of report.contractExceptions) {
-    console.log(
+    lines.push(
       `EXCEPTION ${exception.file}:${exception.line} ${exception.category} -- ${exception.reason}`,
     );
   }
   for (const invalid of report.invalidContractExceptions) {
-    console.log(`INVALID ${invalid.file}:${invalid.line} ${invalid.reason}`);
+    lines.push(`INVALID ${invalid.file}:${invalid.line} ${invalid.reason}`);
   }
-  printMetrics(report);
+  lines.push(renderSourceShapeMetrics(report));
+  return lines.join("\n");
+}
+
+export function renderSourceShapeJson(report: Report): string {
+  return JSON.stringify(report, null, 2);
 }
 
 function contractExceptionKey(file: string, test: string, category: ContractCategory): string {
@@ -2080,21 +2091,34 @@ function checkBudget(report: Report): void {
   }
 }
 
+type SourceShapeCommandDependencies = {
+  readonly writeOutput: (output: string) => void;
+  readonly checkBudget: (report: Report) => void;
+};
+
+export function runSourceShapeCommand(
+  args: readonly string[],
+  report: Report,
+  dependencies: SourceShapeCommandDependencies,
+): void {
+  const options = new Set(args);
+  const output = options.has("--json")
+    ? renderSourceShapeJson(report)
+    : options.has("--metrics")
+      ? renderSourceShapeMetrics(report)
+      : renderSourceShapeHuman(report);
+  dependencies.writeOutput(output);
+
+  if (options.has("--check")) {
+    dependencies.checkBudget(report);
+  }
+}
+
 function main(): void {
-  const args = new Set(process.argv.slice(2));
-  const report = scan();
-
-  if (args.has("--json")) {
-    console.log(JSON.stringify(report, null, 2));
-  } else if (args.has("--metrics")) {
-    printMetrics(report);
-  } else {
-    printHuman(report);
-  }
-
-  if (args.has("--check")) {
-    checkBudget(report);
-  }
+  runSourceShapeCommand(process.argv.slice(2), scan(), {
+    writeOutput: (output) => console.log(output),
+    checkBudget,
+  });
 }
 
 export function scanTextForTest(relPath: string, text: string): SourceShapeCase[] {
@@ -2109,7 +2133,7 @@ function isDirectInvocation(): boolean {
   const invoked = process.argv[1];
   return Boolean(
     invoked &&
-      (import.meta.url === `file://${invoked}` || invoked.endsWith("find-source-shape-tests.mts")),
+    (import.meta.url === `file://${invoked}` || invoked.endsWith("find-source-shape-tests.mts")),
   );
 }
 

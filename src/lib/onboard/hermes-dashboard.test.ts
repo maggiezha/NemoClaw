@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createHermesDashboardForwardEnsurer,
+  createHermesDashboardOnboardForwarding,
   getHermesDashboardRegistryFields,
   hasHermesDashboardDrift,
   resolveHermesDashboardOnboardState,
@@ -181,7 +182,7 @@ describe("onboard Hermes dashboard helpers", () => {
     );
   });
 
-  it("rolls back and fails when an opted-in dashboard forward cannot start", () => {
+  it("rolls back and fails when an opted-in dashboard forward cannot start", async () => {
     const rollback = vi.fn();
     const fail = vi.fn((message: string): never => {
       throw new Error(message);
@@ -199,11 +200,99 @@ describe("onboard Hermes dashboard helpers", () => {
       fail,
     });
 
-    expect(() => ensure("my-hermes", true)).toThrow(/Failed to start Hermes dashboard forward/);
+    await expect(ensure("my-hermes", true)).rejects.toThrow(
+      /Failed to start Hermes dashboard forward/,
+    );
     expect(rollback).toHaveBeenCalledWith("my-hermes");
     expect(fail).toHaveBeenCalledWith(
       expect.stringMatching(/set NEMOCLAW_DASHBOARD_PORT, or pass --control-ui-port <N>/i),
     );
     expect(fail.mock.calls[0]?.[0]).not.toContain("NEMOCLAW_HERMES_DASHBOARD_PORT");
+  });
+
+  it("stops Hermes dashboard forwarding when authority changes between retries (#9833)", async () => {
+    const starts: string[] = [];
+    const revalidateSandboxIdentity = vi
+      .fn<(operation: string) => void>()
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("sandbox identity changed");
+      });
+    const ensureForward = vi.fn(
+      (
+        _sandboxName: string,
+        _port: number,
+        _label: string,
+        revalidate?: (operation: string) => void,
+      ) => {
+        revalidate?.("start Hermes dashboard forward attempt 1");
+        starts.push("attempt 1");
+        revalidate?.("start Hermes dashboard forward attempt 2");
+        starts.push("attempt 2");
+        return true;
+      },
+    );
+    const ensure = createHermesDashboardForwardEnsurer({
+      state: resolveHermesDashboardOnboardState({
+        agentName: "hermes",
+        effectivePort: 18789,
+        env: { NEMOCLAW_HERMES_DASHBOARD: "1" },
+      }),
+      ensureForward,
+      note: vi.fn(),
+      rollbackSandbox: vi.fn(),
+      fail: (message): never => {
+        throw new Error(message);
+      },
+    });
+
+    await expect(ensure("my-hermes", false, revalidateSandboxIdentity)).rejects.toThrow(
+      "sandbox identity changed",
+    );
+
+    expect(starts).toEqual(["attempt 1"]);
+    expect(revalidateSandboxIdentity).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves the sandbox running after Hermes dashboard rollback (#9833)", async () => {
+    const runOpenshell = vi.fn();
+    const forwarding = createHermesDashboardOnboardForwarding({
+      agentName: "hermes",
+      env: { NEMOCLAW_HERMES_DASHBOARD: "1" },
+      ensureForward: vi.fn(() => false),
+      note: vi.fn(),
+      runOpenshell,
+      getApiForwardPort: () => "8642",
+      fail: (message): never => {
+        throw new Error(message);
+      },
+    });
+    const state = forwarding.resolveStateForPort(18789);
+
+    await expect(forwarding.ensureForState(state, "my-hermes", true)).rejects.toThrow(
+      /left the sandbox and any established OpenShell service forwards running/u,
+    );
+    expect(runOpenshell).not.toHaveBeenCalled();
+  });
+
+  it("does not signal a ForwardTcp process during dashboard rollback", async () => {
+    const runOpenshell = vi.fn();
+    const ensureForward = vi.fn(() => false);
+    const forwarding = createHermesDashboardOnboardForwarding({
+      agentName: "hermes",
+      env: { NEMOCLAW_HERMES_DASHBOARD: "1" },
+      ensureForward,
+      note: vi.fn(),
+      runOpenshell,
+      getApiForwardPort: () => "8642",
+      fail: (message): never => {
+        throw new Error(message);
+      },
+    });
+
+    await expect(
+      forwarding.ensureForState(forwarding.resolveStateForPort(18789), "hm", true),
+    ).rejects.toThrow(/left the sandbox and any established OpenShell service forwards running/u);
+    expect(runOpenshell).not.toHaveBeenCalled();
   });
 });

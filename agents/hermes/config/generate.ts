@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { type HermesBuildSettings, readHermesBuildSettings } from "./build-env.ts";
-import { buildHermesConfig, finalizeHermesPlatformToolsets } from "./hermes-config.ts";
-import { buildHermesEnvLines } from "./hermes-env.ts";
+import {
+  buildHermesManagedPolicy,
+  finalizeHermesPlatformToolsets,
+  type HermesManagedPolicyV3,
+} from "./managed-policy.ts";
 import { discoverModelSpecificSetups } from "./model-specific-setup.ts";
 import { type WrittenHermesConfig, writeHermesConfigFiles } from "./write-config.ts";
 
@@ -18,10 +21,11 @@ export type GeneratedHermesConfig = {
   settings: HermesBuildSettings;
   config: Record<string, unknown>;
   envLines: string[];
+  policy: HermesManagedPolicyV3;
   written: WrittenHermesConfig;
 };
 
-/** Generate the immutable Hermes config files from an explicit build environment. */
+/** Generate the initial mutable Hermes config files from an explicit build environment. */
 export function generateHermesConfig({
   env,
   scriptDir,
@@ -29,24 +33,31 @@ export function generateHermesConfig({
   log = console.log,
 }: GenerateHermesConfigOptions): GeneratedHermesConfig {
   const settings = readHermesBuildSettings(env);
-  discoverModelSpecificSetups(
-    "hermes",
-    {
-      model: settings.model,
-      providerKey: settings.providerKey,
-      inferenceApi: settings.inferenceApi,
-      baseUrl: settings.baseUrl,
-    },
-    { env, scriptDir },
-  );
+  if (settings.model !== null)
+    discoverModelSpecificSetups(
+      "hermes",
+      {
+        model: settings.model,
+        providerKey: settings.providerKey,
+        inferenceApi: settings.inferenceApi,
+        baseUrl: settings.baseUrl,
+      },
+      { env, scriptDir },
+    );
 
-  const config = buildHermesConfig(settings, env);
-  const envLines = buildHermesEnvLines(settings, env);
+  const policy = buildHermesManagedPolicy(settings, env);
+  const config = policy.config;
+  const envLines = policy.env_lines;
   finalizeHermesPlatformToolsets(config, settings);
-  const written = writeHermesConfigFiles(config, envLines, homeDir);
+  const written = writeHermesConfigFiles(config, envLines, policy, homeDir);
 
-  log(`[config] Wrote ${written.configPath} (model=${settings.model}, provider=custom)`);
+  log(
+    settings.model === null
+      ? `[config] Wrote ${written.configPath} (inference not configured)`
+      : `[config] Wrote ${written.configPath} (model=${settings.model}, provider=custom)`,
+  );
   log(`[config] Wrote ${written.envPath} (${written.envEntryCount} entries)`);
+  log(`[config] Wrote ${written.policyPath} (schema=${policy.schema_version})`);
 
-  return { settings, config, envLines, written };
+  return { settings, config, envLines, policy, written };
 }

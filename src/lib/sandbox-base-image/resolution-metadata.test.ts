@@ -89,16 +89,14 @@ describe("sandbox base-image resolution metadata lifecycle", () => {
     });
   });
 
-  it.each([
-    "",
-    "not JSON",
-    "null",
-    '"primitive"',
-  ])("ignores unusable Docker inspect output %# (#4680)", (output) => {
-    mocks.dockerImageInspectFormat.mockReturnValue(output);
+  it.each(["", "not JSON", "null", '"primitive"'])(
+    "ignores unusable Docker inspect output %# (#4680)",
+    (output) => {
+      mocks.dockerImageInspectFormat.mockReturnValue(output);
 
-    expect(inspectLocalImageMetadata(REF)).toBeNull();
-  });
+      expect(inspectLocalImageMetadata(REF)).toBeNull();
+    },
+  );
 
   it("creates metadata for a digest-pinned image with matching local identity (#4680)", () => {
     mocks.dockerImageInspectFormat.mockReturnValue(JSON.stringify(inspected));
@@ -106,6 +104,33 @@ describe("sandbox base-image resolution metadata lifecycle", () => {
     expect(createSandboxBaseImageResolutionMetadata(options, KEY, publishedResolution)).toEqual(
       metadata,
     );
+  });
+
+  it("preserves an exact digest resolution when Docker omits RepoDigests (#9386)", () => {
+    mocks.dockerImageInspectFormat.mockReturnValue(
+      JSON.stringify({
+        Id: inspected.Id,
+        Os: inspected.Os,
+        Architecture: inspected.Architecture,
+      }),
+    );
+
+    expect(createSandboxBaseImageResolutionMetadata(options, KEY, publishedResolution)).toEqual(
+      metadata,
+    );
+  });
+
+  it("rejects sparse RepoDigests when the resolved reference is not the exact digest", () => {
+    mocks.dockerImageInspectFormat.mockReturnValue(
+      JSON.stringify({ ...inspected, RepoDigests: [] }),
+    );
+
+    expect(
+      createSandboxBaseImageResolutionMetadata(options, KEY, {
+        ...publishedResolution,
+        ref: `${IMAGE_NAME}:published`,
+      }),
+    ).toBeNull();
   });
 
   it("finalizes a local fallback with identity metadata and no repository digest (#4680)", () => {
@@ -179,7 +204,10 @@ describe("sandbox base-image resolution metadata lifecycle", () => {
         KEY,
       ),
     ).toBeNull();
-    expect(validateImage).toHaveBeenCalledWith(REF);
+    expect(validateImage).toHaveBeenCalledWith(REF, {
+      source: metadata.source,
+      ...(metadata.pinnedRemoteRef ? { pinnedRemoteRef: metadata.pinnedRemoteRef } : {}),
+    });
     expect(mocks.addTraceEvent).toHaveBeenCalledWith("nemoclaw.sandbox_base_image.cache_stale", {
       reason: "custom_validation_failed",
     });

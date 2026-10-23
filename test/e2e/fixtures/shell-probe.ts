@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn } from "node:child_process";
-
 import type { ArtifactSink } from "./artifacts.ts";
-import { superviseChild } from "./shell/supervisor.ts";
+import { loadAgent } from "../../../src/lib/agent/defs.ts";
+import {
+  CANDIDATE_AGENT_FEATURE_ENV,
+  CANDIDATE_QUALIFICATION_RECEIPT_ENV,
+} from "../../../src/lib/agent/candidate.ts";
+import { CUA_FEATURE_ENV } from "../../../src/lib/cua/feature.ts";
+import { type ChildProcessProgress, spawnObservedChild } from "./observed-child-process.ts";
+import { superviseChild } from "../../helpers/process-supervisor.ts";
 import type { TrustedShellCommand } from "./shell/trusted-command.ts";
 
 /**
@@ -12,7 +17,7 @@ import type { TrustedShellCommand } from "./shell/trusted-command.ts";
  *
  * The lifecycle boundary (detached process-group cleanup, SIGTERM ->
  * SIGKILL escalation, timeout, AbortSignal) is owned by
- * fixtures/shell/supervisor.ts and shared with the phase orchestrator
+ * test/helpers/process-supervisor.ts and shared with the phase orchestrator
  * and probe helpers. The trusted-command brand + NUL-byte guard live
  * in fixtures/shell/trusted-command.ts. This file layers the
  * fixture-specific policy on top: redaction at the canonical entry
@@ -20,6 +25,8 @@ import type { TrustedShellCommand } from "./shell/trusted-command.ts";
  */
 
 export interface ShellProbeRunOptions {
+  /** Supply finite input, hold an empty pipe open, or default to immediate EOF. */
+  stdin?: "open-pipe" | { text: string };
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
@@ -28,6 +35,8 @@ export interface ShellProbeRunOptions {
   redactionValues?: string[];
   /** Retain at most the last N bytes from each output stream. */
   captureLimitBytes?: number;
+  /** Persist redacted, size-bounded output and result metadata; set false to write neither. */
+  persistArtifacts?: boolean;
   /** Timestamp-only output observer; chunk contents never cross this boundary. */
   onOutput?: (event: ShellProbeOutputEvent) => void;
 }
@@ -40,8 +49,58 @@ export interface ShellProbeOutputEvent {
 export type { TrustedShellCommand, TrustedShellCommandInput } from "./shell/trusted-command.ts";
 export { trustedShellCommand } from "./shell/trusted-command.ts";
 
+export type LiveE2EAgentName =
+  | "hermes"
+  | "langchain-deepagents-code"
+  | "nemocua"
+  | "openclaw"
+  | "pi";
+
+export function normalizeLiveE2EAgentName(value: string): LiveE2EAgentName {
+  switch (value) {
+    case "hermes":
+      return "hermes";
+    case "langchain-deepagents-code":
+      return "langchain-deepagents-code";
+    case "nemocua":
+      return "nemocua";
+    case "openclaw":
+      return "openclaw";
+    case "pi":
+      return "pi";
+    default:
+      throw new Error("Unsupported E2E agent selector.");
+  }
+}
+
+export function resolveLiveE2eWorkloadSourceEnv(input: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const targetId = input.E2E_TARGET_ID ?? process.env.E2E_TARGET_ID;
+  const source = input.E2E_WORKLOAD_SOURCE ?? process.env.E2E_WORKLOAD_SOURCE;
+  if (!targetId || source !== "local-dockerfile") return input;
+  const localBuildEnvironment = { ...input, NEMOCLAW_SANDBOX_PREBUILD: "1" };
+  if (input.NEMOCLAW_FROM_DOCKERFILE) return localBuildEnvironment;
+  const agentName = normalizeLiveE2EAgentName(
+    input.NEMOCLAW_AGENT ?? process.env.NEMOCLAW_AGENT ?? "openclaw",
+  );
+  const agent = loadAgent(agentName, {
+    [CANDIDATE_AGENT_FEATURE_ENV]:
+      input[CANDIDATE_AGENT_FEATURE_ENV] ?? process.env[CANDIDATE_AGENT_FEATURE_ENV],
+    [CANDIDATE_QUALIFICATION_RECEIPT_ENV]:
+      input[CANDIDATE_QUALIFICATION_RECEIPT_ENV] ??
+      process.env[CANDIDATE_QUALIFICATION_RECEIPT_ENV],
+    [CUA_FEATURE_ENV]: input[CUA_FEATURE_ENV] ?? process.env[CUA_FEATURE_ENV],
+  });
+  const dockerfilePath = agent.dockerfilePath ?? agent.legacyPaths?.dockerfile;
+  if (!dockerfilePath) {
+    throw new Error(`Agent '${agent.name}' has no Dockerfile for local E2E workload source.`);
+  }
+  return { ...localBuildEnvironment, NEMOCLAW_FROM_DOCKERFILE: dockerfilePath };
+}
+
 export interface ShellProbeResult {
   command: string[];
+  startedAt?: string;
+  finishedAt?: string;
   /** Wall-clock command duration, persisted for CI bottleneck analysis. */
   durationMs?: number;
   exitCode: number | null;
@@ -58,13 +117,12 @@ export interface ShellProbeResult {
 
 export interface ShellProbeDeps {
   artifacts: ArtifactSink;
+  progress: ChildProcessProgress;
   redact: (text: string, extraValues?: string[]) => string;
-  signal: AbortSignal;
-  /** Default timestamp-only observer applied to every command in this test. */
-  onOutput?: (event: ShellProbeOutputEvent) => void;
-  /** Content-free activity boundary applied to every command in this test. */
-  onActivity?: (label: string) => (() => void) | void;
+  signal: AbortSignalSource;
 }
+
+export type AbortSignalSource = AbortSignal | (() => AbortSignal);
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -155,23 +213,22 @@ function redactTruncatedSecretPrefix(text: string, redactionValues: string[]): s
 
 export class ShellProbe {
   private readonly artifacts: ArtifactSink;
+  private readonly progress: ChildProcessProgress;
   private readonly redact: (text: string, extraValues?: string[]) => string;
-  private readonly signal: AbortSignal;
-  private readonly onOutput?: (event: ShellProbeOutputEvent) => void;
-  private readonly onActivity?: (label: string) => (() => void) | void;
+  private readonly signal: AbortSignalSource;
 
   constructor(deps: ShellProbeDeps) {
     this.artifacts = deps.artifacts;
+    this.progress = deps.progress;
     this.redact = deps.redact;
     this.signal = deps.signal;
-    this.onOutput = deps.onOutput;
-    this.onActivity = deps.onActivity;
   }
 
   async run(
     trustedCommand: TrustedShellCommand,
     options: ShellProbeRunOptions = {},
   ): Promise<ShellProbeResult> {
+    const signal = typeof this.signal === "function" ? this.signal() : this.signal;
     const command = trustedCommand.command;
     const args = [...trustedCommand.args];
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -203,93 +260,113 @@ export class ShellProbe {
     const artifactBase = `shell/${activityName}`;
     const writeArtifacts = async (
       result: Omit<ShellProbeResult, "artifacts">,
-    ): Promise<ShellProbeResult["artifacts"]> => ({
-      stdout: await this.artifacts.writeText(`${artifactBase}.stdout.txt`, result.stdout),
-      stderr: await this.artifacts.writeText(`${artifactBase}.stderr.txt`, result.stderr),
-      result: await this.artifacts.writeJson(`${artifactBase}.result.json`, result),
-    });
+    ): Promise<ShellProbeResult["artifacts"]> => {
+      if (options.persistArtifacts === false) return { stdout: "", stderr: "", result: "" };
+      if (process.env.NEMOCLAW_E2E_COMMAND_EVIDENCE === "1") {
+        // Preserve completed command metadata through the existing remote log transport.
+        // Output bodies stay in redacted guest artifacts, outside this metadata-only stream.
+        const record = {
+          schemaVersion: 1,
+          artifactName: this.artifacts.redact(activityName).slice(0, 256),
+          command: result.command.map((argument) => this.artifacts.redact(argument)),
+          startedAt: result.startedAt,
+          finishedAt: result.finishedAt,
+          durationMs: result.durationMs,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          timedOut: result.timedOut,
+        };
+        let encoded = this.artifacts.redact(JSON.stringify(record));
+        if (Buffer.byteLength(encoded) > 65_536) {
+          encoded = this.artifacts.redact(
+            JSON.stringify({ ...record, command: [], commandOmitted: "size-limit" }),
+          );
+        }
+        process.stderr.write(`NEMOCLAW_E2E_COMMAND ${encoded}\n`);
+      }
+      return {
+        stdout: await this.artifacts.writeText(`${artifactBase}.stdout.txt`, result.stdout),
+        stderr: await this.artifacts.writeText(`${artifactBase}.stderr.txt`, result.stderr),
+        result: await this.artifacts.writeJson(`${artifactBase}.result.json`, result),
+      };
+    };
 
     const stdout = createTextCapture(options.captureLimitBytes);
     const stderr = createTextCapture(options.captureLimitBytes);
     const startedAtMs = Date.now();
-    let finishActivity: (() => void) | undefined;
-    try {
-      finishActivity = this.onActivity?.(`command: ${activityName}`) ?? undefined;
-    } catch {
-      // Test instrumentation must not change command execution.
-    }
-    const finishActivityBestEffort = () => {
-      try {
-        finishActivity?.();
-      } catch {
-        // Test instrumentation must not change command execution.
-      }
-    };
-    const observeOutput = (event: ShellProbeOutputEvent) => {
-      try {
-        this.onOutput?.(event);
-      } catch {
-        // Test instrumentation must not change command execution.
-      }
-      if (options.onOutput === this.onOutput) return;
-      try {
-        options.onOutput?.(event);
-      } catch {
-        // Test instrumentation must not change command execution.
-      }
-    };
-    try {
-      const child = spawn(command, args, {
+    const commandOutputObserver =
+      options.onOutput === this.progress.onOutput ? undefined : options.onOutput;
+    const commandEnv = resolveLiveE2eWorkloadSourceEnv({
+      ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
+      ...(options.env ?? {}),
+    });
+    const child = spawnObservedChild(command, args, {
+      activityLabel: `command: ${activityName}`,
+      progress: this.progress,
+      spawn: {
         cwd: options.cwd,
         detached: true,
-        env: { ...(options.env ?? {}) },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const supervised = await superviseChild(child, {
-        timeoutMs,
-        killGraceMs,
-        signal: this.signal,
-        onStdout: (chunk) => {
-          stdout.append(chunk);
-          observeOutput({ stream: "stdout", atMs: Date.now() });
-        },
-        onStderr: (chunk) => {
-          stderr.append(chunk);
-          observeOutput({ stream: "stderr", atMs: Date.now() });
-        },
-      });
+        env: commandEnv,
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      },
+    });
+    const supervised = await superviseChild(child, {
+      stdin: typeof options.stdin === "object" ? options.stdin.text : undefined,
+      timeoutMs,
+      killGraceMs,
+      signal,
+      onStdout: (chunk) => {
+        stdout.append(chunk);
+        try {
+          commandOutputObserver?.({ stream: "stdout", atMs: Date.now() });
+        } catch {
+          // Test instrumentation must not change command execution.
+        }
+      },
+      onStderr: (chunk) => {
+        stderr.append(chunk);
+        try {
+          commandOutputObserver?.({ stream: "stderr", atMs: Date.now() });
+        } catch {
+          // Test instrumentation must not change command execution.
+        }
+      },
+    });
 
-      const redactedStdout = renderCapturedText(stdout);
-      const redactedStderr = renderCapturedText(stderr);
-      const durationMs = Date.now() - startedAtMs;
-      if (supervised.spawnError) {
-        const redactedMessage = redactProbeText(errorMessage(supervised.spawnError));
-        const stderrWithError = [redactedStderr, redactedMessage].filter(Boolean).join("\n");
-        await writeArtifacts({
-          command: redactedCommand,
-          durationMs,
-          exitCode: null,
-          signal: null,
-          timedOut: supervised.timedOut,
-          stdout: redactedStdout,
-          stderr: stderrWithError,
-        });
-        throw redactedError(supervised.spawnError, redactedMessage);
-      }
-
-      const result: Omit<ShellProbeResult, "artifacts"> = {
+    const redactedStdout = renderCapturedText(stdout);
+    const redactedStderr = renderCapturedText(stderr);
+    const finishedAtMs = Date.now();
+    const timing = {
+      startedAt: new Date(startedAtMs).toISOString(),
+      finishedAt: new Date(finishedAtMs).toISOString(),
+      durationMs: finishedAtMs - startedAtMs,
+    };
+    const superviseError = supervised.spawnError ?? supervised.cleanupError;
+    if (superviseError) {
+      const redactedMessage = redactProbeText(errorMessage(superviseError));
+      const stderrWithError = [redactedStderr, redactedMessage].filter(Boolean).join("\n");
+      await writeArtifacts({
         command: redactedCommand,
-        durationMs,
+        ...timing,
         exitCode: supervised.exitCode,
         signal: supervised.signal,
         timedOut: supervised.timedOut,
         stdout: redactedStdout,
-        stderr: redactedStderr,
-      };
-      const artifacts = await writeArtifacts(result);
-      return { ...result, artifacts };
-    } finally {
-      finishActivityBestEffort();
+        stderr: stderrWithError,
+      });
+      throw redactedError(superviseError, redactedMessage);
     }
+
+    const result: Omit<ShellProbeResult, "artifacts"> = {
+      command: redactedCommand,
+      ...timing,
+      exitCode: supervised.exitCode,
+      signal: supervised.signal,
+      timedOut: supervised.timedOut,
+      stdout: redactedStdout,
+      stderr: redactedStderr,
+    };
+    const artifacts = await writeArtifacts(result);
+    return { ...result, artifacts };
   }
 }

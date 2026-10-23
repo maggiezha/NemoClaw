@@ -56,9 +56,18 @@ const PINNED_SANDBOX_BUILD_VERSIONS = new Map<string, string>([
   // OpenShell v0.0.82 standalone sandbox binaries.
   ["145246049bd73c60452ac3c2b4b1801663196c8e2f80575af820289c78c1cf09", "0.0.82"],
   ["76bc19b70d9f1e1e9871307045796cd39cc7b8fc4c08ffc90593cc934f36d500", "0.0.82"],
-  // OpenShell v0.0.85 standalone sandbox binaries.
-  ["863ef21ab7ef623f5e7a8728c4e5532b46bfbae3ace3b800665a1c6353a1f7d2", "0.0.85"],
-  ["680115dbc2affde0e88261ab09f4044726d1cc9e01de55dc5077d1118f52968d", "0.0.85"],
+  // OpenShell v0.0.99 standalone sandbox binaries.
+  ["a4b0c38ed90a6dd4b4f312ad3727824a25ec478d88d4e65d22a82377b18e6214", "0.0.99"],
+  ["f60ce5b76e4dbd645f690c8519852d261c8cf6a70b5fc56db329a23d68bc7b2e", "0.0.99"],
+  // OpenShell v0.0.101 standalone sandbox binaries.
+  ["a2704babbb468fd0a359bfdd9844de71095b730758541b4ca8cbab77d4018920", "0.0.101"],
+  ["88300e35f153123e4dc3021c537834dd6c0a09665a4a6d3974cd285d512345c4", "0.0.101"],
+  // OpenShell v0.0.106 standalone sandbox binaries.
+  ["019301ec8618abbed8135e8d39dde7bea47e5e92813bbc17768550de34db59f8", "0.0.106"],
+  ["0031c6b257a23ecc1a2333153918324f3af0005e68abde388858d682ec646c55", "0.0.106"],
+  // OpenShell v0.0.116 standalone sandbox binaries.
+  ["326ee26df8f8575ba761470757a12fe5c1cdc904ba064b81946692dd0328dd40", "0.0.116"],
+  ["7052a87d2b46ef52ecc0f7c64b9bac008dd3010c467881b0648045334eb0ed1d", "0.0.116"],
 ]);
 
 export function pinnedOpenShellSandboxBuildVersion(sha256: string): string | null {
@@ -100,9 +109,9 @@ function componentBuildVersionsMatch(left: string, right: string): boolean {
   const rightGit = right.match(/^(.*\+g)([0-9a-f]{7,})$/i);
   return Boolean(
     leftGit &&
-      rightGit &&
-      leftGit[1] === rightGit[1] &&
-      (leftGit[2].startsWith(rightGit[2]) || rightGit[2].startsWith(leftGit[2])),
+    rightGit &&
+    leftGit[1] === rightGit[1] &&
+    (leftGit[2].startsWith(rightGit[2]) || rightGit[2].startsWith(leftGit[2])),
   );
 }
 
@@ -110,7 +119,7 @@ function componentBuildVersionsMatch(left: string, right: string): boolean {
 // from version text alone. sourceBoundary: OpenShell owns component identity
 // and the future native capability response; this scanner is an artifact and
 // install-repair preflight only and never authorizes an MCP mutation.
-// whyNotSourceFix: v0.0.85 has no structured installed-feature response.
+// whyNotSourceFix: v0.0.116 has no structured installed-feature response.
 // regressionTest: openshell-feature-gate.test.ts covers mixed roots, symlink
 // farms, stale components, unreadable binaries, and the pinned sandbox digest.
 // removalCondition: replace this scan when OpenShell exposes a versioned native
@@ -175,7 +184,6 @@ export function hasRequiredOpenshellMessagingFeatures(options: {
     (candidate): candidate is string => candidate !== null,
   );
 
-  const requiredMarkers = REQUIRED_OPENSHELL_MCP_FEATURES.map((marker) => Buffer.from(marker));
   const foundMarkers = new Set<string>();
   const seen = new Set<string>();
   for (const candidate of candidates) {
@@ -192,10 +200,8 @@ export function hasRequiredOpenshellMessagingFeatures(options: {
     } finally {
       if (fd !== null) fs.closeSync(fd);
     }
-    for (let index = 0; index < requiredMarkers.length; index += 1) {
-      if (content.includes(requiredMarkers[index])) {
-        foundMarkers.add(REQUIRED_OPENSHELL_MCP_FEATURES[index]);
-      }
+    for (const marker of REQUIRED_OPENSHELL_MCP_FEATURES) {
+      if (content.includes(Buffer.from(marker))) foundMarkers.add(marker);
     }
     if (REQUIRED_OPENSHELL_MCP_FEATURES.every((marker) => foundMarkers.has(marker))) break;
   }

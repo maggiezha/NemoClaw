@@ -4,7 +4,6 @@
 import {
   DEFAULT_GATEWAY_NAME,
   gatewayVolumeCandidates,
-  NEMOCLAW_OLLAMA_MODELS,
   NEMOCLAW_PROVIDERS,
   type UninstallPaths,
   uninstallStatePaths,
@@ -20,9 +19,10 @@ export interface UninstallPlanOptions {
 
 export type UninstallPlanAction =
   | { kind: "delete-docker-volume"; name: string }
+  | { kind: "delete-all-ollama-models" }
+  | { kind: "delete-hugging-face-cache-data"; path: string }
   | { kind: "delete-managed-swap" }
-  | { kind: "delete-ollama-model"; name: string }
-  | { kind: "delete-related-docker-containers" }
+  | { kind: "verify-docker-container-cleanup" }
   | { kind: "delete-related-docker-images" }
   | { kind: "delete-openshell-install-path"; path: string }
   | { kind: "delete-openshell-provider"; name: string }
@@ -30,13 +30,13 @@ export type UninstallPlanAction =
   | { kind: "delete-runtime-glob"; pattern: string }
   | { kind: "delete-shim"; reason: string }
   | { kind: "destroy-openshell-gateway"; name: string }
-  | { kind: "preserve-ollama-models"; names: string[] }
+  | { kind: "preserve-hugging-face-cache-data"; path: string }
+  | { kind: "preserve-ollama-models" }
   | { kind: "preserve-openshell-install-paths"; paths: string[] }
   | { kind: "preserve-shim"; reason: string }
   | { kind: "stop-helper-services" }
   | { kind: "stop-model-router" }
   | { kind: "stop-ollama-auth-proxy" }
-  | { kind: "stop-openshell-forward-processes" }
   | { kind: "stop-orphaned-openshell-processes" }
   | { kind: "uninstall-npm-package"; name: "nemoclaw" };
 
@@ -74,7 +74,6 @@ export function buildUninstallPlan(
         actions: [
           { kind: "stop-helper-services" },
           { kind: "delete-runtime-glob", pattern: paths.helperServiceGlob },
-          { kind: "stop-openshell-forward-processes" },
           { kind: "stop-orphaned-openshell-processes" },
           { kind: "stop-ollama-auth-proxy" },
           { kind: "stop-model-router" },
@@ -91,13 +90,9 @@ export function buildUninstallPlan(
         ],
       },
       {
-        name: "NemoClaw CLI",
-        actions: cliActions(options.shim),
-      },
-      {
         name: "Docker resources",
         actions: [
-          { kind: "delete-related-docker-containers" },
+          { kind: "verify-docker-container-cleanup" },
           { kind: "delete-related-docker-images" },
           ...gatewayVolumeCandidates(gatewayName).map((name) => ({
             kind: "delete-docker-volume" as const,
@@ -106,10 +101,26 @@ export function buildUninstallPlan(
         ],
       },
       {
-        name: "Ollama models",
+        name: "NemoClaw CLI",
+        actions: cliActions(options.shim),
+      },
+      {
+        name: "Model stores",
         actions: options.deleteModels
-          ? NEMOCLAW_OLLAMA_MODELS.map((name) => ({ kind: "delete-ollama-model" as const, name }))
-          : [{ kind: "preserve-ollama-models", names: [...NEMOCLAW_OLLAMA_MODELS] }],
+          ? [
+              { kind: "delete-all-ollama-models" },
+              {
+                kind: "delete-hugging-face-cache-data",
+                path: paths.huggingFaceModelCacheDir,
+              },
+            ]
+          : [
+              { kind: "preserve-ollama-models" },
+              {
+                kind: "preserve-hugging-face-cache-data",
+                path: paths.huggingFaceModelCacheDir,
+              },
+            ],
       },
       {
         name: "State and binaries",

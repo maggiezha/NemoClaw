@@ -7,8 +7,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { deleteSnapshotDirectory, snapshotDeletionSupported } from "./snapshot-delete-helper.js";
-
-const SNAPSHOT_DIR_NAME_RE = /^\d{8}T\d{6}Z$/;
+import { SNAPSHOT_DIR_NAME_RE } from "./snapshot-directory.js";
 
 export { snapshotDeletionSupported };
 
@@ -64,9 +63,8 @@ export function deleteSnapshot(
 ): boolean {
   const snapshotsDir = snapshotsDirectory(options);
   const snapshotName = snapshotNameFromPath(snapshotPath, snapshotsDir);
-  // Deletion deliberately does not reuse snapshot.ts's point-in-time
-  // rejectSymlinksOnPath check. The helper freshly opens the root, target, and
-  // every descendant fd-relative with O_NOFOLLOW so path swaps also fail closed.
+  // The helper freshly opens the root, target, and every descendant fd-relative
+  // with O_NOFOLLOW so path swaps also fail closed.
   return (
     snapshotName !== null &&
     (options.deleteDirectory ?? deleteSnapshotDirectory)(snapshotsDir, snapshotName)

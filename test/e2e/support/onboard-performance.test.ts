@@ -9,7 +9,10 @@ import {
   readColdOnboardPerformanceBudget,
   readOnboardTraceWindow,
 } from "../fixtures/onboard-performance.ts";
-import { extractOpenClawAgentPayloadText } from "../live/agent-turn-latency-helpers.ts";
+import {
+  buildOpenClawFirstTurnLatencyEvidence,
+  extractOpenClawAgentDurationEvidence,
+} from "../live/agent-turn-latency-helpers.ts";
 
 const TRACE_ID = "0123456789abcdef0123456789abcdef";
 const FOREIGN_TRACE_ID = "fedcba9876543210fedcba9876543210";
@@ -198,6 +201,7 @@ describe("onboard performance evidence", () => {
     const budget = readColdOnboardPerformanceBudget({
       fullE2eColdPath: {
         authoritativeLocalBaseBuildAllowanceMs: 500,
+        sandboxPhaseSingleObservationMaxOverageMs: 0,
         rootStartToFirstTurnCompletionBudgetMs: 5_000,
         rootEndToFirstTurnCompletionBudgetMs: 1_000,
         phaseBudgetsMs: completePhaseBudgets(),
@@ -206,6 +210,7 @@ describe("onboard performance evidence", () => {
 
     expect(evaluateColdOnboardPerformance(trace, 6_000, budget)).toEqual({
       appliedAuthoritativeLocalBaseBuildAllowanceMs: 0,
+      anomalies: [],
       passed: true,
       rootStartToFirstTurnCompletionMs: 5_000,
       rootEndToFirstTurnCompletionMs: 0,
@@ -213,6 +218,7 @@ describe("onboard performance evidence", () => {
     });
     expect(evaluateColdOnboardPerformance(trace, 7_500, budget)).toEqual({
       appliedAuthoritativeLocalBaseBuildAllowanceMs: 0,
+      anomalies: [],
       passed: false,
       rootStartToFirstTurnCompletionMs: 6_500,
       rootEndToFirstTurnCompletionMs: 1_500,
@@ -228,16 +234,153 @@ describe("onboard performance evidence", () => {
     ]);
     expect(evaluateColdOnboardPerformance(trace, 6_500, budget, true)).toMatchObject({
       appliedAuthoritativeLocalBaseBuildAllowanceMs: 500,
+      anomalies: [],
       passed: true,
       rootStartToFirstTurnCompletionMs: 5_500,
       violations: [],
     });
   });
 
+  it("classifies a sole hosted first-turn tail as a structured non-blocking anomaly (#6660)", () => {
+    const trace = readOnboardTraceWindow(traceArtifact());
+    const budget = readColdOnboardPerformanceBudget({
+      fullE2eColdPath: {
+        authoritativeLocalBaseBuildAllowanceMs: 0,
+        sandboxPhaseSingleObservationMaxOverageMs: 0,
+        rootStartToFirstTurnCompletionBudgetMs: 20_000,
+        rootEndToFirstTurnCompletionBudgetMs: 1_000,
+        phaseBudgetsMs: completePhaseBudgets(),
+      },
+    });
+
+    expect(evaluateColdOnboardPerformance(trace, 7_500, budget)).toEqual({
+      appliedAuthoritativeLocalBaseBuildAllowanceMs: 0,
+      anomalies: [
+        {
+          budgetMs: 1_000,
+          kind: "first-turn-latency-tail",
+          measurementMs: 1_500,
+          overageMs: 500,
+        },
+      ],
+      passed: true,
+      rootStartToFirstTurnCompletionMs: 6_500,
+      rootEndToFirstTurnCompletionMs: 1_500,
+      violations: [],
+    });
+  });
+
+  it("does not double-count one hosted first-turn tail as a cold-path regression (#6660)", () => {
+    const trace = readOnboardTraceWindow(traceArtifact());
+    const budget = readColdOnboardPerformanceBudget({
+      fullE2eColdPath: {
+        authoritativeLocalBaseBuildAllowanceMs: 0,
+        sandboxPhaseSingleObservationMaxOverageMs: 0,
+        rootStartToFirstTurnCompletionBudgetMs: 6_000,
+        rootEndToFirstTurnCompletionBudgetMs: 1_000,
+        phaseBudgetsMs: completePhaseBudgets(),
+      },
+    });
+
+    expect(evaluateColdOnboardPerformance(trace, 7_500, budget)).toMatchObject({
+      anomalies: [
+        {
+          budgetMs: 1_000,
+          kind: "first-turn-latency-tail",
+          measurementMs: 1_500,
+          overageMs: 500,
+        },
+      ],
+      passed: true,
+      rootStartToFirstTurnCompletionMs: 6_500,
+      violations: [],
+    });
+  });
+
+  it("keeps a first-turn overage blocking when another cold-path budget also fails (#6660)", () => {
+    const trace = readOnboardTraceWindow(traceArtifact());
+    trace.phaseDurationsMs[ONBOARD_PHASE_NAMES[4]] = 1_501;
+    const budget = readColdOnboardPerformanceBudget({
+      fullE2eColdPath: {
+        authoritativeLocalBaseBuildAllowanceMs: 0,
+        sandboxPhaseSingleObservationMaxOverageMs: 0,
+        rootStartToFirstTurnCompletionBudgetMs: 20_000,
+        rootEndToFirstTurnCompletionBudgetMs: 1_000,
+        phaseBudgetsMs: completePhaseBudgets(),
+      },
+    });
+
+    expect(evaluateColdOnboardPerformance(trace, 7_500, budget)).toMatchObject({
+      anomalies: [],
+      passed: false,
+      violations: [
+        "root-end-to-first-turn-completion 1500ms exceeds 1000ms",
+        "nemoclaw.onboard.phase.sandbox 1501ms exceeds 1500ms",
+      ],
+    });
+  });
+
+  it("classifies one bounded published-base sandbox overage as an anomaly (#6660)", () => {
+    const trace = readOnboardTraceWindow(traceArtifact());
+    trace.phaseDurationsMs[ONBOARD_PHASE_NAMES[4]] = 1_636;
+    const budget = readColdOnboardPerformanceBudget({
+      fullE2eColdPath: {
+        authoritativeLocalBaseBuildAllowanceMs: 0,
+        sandboxPhaseSingleObservationMaxOverageMs: 5_000,
+        rootStartToFirstTurnCompletionBudgetMs: 20_000,
+        rootEndToFirstTurnCompletionBudgetMs: 1_000,
+        phaseBudgetsMs: completePhaseBudgets(),
+      },
+    });
+
+    expect(evaluateColdOnboardPerformance(trace, 6_500, budget)).toMatchObject({
+      anomalies: [
+        {
+          budgetMs: 1_500,
+          kind: "sandbox-phase-tail",
+          measurementMs: 1_636,
+          overageMs: 136,
+        },
+      ],
+      passed: true,
+      violations: [],
+    });
+  });
+
+  it.each([
+    ["exceeds the overage limit", false, 6_501, 250],
+    ["uses the local-base allowance path", true, 1_636, 250],
+    ["has another phase violation", false, 1_636, 1_501],
+  ])(
+    "keeps a sandbox overage blocking when it %s (#6660)",
+    (_case, localBase, sandboxMs, preflightMs) => {
+      const trace = readOnboardTraceWindow(traceArtifact());
+      trace.phaseDurationsMs[ONBOARD_PHASE_NAMES[4]] = sandboxMs as number;
+      trace.phaseDurationsMs[ONBOARD_PHASE_NAMES[0]] = preflightMs as number;
+      const budget = readColdOnboardPerformanceBudget({
+        fullE2eColdPath: {
+          authoritativeLocalBaseBuildAllowanceMs: 0,
+          sandboxPhaseSingleObservationMaxOverageMs: 5_000,
+          rootStartToFirstTurnCompletionBudgetMs: 20_000,
+          rootEndToFirstTurnCompletionBudgetMs: 1_000,
+          phaseBudgetsMs: completePhaseBudgets(),
+        },
+      });
+
+      expect(
+        evaluateColdOnboardPerformance(trace, 6_500, budget, localBase as boolean),
+      ).toMatchObject({
+        anomalies: [],
+        passed: false,
+      });
+    },
+  );
+
   it("rejects malformed or incomplete cold-path budget configuration", () => {
     expect(() => readColdOnboardPerformanceBudget({})).toThrow("fullE2eColdPath");
     const fullE2eColdPath = {
       authoritativeLocalBaseBuildAllowanceMs: 0,
+      sandboxPhaseSingleObservationMaxOverageMs: 0,
       rootStartToFirstTurnCompletionBudgetMs: 1_000,
       rootEndToFirstTurnCompletionBudgetMs: 1_001,
       phaseBudgetsMs: completePhaseBudgets(),
@@ -278,6 +421,7 @@ describe("onboard performance evidence", () => {
     const budget = readColdOnboardPerformanceBudget({
       fullE2eColdPath: {
         authoritativeLocalBaseBuildAllowanceMs: 0,
+        sandboxPhaseSingleObservationMaxOverageMs: 0,
         rootStartToFirstTurnCompletionBudgetMs: 5_000,
         rootEndToFirstTurnCompletionBudgetMs: 1_000,
         phaseBudgetsMs: completePhaseBudgets(),
@@ -310,31 +454,74 @@ describe("onboard performance evidence", () => {
     );
   });
 
-  it("rejects echoed user messages as first-agent-response evidence", () => {
+  it.each([
+    { commandMs: 10_125, agentMs: 8_916, outsideAgentMs: 1_209 },
+    { commandMs: 252_000, agentMs: 480, outsideAgentMs: 251_520 },
+    { commandMs: 252_000, agentMs: 251_000, outsideAgentMs: 1_000 },
+    { commandMs: 1_000, agentMs: 2_000, outsideAgentMs: undefined },
+  ])(
+    "records command time outside the reported agent duration ($commandMs ms)",
+    ({ commandMs, agentMs, outsideAgentMs }) => {
+      expect(
+        buildOpenClawFirstTurnLatencyEvidence(
+          `progress\n${JSON.stringify({
+            status: "ok",
+            result: { payloads: [], meta: { durationMs: agentMs } },
+          })}`,
+          commandMs,
+        ),
+      ).toEqual({
+        firstTurnAgentDuration: { durationMs: agentMs, status: "available" },
+        firstTurnCommandMs: commandMs,
+        ...(outsideAgentMs === undefined ? {} : { firstTurnHostOverheadMs: outsideAgentMs }),
+      });
+    },
+  );
+
+  it("reads local OpenClaw duration metadata from the shared response envelope", () => {
     expect(
-      extractOpenClawAgentPayloadText(
-        JSON.stringify({
-          messages: [{ role: "user", content: "Reply with exactly: NEMOCLAW_E2E_READY_6002" }],
-        }),
+      extractOpenClawAgentDurationEvidence(
+        JSON.stringify({ payloads: [{ text: "ready" }], meta: { durationMs: 4_200 } }),
       ),
-    ).toBe("");
+    ).toEqual({ durationMs: 4_200, status: "available" });
   });
 
-  it("accepts a framed OpenClaw agent-output payload", () => {
+  it.each([{}, { durationMs: "unknown" }])(
+    "leaves host overhead unavailable without valid agent duration (%j)",
+    (meta) => {
+      expect(
+        buildOpenClawFirstTurnLatencyEvidence(
+          JSON.stringify({ payloads: [{ text: "ready" }], meta }),
+          10_000,
+        ).firstTurnHostOverheadMs,
+      ).toBeUndefined();
+    },
+  );
+
+  it("ignores duration metadata nested in an event record", () => {
     expect(
-      extractOpenClawAgentPayloadText(
-        `progress\n${JSON.stringify({ result: { payloads: [{ text: "NEMOCLAW_E2E_READY_6002" }] } })}`,
+      extractOpenClawAgentDurationEvidence(
+        JSON.stringify({ event: "progress", data: { meta: { durationMs: 4_200 } } }),
       ),
-    ).toBe("NEMOCLAW_E2E_READY_6002");
+    ).toEqual({ reason: "missing", status: "unavailable" });
   });
 
-  it("joins top-level agent-output payload fragments", () => {
+  it("records missing OpenClaw duration metadata as unavailable", () => {
     expect(
-      extractOpenClawAgentPayloadText(
-        JSON.stringify({
-          payloads: [{ text: "NEMOCLAW_" }, { text: "E2E_READY_6002" }],
-        }),
+      extractOpenClawAgentDurationEvidence(
+        `progress\n${JSON.stringify({
+          payloads: [{ text: "NEMOCLAW_E2E_READY_6002" }],
+          meta: {},
+        })}`,
       ),
-    ).toBe("NEMOCLAW_\nE2E_READY_6002");
+    ).toEqual({ reason: "missing", status: "unavailable" });
+  });
+
+  it("records malformed OpenClaw duration metadata as unavailable", () => {
+    expect(
+      extractOpenClawAgentDurationEvidence(
+        `progress\n${JSON.stringify({ payloads: [], meta: { durationMs: "8916" } })}`,
+      ),
+    ).toEqual({ reason: "malformed", status: "unavailable" });
   });
 });

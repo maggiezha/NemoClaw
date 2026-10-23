@@ -30,6 +30,8 @@ export interface LockObservation {
   mtimeMs: number;
   dev: number;
   ino: number;
+  /** A directory cannot be restored with a hard link. */
+  reclaimable: boolean;
 }
 
 export type McpLifecycleLockDisposition = "active" | "stale" | "wait";
@@ -65,7 +67,27 @@ export function isMcpLifecycleLockOwner(value: unknown): value is McpLifecycleLo
   );
 }
 
-function processIsAlive(pid: number): boolean {
+function readLinuxProcessState(pid: number): string | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const statText = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const closeParen = statText.lastIndexOf(")");
+    if (closeParen < 0) return null;
+    return (
+      statText
+        .slice(closeParen + 2)
+        .trim()
+        .split(/\s+/)[0] ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function processIsAlive(pid: number): boolean {
+  // kill(pid, 0) succeeds for an unreaped zombie even though it can no longer
+  // own or release a lifecycle lock.
+  if (readLinuxProcessState(pid) === "Z") return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -198,7 +220,9 @@ export function classifyMcpLifecycleLock(
 ): McpLifecycleLockDisposition {
   const { owner } = observation;
   if (!owner || owner.sandboxName !== sandboxName) {
-    return nowMs - observation.mtimeMs >= corruptLockGraceMs ? "stale" : "wait";
+    return observation.reclaimable && nowMs - observation.mtimeMs >= corruptLockGraceMs
+      ? "stale"
+      : "wait";
   }
   // The lock coordinates local CLI processes, not independent hosts or PID
   // namespaces. Never use this process's PID table to reap a foreign owner;

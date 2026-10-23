@@ -4,7 +4,11 @@
 import { Args } from "@oclif/core";
 import type { AgentDefinition } from "../../../lib/agent/defs";
 import { quietFlag } from "../../../lib/cli/common-flags";
-import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
+import {
+  assertHermesPortableCommandUnavailable,
+  NemoClawCommand,
+  withSandboxCommandLifecycleLock,
+} from "../../../lib/cli/nemoclaw-oclif-command";
 
 import {
   GatewayTokenCommandError,
@@ -13,7 +17,7 @@ import {
 
 type GatewayTokenRuntimeBridge = {
   /** Agent-appropriate token fetcher, resolved per sandbox. */
-  fetchToken: (sandboxName: string) => string | null;
+  fetchToken: (sandboxName: string) => Promise<string | null>;
   getSandboxAgent: (sandboxName: string) => string | null;
   /** Whether the resolved agent exposes a retrievable auth token. */
   agentExposesToken: (agentName: string | null) => boolean;
@@ -21,7 +25,7 @@ type GatewayTokenRuntimeBridge = {
 
 let runtimeBridgeFactory = (): GatewayTokenRuntimeBridge => {
   const onboard = require("../../../lib/onboard") as {
-    fetchGatewayAuthTokenFromSandbox: (sandboxName: string) => string | null;
+    fetchGatewayAuthTokenFromSandbox: (sandboxName: string) => Promise<string | null>;
   };
   const agentWebAuth =
     require("../../../lib/onboard/agent-web-auth-token") as typeof import("../../../lib/onboard/agent-web-auth-token");
@@ -69,7 +73,7 @@ let runtimeBridgeFactory = (): GatewayTokenRuntimeBridge => {
       if (!agentName || agentName === "openclaw") return true;
       return resolveBearerAgent(agentName) !== null;
     },
-    fetchToken: (sandboxName: string): string | null => {
+    fetchToken: async (sandboxName: string): Promise<string | null> => {
       const agentName = getSandboxAgent(sandboxName);
       const bearerAgent = resolveBearerAgent(agentName);
       if (bearerAgent) {
@@ -79,7 +83,7 @@ let runtimeBridgeFactory = (): GatewayTokenRuntimeBridge => {
           bearerAgent,
         );
       }
-      return onboard.fetchGatewayAuthTokenFromSandbox(sandboxName);
+      return await onboard.fetchGatewayAuthTokenFromSandbox(sandboxName);
     },
   };
 };
@@ -129,17 +133,20 @@ export default class GatewayTokenCliCommand extends NemoClawCommand {
       throw err;
     });
 
-    const runtime = getRuntimeBridge();
     try {
-      runGatewayTokenCommand(
-        args.sandboxName,
-        { quiet: flags.quiet === true },
-        {
-          fetchToken: runtime.fetchToken,
-          getSandboxAgent: runtime.getSandboxAgent,
-          agentExposesToken: runtime.agentExposesToken,
-        },
-      );
+      await withSandboxCommandLifecycleLock(args.sandboxName, async () => {
+        assertHermesPortableCommandUnavailable(args.sandboxName, "sandbox:gateway:token");
+        const runtime = getRuntimeBridge();
+        await runGatewayTokenCommand(
+          args.sandboxName,
+          { quiet: flags.quiet === true },
+          {
+            fetchToken: runtime.fetchToken,
+            getSandboxAgent: runtime.getSandboxAgent,
+            agentExposesToken: runtime.agentExposesToken,
+          },
+        );
+      });
       // CodeRabbit #3182: if a prior run() left process.exitCode = 1, a later
       // successful invocation must still report success. Always overwrite.
       this.setExitCode(0);

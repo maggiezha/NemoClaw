@@ -2,8 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import path from "node:path";
-import { hasInvalidSessionToolDisclosure } from "../state/onboard-session";
+import { resolveVllmModelAlias, vllmModelMatchesAlias } from "../inference/vllm-models";
+import { isDecisionSelected } from "../state/onboard-checkpoint-decision";
+import {
+  hasInvalidSessionHostMounts,
+  hasInvalidSessionToolDisclosure,
+} from "../state/onboard-session";
+import type { SandboxHostMount } from "../state/registry/types";
 import { normalizeToolDisclosure, type ToolDisclosure } from "../tool-disclosure";
+import {
+  isValidStationExpressProviderState,
+  parseStationExpressResumeIntent,
+} from "./station-express-resume";
 import { preflightVllmModelEnvOrExit } from "./vllm-model-preflight";
 
 const onboardProviders = require("./providers");
@@ -12,17 +22,43 @@ export interface ResumeSessionLike {
   sandboxName?: string | null;
   provider?: string | null;
   model?: string | null;
+  vllmInstallModel?: string | null;
+  stationExpressIntent?: unknown;
   agent?: string | null;
   toolDisclosure?: ToolDisclosure;
   observabilityEnabled?: boolean;
-  metadata?: { fromDockerfile?: string | null } | null;
-  steps?: { sandbox?: { status?: string | null } | null } | null;
+  metadata?: {
+    fromDockerfile?: string | null;
+    fromImage?: string | null;
+    hostMounts?: SandboxHostMount[];
+  } | null;
+  steps?: {
+    sandbox?: { status?: string | null } | null;
+    provider_selection?: { status?: string | null } | null;
+  } | null;
+  checkpoint?: {
+    sandboxIdentity?: import("../state/onboard-checkpoint-types").CheckpointDecision<
+      import("../state/onboard-checkpoint-types").CheckpointSandboxIdentity
+    >;
+  } | null;
 }
 
 export interface ResumeConfigConflict {
   field: string;
   requested: string | null;
   recorded: string | null;
+}
+
+function canonicalHostMounts(mounts: readonly SandboxHostMount[] | undefined): string {
+  return JSON.stringify(
+    (mounts ?? [])
+      .map(({ source, target }) => ({ source, target, readOnly: true as const }))
+      .sort((left, right) => {
+        const leftKey = `${left.source}\0${left.target}`;
+        const rightKey = `${right.source}\0${right.target}`;
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+      }),
+  );
 }
 
 export function getRequestedSandboxNameHint(
@@ -52,8 +88,14 @@ export function getResumeSandboxConflict(
   // is supplying precisely to recover from the phantom.
   const raw = typeof opts.sandboxName === "string" ? opts.sandboxName.trim().toLowerCase() : "";
   const requestedSandboxName = raw || null;
+  const checkpointIdentity = session?.checkpoint?.sandboxIdentity;
+  const checkpointedSandboxName =
+    checkpointIdentity && isDecisionSelected(checkpointIdentity)
+      ? checkpointIdentity.value.name
+      : null;
   const recordedSandboxName =
-    session?.steps?.sandbox?.status === "complete" ? (session?.sandboxName ?? null) : null;
+    checkpointedSandboxName ??
+    (session?.steps?.sandbox?.status === "complete" ? (session?.sandboxName ?? null) : null);
   if (!requestedSandboxName || !recordedSandboxName) {
     return null;
   }
@@ -106,10 +148,12 @@ export function getResumeConfigConflicts(
   opts: {
     nonInteractive?: boolean;
     fromDockerfile?: string | null;
+    fromImage?: string | null;
     sandboxName?: string | null;
     agent?: string | null;
     toolDisclosure?: ToolDisclosure | null;
     observabilityEnabled?: boolean | null;
+    hostMounts?: readonly SandboxHostMount[];
     /**
      * Internal rebuild-resume mode: the caller already rewrote the session from
      * validated registry state, so credential aliases must not synthesize a new
@@ -132,25 +176,56 @@ export function getResumeConfigConflicts(
   }
 
   const requestedProvider = getRequestedProviderHint(nonInteractive, allowHostedInferenceStaging);
-  const effectiveRequestedProvider = onboardProviders.getEffectiveProviderName(requestedProvider);
+  const stationIntent = parseStationExpressResumeIntent(session?.stationExpressIntent);
+  const providerStepStatus = session?.steps?.provider_selection?.status;
+  // Express replays install-vllm until provider selection completes, including
+  // retries that already selected an owned vLLM server without installing it.
+  const retryingStationProvider =
+    stationIntent?.kind !== "spark" &&
+    stationIntent !== null &&
+    ["pending", "in_progress", "failed"].includes(providerStepStatus ?? "") &&
+    isValidStationExpressProviderState(
+      stationIntent,
+      providerStepStatus,
+      session?.provider,
+      session?.model,
+    );
+  const effectiveRequestedProvider =
+    (session?.vllmInstallModel || retryingStationProvider) && requestedProvider === "install-vllm"
+      ? "vllm-local"
+      : onboardProviders.getEffectiveProviderName(requestedProvider);
+  const recordedProvider = session?.vllmInstallModel ? "vllm-local" : session?.provider;
   if (
     effectiveRequestedProvider &&
-    session?.provider &&
-    effectiveRequestedProvider !== session.provider
+    recordedProvider &&
+    effectiveRequestedProvider !== recordedProvider
   ) {
     conflicts.push({
       field: "provider",
       requested: effectiveRequestedProvider,
-      recorded: session.provider,
+      recorded: recordedProvider,
     });
   }
 
-  const requestedModel = getRequestedModelHint(nonInteractive, allowHostedInferenceStaging);
-  if (requestedModel && session?.model && requestedModel !== session.model) {
+  const requestedVllmModel = String(process.env.NEMOCLAW_VLLM_MODEL ?? "").trim();
+  const requestedModel =
+    session?.vllmInstallModel && requestedVllmModel
+      ? requestedVllmModel
+      : getRequestedModelHint(nonInteractive, allowHostedInferenceStaging);
+  const recordedModel = session?.vllmInstallModel ?? session?.model;
+  const recordedVllmModel = session?.vllmInstallModel
+    ? resolveVllmModelAlias(session.vllmInstallModel)
+    : null;
+  if (
+    requestedModel &&
+    recordedModel &&
+    requestedModel.toLowerCase() !== recordedModel.toLowerCase() &&
+    !(recordedVllmModel && vllmModelMatchesAlias(recordedVllmModel, requestedModel))
+  ) {
     conflicts.push({
       field: "model",
       requested: requestedModel,
-      recorded: session.model,
+      recorded: recordedModel,
     });
   }
 
@@ -163,6 +238,29 @@ export function getResumeConfigConflicts(
       field: "fromDockerfile",
       requested: requestedFrom,
       recorded: recordedFrom,
+    });
+  }
+
+  const requestedImage = opts.fromImage?.trim() || null;
+  const recordedImage = session?.metadata?.fromImage?.trim() || null;
+  if (requestedImage !== recordedImage) {
+    conflicts.push({
+      field: "fromImage",
+      requested: requestedImage,
+      recorded: recordedImage,
+    });
+  }
+
+  const requestedHostMounts =
+    opts.hostMounts === undefined ? null : canonicalHostMounts(opts.hostMounts);
+  const recordedHostMounts = canonicalHostMounts(session?.metadata?.hostMounts);
+  if (hasInvalidSessionHostMounts(session)) {
+    conflicts.push({ field: "host mounts", requested: requestedHostMounts, recorded: "invalid" });
+  } else if (requestedHostMounts !== null && requestedHostMounts !== recordedHostMounts) {
+    conflicts.push({
+      field: "host mounts",
+      requested: requestedHostMounts,
+      recorded: recordedHostMounts,
     });
   }
 

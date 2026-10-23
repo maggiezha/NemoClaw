@@ -7,17 +7,34 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { resolveAgentInferenceApi } from "../../../src/lib/inference/config.ts";
+import {
+  DEFAULT_CLOUD_MODEL,
+  resolveAgentInferenceApi,
+} from "../../../src/lib/inference/config.ts";
+import { NVIDIA_HOSTED_NATIVE_ENDPOINT } from "../../../src/lib/inference/native-nvidia/index.ts";
+import { NATIVE_NVIDIA_AUTH_HEADER_SCRIPT } from "../../../src/lib/inference/native-nvidia/contract.ts";
+import { execTimeout } from "../../helpers/timeouts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
+import { resultText } from "../fixtures/clients/index.ts";
 import {
   type SandboxClient,
   trustedSandboxShellScript,
   validateSandboxName,
 } from "../fixtures/clients/sandbox.ts";
+import {
+  type CompatibleAnthropicSwitchBinding,
+  compatibleAnthropicMockEndpointUrl,
+  compatibleAnthropicSwitchBinding,
+  compatibleAnthropicSwitchEnv,
+  requireCompatibleAnthropicProviderAbsent,
+} from "../fixtures/compatible-anthropic-switch.ts";
 import { expect } from "../fixtures/e2e-test.ts";
 import type { FakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
-import { DEFAULT_HOSTED_INFERENCE_MODEL } from "../fixtures/hosted-inference.ts";
+import {
+  DEFAULT_HOSTED_INFERENCE_BASE_URL,
+  DEFAULT_HOSTED_INFERENCE_MODEL,
+} from "../fixtures/hosted-inference.ts";
 import {
   closeServer,
   writeJsonResponse as jsonResponse,
@@ -26,13 +43,21 @@ import {
 import {
   inferenceResponseModel,
   inferenceSetAttemptCount,
+  type InferenceSwitchRetryArtifactSink,
   runInferenceSetWithRetry,
+  writeInferenceSwitchRetryEvidence,
 } from "../fixtures/inference-switch-retry.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
+import {
+  runBoundedRetry,
+  type RetryEvidence,
+  type RetryFailureClass,
+} from "../../../tools/e2e/retry-evidence.mts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import { stripAnsi } from "./json-envelope.ts";
 import { isTransientProviderValidationFailure } from "./network-policy-transient-provider.ts";
 import {
+  acceptedSwitchResponseModels,
   PUBLIC_NVIDIA_SWITCH_MODEL,
   PUBLIC_NVIDIA_SWITCH_PROVIDER,
 } from "./public-nvidia-switch-provider.ts";
@@ -40,7 +65,7 @@ import {
 export { REPO_ROOT };
 
 export const CLI = CLI_ENTRYPOINT;
-export const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-hermes-inference-switch";
+export const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-hm-inf-switch";
 validateSandboxName(SANDBOX_NAME);
 const USE_COMPATIBLE_HOSTED = process.env.NEMOCLAW_E2E_USE_HOSTED_INFERENCE === "1";
 export const SWITCH_PROVIDER =
@@ -51,6 +76,12 @@ export const RUNTIME_SWITCH_API =
   resolveAgentInferenceApi("hermes", SWITCH_PROVIDER, SWITCH_API) ?? SWITCH_API;
 const SWITCH_MOCK_PORT = Number.parseInt(process.env.NEMOCLAW_SWITCH_MOCK_PORT ?? "0", 10);
 const INSTALL_ATTEMPTS = process.env.CI === "true" || process.env.GITHUB_ACTIONS === "true" ? 3 : 1;
+export const PROXY_RESOLUTION_PROVIDER = "hermes-proxy-resolution-e2e";
+export const PROXY_RESOLUTION_MODEL = "nvidia/nemotron-proxy-resolution-e2e";
+export const PROXY_FORBIDDEN_MARKERS = [
+  "openshell:resolve:env:",
+  "sk-OPENSHELL-PROXY-REWRITE",
+] as const;
 
 interface MockCompatibleAnthropicProvider {
   endpointUrl: string;
@@ -61,14 +92,6 @@ export function compatibleAnthropicMetadataArgs(endpointUrl: string | null): str
   return endpointUrl
     ? ["--endpoint-url", endpointUrl, "--credential-env", "COMPATIBLE_ANTHROPIC_API_KEY"]
     : [];
-}
-
-export function mockAnthropicEndpointUrl(
-  port: number,
-  runtimeEnv: NodeJS.ProcessEnv = process.env,
-): string {
-  const host = runtimeEnv.NEMOCLAW_SWITCH_MOCK_HOST ?? "host.openshell.internal";
-  return `http://${host}:${port}`;
 }
 
 export function openAiSurfaceEndpointUrl(endpointUrl: string): string {
@@ -84,6 +107,15 @@ export function mockAnthropicSwitchEnabled(runtimeEnv: NodeJS.ProcessEnv = proce
   );
 }
 
+export function useLocalHermesInferenceBaseline(
+  runtimeEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    (runtimeEnv.NEMOCLAW_SWITCH_PROVIDER ?? SWITCH_PROVIDER) === PUBLIC_NVIDIA_SWITCH_PROVIDER ||
+    mockAnthropicSwitchEnabled(runtimeEnv)
+  );
+}
+
 export function expectAuthenticatedBaselineInventoryRequest(
   baseline: Pick<FakeOpenAiCompatibleServer, "requests"> | undefined,
 ): void {
@@ -96,6 +128,51 @@ export function expectAuthenticatedBaselineInventoryRequest(
       path: "/v1/models",
     }),
   );
+}
+
+export function expectAuthenticatedProxyResolutionRequests(
+  baseline: Pick<FakeOpenAiCompatibleServer, "requests"> | undefined,
+  requestOffset: number,
+  expectedModel: string,
+): void {
+  if (!baseline) return;
+  const attemptRequests = baseline.requests().slice(requestOffset);
+  expect(attemptRequests.filter((request) => (request.forbiddenMarkerMatches ?? 0) > 0)).toEqual(
+    [],
+  );
+  const proxyRequests = attemptRequests.filter(
+    (request) =>
+      request.method === "POST" &&
+      ["/v1/chat/completions", "/chat/completions"].includes(request.path),
+  );
+  expect(proxyRequests.length).toBeGreaterThan(0);
+  for (const request of proxyRequests) {
+    expect(request).toMatchObject({
+      auth: "ok",
+      authorizationSent: true,
+      model: expectedModel,
+    });
+  }
+}
+
+export function hasAuthenticatedProxyResolutionRequest(
+  baseline: Pick<FakeOpenAiCompatibleServer, "requests"> | undefined,
+  requestOffset: number,
+  expectedModel: string,
+): boolean {
+  if (!baseline) return true;
+  return baseline
+    .requests()
+    .slice(requestOffset)
+    .some(
+      (request) =>
+        request.method === "POST" &&
+        ["/v1/chat/completions", "/chat/completions"].includes(request.path) &&
+        request.auth === "ok" &&
+        request.authorizationSent === true &&
+        request.model === expectedModel &&
+        (request.forbiddenMarkerMatches ?? 0) === 0,
+    );
 }
 
 export function hostedInstallModel(runtimeEnv: NodeJS.ProcessEnv = process.env): string {
@@ -118,7 +195,12 @@ export function env(apiKey?: string, extra: NodeJS.ProcessEnv = {}): NodeJS.Proc
     NEMOCLAW_SANDBOX_NAME: SANDBOX_NAME,
     OPENSHELL_GATEWAY: openshellGatewayName(),
   };
-  apiKey && Object.assign(out, { NVIDIA_INFERENCE_API_KEY: apiKey });
+  apiKey &&
+    Object.assign(out, {
+      NVIDIA_INFERENCE_API_KEY: apiKey,
+      NEMOCLAW_PROVIDER: "build",
+      NEMOCLAW_MODEL: process.env.NEMOCLAW_MODEL ?? DEFAULT_CLOUD_MODEL,
+    });
   USE_COMPATIBLE_HOSTED &&
     apiKey &&
     Object.assign(out, {
@@ -131,6 +213,96 @@ export function env(apiKey?: string, extra: NodeJS.ProcessEnv = {}): NodeJS.Proc
       NEMOCLAW_PROVIDER: "custom",
     });
   return { ...out, ...extra };
+}
+
+export async function expectOpenAiProvider(
+  host: HostCliClient,
+  providerName: string,
+  credentialEnv: string,
+): Promise<void> {
+  const provider = await host.command(
+    "openshell",
+    ["provider", "get", "-g", "nemoclaw", providerName],
+    {
+      artifactName: `${providerName}-openai-provider-metadata`,
+      env: env(),
+      timeoutMs: 30_000,
+    },
+  );
+  const output = resultText(provider);
+  expect(provider.exitCode, output).toBe(0);
+  const plain = stripAnsi(output);
+  expect(plain).toMatch(/^\s*Type:\s*openai\s*$/imu);
+  expect(plain).toContain(credentialEnv);
+  expect(plain).toContain("OPENAI_BASE_URL");
+}
+
+export async function prepareProxyResolutionRoute({
+  apiKey,
+  host,
+  mockBaseline,
+  redactionValues,
+}: {
+  apiKey: string;
+  host: HostCliClient;
+  mockBaseline: FakeOpenAiCompatibleServer | undefined;
+  redactionValues: string[];
+}): Promise<{ model: string; requestOffset: number }> {
+  const endpoint =
+    mockBaseline?.baseUrl ??
+    (USE_COMPATIBLE_HOSTED
+      ? (process.env.NEMOCLAW_ENDPOINT_URL ?? DEFAULT_HOSTED_INFERENCE_BASE_URL)
+      : NVIDIA_HOSTED_NATIVE_ENDPOINT);
+  const model = mockBaseline ? PROXY_RESOLUTION_MODEL : SWITCH_MODEL;
+  const requestOffset = mockBaseline?.requests().length ?? 0;
+
+  const registered = await host.command(
+    "openshell",
+    [
+      "provider",
+      "create",
+      "-g",
+      "nemoclaw",
+      "--name",
+      PROXY_RESOLUTION_PROVIDER,
+      "--type",
+      "openai",
+      "--credential",
+      "NVIDIA_INFERENCE_API_KEY",
+      "--config",
+      `OPENAI_BASE_URL=${endpoint}`,
+    ],
+    {
+      artifactName: "register-proxy-resolution-provider",
+      env: env(undefined, { NVIDIA_INFERENCE_API_KEY: apiKey }),
+      redactionValues,
+      timeoutMs: 120_000,
+    },
+  );
+  expect(registered.exitCode, resultText(registered)).toBe(0);
+  await expectOpenAiProvider(host, PROXY_RESOLUTION_PROVIDER, "NVIDIA_INFERENCE_API_KEY");
+
+  const setRoute = await host.command(
+    "node",
+    [
+      CLI,
+      "inference",
+      "set",
+      "--provider",
+      PROXY_RESOLUTION_PROVIDER,
+      "--model",
+      model,
+      "--no-verify",
+    ],
+    {
+      artifactName: "set-proxy-resolution-route",
+      env: env(),
+      redactionValues,
+      timeoutMs: 180_000,
+    },
+  );
+  expect(setRoute.exitCode, resultText(setRoute)).toBe(0);
+  return { model, requestOffset };
 }
 
 export async function preCleanBestEffort(run: () => Promise<unknown>): Promise<void> {
@@ -175,50 +347,172 @@ export function chatContent(raw: string): string {
   );
 }
 
-export async function runHermesPongWithRetry(options: {
-  attempts?: number;
-  delay?: (milliseconds: number) => Promise<void>;
-  expectedModel: string;
-  run: (attempt: number) => Promise<ShellProbeResult>;
-}): Promise<ShellProbeResult> {
-  const attempts = options.attempts ?? 3;
-  const delay =
-    options.delay ??
-    ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
-  let last: ShellProbeResult | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    last = await options.run(attempt);
-    let pong = false;
-    if (last.exitCode === 0) {
-      try {
-        pong =
-          inferenceResponseModel(last.stdout) === options.expectedModel &&
-          /PONG/iu.test(chatContent(last.stdout));
-      } catch {}
-    }
-    if (pong || attempt === attempts) return last;
-    await delay(5_000);
+const TERMINAL_HERMES_PROBE_RE =
+  /authentication failed|authorization failed|unauthorized|forbidden|HTTP 40[13]\b|\b40[13]\b|denied by network policy|network policy denied|policy (?:update |validation )?failed|malformed|invalid (?:credential|api[_ -]?key|request|json)/iu;
+const TRANSIENT_HERMES_PROBE_RE =
+  /ECONNREFUSED|EAI_AGAIN|ECONNRESET|ETIMEDOUT|timed? out|gateway unavailable|network connection error|DNS error|fetch failed|inference service unavailable|rawError=503/iu;
+
+function hermesProbeFailureClass(result: ShellProbeResult): RetryFailureClass {
+  const output = resultText(result);
+  if (
+    /authentication failed|unauthorized|HTTP 401\b|\b401\b|invalid (?:credential|api[_ -]?key)/iu.test(
+      output,
+    )
+  ) {
+    return "authentication";
   }
-  throw new Error("Hermes live probe retry loop completed without running an attempt.");
+  if (/authorization failed|forbidden|HTTP 403\b|\b403\b/iu.test(output)) {
+    return "authorization";
+  }
+  if (
+    /denied by network policy|network policy denied|policy (?:update |validation )?failed/iu.test(
+      output,
+    )
+  ) {
+    return "policy-denial";
+  }
+  if (/malformed|invalid (?:request|json)/iu.test(output)) return "malformed-input";
+  if (
+    result.exitCode !== 0 &&
+    !TERMINAL_HERMES_PROBE_RE.test(output) &&
+    TRANSIENT_HERMES_PROBE_RE.test(output)
+  ) {
+    return "transient-external";
+  }
+  return "deterministic";
 }
 
-export async function runHermesCliPongWithRetry(options: {
+interface HermesProbeRetryOptions {
   attempts?: number;
   delay?: (milliseconds: number) => Promise<void>;
-  run: (attempt: number) => Promise<ShellProbeResult>;
-}): Promise<ShellProbeResult> {
-  const attempts = options.attempts ?? 3;
-  const delay =
-    options.delay ??
-    ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
-  let last: ShellProbeResult | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    last = await options.run(attempt);
-    if ((last.exitCode === 0 && /\bPONG\b/iu.test(last.stdout)) || attempt === attempts)
-      return last;
-    await delay(5_000);
-  }
-  throw new Error("Hermes CLI retry loop completed without running an attempt.");
+  onEvidence?: (evidence: RetryEvidence) => Promise<void> | void;
+}
+
+export async function runHermesPongWithRetry(
+  options: HermesProbeRetryOptions & {
+    expectedModel: string;
+    run: (attempt: number) => Promise<ShellProbeResult>;
+  },
+): Promise<ShellProbeResult> {
+  const execution = await runBoundedRetry({
+    operation: "hermes-inference-switch.pong",
+    owner: "inference-provider",
+    idempotence: "read-only",
+    maxAttempts: options.attempts ?? 3,
+    delayMs: 5_000,
+    onEvidence: options.onEvidence,
+    run: async (attempt) => {
+      const result = await options.run(attempt);
+      let passed = false;
+      if (result.exitCode === 0) {
+        try {
+          passed =
+            acceptedSwitchResponseModels(options.expectedModel).includes(
+              inferenceResponseModel(result.stdout),
+            ) && /PONG/iu.test(chatContent(result.stdout));
+        } catch {}
+      }
+      return { passed, result };
+    },
+    sleep: options.delay,
+    classify: (value, error) => {
+      if (error !== undefined || !value) {
+        return { outcome: "failed", failureClass: "deterministic" };
+      }
+      if (value.passed) return { outcome: "passed" };
+      return { outcome: "failed", failureClass: hermesProbeFailureClass(value.result) };
+    },
+  });
+  if (execution.value) return execution.value.result;
+  throw new Error("Hermes live probe completed without an attempt result.");
+}
+
+/** Real Hermes gateway requests must cross the attached local provider boundary. */
+export async function expectNativeLocalHermesTurn(options: {
+  sandbox: SandboxClient;
+  endpoint: FakeOpenAiCompatibleServer;
+  model: string;
+  artifactName: string;
+  redactionValues: string[];
+  onEvidence: NonNullable<HermesProbeRetryOptions["onEvidence"]>;
+}): Promise<void> {
+  const offset = options.endpoint.requests().length;
+  const payload = JSON.stringify({
+    model: options.model,
+    messages: [{ role: "user", content: "Reply with exactly one word: PONG" }],
+    max_tokens: 100,
+  });
+  const result = await runHermesPongWithRetry({
+    expectedModel: options.model,
+    onEvidence: options.onEvidence,
+    run: (attempt) =>
+      options.sandbox.execShell(
+        SANDBOX_NAME,
+        trustedSandboxShellScript(hermesApiCommand(payload)),
+        {
+          artifactName: `${options.artifactName}-${attempt}`,
+          env: env(),
+          redactionValues: options.redactionValues,
+          timeoutMs: 150_000,
+        },
+      ),
+  });
+  expect(result.exitCode, resultText(result)).toBe(0);
+  expect(chatContent(result.stdout)).toMatch(/PONG/i);
+  expect(inferenceResponseModel(result.stdout)).toBe(options.model);
+  expect(
+    options.endpoint
+      .requests()
+      .slice(offset)
+      .some(
+        (request) =>
+          request.auth === "ok" &&
+          request.method === "POST" &&
+          request.path === "/v1/chat/completions" &&
+          request.model === options.model,
+      ),
+  ).toBe(true);
+}
+
+export async function runHermesCliPongWithRetry(
+  options: HermesProbeRetryOptions & {
+    accept?: (result: ShellProbeResult, attempt: number) => boolean;
+    run: (attempt: number) => Promise<ShellProbeResult>;
+  },
+): Promise<ShellProbeResult> {
+  const execution = await runBoundedRetry({
+    operation: "hermes-inference-switch.cli-pong",
+    owner: "inference-provider",
+    idempotence: "read-only",
+    maxAttempts: options.attempts ?? 3,
+    delayMs: 5_000,
+    onEvidence: options.onEvidence,
+    run: async (attempt) => {
+      const result = await options.run(attempt);
+      const pong = result.exitCode === 0 && /\bPONG\b/iu.test(result.stdout);
+      const selectedRouteAccepted = pong && (options.accept?.(result, attempt) ?? true);
+      return {
+        passed: selectedRouteAccepted,
+        result,
+        selectedRoutePending: pong && !selectedRouteAccepted,
+      };
+    },
+    sleep: options.delay,
+    classify: (value, error) => {
+      if (error !== undefined || !value) {
+        return { outcome: "failed", failureClass: "deterministic" };
+      }
+      const failureClass = hermesProbeFailureClass(value.result);
+      if (failureClass !== "deterministic") return { outcome: "failed", failureClass };
+      if (value.passed) return { outcome: "passed" };
+      if (value.selectedRoutePending) {
+        return { outcome: "failed", failureClass: "transient-external" };
+      }
+      return { outcome: "failed", failureClass };
+    },
+  });
+  if (execution.value) return execution.value.result;
+  throw new Error("Hermes CLI probe completed without an attempt result.");
 }
 
 export async function cleanupHermesSwitch(
@@ -376,47 +670,27 @@ async function startMockAnthropicProvider(): Promise<MockCompatibleAnthropicProv
     throw new Error("mock Anthropic provider did not expose a TCP port");
   }
   return {
-    endpointUrl: mockAnthropicEndpointUrl((address as AddressInfo).port),
+    endpointUrl: compatibleAnthropicMockEndpointUrl((address as AddressInfo).port),
     close: () => closeServer(server),
   };
 }
 
-export async function ensureCompatibleAnthropicSwitchProvider(
+export async function prepareCompatibleAnthropicSwitchBinding(
   host: HostCliClient,
   cleanup: { add(name: string, run: () => Promise<void> | void): void },
-): Promise<string | null> {
+): Promise<CompatibleAnthropicSwitchBinding | null> {
   if (SWITCH_PROVIDER !== "compatible-anthropic-endpoint" || SWITCH_API !== "anthropic-messages")
     return null;
   const mock = mockAnthropicSwitchEnabled() ? await startMockAnthropicProvider() : undefined;
   mock && cleanup.add("close compatible Anthropic switch mock", () => mock.close());
-  const endpointUrl = process.env.NEMOCLAW_SWITCH_ENDPOINT_URL ?? mock?.endpointUrl ?? "";
-  const compatibleKey = process.env.COMPATIBLE_ANTHROPIC_API_KEY ?? "test-compatible-anthropic-key";
-  expect(
-    endpointUrl,
-    "NEMOCLAW_SWITCH_ENDPOINT_URL is required for compatible Anthropic inference switches",
-  ).not.toBe("");
-  expect(
-    compatibleKey,
-    "COMPATIBLE_ANTHROPIC_API_KEY is required for compatible Anthropic inference switches",
-  ).not.toBe("");
-  const providerScript = [
-    "set -euo pipefail",
-    "if openshell provider get -g nemoclaw compatible-anthropic-endpoint >/dev/null 2>&1; then",
-    "  openshell provider delete -g nemoclaw compatible-anthropic-endpoint",
-    "fi",
-    'openshell provider create -g nemoclaw --name compatible-anthropic-endpoint --type openai --credential COMPATIBLE_ANTHROPIC_API_KEY --config "OPENAI_BASE_URL=${SWITCH_OPENAI_ENDPOINT_URL}"',
-  ].join("\n");
-  const result = await host.command("bash", ["-lc", providerScript], {
-    artifactName: "register-compatible-anthropic-switch-provider",
-    env: env(undefined, {
-      COMPATIBLE_ANTHROPIC_API_KEY: compatibleKey,
-      SWITCH_OPENAI_ENDPOINT_URL: openAiSurfaceEndpointUrl(endpointUrl),
-    }),
-    redactionValues: [compatibleKey],
-    timeoutMs: 120_000,
+  const binding = compatibleAnthropicSwitchBinding(
+    process.env.NEMOCLAW_SWITCH_ENDPOINT_URL ?? mock?.endpointUrl ?? "",
+  );
+  await requireCompatibleAnthropicProviderAbsent(host, {
+    artifactName: "compatible-anthropic-provider-absent-before-switch",
+    env: env(),
   });
-  expect(result.exitCode).toBe(0);
-  return endpointUrl;
+  return { ...binding, endpointUrl: openAiSurfaceEndpointUrl(binding.endpointUrl) };
 }
 
 export async function installHermes(
@@ -434,7 +708,7 @@ export async function installHermes(
         cwd: REPO_ROOT,
         env: env(apiKey, installEnv),
         redactionValues: [apiKey],
-        timeoutMs: 25 * 60_000,
+        timeoutMs: execTimeout(25 * 60_000),
       },
     );
     const retry =
@@ -453,7 +727,13 @@ export async function runHermesInferenceSetWithRetry(
   host: HostCliClient,
   redactionValues: string[],
   compatibleMetadataArgs: string[],
-  options: { attempts?: number; delay?: (milliseconds: number) => Promise<void> } = {},
+  options: {
+    attempts?: number;
+    artifacts?: InferenceSwitchRetryArtifactSink;
+    compatibleBinding?: CompatibleAnthropicSwitchBinding | null;
+    delay?: (milliseconds: number) => Promise<void>;
+    publicNvidiaApiKey?: string | null;
+  } = {},
 ): Promise<ShellProbeResult> {
   const args = [
     CLI,
@@ -465,16 +745,23 @@ export async function runHermesInferenceSetWithRetry(
     SWITCH_MODEL,
     ...compatibleMetadataArgs,
   ];
+  const evidenceArtifacts = options.artifacts;
   return runInferenceSetWithRetry({
     attempts:
       options.attempts ?? inferenceSetAttemptCount(process.env.NEMOCLAW_SWITCH_SET_ATTEMPTS),
     delay: options.delay,
-    run: (attempt, verify) =>
-      host.command("node", verify ? args : [...args, "--no-verify"], {
-        artifactName: verify
-          ? `hermes-inference-set-${attempt}`
-          : "hermes-inference-set-no-verify-after-transient-failures",
-        env: env(),
+    onEvidence: evidenceArtifacts
+      ? (evidence) => writeInferenceSwitchRetryEvidence(evidenceArtifacts, evidence)
+      : undefined,
+    run: (attempt) =>
+      host.command("node", args, {
+        artifactName: `hermes-inference-set-${attempt}`,
+        env: env(undefined, {
+          ...compatibleAnthropicSwitchEnv(options.compatibleBinding ?? null),
+          ...(options.publicNvidiaApiKey
+            ? { NVIDIA_INFERENCE_API_KEY: options.publicNvidiaApiKey }
+            : {}),
+        }),
         redactionValues,
         timeoutMs: 180_000,
       }),
@@ -488,7 +775,7 @@ export async function hermesGatewayPid(
   return await sandbox.execShell(
     SANDBOX_NAME,
     trustedSandboxShellScript(
-      "ps -eo pid=,comm=,args= | awk '$0 ~ /hermes/ && $0 ~ /gateway run/ { print $1; exit }'",
+      "ps -eo pid=,comm=,args= | awk '$2 ~ /^(hermes([.]real)?|python[0-9.]*)$/ && $0 ~ /[h]ermes/ && $0 ~ /gateway[ ]run/ { print $1 }'",
     ),
     { artifactName, env: env(), timeoutMs: 30_000 },
   );
@@ -505,17 +792,15 @@ export async function envHash(
   });
 }
 
-export function maybeAssertPidStable(
-  before: ShellProbeResult,
-  after: ShellProbeResult,
-  assertStable: (a: string, b: string) => void,
-): void {
-  const beforePid = before.stdout.trim();
-  const afterPid = after.stdout.trim();
-  beforePid && afterPid && assertStable(afterPid, beforePid);
+export function parseHermesGatewayPid(
+  result: Pick<ShellProbeResult, "exitCode" | "stdout">,
+): string | undefined {
+  const pid = result.stdout.trim();
+  return result.exitCode === 0 && /^[1-9][0-9]*$/u.test(pid) ? pid : undefined;
 }
 
 export function expectedBaseUrl(): string {
+  if (SWITCH_PROVIDER === PUBLIC_NVIDIA_SWITCH_PROVIDER) return NVIDIA_HOSTED_NATIVE_ENDPOINT;
   return RUNTIME_SWITCH_API === "anthropic-messages"
     ? "https://inference.local"
     : "https://inference.local/v1";
@@ -535,9 +820,16 @@ export function expectedApiMode(): string | undefined {
 // This live lane runs on ubuntu-latest and intentionally uses GNU grep's
 // POSIX ERE character classes; support tests pin the accepted scalar shapes.
 export const API_KEY_SHAPE_PATTERN = `^[[:space:]]*api_key:[[:space:]]*("sk-[^"[:space:]]+"|'sk-[^'[:space:]]+'|sk-[^"'[:space:]]+)[[:space:]]*$`;
+const NVIDIA_REFERENCE =
+  "openshell:resolve:env:(v[0-9]{1,20}|s[a-f0-9]{64})_NVIDIA_INFERENCE_API_KEY";
+export const NVIDIA_API_KEY_SHAPE_PATTERN = `^[[:space:]]*api_key:[[:space:]]*("${NVIDIA_REFERENCE}"|'${NVIDIA_REFERENCE}'|${NVIDIA_REFERENCE})[[:space:]]*$`;
 
-export function apiKeyShapeCommand(): string[] {
-  return ["grep", "-Eq", API_KEY_SHAPE_PATTERN, "/sandbox/.hermes/config.yaml"];
+export function apiKeyShapeCommand(provider: string = SWITCH_PROVIDER): string[] {
+  const pattern =
+    provider === PUBLIC_NVIDIA_SWITCH_PROVIDER
+      ? NVIDIA_API_KEY_SHAPE_PATTERN
+      : API_KEY_SHAPE_PATTERN;
+  return ["grep", "-Eq", pattern, "/sandbox/.hermes/config.yaml"];
 }
 
 export async function apiKeyShape(sandbox: SandboxClient): Promise<ShellProbeResult> {
@@ -593,7 +885,13 @@ function quotePayload(payload: string): string {
   return payload.replace(/'/gu, `'\\''`);
 }
 
-export function inferenceLocalCommand(payload: string): string {
+export function sandboxInferenceCommand(payload: string): string {
+  if (SWITCH_PROVIDER === PUBLIC_NVIDIA_SWITCH_PROVIDER) {
+    // The upstream URL is the managed route for an attached OpenShell
+    // provider. OpenShell authorizes this profile-scoped request and replaces
+    // the placeholder without exposing the provider credential to the sandbox.
+    return `${NATIVE_NVIDIA_AUTH_HEADER_SCRIPT}; curl -sS --max-time 90 ${NVIDIA_HOSTED_NATIVE_ENDPOINT}/chat/completions -H 'Content-Type: application/json' -H "$AUTH_HEADER" -d '${quotePayload(payload)}'`;
+  }
   return RUNTIME_SWITCH_API === "anthropic-messages"
     ? `curl -sS --max-time 90 https://inference.local/v1/messages -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' -d '${quotePayload(payload)}'`
     : `curl -sS --max-time 90 https://inference.local/v1/chat/completions -H 'Content-Type: application/json' -d '${quotePayload(payload)}'`;

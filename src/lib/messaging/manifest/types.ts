@@ -39,6 +39,8 @@ export interface ChannelManifest {
   readonly auth: ChannelAuthSpec;
   readonly inputs: readonly ChannelInputSpec[];
   readonly credentials: readonly ChannelCredentialSpec[];
+  /** Agent config-relative durable state directories cleared during channel removal. */
+  readonly state?: Partial<Record<MessagingAgentId, readonly string[]>>;
   /** Policy presets needed when this channel is active. */
   readonly policyPresets?: readonly ChannelPolicyPresetReference[];
   readonly render: readonly ChannelRenderSpec[];
@@ -65,6 +67,7 @@ export interface ChannelPolicyPresetSpec {
   readonly agentPolicyKeys?: Partial<Record<MessagingAgentId, readonly string[]>>;
   readonly requiredAtCreate?: boolean;
   readonly validationWarningLines?: readonly string[];
+  readonly validationWarningLinesByAgent?: Partial<Record<MessagingAgentId, readonly string[]>>;
 }
 
 /** How a channel obtains credential or session material. */
@@ -91,12 +94,24 @@ interface ChannelInputBaseSpec {
   readonly validValues?: readonly string[];
   readonly formatPattern?: string;
   readonly formatHint?: string;
+  /**
+   * Allow a raw \r/\n in this input's value. Default false rejects line
+   * breaks because most inputs render into a single env-file line or JSON
+   * string where an embedded newline would corrupt the target. Set this only
+   * for a value that is never rendered into such a target (e.g. a JSON blob
+   * consumed solely as gateway-side credential material).
+   */
+  readonly allowLineBreaks?: boolean;
 }
 
 /** Secret input metadata; values must be referenced, not stored in manifests or plans. */
 export interface ChannelSecretInputSpec extends ChannelInputBaseSpec {
   readonly kind: "secret";
   readonly statePath?: never;
+  /** Cap the echoed asterisks and show "(and N more characters)" for a long pasted secret. */
+  readonly maskCap?: number;
+  /** Interactive re-prompts allowed on a format mismatch before the channel is skipped (default 1 = skip on first invalid). */
+  readonly maxTokenAttempts?: number;
 }
 
 /** Non-secret input metadata that may persist into channel state. */
@@ -157,8 +172,9 @@ export interface ChannelHostForwardSpec {
 }
 
 /** Agent-runtime metadata consumed by shared runtime setup and diagnostics. */
-export interface ChannelRuntimeByAgentSpec
-  extends Partial<Record<MessagingAgentId, ChannelRuntimeSpec>> {
+export interface ChannelRuntimeByAgentSpec extends Partial<
+  Record<MessagingAgentId, ChannelRuntimeSpec>
+> {
   readonly openclaw?: ChannelOpenClawRuntimeSpec;
   readonly hermes?: ChannelRuntimeSpec;
 }
@@ -195,7 +211,10 @@ export interface ChannelRuntimeNodePreloadSpec {
 }
 
 export interface ChannelRuntimeEnvAliasSpec {
+  /** Provider environment key populated by OpenShell. */
   readonly envKey: string;
+  /** Agent-native environment key that receives the runtime provider placeholder. */
+  readonly targetEnvKey?: string;
   readonly match: string;
   readonly value: string;
   readonly message?: string;
@@ -256,6 +275,7 @@ export interface ChannelHookSpec {
   readonly id: string;
   readonly phase: ChannelHookPhase;
   readonly handler: string;
+  readonly providesReadiness?: true;
   readonly agents?: readonly MessagingAgentId[];
   readonly inputs?: readonly string[];
   readonly outputs?: readonly ChannelHookOutputSpec[];
@@ -314,6 +334,8 @@ export interface SandboxMessagingChannelPlan {
   readonly selected: boolean;
   readonly configured: boolean;
   readonly disabled: boolean;
+  /** Exact command-owned removal transaction retained until post-restore config cleanup succeeds. */
+  readonly pendingRemoval?: boolean;
   readonly inputs: readonly SandboxMessagingInputReference[];
   readonly hostForward?: SandboxMessagingHostForwardPlan;
   readonly hooks: readonly SandboxMessagingHookReferencePlan[];

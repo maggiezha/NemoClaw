@@ -4,16 +4,16 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
+  type CommandRunner,
   ProviderClient,
   SandboxClient,
   trustedProviderEndpoint,
-  type CommandRunner,
 } from "../fixtures/clients/index.ts";
 import type { E2ETargetFixtures } from "../fixtures/e2e-test.ts";
 import {
   inferenceRouteUrl,
-  RuntimePhaseFixture,
   type NemoClawInstance,
+  RuntimePhaseFixture,
 } from "../fixtures/phases/index.ts";
 import type {
   ShellProbeResult,
@@ -73,7 +73,7 @@ class FakeRunner implements CommandRunner {
 function instance(overrides: Partial<NemoClawInstance> = {}): NemoClawInstance {
   return {
     onboarding: "cloud-openclaw",
-    sandboxName: "e2e-ubuntu-repo-cloud-openclaw",
+    sandboxName: "e2e-cloud-oc",
     agent: "openclaw",
     provider: "nvidia",
     providerEnv: "cloud",
@@ -116,7 +116,7 @@ describe("runtime phase fixture", () => {
           "sandbox",
           "exec",
           "-n",
-          "e2e-ubuntu-repo-cloud-openclaw",
+          "e2e-cloud-oc",
           "--",
           "curl",
           "-fsS",
@@ -176,7 +176,7 @@ describe("runtime phase fixture", () => {
       "sandbox",
       "exec",
       "-n",
-      "e2e-ubuntu-repo-cloud-openclaw",
+      "e2e-cloud-oc",
       "--",
       "curl",
       "-fsS",
@@ -241,7 +241,7 @@ describe("runtime phase fixture", () => {
         "sandbox",
         "exec",
         "-n",
-        "e2e-ubuntu-repo-cloud-openclaw",
+        "e2e-cloud-oc",
         "--",
         "curl",
         "-sS",
@@ -353,8 +353,9 @@ describe("runtime phase fixture", () => {
     });
   });
 
-  it("rejects invalid curl max time values before runtime probe execution", async () => {
-    for (const curlMaxTimeSeconds of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects invalid curl max time values before runtime probe execution [case %#]",
+    async (curlMaxTimeSeconds) => {
       const runner = new FakeRunner();
 
       await expect(
@@ -363,8 +364,8 @@ describe("runtime phase fixture", () => {
         }),
       ).rejects.toThrow("inference request curlMaxTimeSeconds must be a finite positive number");
       expect(runner.calls).toEqual([]);
-    }
-  });
+    },
+  );
 
   it("rejects provider model probes without compatible model data", async () => {
     const runner = new FakeRunner();

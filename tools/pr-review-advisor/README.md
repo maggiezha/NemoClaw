@@ -3,25 +3,18 @@
 
 # PR Review Advisor
 
-The PR Review Advisor is an SDK-powered, NemoClaw-specific pull request reviewer. It runs as a
-trusted GitHub Actions job, inspects PRs as read-only data, and posts a sticky comment with blockers,
-warnings, and suggestions. Artifacts retain
-acceptance coverage, security notes, and other review context.
+The PR Review Advisor is an SDK-powered, NemoClaw-specific pull request reviewer. It runs its
+model-backed analysis in OpenShell sandboxes from trusted GitHub Actions jobs and inspects PRs as
+read-only data. For automatic PR runs, it posts a sticky comment that links to the complete
+specialist reviews in the workflow run. Manual dispatch does not post a PR comment.
 
-It complements the existing PR surfaces by keeping a NemoClaw maintainer code-review lens focused on the patch itself and by including E2E coverage and target guidance in the same model session:
+After a required `CI / Pull Request` run whose name ends in `gate true` succeeds, it runs every specialist prompt in `tools/pr-review-advisor/specialists`. Other completed CI runs do not schedule the Advisor. Each prompt owns a distinct review concern and defines its purpose, investigation method, evidence expectations, and finding threshold.
 
-- sandbox and workflow security review;
-- acceptance coverage for observable outcomes, current constraints and non-goals, supported
-  contracts, and explicit maintainer decisions in linked issues. Proposed designs, implementation
-  ideas, and ordinary discussion remain context; `Refs #...`, `References #...`, and
-  `Follow-up to #...` relations do not make an entire issue binding;
-- codebase drift and architecture review grounded in current behavior and contracts;
-- source-of-truth review for fallback, recovery, tolerant parsing, monkeypatching, and other localized workaround behavior;
-- static test-inventory context from changed test files and nearby test names;
-- simplification review for safe delete/stdlib/native/YAGNI/shrink opportunities;
-- E2E coverage, job, target, and fan-out selections normalized against the checked-in
-  deterministic plan and supported inventory;
-- correctness and test-quality checks that CI cannot prove.
+Specialists inspect their assigned concern and recommend the smallest direct correction. They run independently and publish separate reports. The Advisor does not select or summarize their findings. A trusted aggregate gate reports only whether their blocker evidence is clear.
+
+The first run on an unreviewed pull request is a complete assessment. After trusted human maintainers submit `CHANGES_REQUESTED` or `APPROVED` and the author pushes another commit, the next run becomes a bounded follow-up: it preserves unresolved change requests across successive reviews and reviewers as the frozen contract, reads the exact earliest-reviewed-commit-to-current-commit delta first, rechecks the contract, and inspects only affected seams. An approval on the current head clears only that reviewer's earlier change requests; an approval for an older head does not, and no approval discards another reviewer's unresolved blockers. A follow-up may add a blocker only when the new delta introduces it or newly available repository evidence proves a material failure that could not reasonably have been established in the frozen review. Resolved findings disappear; when the contract is resolved and no material delta regression exists, the aggregate gate becomes green so the separate maintainer workflow can perform its normal readiness check and approval.
+
+This split is intentional. The Advisor supplies current-commit code evidence; it never approves or writes reviews. The maintainer review-request workflow owns FIFO scheduling, repository gates, idempotent GitHub writes, and the final approval.
 
 It intentionally does not report GitHub mergeability, branch protection, CI status, reviewer state, CodeRabbit state, or E2E pass/fail status; those are handled elsewhere in the PR UI.
 
@@ -29,43 +22,57 @@ It intentionally does not report GitHub mergeability, branch protection, CI stat
 
 `.github/workflows/pr-review-advisor.yaml`:
 
-1. Runs on `pull_request_target` for internal and fork PRs, plus `workflow_dispatch`.
-2. Checks out advisor implementation code at the immutable trusted `github.workflow_sha` into `advisor/`.
-3. Fetches the event's PR base and head SHAs into an isolated analysis workspace without running PR-controlled actions, hooks, submodules, LFS filters, package setup, scripts, or tests.
-4. Installs and verifies pinned `ripgrep` and `fd-find` packages on a pinned Ubuntu runner, then installs a pinned Pi SDK package with lifecycle scripts disabled.
-5. Builds the deterministic regression risk plan and E2E inventory in trusted code and injects them into the review contexts.
-6. Runs `tools/pr-review-advisor/analyze.mts` from the trusted checkout.
-7. Runs the same advisor conversation in parallel for the primary GPT-5.6 Terra lane and an artifact-only Nemotron Ultra evaluation lane.
-8. Opens one Pi session per model variant and reviews the PR in 14 bounded turns: six small analysis/commit pairs for scope/risk, correctness/state, security/trust, tests/regressions, CI/operations, and reconciliation, followed by draft and validation JSON synthesis turns in that same session. The tests/regressions turn analyzes E2E coverage and new-test gaps, while the CI/operations turn selects supported E2E jobs, targets, or fan-out. Only trusted identifiers from these receipts reach normalized E2E output; free-form model E2E prose is discarded. No second advisor session is opened, including for synthesis repair.
-9. Gives each commit turn one job: apply one successful atomic ledger commit for the preceding analysis. The model-facing commit is one flat object with homogeneous additions, updates, resolutions, and supersessions arrays plus a no-change reason; legacy nested operation unions and stringified arrays are rejected. Additions require a structured observed-versus-expected basis, a file and line, and eligibility for the active stage. Positives, advisor/provider state, prior-review process state, open-PR overlap, merge coordination, and live CI/E2E status stay in prose receipts rather than becoming findings. The ledger mutation tool is the turn's only active tool, and the runner rejects prose, other tool calls, or activity after the successful commit. Rejected attempts do not mutate the ledger and may be corrected before one success. If a commit turn ends with no successful call and every attempt settled without mutating state, the runner permits one tool-only retry and then fails closed. Ledger findings receive stable `F-...` IDs, and conclusion changes require a reason plus new evidence; final synthesis can only read the ledger.
-10. Treats open ledger records as the canonical finding set. Final synthesis cannot silently add, drop, merge, reword, or reclassify those findings. Unresolved source-of-truth review entries must reference their covering open ledger ID structurally rather than relying on prose matching.
-11. Logs each turn start and settled status and writes the assistant response immediately, preserving partial failed/timed-out turn evidence and the raw transcript. If a later stage fails, already-committed canonical findings remain in the low-confidence incomplete result instead of being replaced by a generic unavailable finding.
-12. Retries transient provider failures such as HTTP 429 within the same session using one bounded exponential-backoff layer. GPT waits 6s, 12s, 24s, and 48s; Nemotron waits 9s, 18s, 36s, and 72s so parallel lanes do not retry in lockstep. The workflow still publishes the primary comment and lane artifacts after an incomplete analysis. An incomplete primary review fails its outcome step; the artifact-only evaluation lane does not affect the workflow result.
-13. Validates and repairs the draft synthesis in the final turn of the same session. If that turn fails or emits malformed output, the runner preserves a schema-valid canonical draft with a limitation; a post-validation ledger mismatch still fails closed.
-14. Writes artifacts under the model-specific artifact directory, for example `artifacts/pr-review-advisor/` and `artifacts/pr-review-advisor-nemotron-ultra/`.
-15. Uploads each lane's artifacts from the read-only analysis job. A separate publisher job receives no model credential or untrusted worktree, validates the primary artifact and live PR head/base, then posts or updates one combined sticky PR comment marked by `<!-- nemoclaw-pr-review-advisor -->`. The evaluation lane does not publish another review. Previous sticky-comment ingestion is disabled for both lanes.
+1. Runs after `CI / Pull Request` completes, plus trusted manual dispatch.
+2. Runs automatically only when the source workflow succeeds for a required PR revision.
+3. Prepares the target PR as inert analysis data, including its unresolved trusted human review contract and an exact follow-up delta when applicable, and executes the trusted Advisor entrypoint from the workflow checkout.
+4. Runs model analysis inside OpenShell. The sandbox receives neither a GitHub token nor the upstream model credential.
+5. Runs one required Pi session for each valid Markdown prompt in `tools/pr-review-advisor/specialists`. Each specialist performs either the initial complete assessment or the bounded frozen-contract follow-up, reads repository evidence, and records a native session trace.
+6. Each successfully completed specialist publishes its Markdown review as the job summary. Its artifact contains the Markdown, native session trace, E2E receipt, findings ledger, and shared review-queue context.
+7. After every specialist completes successfully, a trusted aggregate job validates all exact-attempt finding ledgers and E2E receipts. It fails the workflow for any P0/P1 finding, unresolved E2E recommendation, or incomplete or malformed evidence.
+8. For a PR-bound run, a read-only coordinator shadow consumes the same exact-head context and
+   specialist evidence. It publishes only a job summary and decision artifact.
+9. For automatic `workflow_run` PR runs, one publisher attempts to post a sticky comment that links to the workflow run, including after the aggregate job fails. A failed specialist suppresses publication. Manual dispatch does not run the publisher.
 
-The ordered stage array in `buildPromptTurns` is the source of truth for stage order, evidence, and
-prompt text. Runtime numbering and prompt artifact names derive from that array, so adding or
-reordering a stage does not require parallel orchestration changes.
+For a PR-bound run, `Require no Advisor blockers` is the review-request signal. Request human review only when that job is green for the latest PR commit. It is not merge authorization, and contributors must still inspect the specialist reports.
 
-Provider failures and timeouts settle the active turn before the analysis fails, so its status and
-partial response remain available beside the raw transcript. Turn-artifact persistence failures are
-also fatal. A finding mismatch after same-session synthesis validation is fatal as well. Fatal runs remain
-visibly incomplete, but their final-result artifact preserves any open canonical findings committed
-before the failure so later runs and reviewers do not lose substantive review history.
+`investigate-turn.mts` owns the shared investigation turn and deterministic context contract. `specialist-tools.mts` owns specialist tool policy and implementations. `specialists.mts` applies each specialist prompt and tool policy. `trusted-guidance.mts` owns the system prompt and checked-in review guidance. `turn-context.mts` and the context modules build bounded deterministic evidence. `run-specialist.mts` composes these modules and writes each specialist's Markdown review and native session trace.
 
-The workflow is advisory and must not be configured as an E2E-required status check. Its combined
-comment lists trusted E2E recommendations, but does not dispatch or report pass/fail for E2E jobs.
+`tools/pr-review-advisor/specialist-lifecycle.mts` owns the advisor-specific prepare, configure,
+complete, and cleanup sequence. `tools/pr-review-advisor/openshell.mts` exports its OpenShell
+primitives and exposes only sandbox runtime initialization as a CLI command. Both use the shared
+lifecycle and credential-boundary helpers in `tools/openshell-agent/runtime.mts`, which are also
+used by the merge-conflict fixer.
+
+Provider failures, timeouts, missing specialist artifacts, blocker findings, unresolved E2E recommendations, and malformed evidence fail closed. GitHub context collection has one 120-second deadline across all required API reads. A timeout or partial result prevents context artifact publication. Workflow logs retain orchestration diagnostics. Hosted failed specialist execution attempts to recover artifacts before sandbox cleanup. When the model session returns an invalid result, its artifact retains `failure.json`, `failed-analysis.txt`, and the native session when available. These files are diagnostic evidence, not completed review receipts. Recovery failure does not suppress the original error or skip cleanup.
+
+After the trusted Advisor checkout is available, hosted specialist failures also retain `job-failure.json` with each subsequent setup and analysis step outcome plus run identity. Earlier checkout failures have workflow logs only. A PR revision that changes before checkout is classified as `superseded`; the SHA check still rejects that revision. Setup failures may have only this host receipt. No automatic infrastructure retry is added.
+
+Findings submission requires a recorded E2E recommendation result. The bounded terminal repair can record missing E2E recommendations before submitting findings. A repair that still omits required evidence fails closed.
+
+The workflow is advisory and must not be configured as an E2E-required status check. Its comment
+links to the specialist reviews and does not dispatch or report pass/fail for E2E jobs.
 Model availability must not become the authority
 for whether a pull request can merge.
-For PRs from this repository, the PR E2E controller separately rebuilds the plan from GitHub's
-changed-file list and dispatches every selected job after `CI / Pull Request` completes. `E2E / PR
-Gate` does not consume advisor output.
+When a maintainer requires live E2E for a pull request, they run it explicitly through the current
+[E2E workflow](../../.github/workflows/e2e.yaml) and follow the
+[maintainer E2E procedure](../../.agents/skills/nemoclaw-maintainer-day/MERGE-GATE.md). Former PR E2E
+check contexts remain advisory and are ignored by the merge-readiness gate.
 
-Required-check status is point-in-time context, not a settled-CI gate. Earlier
-`PR_REVIEW_ADVISOR_WAIT_*` workflow variables were inert and have been removed; any future waiting
-behavior must be implemented and tested before the workflow claims to provide it.
+On automatic runs, the gate accepts a successful `CI / Pull Request` run whose name ends in
+`gate true`. It uses the source repository, branch, and commit to resolve one open PR through the
+GitHub API. Manual dispatch does not require CI-run evidence. A PR-targeted dispatch requires both
+`target_repo` and a positive `target_pr`, resolves the open PR's head and base SHAs through the
+GitHub API, and requires its base branch to match `target_base`. A ref-targeted dispatch resolves
+`head_ref` and `base_ref` to full SHAs in `NVIDIA/NemoClaw`. In both cases, the analysis checkout
+and sandbox inputs use those resolved SHAs, so later PR or ref movement cannot change the reviewed
+revision. The blocker gate rejects missing or mismatched expected SHAs.
+
+PR-targeted manual dispatch intentionally supports both same-repository and fork PRs. GitHub limits
+manual workflow dispatch to repository writers, and the fork head is handled only as inert read-only
+data bound to its base and full head SHAs. The specialist job has only artifact-read permission and
+no repository write permission; the model sandbox receives neither a GitHub credential nor the real
+provider credential. A same-repository restriction belongs on automation that changes a contributor
+branch; here it would only remove static review coverage.
 
 ## Author and agent follow-up
 
@@ -75,23 +82,62 @@ Authors and coding agents should follow the shared [PR CI and Review Follow-Up](
 
 - Static analysis only.
 - PR-provided scripts, tests, package lifecycle hooks, and build tools are never executed.
-- The advisor receives repo-confined read-only repository tools plus deterministic context tools. Repository paths must remain inside the checked-out analysis workspace after lexical and symlink resolution. Its only mutation tool updates the in-memory finding ledger; it cannot change repository or GitHub state.
+- The model session runs in a digest-pinned OpenShell sandbox under a hard-required Landlock policy with no direct network policy and no ambient workdir. Four canonical host inputs are mounted read-only through the advisor's ephemeral Docker gateway outside `/sandbox`, so OpenShell v0.0.99 applies the final immutable boundary before the first process starts. Landlock independently grants those inputs read-only access. It grants application-data writes only to a bounded runtime tmpfs; required device access remains writable under `/dev`. The sandbox pins Git to `/pr-workdir/.git` and `/pr-workdir` instead of relying on cross-UID repository discovery. A startup proof must read every input canary, resolve the checkout and `HEAD`, fail chmod, overwrite, replacement, and creation in each input, and complete runtime writes. The model-facing Advisor tools remain repository-confined and read-only; generated configuration and artifacts use the dedicated runtime subtree.
+- The advisor receives repo-confined read-only repository tools plus deterministic context tools. Repository paths must remain inside the checked-out analysis workspace after lexical and symlink resolution. None of these tools can change repository or GitHub state.
 - PR bodies, comments, titles, branch names, and diffs are treated as untrusted evidence, never as instructions.
 - Manual target analysis validates the repository token, decimal PR number, and base-ref token before running any `git` command.
-- Generated advisor credential config is written under `/tmp`, not uploaded artifacts.
-- The analysis job is limited to `NVIDIA/NemoClaw`, has read-only GitHub permissions, and is the only job that receives the model secret.
-- The analyzer collects deterministic GitHub context before model work, then removes GitHub tokens from the process environment.
-  After registering the model credential in the in-memory SDK auth store, it also removes that credential from the process environment before model turns begin.
-- The separate publisher has pull-request write permission, but receives neither the model secret nor the untrusted PR worktree. It accepts only the bounded primary artifact from the same workflow run and rechecks the live PR head and base before commenting. Before rendering E2E guidance, it independently allowlists coverage IDs and selector tuples and ignores artifact-authored E2E prose. A newly added credential-free test can extend the job allowlist only through trusted-normalizer evidence bound to the same head SHA, changed-file path, and basename-derived selector ID.
-- Sticky publication updates only a marker-bearing comment owned by `github-actions[bot]`; a user-authored marker cannot claim the update target.
-  The rendered comment preserves its hidden identity metadata while enforcing a 60 KiB UTF-8 limit, and publication errors remain visible in the publisher logs.
+- Generated Pi configuration is written under the sandbox's runtime-only configuration directory, not uploaded artifacts.
+- The review job is limited to `NVIDIA/NemoClaw` and has read-only GitHub permissions. Within it, only the trusted host provider-configuration step receives the upstream model secret.
+- The gate uses a job-scoped GitHub token to read open PR identity. It receives no model credential.
+- A separate trusted host step collects deterministic GitHub context with `github.token` and writes a bounded, identity-checked context file before model work. The sandbox receives that file, not the token.
+- The OpenShell gateway binds only to loopback and holds the upstream provider credential. The sandbox uses `https://inference.local/v1` with an inert SDK key, and receives neither the provider credential nor a GitHub token.
+- The separate publisher has pull-request write permission, but receives neither the model secret, specialist artifacts, nor the untrusted PR worktree. It rechecks the latest PR commit immediately before posting only the workflow-run link.
+- Sticky publication updates only a marker-bearing comment owned by `github-actions[bot]`; a user-authored marker cannot claim the update target. Publication errors remain visible in the publisher logs.
 - The workflow posts advisory comments only; it does not approve, request changes, merge, push, label, or dispatch E2E.
-- Previous sticky-comment ingestion is disabled because issue comments are mutable and GitHub does not expose a durable comment-to-workflow ownership binding. Any future follow-up context must come from a verified immutable run artifact rather than comment metadata.
-- During rollout, non-default advisor lanes may see an older trusted `main` checkout that has the workflow matrix but not the matching model support. The workflow treats that as trusted-main rollout skew and writes low-confidence skip artifacts in the lane-specific artifact directory. Do not run PR-controlled advisor code to bypass this gate; remove the gate only after the trusted `main` implementation always supports the parallel advisor lane.
-- The checked-in risk plan is deterministic and additive. PR Review Advisor reviews every listed
-  invariant and required job for missing evidence. The trusted E2E normalizer restores any listed
-  job that the model omits or downgrades. The PR E2E controller separately dispatches every listed
-  job without consuming the advisor's normalized result.
+- The checked-in risk plan is deterministic and additive. PR Review Advisor reviews every listed invariant and required job for missing evidence, but does not dispatch jobs. Maintainers decide whether to run its recommended E2E coverage through the [separate manual E2E procedure](../../.agents/skills/nemoclaw-maintainer-day/MERGE-GATE.md).
+
+The checked-in risk plan selects the `gateway-topology` family for the production paths in the canonical `GATEWAY_TOPOLOGY_FILES` inventory in `tools/advisors/risk-plan.mts`.
+
+The family requires PR Review Advisor to check this invariant against the diff, sibling consumers,
+and checked-in evidence:
+
+> An explicit sandbox-visible host address must be outside the sandbox network subnet, and every
+> gateway-address projection must derive from the same authority.
+
+The family does not add an E2E job. Existing topology tests and workflows remain the behavior
+authority. Documentation-only and test-only changes do not select the family.
+
+The same risk plan maps runtime changes from these paths to the `focused-e2e` family:
+
+- `src/lib/onboard/managed-startup/**`.
+- `src/lib/onboard/sandbox-create-launch.ts`.
+- `scripts/lib/entrypoint-env-wrapper.sh`.
+
+Each match selects these focused E2E jobs:
+
+- `issue-4462-scope-upgrade-approval`.
+- `openclaw-inference-switch`.
+
+The same risk plan maps these Hermes CLI adapter paths to `focused-e2e`:
+
+- `agents/hermes/hermes-cli-adapter-v1.json`.
+- `agents/hermes/hermes-wrapper.py`.
+- `agents/hermes/validate-cli-adapter.py`.
+
+Each Hermes CLI adapter match selects these focused E2E jobs:
+
+- `channels-stop-start`.
+- `mcp-bridge`.
+
+The same risk plan maps these Hermes cron restore paths to `focused-e2e`:
+
+- `agents/hermes/cron-restore-control.py`.
+- `agents/hermes/patch-cron-restore-drain.py`.
+- `src/lib/actions/sandbox/rebuild-hermes-post-restore.ts`.
+- `src/lib/actions/sandbox/runtime/hermes-cron-restore-recovery.ts`.
+
+Each Hermes cron restore match selects `rebuild-hermes`.
+The generic `src/commands/sandbox/recover.ts` adapter remains agent-neutral and does not select that job.
 
 ## Required secret
 
@@ -99,78 +145,102 @@ Configure this repository secret for review analysis:
 
 - `PR_REVIEW_ADVISOR_API_KEY`
 
-The analyzer uses the OpenAI-compatible `https://inference-api.nvidia.com/v1` service.
-The primary lane uses `azure/openai/gpt-5.6-terra`; the parallel Nemotron lane sets
-`PR_REVIEW_ADVISOR_MODEL=nvidia/nvidia/nemotron-3-ultra` and reuses the same analyzer,
-prompts, schema, safety boundary, and credential secret.
-
-If advisor credentials are unavailable, the advisor writes a low-confidence unavailable result
-instead of failing closed without artifacts.
+The trusted host uses this secret only to register the OpenAI-compatible
+`https://inference-api.nvidia.com/v1` service with OpenShell. The sandboxed specialists reach that
+provider through `https://inference.local/v1` and do not receive the secret.
+The discovered specialists use the workflow-configured model and share the same credential boundary.
 
 ## Artifacts
 
-- `prompts/00-system.md` — system prompt sent to the advisor.
-- `prompts/01-scope-risk-map-analysis.md` through `prompts/14-validate-synthesis-json.md` — six alternating analysis/commit pairs followed by draft and validation synthesis turns in the same session, in execution order.
-- `prompts/*.tool-results/` — bounded deterministic, domain-specific context payloads exposed as real tools after the matching user turn. The untrusted truncated diff appears only in the first turn, and repeated risk-plan projections use capped path samples.
-- `turns/01-scope-risk-map-analysis.txt` through `turns/14-validate-synthesis-json.txt` — assistant output and completed/failed/timed-out status written as each turn settles.
-- `context/drift-context.json` — deterministic drift and overlap context.
-- `context/security-context.json` — deterministic security-risk context and the risk plan for the
-  PR SHA.
-- `context/validation-context.json` — deterministic acceptance, source-of-truth, static
-  test-inventory, simplification-signal, and risk plan for the PR SHA, including the
-  regression invariants reviewed for the PR.
-- `context/pr.diff` — truncated PR diff used by the advisor.
-- `pr-review-advisor-raw-output.txt` — raw multi-turn advisor transcript and diagnostics.
-- `pr-review-advisor-result.json` — normalized advisor result with findings projected from the canonical open ledger records, or execution metadata when analysis is unavailable.
-- `pr-review-advisor-final-result.json` — normalized canonical result used for comments.
-- `pr-review-advisor-finding-ledger.json` — all open, resolved, and superseded finding records with stable IDs and reasoned transition history, refreshed after every settled turn.
-- `pr-review-advisor-summary.md` — markdown summary used in the job summary.
-- `pr-review-advisor-detailed-review.md` — expanded acceptance, security, and source-of-truth review details.
-- `pr-review-advisor-session.html` — exported advisor session transcript showing each user instruction before its context tools, the visible stage analysis before its ledger update, and the final read-only ledger synthesis.
+Each successfully completed specialist artifact contains a Markdown review, Pi's unchanged native JSONL session, E2E recommendations, a findings ledger, and shared review-queue context. Failed artifacts may contain only diagnostic failure evidence and cannot satisfy the review-queue contract. See [Review queue evidence](REVIEW-QUEUE.md) for the consumer contract. The
+workflow run also displays each Markdown review as a job summary. Replace `<interest>` with the
+specialist interest and `<attempt>` with the workflow run attempt number, then download the artifact
+with `gh run download <run-id> --name pr-review-specialist-<interest>-<attempt>`.
 
-The parallel Nemotron Ultra lane writes the same filenames under
-`artifacts/pr-review-advisor-nemotron-ultra/` and uploads them as the
-`pr-review-advisor-nemotron-ultra` artifact.
+For a complete PR-bound run, `pr-review-coordinator-shadow-<attempt>` contains the read-only
+coordinator decision in `decision.json`. The coordinator job also writes that decision to its job
+summary. The artifact does not authorize a review write or approval.
 
-## Manual run
+The publisher has the only pull-request write permission. It receives neither the model credential
+nor the specialist artifacts. It posts only the workflow-run link.
+
+## Local run
+
+From a prepared contributor checkout, run:
 
 ```bash
-node --experimental-strip-types tools/pr-review-advisor/analyze.mts \
-  --base origin/main \
-  --head HEAD \
-  --schema tools/pr-review-advisor/schema.json \
-  --out-dir artifacts/pr-review-advisor
+npm run review:local
 ```
 
-Set `PR_REVIEW_ADVISOR_API_KEY` locally, or configure the repository
-`PR_REVIEW_ADVISOR_API_KEY` secret. Add `PR_REVIEW_ADVISOR_MODEL=nvidia/nvidia/nemotron-3-ultra`
-to exercise the Nemotron Ultra lane locally. Run `npm install` first so the Pi SDK dependency is
-available.
+To run the same local specialists against a directly selected exact open, non-draft GitHub pull
+request:
+
+```bash
+npm run review:local -- --pr 12345
+```
+
+The repository defaults to `NVIDIA/NemoClaw`. Use `--repo OWNER/REPO` after the PR number only
+when reviewing another repository.
+
+The PR form is read-only. It does not authenticate or admit a maintainer review-request queue. It
+resolves and rechecks the selected PR's live head and base, checks out the exact head in a disposable
+clone, collects bounded GitHub review context, and publishes specialist artifacts back to
+`artifacts/pr-review-advisor-local/`. It does not combine findings, post a review, or approve the PR.
+The repository workflow's coordinator shadow consumes the same exact-head evidence and reports a
+read-only decision; a human maintainer still owns any consolidated review or approval. The
+disposable clone and every published artifact retain the fetched PR's real full head SHA rather than
+a locally synthesized commit identity. On a later commit, unresolved trusted human change requests
+become the frozen contract and the specialists inspect their exact commit delta instead of starting
+over.
+
+Without `--pr`, the command snapshots the committed branch delta from `origin/main`, staged and
+unstaged final content, and nonignored untracked files. It does not use GitHub context, so this
+checkout form always uses the initial complete-assessment path. Both forms run every checked-in
+specialist separately through OpenShell, write each specialist's Markdown review and native JSONL
+session under `artifacts/pr-review-advisor-local/`, and do not run tests, inspect CI state, or combine
+findings. Test recommendations are advisory targets verified against the repository inventory, not
+executed test results.
+
+Prerequisites:
+
+- Node.js 22.19.0 or newer and npm registry access for the dependencies locked on `origin/main`;
+- for `--pr`, an authenticated GitHub CLI (`gh`) identity with read access to the target repository;
+- an `origin/main` remote-tracking commit that contains the trusted local review implementation;
+- a running Docker-compatible container runtime. Run `npm run dev:doctor` to verify Docker availability and resources;
+- `git`, `openshell`, `openshell-gateway`, `openshell-sandbox`, `rg`, and `fdfind` available on `PATH`;
+- `PR_REVIEW_ADVISOR_API_KEY` exported in the host environment for the existing advisor provider.
+  The local gateway receives this credential. The sandbox does not receive it. The variable remains
+  in the caller environment until you clear it. The command attempts to remove the local gateway after
+  the run. If cleanup fails, it reports the remaining resource; remove that resource before retrying.
+
+`npm run dev:doctor` checks general contributor readiness. It does not check these local-review
+executables, the advisor credential, or the `origin/main` ref.
+
+Running the npm script trusts the contributor checkout's `package.json` entry and built-in-only bootstrap.
+After that narrow entry boundary, the executable advisor checkout is detached at the resolved
+`origin/main` commit. Other branch changes to tracked files, including advisor implementation,
+policy, and specialist prompts, exist only in the read-only review snapshot. Ignored files, including
+the contributor checkout's `node_modules`, are excluded. Before it reads the advisor credential or
+starts the implementation, the built-in-only bootstrap runs `npm ci --ignore-scripts --no-audit
+--no-fund` in the trusted checkout. Those separately installed dependencies are the only
+`node_modules` used for execution. npm uses the committed `origin/main` lockfile, normal
+cache behavior, and a credential-free environment with user and global npm configuration disabled.
+Failure stops the run before the credential-bearing advisor lifecycle starts.
+
+The command attempts to remove its temporary snapshot, trusted dependencies, gateway, and each
+sandbox after success, failure, or a handled termination signal. It reports cleanup failures with the
+remaining resource name or path. Remove that named resource before retrying.
+
+Each locally owned gateway uses an in-memory database. Its provider records are discarded when the
+gateway process stops. The local runner ignores inherited
+database URLs for its gateway; it does not read or replace an existing gateway database.
 
 ## Output contract
 
-`tools/pr-review-advisor/schema.json` defines the normalized JSON result shape used for the PR
-comment and future reporting work. Findings include probe-shaped fields for impact, verification
-hints, and missing regression-test guidance so agents know what to check rather than treating findings
-as generic commentary. Every source-of-truth review item includes a `findingId`: unresolved items
-reference their covering open ledger finding, while satisfied and not-applicable items use `null`.
-Every result also includes nested `e2e.coverage` and `e2e.targets` guidance. The fields stay
-separate in JSON, but comments and summaries combine their IDs into one `Recommended E2E` list and
-one optional list. Duplicate IDs appear once. If a list is longer than the display limit, the output
-reports how many more IDs exist. The trusted normalizer
-restores deterministic requirements before model selections, retains only allowlisted coverage IDs
-and supported selector tuples, and replaces model-authored reasons with trusted
-reasons. It discards free-form E2E domains, new-test recommendations, and no-selection explanations.
-For a changed credential-free test, the normalizer also records structured head evidence only
-after the trusted module-tag parser accepts the source; model-provided evidence is overwritten. The
-trusted publisher independently repeats the ID and tuple checks, verifies that evidence against the
-result head and changed-file identity, and renders only trusted IDs.
-The compatibility schema retains `requiredTests` and `targets.required`, but those names describe
-the normalized advisory tier, not merge requirements. Rendered comments label them as recommended;
-the independent PR E2E controller does not consume advisor output.
-Findings can also include safe simplification metadata with delete, stdlib,
-native, YAGNI, or shrink tags; those suggestions must keep validation, security, data-loss prevention,
-and required tests intact. Only blockers set a blocking advisory recommendation; results without
-blockers are info-only unless superseded. That recommendation is review input, never merge
-authorization. Warnings do not block. Suggestions do not require a response. Every result includes
-limitations and requires maintainer review.
+Each successfully completed specialist returns a Markdown review grounded in repository evidence and shared trusted
+guidance. No component combines findings or makes merge decisions. Specialist reviews are advisory.
+They do not replace required human review or change repository merge gates.
+
+Each specialist also records all additional E2E recommendations through a validated tool.
+The receipt preserves the deterministic floor, optional coverage, explicit empty decisions, and unresolved coverage.
+The [review queue contract](REVIEW-QUEUE.md) defines discovery, identity, dispatch, and result rules for read-only consumers.

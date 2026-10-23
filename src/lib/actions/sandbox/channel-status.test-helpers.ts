@@ -7,7 +7,6 @@ import { vi } from "vitest";
 // both of which require runner.ts via CJS; runner.ts uses `require()` calls
 // vitest cannot resolve from a TS source file. Stub the heavy modules so the
 // tests stay focused on the orchestrator's diagnostic glue. See
-// src/lib/shields/index.test.ts for the same workaround pattern.
 vi.mock("../../policy", () => ({
   getAppliedPresets: vi.fn(() => []),
   getGatewayPresets: vi.fn(() => null),
@@ -34,13 +33,14 @@ vi.mock("../../agent/defs", () => ({
   loadAgent: vi.fn(),
 }));
 
-vi.mock("./process-recovery", () => ({
+vi.mock("../../adapters/sandbox/command-transport", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../adapters/sandbox/command-transport")>()),
   executeSandboxExecCommand: vi.fn(),
 }));
 
 import type { AgentDefinition } from "../../agent/defs";
-import type { SandboxMessagingInputReference } from "../../messaging/manifest";
 import type { DiagnosticSignal } from "../../messaging/channels/channel-health";
+import type { SandboxMessagingInputReference } from "../../messaging/manifest";
 import type { SandboxEntry } from "../../state/registry";
 
 type ShowSandboxChannelStatus = typeof import("./channel-status").showSandboxChannelStatus;
@@ -56,7 +56,6 @@ const PROBED_AT = new Date("2026-05-28T04:00:00.000Z");
 
 function fakeAgent(name: "openclaw" | "hermes" = "openclaw"): AgentDefinition {
   const configDir = name === "openclaw" ? "/sandbox/.openclaw" : "/sandbox/.hermes";
-  const stateDirs = name === "openclaw" ? ["whatsapp"] : ["platforms"];
   return {
     name,
     agentDir: `/fake/${name}`,
@@ -84,12 +83,6 @@ function fakeAgent(name: "openclaw" | "hermes" = "openclaw"): AgentDefinition {
     get inferenceProviderOptions() {
       return [];
     },
-    get stateDirs() {
-      return stateDirs;
-    },
-    get stateFiles() {
-      return [];
-    },
     get versionCommand() {
       return `${name} --version`;
     },
@@ -112,9 +105,6 @@ function fakeAgent(name: "openclaw" | "hermes" = "openclaw"): AgentDefinition {
       return null;
     },
     get policyAdditionsPath() {
-      return null;
-    },
-    get policyPermissivePath() {
       return null;
     },
     get pluginDir() {
@@ -173,6 +163,8 @@ export function makeDeps(opts: {
   agentName?: "openclaw" | "hermes";
   sandbox?: SandboxEntry | undefined;
   out?: (line: string) => void;
+  nowMs?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
 }) {
   const calls: string[] = [];
   const out = opts.out ?? ((line: string) => calls.push(line));
@@ -186,6 +178,8 @@ export function makeDeps(opts: {
         opts.gatewayPresets === undefined ? ["whatsapp"] : opts.gatewayPresets,
       execSandbox: vi.fn(opts.exec),
       now: () => PROBED_AT,
+      nowMs: opts.nowMs,
+      sleep: opts.sleep,
       out,
     },
     out_lines: calls,

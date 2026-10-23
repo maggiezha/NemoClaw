@@ -8,29 +8,33 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import {
+  decideMcpLifecycleAcquisition,
+  decideMcpLifecycleLock,
+  type CorruptGenerationState,
+} from "./mcp-lifecycle-lock/decisions";
+import {
   classifyMcpLifecycleLock,
   createMcpLifecycleLockOwner,
   type LockObservation,
-  type McpLifecycleLockDisposition,
 } from "./mcp-lifecycle-lock-identity";
 import {
   getMcpLifecycleLockPath,
   mcpLifecycleLockPathExists,
+  mcpLifecycleLockPathExistsSync,
   readMcpLifecycleLockObservation,
+  readMcpLifecycleLockObservationSync,
   reclaimStaleMcpLifecycleLockGeneration,
+  reclaimStaleMcpLifecycleLockGenerationSync,
   safelyReleaseMcpLifecycleLock,
+  safelyReleaseMcpLifecycleLockSync,
   writeMcpLifecycleLockCandidateAndLink,
+  writeMcpLifecycleLockCandidateAndLinkSync,
+  resolveNemoclawStateDir,
 } from "./mcp-lifecycle-lock-storage";
-import { resolveNemoclawStateDir } from "./paths";
 
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_CORRUPT_LOCK_GRACE_MS = 30_000;
-
-interface CorruptGenerationTracker {
-  generation: string | null;
-  firstSeenAt: number;
-}
 
 interface AcquiredMcpLifecycleLock {
   lockPath: string;
@@ -43,6 +47,8 @@ export interface McpLifecycleLockOptions {
   pollIntervalMs?: number;
   timeoutMs?: number;
   corruptLockGraceMs?: number;
+  /** Monotonic clock override used by deterministic acquisition tests. */
+  monotonicNow?: () => number;
 }
 
 interface HeldLockLease {
@@ -52,77 +58,123 @@ interface HeldLockLease {
 type HeldLockContext = ReadonlyMap<string, HeldLockLease>;
 
 const heldLocks = new AsyncLocalStorage<HeldLockContext>();
+const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 
 function positiveInteger(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) && (value ?? 0) > 0 ? Math.floor(value as number) : fallback;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function resetCorruptGenerationTracker(tracker: CorruptGenerationTracker): void {
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(sleepBuffer, 0, 0, milliseconds);
+}
+
+function decideObservedMcpLifecycleLock(
+  observation: LockObservation,
+  sandboxName: string,
+  corruptLockGraceMs: number,
+  corruptTracker: CorruptGenerationState,
+  monotonicNow: number,
+): ReturnType<typeof decideMcpLifecycleLock> {
+  const ownerDisposition =
+    observation.owner?.sandboxName === sandboxName
+      ? classifyMcpLifecycleLock(observation, sandboxName, observation.mtimeMs, corruptLockGraceMs)
+      : undefined;
+  const decision = decideMcpLifecycleLock({
+    observation,
+    sandboxName,
+    corruptLockGraceMs,
+    corruptGeneration: corruptTracker,
+    monotonicNow,
+    ownerDisposition,
+  });
+  corruptTracker.generation = decision.corruptGeneration.generation;
+  corruptTracker.firstSeenAt = decision.corruptGeneration.firstSeenAt;
+  return decision;
+}
+
+function resetCorruptGenerationTracker(tracker: CorruptGenerationState): void {
   tracker.generation = null;
   tracker.firstSeenAt = 0;
 }
 
-/** Age one continuously observed corrupt inode with a monotonic clock. */
-function classifyObservedMcpLifecycleLock(
-  observation: LockObservation,
-  sandboxName: string,
-  corruptLockGraceMs: number,
-  corruptTracker: CorruptGenerationTracker,
-): McpLifecycleLockDisposition {
-  if (!observation.owner || observation.owner.sandboxName !== sandboxName) {
-    const generation = `${observation.dev}:${observation.ino}:${observation.mtimeMs}`;
-    const now = performance.now();
-    if (corruptTracker.generation !== generation) {
-      corruptTracker.generation = generation;
-      corruptTracker.firstSeenAt = now;
-      return "wait";
-    }
-    return now - corruptTracker.firstSeenAt >= corruptLockGraceMs ? "stale" : "wait";
-  }
-  resetCorruptGenerationTracker(corruptTracker);
-  // The wall-clock arguments are irrelevant for a structurally valid owner.
-  return classifyMcpLifecycleLock(
-    observation,
-    sandboxName,
-    observation.mtimeMs,
-    corruptLockGraceMs,
+function timeoutError(sandboxName: string, ownerPid: number | null): Error {
+  const ownerSuffix = ownerPid ? ` (owner PID ${String(ownerPid)})` : "";
+  return new Error(
+    `Timed out waiting for the sandbox mutation lock for '${sandboxName}'${ownerSuffix}. Another lifecycle, policy, channel, inference, session, or snapshot operation is still running.`,
   );
 }
 
-async function tryReapStaleLock(
+async function tryReapStaleMainLock(
   lockPath: string,
   sandboxName: string,
   corruptLockGraceMs: number,
-  corruptTracker: CorruptGenerationTracker,
+  corruptTracker: CorruptGenerationState,
+  monotonicNow: () => number,
+  assertBeforeTimeout: () => void,
 ): Promise<boolean> {
   const reaperPath = `${lockPath}.reaper`;
   const reaperToken = crypto.randomUUID();
   const reaperOwner = createMcpLifecycleLockOwner(sandboxName, reaperToken);
+  assertBeforeTimeout();
   if (!(await writeMcpLifecycleLockCandidateAndLink(reaperPath, reaperOwner))) return false;
-
   try {
+    assertBeforeTimeout();
     const latest = await readMcpLifecycleLockObservation(lockPath);
     if (!latest) return true;
-    if (
-      classifyObservedMcpLifecycleLock(latest, sandboxName, corruptLockGraceMs, corruptTracker) !==
-      "stale"
-    ) {
-      return false;
-    }
-
-    return reclaimStaleMcpLifecycleLockGeneration(lockPath, latest);
+    const decision = decideObservedMcpLifecycleLock(
+      latest,
+      sandboxName,
+      corruptLockGraceMs,
+      corruptTracker,
+      monotonicNow(),
+    );
+    if (decision.kind !== "reap") return false;
+    assertBeforeTimeout();
+    return await reclaimStaleMcpLifecycleLockGeneration(lockPath, latest, assertBeforeTimeout);
   } finally {
     await safelyReleaseMcpLifecycleLock(reaperPath, reaperToken);
   }
 }
 
+function tryReapStaleMainLockSync(
+  lockPath: string,
+  sandboxName: string,
+  corruptLockGraceMs: number,
+  corruptTracker: CorruptGenerationState,
+  monotonicNow: () => number,
+  assertBeforeTimeout: () => void,
+): boolean {
+  const reaperPath = `${lockPath}.reaper`;
+  const reaperToken = crypto.randomUUID();
+  const reaperOwner = createMcpLifecycleLockOwner(sandboxName, reaperToken);
+  assertBeforeTimeout();
+  if (!writeMcpLifecycleLockCandidateAndLinkSync(reaperPath, reaperOwner)) return false;
+  try {
+    assertBeforeTimeout();
+    const latest = readMcpLifecycleLockObservationSync(lockPath);
+    if (!latest) return true;
+    const decision = decideObservedMcpLifecycleLock(
+      latest,
+      sandboxName,
+      corruptLockGraceMs,
+      corruptTracker,
+      monotonicNow(),
+    );
+    if (decision.kind !== "reap") return false;
+    assertBeforeTimeout();
+    return reclaimStaleMcpLifecycleLockGenerationSync(lockPath, latest, assertBeforeTimeout);
+  } finally {
+    safelyReleaseMcpLifecycleLockSync(reaperPath, reaperToken);
+  }
+}
+
 async function acquireMcpLifecycleLock(
   sandboxName: string,
-  options: McpLifecycleLockOptions,
+  options: McpLifecycleLockOptions & { stateDir: string },
 ): Promise<AcquiredMcpLifecycleLock> {
   const pollIntervalMs = positiveInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
   const timeoutMs = positiveInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS);
@@ -130,38 +182,40 @@ async function acquireMcpLifecycleLock(
     options.corruptLockGraceMs,
     DEFAULT_CORRUPT_LOCK_GRACE_MS,
   );
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   const lockPath = getMcpLifecycleLockPath(sandboxName, options.stateDir);
-  await fs.promises.mkdir(path.dirname(lockPath), {
-    recursive: true,
-    mode: 0o700,
-  });
-
-  const startedAt = performance.now();
-  const corruptMainTracker: CorruptGenerationTracker = { generation: null, firstSeenAt: 0 };
-  const corruptReaperTracker: CorruptGenerationTracker = { generation: null, firstSeenAt: 0 };
+  await fs.promises.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const deadline = monotonicNow() + timeoutMs;
+  const corruptMainTracker: CorruptGenerationState = { generation: null, firstSeenAt: 0 };
+  const corruptReaperTracker: CorruptGenerationState = { generation: null, firstSeenAt: 0 };
   let lastOwnerPid: number | null = null;
-  for (;;) {
-    if (performance.now() - startedAt >= timeoutMs) {
-      const ownerSuffix = lastOwnerPid ? ` (owner pid ${lastOwnerPid})` : "";
-      throw new Error(
-        `Timed out waiting for the sandbox mutation lock for '${sandboxName}'${ownerSuffix}. Another lifecycle, policy, channel, shields, or snapshot operation is still running.`,
-      );
-    }
+  const assertBeforeTimeout = () => {
+    if (monotonicNow() >= deadline) throw timeoutError(sandboxName, lastOwnerPid);
+  };
 
+  for (;;) {
+    assertBeforeTimeout();
     const reaperPath = `${lockPath}.reaper`;
     const reaperObservation = await readMcpLifecycleLockObservation(reaperPath);
     if (reaperObservation) {
-      const reaperDisposition = classifyObservedMcpLifecycleLock(
+      const reaperDecision = decideObservedMcpLifecycleLock(
         reaperObservation,
         sandboxName,
         corruptLockGraceMs,
         corruptReaperTracker,
+        monotonicNow(),
       );
-      if (reaperDisposition === "stale") {
-        // The reaper has the same atomic, PID-identified owner format as the
-        // main lock. A SIGKILL at any point in stale-lock cleanup is therefore
-        // recoverable without age-expiring a legitimate long operation.
-        await reclaimStaleMcpLifecycleLockGeneration(reaperPath, reaperObservation);
+      const acquisitionDecision = decideMcpLifecycleAcquisition({
+        phase: "reaper",
+        lock: reaperDecision,
+      });
+      if (acquisitionDecision.kind === "reap") {
+        assertBeforeTimeout();
+        await reclaimStaleMcpLifecycleLockGeneration(
+          reaperPath,
+          reaperObservation,
+          assertBeforeTimeout,
+        );
         continue;
       }
       await sleep(pollIntervalMs);
@@ -172,11 +226,24 @@ async function acquireMcpLifecycleLock(
     if (!(await mcpLifecycleLockPathExists(reaperPath))) {
       const token = crypto.randomUUID();
       const owner = createMcpLifecycleLockOwner(sandboxName, token);
+      assertBeforeTimeout();
       if (await writeMcpLifecycleLockCandidateAndLink(lockPath, owner)) {
-        // A stale-lock reaper may have appeared between our pre-check and the
-        // atomic link. Do not enter the critical section until that generation
-        // gate has gone away.
-        if (!(await mcpLifecycleLockPathExists(reaperPath))) return { lockPath, token };
+        const published = await readMcpLifecycleLockObservation(lockPath);
+        const publicationDecision = decideMcpLifecycleAcquisition({
+          phase: "published",
+          reaperPresent: await mcpLifecycleLockPathExists(reaperPath),
+          expectedOwnerToken: token,
+          observedOwnerToken: published?.owner?.token,
+        });
+        if (publicationDecision.kind === "enter") {
+          try {
+            assertBeforeTimeout();
+          } catch (error) {
+            await safelyReleaseMcpLifecycleLock(lockPath, token);
+            throw error;
+          }
+          return { lockPath, token };
+        }
         await safelyReleaseMcpLifecycleLock(lockPath, token);
       }
     }
@@ -184,62 +251,189 @@ async function acquireMcpLifecycleLock(
     const observation = await readMcpLifecycleLockObservation(lockPath);
     if (observation) {
       lastOwnerPid = observation.owner?.pid ?? null;
+      const mainDecision = decideObservedMcpLifecycleLock(
+        observation,
+        sandboxName,
+        corruptLockGraceMs,
+        corruptMainTracker,
+        monotonicNow(),
+      );
       if (
-        classifyObservedMcpLifecycleLock(
-          observation,
+        decideMcpLifecycleAcquisition({ phase: "main-owner", lock: mainDecision }).kind === "reap"
+      ) {
+        await tryReapStaleMainLock(
+          lockPath,
           sandboxName,
           corruptLockGraceMs,
           corruptMainTracker,
-        ) === "stale"
-      ) {
-        if (await tryReapStaleLock(lockPath, sandboxName, corruptLockGraceMs, corruptMainTracker)) {
-          continue;
-        }
+          monotonicNow,
+          assertBeforeTimeout,
+        );
+        continue;
       }
     } else {
+      lastOwnerPid = null;
       resetCorruptGenerationTracker(corruptMainTracker);
     }
     await sleep(pollIntervalMs);
   }
 }
 
-/**
- * Serializes the complete MCP lifecycle for one sandbox across processes.
- * AsyncLocalStorage makes nested calls in the same lifecycle operation
- * reentrant (rebuild recovery -> MCP restart), while separate top-level
- * promises in one Node process still contend on the filesystem lock.
- *
- * The lease is host-local. If a state directory is shared across machines or
- * PID namespaces, foreign owners fail closed and require operator/distributed
- * lease resolution; local PID probing is never used to reap them.
- *
- * This is a CLI state lock only. It is not an MCP bridge, proxy, listener, or
- * credential process and never participates in sandbox network traffic.
- */
+function acquireMcpLifecycleLockSync(
+  sandboxName: string,
+  options: McpLifecycleLockOptions & { stateDir: string },
+): AcquiredMcpLifecycleLock {
+  const pollIntervalMs = positiveInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
+  const timeoutMs = positiveInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS);
+  const corruptLockGraceMs = positiveInteger(
+    options.corruptLockGraceMs,
+    DEFAULT_CORRUPT_LOCK_GRACE_MS,
+  );
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const lockPath = getMcpLifecycleLockPath(sandboxName, options.stateDir);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const deadline = monotonicNow() + timeoutMs;
+  const corruptMainTracker: CorruptGenerationState = { generation: null, firstSeenAt: 0 };
+  const corruptReaperTracker: CorruptGenerationState = { generation: null, firstSeenAt: 0 };
+  let lastOwnerPid: number | null = null;
+  const assertBeforeTimeout = () => {
+    if (monotonicNow() >= deadline) throw timeoutError(sandboxName, lastOwnerPid);
+  };
+
+  for (;;) {
+    assertBeforeTimeout();
+    const reaperPath = `${lockPath}.reaper`;
+    const reaperObservation = readMcpLifecycleLockObservationSync(reaperPath);
+    if (reaperObservation) {
+      const reaperDecision = decideObservedMcpLifecycleLock(
+        reaperObservation,
+        sandboxName,
+        corruptLockGraceMs,
+        corruptReaperTracker,
+        monotonicNow(),
+      );
+      const acquisitionDecision = decideMcpLifecycleAcquisition({
+        phase: "reaper",
+        lock: reaperDecision,
+      });
+      if (acquisitionDecision.kind === "reap") {
+        assertBeforeTimeout();
+        reclaimStaleMcpLifecycleLockGenerationSync(
+          reaperPath,
+          reaperObservation,
+          assertBeforeTimeout,
+        );
+        continue;
+      }
+      sleepSync(pollIntervalMs);
+      continue;
+    }
+    resetCorruptGenerationTracker(corruptReaperTracker);
+
+    if (!mcpLifecycleLockPathExistsSync(reaperPath)) {
+      const token = crypto.randomUUID();
+      const owner = createMcpLifecycleLockOwner(sandboxName, token);
+      assertBeforeTimeout();
+      if (writeMcpLifecycleLockCandidateAndLinkSync(lockPath, owner)) {
+        const published = readMcpLifecycleLockObservationSync(lockPath);
+        const publicationDecision = decideMcpLifecycleAcquisition({
+          phase: "published",
+          reaperPresent: mcpLifecycleLockPathExistsSync(reaperPath),
+          expectedOwnerToken: token,
+          observedOwnerToken: published?.owner?.token,
+        });
+        if (publicationDecision.kind === "enter") {
+          try {
+            assertBeforeTimeout();
+          } catch (error) {
+            safelyReleaseMcpLifecycleLockSync(lockPath, token);
+            throw error;
+          }
+          return { lockPath, token };
+        }
+        safelyReleaseMcpLifecycleLockSync(lockPath, token);
+      }
+    }
+
+    const observation = readMcpLifecycleLockObservationSync(lockPath);
+    if (observation) {
+      lastOwnerPid = observation.owner?.pid ?? null;
+      const mainDecision = decideObservedMcpLifecycleLock(
+        observation,
+        sandboxName,
+        corruptLockGraceMs,
+        corruptMainTracker,
+        monotonicNow(),
+      );
+      if (
+        decideMcpLifecycleAcquisition({ phase: "main-owner", lock: mainDecision }).kind === "reap"
+      ) {
+        tryReapStaleMainLockSync(
+          lockPath,
+          sandboxName,
+          corruptLockGraceMs,
+          corruptMainTracker,
+          monotonicNow,
+          assertBeforeTimeout,
+        );
+        continue;
+      }
+    } else {
+      lastOwnerPid = null;
+      resetCorruptGenerationTracker(corruptMainTracker);
+    }
+    sleepSync(pollIntervalMs);
+  }
+}
+
+export function isMcpLifecycleLockHeld(
+  sandboxName: string,
+  stateDir = resolveNemoclawStateDir(),
+): boolean {
+  return heldLocks.getStore()?.get(getMcpLifecycleLockPath(sandboxName, stateDir))?.active === true;
+}
+
+export function withMcpLifecycleLockSync<T>(
+  sandboxName: string,
+  operation: () => T,
+  options: McpLifecycleLockOptions = {},
+): T {
+  const stateDir = options.stateDir ?? resolveNemoclawStateDir();
+  const lockPath = getMcpLifecycleLockPath(sandboxName, stateDir);
+  const inherited = heldLocks.getStore();
+  if (inherited?.get(lockPath)?.active) return operation();
+
+  const acquired = acquireMcpLifecycleLockSync(sandboxName, { ...options, stateDir });
+  const lease: HeldLockLease = { active: true };
+  const context = new Map(inherited ?? []);
+  context.set(lockPath, lease);
+  try {
+    return heldLocks.run(context, operation);
+  } finally {
+    lease.active = false;
+    safelyReleaseMcpLifecycleLockSync(acquired.lockPath, acquired.token);
+  }
+}
+
+/** Serialize one sandbox mutation across processes. */
 export async function withMcpLifecycleLock<T>(
   sandboxName: string,
   operation: () => Promise<T> | T,
   options: McpLifecycleLockOptions = {},
 ): Promise<T> {
   const stateDir = options.stateDir ?? resolveNemoclawStateDir();
-  const lockKey = getMcpLifecycleLockPath(sandboxName, stateDir);
+  const lockPath = getMcpLifecycleLockPath(sandboxName, stateDir);
   const inherited = heldLocks.getStore();
-  if (inherited?.get(lockKey)?.active) return await operation();
+  if (inherited?.get(lockPath)?.active) return await operation();
 
-  const acquired = await acquireMcpLifecycleLock(sandboxName, {
-    ...options,
-    stateDir,
-  });
+  const acquired = await acquireMcpLifecycleLock(sandboxName, { ...options, stateDir });
   const lease: HeldLockLease = { active: true };
   const context = new Map(inherited ?? []);
-  context.set(lockKey, lease);
+  context.set(lockPath, lease);
   return heldLocks.run(context, async () => {
     try {
       return await operation();
     } finally {
-      // Async resources created by the callback retain their ALS store. Mark
-      // the lease inactive before releasing so a detached/later promise cannot
-      // mistake an ended parent operation for a still-held reentrant lock.
       lease.active = false;
       await safelyReleaseMcpLifecycleLock(acquired.lockPath, acquired.token);
     }

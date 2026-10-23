@@ -1,13 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import path from "node:path";
+
 import type { RebuildSandboxOptions } from "../../domain/lifecycle/options";
+import {
+  hasLegacySharedLocalInferenceRoute,
+  isPersistedPiSharedLocalInferenceRoute,
+} from "../../inference/selection";
 import type { SandboxMessagingPlan } from "../../messaging";
 import { hydrateCredentialEnv } from "../../onboard/credential-env";
 import { DCODE_AUTO_APPROVAL_FEATURE } from "../../onboard/dcode-auto-approval";
 import { managedSandboxFeatureIssue } from "../../onboard/managed-sandbox-feature";
-import type { RebuildManifest } from "../../state/sandbox";
-import { assertMcpDestroyNotPending } from "./mcp-bridge-state";
+import {
+  type HermesCronRestorePlan,
+  validateHermesCronRestoreBackup,
+} from "../../state/rebuild/hermes-cron-restore-backup";
+import {
+  inspectNativeSandboxState,
+  readRebuildMcpHandoff,
+  readRebuildPolicyHandoff,
+  type RebuildManifest,
+} from "../../state/sandbox";
 import {
   preflightRebuildCredentials,
   type RebuildBail,
@@ -25,6 +39,8 @@ import {
   type RebuildLiveState,
   type RebuildSandboxEntry,
   resolveRebuildLiveState,
+  prepareRebuildStoppedAgentState,
+  restoreRecordedRebuildGatewayStateDir,
 } from "./rebuild-flow-helpers";
 import type { RebuildRecreateOnboardOpts } from "./rebuild-gpu-opt-out";
 import {
@@ -38,13 +54,19 @@ import { printRebuildPreflightFailure } from "./rebuild-preflight-error";
 import {
   acquireRebuildOnboardLock,
   assertRebuildEntryUnchanged,
+  blockRebuildOnRetainedSandboxRecovery,
   checkRebuildGatewaySchemaPreflight,
   expectedRebuildEntryAfterVersionCheck,
   getRebuildSandboxEntryOrBail,
   isSingleAgentRebuildSupported,
+  type RebuildRoutePreflightReceipt,
   runRebuildGatewayIntentPreflight,
 } from "./rebuild-preflight-guards";
-import { prepareRebuildTargetPreflights } from "./rebuild-preflight-target-phase";
+import {
+  pinRebuildTargetGatewayForReadiness,
+  prepareRebuildTargetPreflights,
+  type RebuildPreparedTarget,
+} from "./rebuild-preflight-target-phase";
 import { disposePreparedBuildContext } from "./rebuild-prepared-image-context";
 import {
   type RebuildSandboxExecutionOptions,
@@ -54,20 +76,84 @@ import { checkRebuildGatewayCredentialReuseOrBail } from "./rebuild-provider-pre
 import type { RebuildTargetConfig } from "./rebuild-target-preflight";
 
 export interface RebuildPreflightPhaseResult {
+  stoppedSource?: NonNullable<Awaited<ReturnType<typeof prepareRebuildStoppedAgentState>>>;
   sandboxEntry: RebuildSandboxEntry;
   rebuildAgent: string | null;
   versionCheck: RebuildVersionCheck;
   targetConfig: RebuildTargetConfig;
   recreateOptions: RebuildRecreateOnboardOpts;
   messagingPlan: SandboxMessagingPlan | null;
+  recheckMessagingConflicts: RebuildPreparedTarget["recheckMessagingConflicts"];
   baseImagePreflight: RebuildAgentBaseImagePreflight;
   liveState: RebuildLiveState;
   recoveryManifest: RebuildManifest | null;
   dcodePreflight: DcodeRebuildOrchestrator;
   preparedImage: PreparedRebuildImage | null;
+  routePreflightReceipt: RebuildRoutePreflightReceipt;
   releaseOnboardLock: () => void;
   log: RebuildLog;
   bail: RebuildBail;
+}
+
+interface HermesCronRestoreBackupPreflightInput {
+  rebuildAgent: string | null;
+  backupManifest: RebuildManifest | null;
+  log: RebuildLog;
+  bail: RebuildBail;
+}
+
+export function runHermesCronRestoreBackupPreflight({
+  rebuildAgent,
+  backupManifest,
+  log,
+  bail,
+}: HermesCronRestoreBackupPreflightInput): {
+  plan: HermesCronRestorePlan | null;
+} | null {
+  if (rebuildAgent !== "hermes" || !backupManifest?.nativeState) {
+    return { plan: null };
+  }
+  const backupPath = backupManifest.backupPath;
+  try {
+    const plan = inspectNativeSandboxState(
+      backupPath,
+      (nativeRoot) => validateHermesCronRestoreBackup(path.join(nativeRoot, ".hermes")),
+      ".hermes",
+    );
+    log(
+      `Hermes cron restore preflight: activeJobs=${String(plan.activeJobs)}, scriptJobs=${String(plan.scriptJobs)}, gate=${String(plan.requiresDispatchGate)}`,
+    );
+    return { plan };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    printRebuildPreflightFailure(
+      `the Hermes cron backup failed script-reference validation: ${detail}`,
+      `Repair or disable the affected job before rebuilding. Backup: ${backupPath}`,
+      "Hermes cron restore preflight failed.",
+      bail,
+    );
+    return null;
+  }
+}
+
+/** Stop before backup or deletion when an old local route cannot be recreated. */
+export function blockRebuildOnLegacySharedLocalRoute(
+  sandboxName: string,
+  sandboxEntry: RebuildSandboxEntry,
+  bail: RebuildBail,
+): boolean {
+  if (
+    !hasLegacySharedLocalInferenceRoute(sandboxEntry) ||
+    isPersistedPiSharedLocalInferenceRoute(sandboxEntry)
+  )
+    return false;
+  printRebuildPreflightFailure(
+    `sandbox '${sandboxName}' uses a legacy shared local inference route without a native provider attachment.`,
+    "Back up the sandbox, then re-onboard it with --fresh --name <name> --recreate-sandbox before upgrading OpenShell.",
+    "Legacy shared local inference cannot be rebuilt safely",
+    bail,
+  );
+  return true;
 }
 
 /**
@@ -90,22 +176,11 @@ export async function runRebuildPreflightPhase(
     requestedObservabilityEnabled,
     skipConfirm,
   } = createRebuildCommandContext(options, opts);
-  const activeSessionCount = countActiveSandboxSessionsForRebuild(sandboxName);
   const sandboxEntry = getRebuildSandboxEntryOrBail(sandboxName, bail);
   if (!sandboxEntry) return null;
-  // #6376: refuse a stuck MCP destroy transaction up front — before backup,
-  // image prep, or the old-sandbox delete. The only MCP marker check used to
-  // live inside the destroy phase, which runs AFTER the backup phase, so a
-  // stuck sandbox paid destructive/backup cost before the guard fired. Moving
-  // it here fails closed before any destructive work; the guard's message is
-  // phase-aware (prepared -> non-destructive `mcp remove --force`; pending ->
-  // finish the destroy).
-  try {
-    assertMcpDestroyNotPending(sandboxEntry);
-  } catch (error) {
-    bail(error instanceof Error ? error.message : String(error));
-    return null;
-  }
+  if (blockRebuildOnLegacySharedLocalRoute(sandboxName, sandboxEntry, bail)) return null;
+  if (blockRebuildOnRetainedSandboxRecovery(sandboxEntry, bail)) return null;
+  restoreRecordedRebuildGatewayStateDir(sandboxEntry);
   const confirmedEntrySnapshot = JSON.stringify(sandboxEntry);
   const allowLegacyManagedImageRecovery =
     opts.recoveryManifest !== undefined && opts.allowLegacyManagedImageRecovery === true;
@@ -152,10 +227,22 @@ export async function runRebuildPreflightPhase(
     return null;
   }
   const agentName = getRebuildAgentDisplayName(sandboxName);
+  const mcpRuntimeSelection = recoveryManifest
+    ? (readRebuildMcpHandoff(recoveryManifest)?.runtimeSelection ?? undefined)
+    : undefined;
+  if (mcpRuntimeSelection) {
+    pinRebuildTargetGatewayForReadiness(sandboxName, sandboxEntry, log, mcpRuntimeSelection);
+  }
+  const activeSessionCount = countActiveSandboxSessionsForRebuild(sandboxName);
   const versionCheck = await runRebuildGatewayIntentPreflight({
-    checkGatewaySchema: () =>
+    checkGatewaySchema: async () =>
       isDcodeRebuildAgent(rebuildAgent) ||
-      checkRebuildGatewaySchemaPreflight(sandboxName, sandboxEntry, bail),
+      (await checkRebuildGatewaySchemaPreflight(
+        sandboxName,
+        sandboxEntry,
+        bail,
+        mcpRuntimeSelection,
+      )),
     confirmIntent: () =>
       confirmRebuildIntent(
         sandboxName,
@@ -176,11 +263,17 @@ export async function runRebuildPreflightPhase(
     sandboxName,
     entry: expectedSandboxEntry,
     rebuildAgent,
+    managedWorkloadRebuild: expectedSandboxEntry.workload?.kind === "managed-image",
     log,
     bail,
     deps: {
-      checkGatewaySchema: (name, scopedBail) =>
-        checkRebuildGatewaySchemaPreflight(name, expectedSandboxEntry, scopedBail),
+      checkGatewaySchema: (name, scopedBail, runtimeSelection) =>
+        checkRebuildGatewaySchemaPreflight(
+          name,
+          expectedSandboxEntry,
+          scopedBail,
+          runtimeSelection,
+        ),
       preflightCredentials: (_name, entry, scopedLog, scopedBail) =>
         preflightRebuildCredentials(entry, scopedLog, scopedBail),
       // Non-DCode rebuilds stay on the existing typed base-image preflight.
@@ -193,8 +286,11 @@ export async function runRebuildPreflightPhase(
   let retainPreparedImage = false;
   let baseImagePreflight: RebuildAgentBaseImagePreflight | null = null;
   let retainBaseImagePreflight = false;
+  let stoppedSource: Awaited<ReturnType<typeof prepareRebuildStoppedAgentState>> = null;
+  let retainStoppedSource = false;
   try {
     const releaseOnboardLock = acquireRebuildOnboardLock(sandboxName, bail);
+    if (!releaseOnboardLock) return null;
     let retainOnboardLock = false;
     try {
       assertRebuildEntryUnchanged(sandboxName, JSON.stringify(expectedSandboxEntry), bail);
@@ -209,6 +305,7 @@ export async function runRebuildPreflightPhase(
         requestedDcodeAutoApprovalMode,
         requestedObservabilityEnabled,
         allowLegacyManagedImageRecovery,
+        mcpRuntimeSelection,
         // A validated prepared backup is the only path allowed to reconstruct
         // a missing gateway provider and route during recreate. The exact
         // endpoint, credential, image, and registry checks still run before
@@ -221,8 +318,24 @@ export async function runRebuildPreflightPhase(
       baseImagePreflight = preparedTarget.baseImagePreflight;
       preparedImage = preparedTarget.preparedImage;
 
-      const liveState = await resolveRebuildLiveState(sandboxName, expectedSandboxEntry, log, bail);
+      const liveState = await resolveRebuildLiveState(
+        sandboxName,
+        expectedSandboxEntry,
+        log,
+        bail,
+        {
+          authoritativeRecoveryPolicyAvailable:
+            recoveryManifest !== null && readRebuildPolicyHandoff(recoveryManifest) !== null,
+        },
+      );
       if (!liveState) return null;
+      stoppedSource = await prepareRebuildStoppedAgentState(
+        expectedSandboxEntry,
+        liveState,
+        recoveryManifest !== null,
+        (name) => (name === sandboxName ? getRebuildSandboxEntryOrBail(name, bail) : null),
+      );
+      stoppedSource?.assertCurrent();
       if (isDcodeRebuildAgent(rebuildAgent)) {
         const recoveryRecreate = liveState.staleRecovery || recoveryManifest !== null;
         const imageReady = await dcodePreflight.prepareImage(
@@ -230,26 +343,34 @@ export async function runRebuildPreflightPhase(
           preparedTarget.targetConfig.durableConfig.webSearchConfig,
           preparedTarget.targetConfig.durableConfig.toolDisclosure,
           preparedTarget.targetConfig.durableConfig.dcodeAutoApprovalMode,
-          recoveryRecreate,
+          recoveryRecreate || stoppedSource !== null,
           preparedTarget.recreateOptions.targetGatewayPort,
+          {
+            resolutionHint: preparedTarget.recreateOptions.baseImageResolutionHint,
+          },
+          preparedTarget.recreateOptions.runtimeSelection,
         );
-        if (!imageReady || !dcodePreflight.preparedReplacement) return null;
-        preparedTarget.recreateOptions.preparedDcodeRebuild = dcodePreflight.preparedReplacement;
+        if (!imageReady) return null;
+        stoppedSource?.assertCurrent();
+        if (!preparedTarget.recreateOptions.managedWorkloadRebuild) {
+          if (!dcodePreflight.preparedReplacement) return null;
+          preparedTarget.recreateOptions.preparedDcodeRebuild = dcodePreflight.preparedReplacement;
+        }
       }
       // Keep credential-reuse validation after DCode's live-route/image proofs,
-      // but before shields, backup, or any destructive rebuild work begins.
+      // but before backup or any destructive rebuild work begins.
       const { resumeConfig } = preparedTarget.targetConfig;
       const hostCredentialAvailable = Boolean(
         resumeConfig.credentialEnv && hydrateCredentialEnv(resumeConfig.credentialEnv),
       );
       if (
-        !checkRebuildGatewayCredentialReuseOrBail(
+        !(await checkRebuildGatewayCredentialReuseOrBail(
           sandboxName,
           resumeConfig,
           hostCredentialAvailable,
           log,
           bail,
-        )
+        ))
       ) {
         return null;
       }
@@ -257,7 +378,9 @@ export async function runRebuildPreflightPhase(
       retainDcodePreflight = true;
       retainPreparedImage = true;
       retainBaseImagePreflight = true;
+      retainStoppedSource = true;
       return {
+        ...(stoppedSource ? { stoppedSource } : {}),
         sandboxEntry: expectedSandboxEntry,
         rebuildAgent,
         versionCheck,
@@ -276,6 +399,15 @@ export async function runRebuildPreflightPhase(
       }
     }
   } finally {
+    if (stoppedSource && !retainStoppedSource) {
+      try {
+        stoppedSource.dispose();
+      } catch {
+        console.warn(
+          `  Warning: private stopped-state capture files could not be fully removed. Remove ${JSON.stringify(stoppedSource.cleanupDirectory)} before retrying.`,
+        );
+      }
+    }
     if (!retainDcodePreflight) dcodePreflight.cleanup();
     if (!retainPreparedImage && preparedImage) disposePreparedBuildContext(preparedImage);
     if (

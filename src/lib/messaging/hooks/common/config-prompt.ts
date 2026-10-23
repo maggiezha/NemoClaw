@@ -61,6 +61,8 @@ export function createConfigPromptHook(
         continue;
       }
 
+      log(options, "");
+
       const existing = readExistingConfigValue(field, availableInputs, options);
       if (existing) {
         recordConfigValue(field, existing, outputs, availableInputs, options);
@@ -296,5 +298,3 @@ function formatMentionMode(value: string): string {
 function log(options: ConfigPromptHookOptions, message: string): void {
   (options.log ?? console.log)(message);
 }
-
-export const configPromptHook = createConfigPromptHook();

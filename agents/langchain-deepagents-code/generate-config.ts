@@ -6,9 +6,25 @@
 // SECURITY: this file writes only non-secret provider/model metadata. Real
 // provider credentials stay outside ~/.deepagents files.
 
+import {
+  nativeLocalCredentialReference,
+  NATIVE_LOCAL_CREDENTIAL_ENV,
+} from "../../src/lib/inference/native-local/agent-config.ts";
+import { nativeHostedAgentConfig } from "../../src/lib/inference/native-provider/agent-config.ts";
+
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import {
+  type ManagedDcodeProvider,
+  managedDcodeRequiresNonemptyContent,
+  normalizeManagedDcodeEndpointUrl,
+  resolveManagedDcodeIdentity,
+} from "../../src/lib/inference/managed-dcode/identity.ts";
+import { NVIDIA_HOSTED_NATIVE_ENDPOINT } from "../../src/lib/inference/native-nvidia/contract.ts";
+
+type ReasoningEffort = "low" | "medium" | "high";
 
 type Settings = {
   model: string;
@@ -17,25 +33,18 @@ type Settings = {
   upstreamProvider: string;
   upstreamEndpointUrl: string | null;
   inferenceApi: string;
+  reasoningEffort: ReasoningEffort | null;
 };
-
-type ManagedDeepAgentsProvider = "openai" | "openrouter";
 
 type ManagedDeepAgentsConfig = {
   text: string;
-  provider: ManagedDeepAgentsProvider;
+  provider: ManagedDcodeProvider;
   model: string;
   defaultModel: string;
 };
 
-const NEMOTRON_ULTRA_MODEL_IDS = new Set([
-  "nvidia/nemotron-3-ultra-550b-a55b",
-  "nvidia/nvidia/nemotron-3-ultra",
-]);
-
-const OPENROUTER_UPSTREAM_PROVIDERS = new Set(["openrouter", "openrouter-api"]);
-const OPENROUTER_ENDPOINT_HOST = "openrouter.ai";
-const OPENROUTER_ENDPOINT_PATH = "/api/v1";
+const MANAGED_INFERENCE_API_KEY_ENV = "DEEPAGENTS_CODE_OPENAI_API_KEY";
+const ATTACHED_PROVIDER_API_KEY_ENV = "NVIDIA_INFERENCE_API_KEY";
 
 function readSettings(env: NodeJS.ProcessEnv): Settings {
   const providerKey = normalizeCommentMetadata(
@@ -55,7 +64,7 @@ function readSettings(env: NodeJS.ProcessEnv): Settings {
         "inference",
       "NEMOCLAW_UPSTREAM_PROVIDER",
     ),
-    upstreamEndpointUrl: normalizeOptionalEndpointUrl(
+    upstreamEndpointUrl: normalizeManagedDcodeEndpointUrl(
       env.NEMOCLAW_UPSTREAM_ENDPOINT_URL,
       "NEMOCLAW_UPSTREAM_ENDPOINT_URL",
     ),
@@ -63,7 +72,17 @@ function readSettings(env: NodeJS.ProcessEnv): Settings {
       env.NEMOCLAW_INFERENCE_API || "openai-completions",
       "NEMOCLAW_INFERENCE_API",
     ),
+    reasoningEffort: normalizeReasoningEffort(env.NEMOCLAW_REASONING_EFFORT),
   };
+}
+
+function normalizeReasoningEffort(value: string | undefined): ReasoningEffort | null {
+  if (value === undefined || value.trim() === "") return null;
+  const text = value.trim();
+  if (text !== "low" && text !== "medium" && text !== "high") {
+    throw new Error("NEMOCLAW_REASONING_EFFORT must be low, medium, or high.");
+  }
+  return text;
 }
 
 function readRequiredEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -77,30 +96,6 @@ function normalizeCommentMetadata(value: string, name: string): string {
     throw new Error(`${name} must not contain control characters.`);
   }
   return value.trim();
-}
-
-function normalizeOptionalEndpointUrl(value: string | undefined, name: string): string | null {
-  if (value === undefined || value.trim() === "") return null;
-  if (/[\p{Cc}\p{Cf}]/u.test(value)) {
-    throw new Error(`${name} must not contain control characters.`);
-  }
-  const text = value.trim();
-  let url: URL;
-  try {
-    url = new URL(text);
-  } catch {
-    throw new Error(`${name} must be a valid URL.`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error(`${name} must use HTTP or HTTPS.`);
-  }
-  if (url.username || url.password) {
-    throw new Error(`${name} must not include credentials.`);
-  }
-  if (url.search || url.hash) {
-    throw new Error(`${name} must not include query strings or fragments.`);
-  }
-  return url.href;
 }
 
 function normalizeInferenceBaseUrl(value: string): string {
@@ -136,87 +131,97 @@ function tomlArray(values: readonly string[]): string {
   return `[${values.map(tomlString).join(", ")}]`;
 }
 
-function managedDeepAgentsProviderFor(settings: Settings): ManagedDeepAgentsProvider {
-  if (OPENROUTER_UPSTREAM_PROVIDERS.has(settings.upstreamProvider)) return "openrouter";
-  if (
-    settings.upstreamProvider === "compatible-endpoint" &&
-    isOpenRouterEndpointUrl(settings.upstreamEndpointUrl)
-  ) {
-    return "openrouter";
-  }
-  return "openai";
-}
-
-function isOpenRouterEndpointUrl(value: string | null): boolean {
-  if (!value) return false;
-  const url = new URL(value);
-  return (
-    url.protocol === "https:" &&
-    url.hostname.toLowerCase() === OPENROUTER_ENDPOINT_HOST &&
-    url.pathname.replace(/\/+$/, "") === OPENROUTER_ENDPOINT_PATH
-  );
-}
-
-function modelNameForManagedProvider(model: string): string {
-  const trimmed = model.trim();
-  for (const prefix of ["openai:", "openrouter:"]) {
-    if (trimmed.startsWith(prefix)) return trimmed.slice(prefix.length);
-  }
-  return trimmed;
-}
-
-function openAiModelRequestParamLines(model: string): string[] {
+function openAiModelRequestParamLines(
+  model: string,
+  reasoningEffort: ReasoningEffort | null,
+  baseUrl: string,
+): string[] {
   // Source boundary: NVIDIA's Ultra serving template owns the empty assistant
   // content behavior; this generator owns only the managed per-model request
   // parameters. Keep the exact invalid state, regression proof, and separate
   // removal conditions for this option and the dispatch guard in
   // dependency-review.md under "Managed Ultra compatibility workarounds."
-  return NEMOTRON_ULTRA_MODEL_IDS.has(model)
-    ? [
-        "",
-        `[models.providers.openai.params.${tomlString(model)}]`,
-        "# Nemotron Ultra coding-agent requests need nonempty content when tool calls and reasoning are combined.",
-        "extra_body = { chat_template_kwargs = { force_nonempty_content = true } }",
-      ]
-    : [];
+  const isUltra = managedDcodeRequiresNonemptyContent(model, baseUrl);
+  const extraBodyEntries = [
+    ...(isUltra ? ["chat_template_kwargs = { force_nonempty_content = true }"] : []),
+    ...(reasoningEffort ? [`reasoning_effort = ${tomlString(reasoningEffort)}`] : []),
+  ];
+  if (extraBodyEntries.length === 0) return [];
+  return [
+    "",
+    `[models.providers.openai.params.${tomlString(model)}]`,
+    ...(isUltra
+      ? [
+          "# Nemotron Ultra coding-agent requests need nonempty content when tool calls and reasoning are combined.",
+        ]
+      : []),
+    `extra_body = { ${extraBodyEntries.join(", ")} }`,
+  ];
 }
 
 function providerConfigLines(
-  provider: ManagedDeepAgentsProvider,
+  provider: ManagedDcodeProvider,
   model: string,
   baseUrl: string,
+  reasoningEffort: ReasoningEffort | null,
+  upstreamProvider: string,
 ): string[] {
+  const nativeHosted = nativeHostedAgentConfig(upstreamProvider, baseUrl);
+  const apiKeyEnv = nativeLocalCredentialReference(upstreamProvider, baseUrl)
+    ? NATIVE_LOCAL_CREDENTIAL_ENV
+    : (nativeHosted?.credentialEnv ??
+      (baseUrl === NVIDIA_HOSTED_NATIVE_ENDPOINT
+        ? ATTACHED_PROVIDER_API_KEY_ENV
+        : MANAGED_INFERENCE_API_KEY_ENV));
   return [
     `[models.providers.${provider}]`,
     `models = ${tomlArray([model])}`,
-    'api_key_env = "DEEPAGENTS_CODE_OPENAI_API_KEY"',
+    `api_key_env = ${tomlString(apiKeyEnv)}`,
     `base_url = ${tomlString(baseUrl)}`,
     "enabled = true",
+    ...(nativeHosted?.headers
+      ? [
+          "",
+          `[models.providers.${provider}.params.${tomlString(model)}]`,
+          `default_headers = { "HTTP-Referer" = "https://www.nvidia.com/nemoclaw/", "X-OpenRouter-Title" = "NVIDIA NemoClaw" }`,
+        ]
+      : []),
     ...(provider === "openai"
       ? [
           "",
           "[models.providers.openai.params]",
-          "# NemoClaw-managed inference.local currently exposes Chat Completions.",
-          "# Remove this override when that route supports OpenAI Responses API.",
+          "# NemoClaw-managed OpenAI-compatible routes use Chat Completions.",
+          "# Remove this override when the selected route supports OpenAI Responses API.",
           "use_responses_api = false",
-          ...openAiModelRequestParamLines(model),
+          ...openAiModelRequestParamLines(model, reasoningEffort, baseUrl),
         ]
       : []),
   ];
 }
 
 function buildConfig(settings: Settings): ManagedDeepAgentsConfig {
-  const provider = managedDeepAgentsProviderFor(settings);
-  const model = modelNameForManagedProvider(settings.model);
-  const defaultModel = `${provider}:${model}`;
+  const { provider, model, defaultModel } = resolveManagedDcodeIdentity(
+    settings.upstreamProvider,
+    settings.model,
+    settings.upstreamEndpointUrl,
+  );
   const text = [
     "# Generated by NemoClaw. This file contains no provider secrets.",
     `# NemoClaw provider route: ${settings.providerKey}; upstream provider: ${settings.upstreamProvider}; API: ${settings.inferenceApi}.`,
     "",
     "[models]",
     `default = ${tomlString(defaultModel)}`,
+    // A managed sandbox has credentials only for its selected inference route.
+    // Use a separate classifier request on that route, preserving Auto's policy.
+    `auto_classifier = ${tomlString(defaultModel)}`,
     "",
-    ...providerConfigLines(provider, model, settings.baseUrl),
+    ...providerConfigLines(
+      provider,
+      model,
+      settings.baseUrl,
+      settings.reasoningEffort,
+      settings.upstreamProvider,
+    ),
     "",
     "[update]",
     "check = false",
@@ -234,7 +239,6 @@ function main(): void {
   const settings = readSettings(process.env);
   const configDir = join(homedir(), ".deepagents");
   mkdirSync(join(configDir, ".state"), { recursive: true, mode: 0o770 });
-  mkdirSync(join(configDir, "skills"), { recursive: true, mode: 0o770 });
 
   const configPath = join(configDir, "config.toml");
   const config = buildConfig(settings);

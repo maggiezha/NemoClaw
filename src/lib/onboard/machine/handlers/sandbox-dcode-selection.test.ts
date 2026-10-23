@@ -6,10 +6,11 @@ import { describe, expect, it, vi } from "vitest";
 import { createSession, type Session } from "../../../state/onboard-session";
 import type { SandboxEntry } from "../../../state/registry";
 import { handleSandboxState } from "./sandbox";
-import { baseOptions, createDeps } from "./sandbox-test-fixtures";
+import { baseOptions, bindJournaledRecreate, createDeps } from "./sandbox-test-fixtures";
 
 vi.mock("../../messaging-channel-setup", () => ({
   detectMessagingChannelsFromEnv: vi.fn(() => []),
+  detectUnconfiguredMessagingChannels: vi.fn(() => []),
 }));
 
 function completedSession() {
@@ -39,9 +40,12 @@ function dcodeRegistryEntry(
   };
 }
 
-function dcodeOptions(deps: ReturnType<typeof createDeps>["deps"]) {
+function dcodeOptions(
+  deps: ReturnType<typeof createDeps>["deps"],
+  session: Session = completedSession(),
+) {
   return {
-    ...baseOptions(deps, completedSession()),
+    ...baseOptions(deps, session),
     resume: true,
     sandboxName: "saved",
     agent: { name: "langchain-deepagents-code", displayName: "Deep Agents Code" },
@@ -49,7 +53,7 @@ function dcodeOptions(deps: ReturnType<typeof createDeps>["deps"]) {
 }
 
 describe("handleSandboxState live DCode selection", () => {
-  it("carries durable observability intent in the sandbox create intent", async () => {
+  it("keeps observability in the create intent when the verified-create callback is absent (#10964)", async () => {
     const session = createSession({
       observabilityEnabled: true,
       observabilityRequestedExplicitly: true,
@@ -66,16 +70,18 @@ describe("handleSandboxState live DCode selection", () => {
       agent: { name: "langchain-deepagents-code" },
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toEqual({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       resolved: expect.any(Object),
       recreate: false,
       toolDisclosure: "progressive",
       observabilityEnabled: true,
-      endpointSource: "onboard",
+      endpointSource: null,
       observabilityRequestedExplicitly: true,
       dcodeAutoApprovalMode: "disabled",
       extraProviders: [],
     });
+    expect(calls.createSandbox.mock.calls[0]).toHaveLength(17);
+    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toBeUndefined();
   });
 
   it("carries authoritative thread opt-in in the create intent (#6478)", async () => {
@@ -88,31 +94,38 @@ describe("handleSandboxState live DCode selection", () => {
       requestedDcodeAutoApprovalMode: "thread-opt-in",
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       dcodeAutoApprovalMode: "thread-opt-in",
     });
   });
 
   it("recreates a ready DCode sandbox when the image-baked mode changes (#6478)", async () => {
     const session = completedSession();
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getSandboxRegistryEntry: (name: string) => ({
-        ...dcodeRegistryEntry(name),
-        dcodeAutoApprovalMode: "disabled",
-      }),
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
+    const journal = bindJournaledRecreate(session, "saved", "langchain-deepagents-code");
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "ready",
+        getSandboxRecreateObservation: journal.observe,
+        getSandboxRegistryEntry: (name: string) => ({
+          ...dcodeRegistryEntry(name),
+          dcodeAutoApprovalMode: "disabled",
+        }),
+        createSandbox: journal.completeCreate,
+        updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
+          return mutator(session) ?? session;
+        }),
+      },
+      session,
+    );
 
     await handleSandboxState({
-      ...dcodeOptions(deps),
+      ...dcodeOptions(deps, session),
       requestedDcodeAutoApprovalMode: "thread-opt-in",
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(journal.completeCreate.mock.calls[0]?.at(-2)).toMatchObject({
       recreate: true,
+      recreateTransaction: expect.any(Object),
       dcodeAutoApprovalMode: "thread-opt-in",
     });
     expect(calls.note).toHaveBeenCalledWith(
@@ -122,29 +135,39 @@ describe("handleSandboxState live DCode selection", () => {
 
   it("repairs a not-ready DCode sandbox before recreating for mode drift (#6478)", async () => {
     const session = completedSession();
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "not_ready",
-      getSandboxRegistryEntry: (name: string) => ({
-        ...dcodeRegistryEntry(name),
-        dcodeAutoApprovalMode: "disabled",
-      }),
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
+    const journal = bindJournaledRecreate(session, "saved", "langchain-deepagents-code");
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "not_ready",
+        getSandboxRecreateObservation: journal.observe,
+        getSandboxRegistryEntry: (name: string) => ({
+          ...dcodeRegistryEntry(name),
+          dcodeAutoApprovalMode: "disabled",
+        }),
+        createSandbox: journal.completeCreate,
+        updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
+          return mutator(session) ?? session;
+        }),
+      },
+      session,
+    );
 
     await handleSandboxState({
-      ...dcodeOptions(deps),
+      ...dcodeOptions(deps, session),
       requestedDcodeAutoApprovalMode: "thread-opt-in",
     });
 
-    expect(calls.repairSandbox).toHaveBeenCalledWith("saved");
+    expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.started", {
+      state: "sandbox",
+      metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
+    });
     expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.completed", {
       state: "sandbox",
       metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
     });
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(journal.completeCreate.mock.calls[0]?.at(-2)).toMatchObject({
       recreate: true,
+      recreateTransaction: expect.any(Object),
       dcodeAutoApprovalMode: "thread-opt-in",
     });
   });
@@ -172,7 +195,7 @@ describe("handleSandboxState live DCode selection", () => {
     ["changed", { changed: true, unknown: false }],
     ["unreadable", { changed: false, unknown: true }],
   ])("recreates a ready sandbox when live selection is %s (#6311)", async (_label, drift) => {
-    const getDcodeSelectionDrift = vi.fn(() => drift);
+    const getDcodeSelectionDrift = vi.fn(async () => drift);
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
       getDcodeSelectionDrift,
@@ -186,10 +209,13 @@ describe("handleSandboxState live DCode selection", () => {
       "provider",
       "model",
       "openai-completions",
+      null,
+      false,
     );
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toEqual({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       resolved: expect.any(Object),
       recreate: true,
+      reservePublishedRouteAfterBackup: expect.any(Function),
       toolDisclosure: "progressive",
       observabilityEnabled: false,
       endpointSource: null,
@@ -202,7 +228,7 @@ describe("handleSandboxState live DCode selection", () => {
   it("preserves registry fidelity when GPU drift recreates managed DCode (#6311)", async () => {
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
-      getDcodeSelectionDrift: () => ({ changed: false, unknown: false }),
+      getDcodeSelectionDrift: async () => ({ changed: false, unknown: false }),
       hasSandboxGpuDrift: () => true,
       getSandboxRegistryEntry: (name) => dcodeRegistryEntry(name),
     });
@@ -210,9 +236,10 @@ describe("handleSandboxState live DCode selection", () => {
     await handleSandboxState(dcodeOptions(deps));
 
     expect(calls.removeSandbox).not.toHaveBeenCalled();
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toEqual({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       resolved: expect.any(Object),
       recreate: true,
+      reservePublishedRouteAfterBackup: expect.any(Function),
       toolDisclosure: "progressive",
       observabilityEnabled: false,
       endpointSource: null,
@@ -221,23 +248,85 @@ describe("handleSandboxState live DCode selection", () => {
     });
   });
 
-  it("reuses a ready sandbox only after the live selection is verified (#6311)", async () => {
-    const getDcodeSelectionDrift = vi.fn(() => ({ changed: false, unknown: false }));
+  it.each([
+    undefined,
+    {
+      schemaVersion: 1 as const,
+      profileId: "nemoclaw-openai-inference-v1",
+      providerName: "nemoclaw-openai-api-v1",
+      providerId: "provider-id",
+    },
+  ])(
+    "uses the recorded attachment when verifying a ready sandbox: %j",
+    async (nativeHostedProviderAttachment) => {
+      const getDcodeSelectionDrift = vi.fn(async () => ({
+        changed: false,
+        unknown: false,
+      }));
+      const { deps, calls } = createDeps({
+        getSandboxReuseState: () => "ready",
+        getDcodeSelectionDrift,
+        getSandboxRegistryEntry: (name) => ({
+          ...dcodeRegistryEntry(name, {
+            provider: "openai-api",
+            model: "model",
+          }),
+          nativeHostedProviderAttachment,
+        }),
+      });
+
+      await handleSandboxState({
+        ...dcodeOptions(deps),
+        provider: "openai-api",
+      });
+
+      expect(getDcodeSelectionDrift).toHaveBeenCalledExactlyOnceWith(
+        "saved",
+        "openai-api",
+        "model",
+        "openai-completions",
+        null,
+        Boolean(nativeHostedProviderAttachment),
+      );
+      expect(calls.createSandbox).not.toHaveBeenCalled();
+      expect(calls.skipped).toHaveBeenCalledWith("sandbox", "saved", "reuse");
+    },
+  );
+
+  it("reuses a ready OpenRouter-compatible sandbox after endpoint-aware verification (#9555)", async () => {
+    const endpointUrl = "https://openrouter.ai/api/v1/";
+    const getDcodeSelectionDrift = vi.fn(async () => ({ changed: false, unknown: false }));
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
       getDcodeSelectionDrift,
-      getSandboxRegistryEntry: (name) => dcodeRegistryEntry(name),
+      getSandboxRegistryEntry: (name) =>
+        dcodeRegistryEntry(name, {
+          provider: "compatible-endpoint",
+          model: "nvidia/nemotron-3-ultra-550b-a55b",
+        }),
     });
 
-    await handleSandboxState(dcodeOptions(deps));
+    await handleSandboxState({
+      ...dcodeOptions(deps),
+      provider: "compatible-endpoint",
+      model: "nvidia/nemotron-3-ultra-550b-a55b",
+      endpointUrl,
+    });
 
-    expect(getDcodeSelectionDrift).toHaveBeenCalledOnce();
+    expect(getDcodeSelectionDrift).toHaveBeenCalledWith(
+      "saved",
+      "compatible-endpoint",
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "openai-completions",
+      endpointUrl,
+      false,
+    );
     expect(calls.createSandbox).not.toHaveBeenCalled();
-    expect(calls.skipped).toHaveBeenCalledWith("sandbox", "saved");
+    expect(calls.skipped).toHaveBeenCalledWith("sandbox", "saved", "reuse");
   });
 
   it("refuses managed DCode reuse when the registry record is missing (#6311)", async () => {
-    const getDcodeSelectionDrift = vi.fn(() => ({ changed: false, unknown: false }));
+    const getDcodeSelectionDrift = vi.fn(async () => ({ changed: false, unknown: false }));
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
       getDcodeSelectionDrift,
@@ -254,30 +343,47 @@ describe("handleSandboxState live DCode selection", () => {
   });
 
   it("keeps custom DCode images outside the managed identity contract (#6311)", async () => {
-    const getDcodeSelectionDrift = vi.fn(() => ({ changed: true, unknown: true }));
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getDcodeSelectionDrift,
-      getSandboxRegistryEntry: (name) => ({
-        ...dcodeRegistryEntry(name),
-        fromDockerfile: "/tmp/CustomDockerfile",
-      }),
+    const session = completedSession();
+    const registryEntry: SandboxEntry = {
+      ...dcodeRegistryEntry("saved"),
+      fromDockerfile: "/tmp/CustomDockerfile",
+      pendingRouteReservation: true,
+      reservationSessionId: session.sessionId,
+    };
+    const getDcodeSelectionDrift = vi.fn(async () => ({ changed: true, unknown: true }));
+    const finalizeSandboxRouteReservation = vi.fn((name: string, sessionId: string) => {
+      expect(name).toBe(registryEntry.name);
+      expect(sessionId).toBe(registryEntry.reservationSessionId);
+      delete registryEntry.pendingRouteReservation;
+      return true;
     });
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "ready",
+        getDcodeSelectionDrift,
+        getSandboxRegistryEntry: () => registryEntry,
+        finalizeSandboxRouteReservation,
+      },
+      session,
+    );
 
     await handleSandboxState({
-      ...dcodeOptions(deps),
+      ...dcodeOptions(deps, session),
       fromDockerfile: "/tmp/CustomDockerfile",
     });
 
     expect(getDcodeSelectionDrift).not.toHaveBeenCalled();
     expect(calls.createSandbox).not.toHaveBeenCalled();
-    expect(calls.updateSandbox).toHaveBeenCalledWith("saved", {
-      pendingRouteReservation: undefined,
-    });
+    expect(finalizeSandboxRouteReservation).toHaveBeenCalledExactlyOnceWith(
+      "saved",
+      session.sessionId,
+    );
+    expect(registryEntry.pendingRouteReservation).toBeUndefined();
+    expect(registryEntry.reservationSessionId).toBe(session.sessionId);
   });
 
   it("fails closed for missing registry selection before live reuse (#6311)", async () => {
-    const getDcodeSelectionDrift = vi.fn(() => ({ changed: false, unknown: false }));
+    const getDcodeSelectionDrift = vi.fn(async () => ({ changed: false, unknown: false }));
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
       getDcodeSelectionDrift,
@@ -291,23 +397,49 @@ describe("handleSandboxState live DCode selection", () => {
   });
 
   it("backfills stale registry selection after verified live reuse (#6311)", async () => {
-    const getDcodeSelectionDrift = vi.fn(() => ({ changed: false, unknown: false }));
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getDcodeSelectionDrift,
-      getSandboxRegistryEntry: (name) =>
-        dcodeRegistryEntry(name, { provider: "old-provider", model: "old-model" }),
+    const session = completedSession();
+    const registryEntry: SandboxEntry = {
+      ...dcodeRegistryEntry("saved", { provider: "old-provider", model: "old-model" }),
+      pendingRouteReservation: true,
+      reservationSessionId: session.sessionId,
+    };
+    const getDcodeSelectionDrift = vi.fn(async () => ({ changed: false, unknown: false }));
+    const updateSandboxRegistry = vi.fn((_name: string, updates: Record<string, unknown>) => {
+      Object.assign(registryEntry, updates);
     });
+    const finalizeSandboxRouteReservation = vi.fn((name: string, sessionId: string) => {
+      expect(name).toBe(registryEntry.name);
+      expect(sessionId).toBe(registryEntry.reservationSessionId);
+      delete registryEntry.pendingRouteReservation;
+      return true;
+    });
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "ready",
+        getDcodeSelectionDrift,
+        getSandboxRegistryEntry: () => registryEntry,
+        updateSandboxRegistry,
+        finalizeSandboxRouteReservation,
+      },
+      session,
+    );
 
-    await handleSandboxState(dcodeOptions(deps));
+    await handleSandboxState(dcodeOptions(deps, session));
 
     expect(calls.createSandbox).not.toHaveBeenCalled();
-    expect(calls.updateSandbox).toHaveBeenCalledWith("saved", {
+    expect(updateSandboxRegistry).toHaveBeenCalledWith("saved", {
       provider: "provider",
       model: "model",
     });
-    expect(calls.updateSandbox).toHaveBeenCalledWith("saved", {
-      pendingRouteReservation: undefined,
+    expect(finalizeSandboxRouteReservation).toHaveBeenCalledExactlyOnceWith(
+      "saved",
+      session.sessionId,
+    );
+    expect(registryEntry).toMatchObject({
+      provider: "provider",
+      model: "model",
+      reservationSessionId: session.sessionId,
     });
+    expect(registryEntry.pendingRouteReservation).toBeUndefined();
   });
 });

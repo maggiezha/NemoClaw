@@ -7,9 +7,10 @@
  * Checks all required gates and outputs structured JSON.
  * Claude uses the output to decide: approve, route to salvage, or report blockers.
  *
- * Usage: node --experimental-strip-types --no-warnings .agents/skills/nemoclaw-maintainer-day/scripts/check-gates.ts <pr-number> [--repo OWNER/REPO]
+ * Usage: node --no-warnings .agents/skills/nemoclaw-maintainer-day/scripts/check-gates.ts <pr-number> [--repo OWNER/REPO]
  */
 
+import { isDeepStrictEqual } from "node:util";
 import {
   ghJson,
   isRiskyFile,
@@ -312,13 +313,6 @@ interface ExactDiffIdentity {
   headRepository: string;
 }
 
-interface E2eCoordinationEvidence {
-  valid: boolean | null;
-  startedAt?: number;
-  completedAt?: number;
-  trustedLegacyCheckId?: number;
-}
-
 function parseGitHubTimestamp(value: string | undefined): number {
   const match = value?.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?Z$/u);
   if (!match) return Number.NaN;
@@ -333,92 +327,6 @@ function parseGitHubTimestamp(value: string | undefined): number {
     parsed.getUTCSeconds() === second
     ? Date.parse(match[0])
     : Number.NaN;
-}
-
-function fetchE2eCoordinationEvidence(
-  repo: string,
-  exactDiff: ExactDiffIdentity,
-): E2eCoordinationEvidence {
-  const checkNames = ["E2E / PR Gate Coordination", "E2E / PR Gate"];
-  const checkRuns: Array<Record<string, unknown>> = [];
-  const ids = new Set<number>();
-  for (const checkName of checkNames) {
-    const pages = ghJson([
-      "api",
-      "--paginate",
-      "--slurp",
-      `repos/${repo}/commits/${exactDiff.headSha}/check-runs?check_name=${encodeURIComponent(checkName)}&filter=all&per_page=100`,
-    ]);
-    if (!Array.isArray(pages) || pages.length === 0) return { valid: null };
-
-    let expectedTotal: number | null = null;
-    let observedTotal = 0;
-    for (const page of pages) {
-      if (typeof page !== "object" || page === null || Array.isArray(page)) {
-        return { valid: null };
-      }
-      const { total_count: totalCount, check_runs: pageRuns } = page as Record<string, unknown>;
-      if (
-        !Number.isSafeInteger(totalCount) ||
-        (totalCount as number) < 0 ||
-        (expectedTotal !== null && totalCount !== expectedTotal) ||
-        !Array.isArray(pageRuns)
-      ) {
-        return { valid: null };
-      }
-      expectedTotal = totalCount as number;
-      observedTotal += pageRuns.length;
-      for (const value of pageRuns) {
-        if (typeof value !== "object" || value === null || Array.isArray(value)) {
-          return { valid: null };
-        }
-        const record = value as Record<string, unknown>;
-        if (
-          !Number.isSafeInteger(record.id) ||
-          (record.id as number) < 1 ||
-          ids.has(record.id as number) ||
-          (typeof record.external_id !== "string" && record.external_id !== null)
-        ) {
-          return { valid: null };
-        }
-        ids.add(record.id as number);
-        checkRuns.push(record);
-      }
-    }
-    if (expectedTotal === null || observedTotal !== expectedTotal) {
-      return { valid: null };
-    }
-  }
-
-  const externalId = `nemoclaw-pr-e2e:v2:${exactDiff.number}:${exactDiff.headSha}:${exactDiff.baseSha}`;
-  const exactChecks = checkRuns.filter((check) => check.external_id === externalId);
-  if (exactChecks.length !== 1) return { valid: false };
-  const exact = exactChecks[0];
-  const app = exact.app;
-  const startedAt =
-    typeof exact.started_at === "string" ? parseGitHubTimestamp(exact.started_at) : Number.NaN;
-  const completedAt =
-    typeof exact.completed_at === "string" ? parseGitHubTimestamp(exact.completed_at) : Number.NaN;
-  const valid =
-    typeof exact.name === "string" &&
-    checkNames.includes(exact.name) &&
-    exact.head_sha === exactDiff.headSha &&
-    typeof app === "object" &&
-    app !== null &&
-    !Array.isArray(app) &&
-    (app as Record<string, unknown>).id === 15368 &&
-    exact.status === "completed" &&
-    exact.conclusion === "success" &&
-    Number.isFinite(startedAt) &&
-    Number.isFinite(completedAt) &&
-    startedAt <= completedAt;
-  return {
-    valid,
-    ...(valid ? { startedAt, completedAt } : {}),
-    ...(valid && exact.name === "E2E / PR Gate"
-      ? { trustedLegacyCheckId: exact.id as number }
-      : {}),
-  };
 }
 
 const ACTION_STATUSES = new Set([
@@ -446,15 +354,15 @@ const PR_CI_RUN_TITLE =
   /^CI PR #([1-9][0-9]*) head ([a-f0-9]{40}) base ([a-f0-9]{40}) gate (true|false)$/u;
 const INSTALLER_HASH_RUN_TITLE =
   /^Installer Hash PR #([1-9][0-9]*) head ([a-f0-9]{40}) base ([a-f0-9]{40}) gate (true|false)$/u;
-const E2E_GATE_RUN_TITLE =
-  /^E2E Gate PR #([1-9][0-9]*) head ([a-f0-9]{40}) base ([a-f0-9]{40}) gate (true|false)$/u;
+const PR_REVIEW_ADVISOR_RUN_TITLE =
+  /^Advisor after CI PR #([1-9][0-9]*) head ([a-f0-9]{40}) base ([a-f0-9]{40}) gate true$/u;
+const REPOSITORY_NAME_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 const REQUIRED_CHECK_WORKFLOW_PATHS = new Map([
   ["checks", ".github/workflows/pr.yaml"],
   ["changes", ".github/workflows/pr.yaml"],
   ["check-hash", ".github/workflows/installer-hash-check.yaml"],
   ["commit-lint", ".github/workflows/commit-lint.yaml"],
   ["dco-check", ".github/workflows/dco-check.yaml"],
-  ["E2E / PR Gate", ".github/workflows/pr-e2e-gate.yaml"],
 ]);
 const PR_METADATA_EDIT_JOB_NAMES = new Set([
   "build-typecheck",
@@ -462,13 +370,24 @@ const PR_METADATA_EDIT_JOB_NAMES = new Set([
   "checks",
   "cli-test-shards",
   "cli-tests",
+  "compile-artifacts",
   "docs-only-checks",
+  "hugging-face-models",
   "installer-integration",
+  "openshell-sdk-package",
   "plugin-tests",
+  "real-openclaw-dist-harness",
   "reviewed-npm-audit",
   "static-checks",
-  "wechat-runtime-audit",
 ]);
+const PR_REVIEW_ADVISOR_WORKFLOW_NAME = "Automation / PR Review Advisor";
+const PR_REVIEW_ADVISOR_WORKFLOW_PATH = ".github/workflows/pr-review-advisor.yaml";
+const ADVISORY_PR_REVIEW_ADVISOR_JOB_NAMES = new Set([
+  "Require green PR checks",
+  "Discover review specialists and collect GitHub context",
+  "Publish advisor link",
+]);
+const ADVISORY_PR_REVIEW_ADVISOR_SPECIALIST_JOB = /^Specialist \/ [^/]+$/u;
 
 interface ActionRunMetadata {
   attempt: number;
@@ -482,8 +401,6 @@ interface ActionRunMetadata {
   immutablePrDiff: boolean | null;
   prCiGate: boolean | null;
   installerHashGate: boolean | null;
-  e2eGateDiff: boolean | null;
-  e2eGateRun: boolean | null;
   event: string | null;
   path: string | null;
   status: string | null;
@@ -494,6 +411,20 @@ interface ActionJobMetadata {
   name: string;
   status: string;
   conclusion: string | null;
+  startedAt: number | null;
+  completedAt: number | null;
+}
+
+interface CiActionEvidenceCache {
+  actionRunMetadataById: Map<string, ActionRunMetadata | null>;
+  latestAttemptJobsByRun: Map<string, Map<string, ActionJobMetadata> | null>;
+}
+
+function createCiActionEvidenceCache(): CiActionEvidenceCache {
+  return {
+    actionRunMetadataById: new Map(),
+    latestAttemptJobsByRun: new Map(),
+  };
 }
 
 interface CurrentCheckRollup {
@@ -505,13 +436,14 @@ function currentCheckRollup(
   statusCheckRollup: StatusCheck[],
   repo: string,
   exactDiff: ExactDiffIdentity,
-  e2eCoordinationEvidence: E2eCoordinationEvidence,
+  actionEvidence = createCiActionEvidenceCache(),
+  allowActionEvidenceReads = true,
 ): CurrentCheckRollup {
-  const actionRunMetadataById = new Map<string, ActionRunMetadata | null>();
-  const latestAttemptJobsByRun = new Map<string, Map<string, ActionJobMetadata> | null>();
+  const { actionRunMetadataById, latestAttemptJobsByRun } = actionEvidence;
   const incompleteAttemptEvidence = new Set<string>();
 
   const fetchActionRunMetadata = (runId: string): ActionRunMetadata | null => {
+    if (!allowActionEvidenceReads) return null;
     const runData = ghJson(["api", `repos/${repo}/actions/runs/${runId}`]);
     if (typeof runData !== "object" || runData === null || Array.isArray(runData)) {
       return null;
@@ -583,8 +515,6 @@ function currentCheckRollup(
     let immutablePrDiff: boolean | null = null;
     let prCiGate: boolean | null = null;
     let installerHashGate: boolean | null = null;
-    let e2eGateDiff: boolean | null = null;
-    let e2eGateRun: boolean | null = null;
     if (event === "pull_request") {
       const title = typeof record.display_title === "string" ? record.display_title : "";
       const titlePattern =
@@ -609,18 +539,16 @@ function currentCheckRollup(
         }
       }
     }
-    if (event === "pull_request_target" && path === ".github/workflows/pr-e2e-gate.yaml") {
+    if (event === "workflow_run" && path === PR_REVIEW_ADVISOR_WORKFLOW_PATH) {
       const title = typeof record.display_title === "string" ? record.display_title : "";
-      const match = title.match(E2E_GATE_RUN_TITLE);
+      const match = title.match(PR_REVIEW_ADVISOR_RUN_TITLE);
       if (match) {
         const titlePrNumber = Number(match[1]);
-        if (Number.isSafeInteger(titlePrNumber) && titlePrNumber > 0) {
-          e2eGateDiff =
-            titlePrNumber === exactDiff.number &&
-            match[2] === exactDiff.headSha &&
-            match[3] === exactDiff.baseSha;
-          e2eGateRun = match[4] === "true";
-        }
+        immutablePrDiff =
+          Number.isSafeInteger(titlePrNumber) &&
+          titlePrNumber === exactDiff.number &&
+          match[2] === exactDiff.headSha &&
+          match[3] === exactDiff.baseSha;
       }
     }
 
@@ -648,8 +576,6 @@ function currentCheckRollup(
       immutablePrDiff,
       prCiGate,
       installerHashGate,
-      e2eGateDiff,
-      e2eGateRun,
       event,
       path,
       status,
@@ -659,6 +585,7 @@ function currentCheckRollup(
 
   const actionRunMetadata = (runId: string): ActionRunMetadata | null => {
     if (actionRunMetadataById.has(runId)) return actionRunMetadataById.get(runId) ?? null;
+    if (!allowActionEvidenceReads) return null;
     const metadata = fetchActionRunMetadata(runId);
     actionRunMetadataById.set(runId, metadata);
     return metadata;
@@ -666,6 +593,7 @@ function currentCheckRollup(
 
   const latestAttemptJobs = (runId: string): Map<string, ActionJobMetadata> | null => {
     if (latestAttemptJobsByRun.has(runId)) return latestAttemptJobsByRun.get(runId) ?? null;
+    if (!allowActionEvidenceReads) return null;
 
     const metadata = actionRunMetadata(runId);
     if (!metadata) {
@@ -708,10 +636,21 @@ function currentCheckRollup(
           latestAttemptJobsByRun.set(runId, null);
           return null;
         }
-        const { id, name, status, conclusion } = value as Record<string, unknown>;
+        const {
+          id,
+          name,
+          status,
+          conclusion,
+          started_at: startedAt,
+          completed_at: completedAt,
+        } = value as Record<string, unknown>;
         const normalizedStatus = typeof status === "string" ? status.toUpperCase() : null;
         const normalizedConclusion =
           typeof conclusion === "string" ? conclusion.toUpperCase() : conclusion;
+        const parsedStartedAt =
+          typeof startedAt === "string" ? parseGitHubTimestamp(startedAt) : Number.NaN;
+        const parsedCompletedAt =
+          typeof completedAt === "string" ? parseGitHubTimestamp(completedAt) : Number.NaN;
         if (
           !Number.isSafeInteger(id) ||
           (id as number) < 1 ||
@@ -730,6 +669,8 @@ function currentCheckRollup(
           name,
           status: normalizedStatus,
           conclusion: normalizedConclusion,
+          startedAt: Number.isFinite(parsedStartedAt) ? parsedStartedAt : null,
+          completedAt: Number.isFinite(parsedCompletedAt) ? parsedCompletedAt : null,
         });
       }
     }
@@ -755,8 +696,6 @@ function currentCheckRollup(
       refreshed.immutablePrDiff !== metadata.immutablePrDiff ||
       refreshed.prCiGate !== metadata.prCiGate ||
       refreshed.installerHashGate !== metadata.installerHashGate ||
-      refreshed.e2eGateDiff !== metadata.e2eGateDiff ||
-      refreshed.e2eGateRun !== metadata.e2eGateRun ||
       refreshed.event !== metadata.event ||
       refreshed.path !== metadata.path ||
       refreshed.status !== metadata.status ||
@@ -782,7 +721,7 @@ function currentCheckRollup(
       run.event !== "pull_request" ||
       run.path !== ".github/workflows/pr.yaml" ||
       run.status !== "COMPLETED" ||
-      run.conclusion !== "SUCCESS"
+      (run.conclusion !== "SUCCESS" && run.conclusion !== "CANCELLED")
     ) {
       return "not_metadata_edit";
     }
@@ -801,56 +740,10 @@ function currentCheckRollup(
     return hasExactMetadataEditShape ? "recognized" : "invalid";
   };
 
-  const e2eControllerHeadBinding = (run: ActionRunMetadata): "current" | "other" | "unknown" => {
-    if (run.event !== "pull_request_target" || run.path !== ".github/workflows/pr-e2e-gate.yaml") {
-      return "unknown";
-    }
-    if (
-      run.exactDiff === false ||
-      run.e2eGateDiff === false ||
-      run.headShaMatches === false ||
-      run.headRefNameMatches === false ||
-      run.headRepositoryMatches === false
-    ) {
-      return "other";
-    }
-    return e2eCoordinationEvidence.valid === true &&
-      run.e2eGateDiff === true &&
-      run.hasPullRequests === false &&
-      run.headShaMatches === true &&
-      run.headRefNameMatches === true &&
-      run.headRepositoryMatches === true
-      ? "current"
-      : "unknown";
-  };
-
-  const e2eCoordinationIsEnclosed = (run: ActionRunMetadata): boolean =>
-    e2eControllerHeadBinding(run) === "current" &&
-    run.e2eGateRun === true &&
-    e2eCoordinationEvidence.startedAt !== undefined &&
-    e2eCoordinationEvidence.completedAt !== undefined &&
-    run.createdAt <= e2eCoordinationEvidence.startedAt &&
-    e2eCoordinationEvidence.completedAt <= run.updatedAt;
-
   const isNonAttemptRun = (runId: string): boolean => {
     const run = actionRunMetadata(runId);
     const jobs = latestAttemptJobs(runId);
     if (!run || !jobs || jobs.size === 0) return false;
-
-    const allSkippedTargetRun = Boolean(
-      (runIdentityEvidence(runId, true) === "current" ||
-        e2eControllerHeadBinding(run) === "current") &&
-        run.event === "pull_request_target" &&
-        run.path === ".github/workflows/pr-e2e-gate.yaml" &&
-        run.e2eGateDiff === true &&
-        run.e2eGateRun === false &&
-        run.status === "COMPLETED" &&
-        run.conclusion === "SKIPPED" &&
-        [...jobs.values()].every(
-          (job) => job.status === "COMPLETED" && job.conclusion === "SKIPPED",
-        ),
-    );
-    if (allSkippedTargetRun) return true;
     return classifyPrMetadataEditRun(runId) === "recognized";
   };
 
@@ -859,23 +752,20 @@ function currentCheckRollup(
     const jobs = latestAttemptJobs(runId);
     return Boolean(
       run &&
-        jobs &&
-        classifyPrMetadataEditRun(runId) === "not_metadata_edit" &&
-        runIdentityEvidence(runId, true) === "current" &&
-        run.event === event &&
-        run.path === path &&
-        (run.path !== ".github/workflows/pr.yaml" || run.prCiGate === true) &&
-        (run.path !== ".github/workflows/installer-hash-check.yaml" ||
-          run.installerHashGate === true) &&
-        (run.path !== ".github/workflows/pr-e2e-gate.yaml" ||
-          run.event !== "pull_request_target" ||
-          (run.e2eGateDiff === true && run.e2eGateRun === true)) &&
-        run.status === "COMPLETED" &&
-        run.conclusion !== null &&
-        run.conclusion !== "SKIPPED" &&
-        jobs.size > 0 &&
-        [...jobs.values()].every((job) => job.status === "COMPLETED" && job.conclusion !== null) &&
-        [...jobs.values()].some((job) => job.conclusion !== "SKIPPED"),
+      jobs &&
+      classifyPrMetadataEditRun(runId) === "not_metadata_edit" &&
+      runIdentityEvidence(runId, true) === "current" &&
+      run.event === event &&
+      run.path === path &&
+      (run.path !== ".github/workflows/pr.yaml" || run.prCiGate === true) &&
+      (run.path !== ".github/workflows/installer-hash-check.yaml" ||
+        run.installerHashGate === true) &&
+      run.status === "COMPLETED" &&
+      run.conclusion !== null &&
+      run.conclusion !== "SKIPPED" &&
+      jobs.size > 0 &&
+      [...jobs.values()].every((job) => job.status === "COMPLETED" && job.conclusion !== null) &&
+      [...jobs.values()].some((job) => job.conclusion !== "SKIPPED"),
     );
   };
 
@@ -892,13 +782,11 @@ function currentCheckRollup(
     const selected: StatusCheck[] = [];
     const selectedIds = new Set<string>();
     for (const check of checks) {
-      const match = check.detailsUrl?.match(
-        new RegExp(`/actions/runs/${runId}/job/(\\d+)(?:[/?#]|$)`, "u"),
-      );
-      if (!match) return null;
-      if (expectedIds.has(match[1])) {
-        if (selectedIds.has(match[1])) return null;
-        selectedIds.add(match[1]);
+      const identity = actionRunJobIdentity(check);
+      if (!identity || identity.runId !== runId) return null;
+      if (expectedIds.has(identity.jobId)) {
+        if (selectedIds.has(identity.jobId)) return null;
+        selectedIds.add(identity.jobId);
         selected.push(check);
       }
     }
@@ -922,9 +810,6 @@ function currentCheckRollup(
       (expectedWorkflowPath === ".github/workflows/pr.yaml" && runMetadata.prCiGate !== true) ||
       (expectedWorkflowPath === ".github/workflows/installer-hash-check.yaml" &&
         runMetadata.installerHashGate !== true) ||
-      (expectedWorkflowPath === ".github/workflows/pr-e2e-gate.yaml" &&
-        runMetadata.event === "pull_request_target" &&
-        (runMetadata.e2eGateDiff !== true || runMetadata.e2eGateRun !== true)) ||
       runMetadata.status !== "COMPLETED" ||
       runMetadata.conclusion === null ||
       (requiresExactDiff
@@ -939,11 +824,98 @@ function currentCheckRollup(
   const actionRunId = (check: StatusCheck): string | undefined =>
     check.detailsUrl?.match(/\/actions\/runs\/(\d+)(?:\/|$)/)?.[1];
 
-  const isTrustedLegacyE2eCheck = (check: StatusCheck): boolean =>
-    e2eCoordinationEvidence.trustedLegacyCheckId !== undefined &&
-    check.name === "E2E / PR Gate" &&
-    check.detailsUrl?.match(/\/runs\/(\d+)(?:[/?#]|$)/u)?.[1] ===
-      String(e2eCoordinationEvidence.trustedLegacyCheckId);
+  const actionRunJobIdentity = (check: StatusCheck): { runId: string; jobId: string } | null => {
+    if (!check.detailsUrl) return null;
+    let url: URL;
+    try {
+      url = new URL(check.detailsUrl);
+    } catch {
+      return null;
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "github.com" ||
+      url.port ||
+      url.username ||
+      url.password
+    ) {
+      return null;
+    }
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (
+      segments.length !== 7 ||
+      `${segments[0]}/${segments[1]}` !== repo ||
+      segments[2] !== "actions" ||
+      segments[3] !== "runs" ||
+      segments[5] !== "job" ||
+      !/^[1-9][0-9]*$/u.test(segments[4]) ||
+      !/^[1-9][0-9]*$/u.test(segments[6])
+    ) {
+      return null;
+    }
+    return { runId: segments[4], jobId: segments[6] };
+  };
+
+  const associationLessHeadBinding = (
+    metadata: ActionRunMetadata,
+  ): "current" | "other" | "unknown" => {
+    if (
+      metadata.hasPullRequests !== false ||
+      (metadata.event !== "pull_request" && metadata.event !== "pull_request_target")
+    ) {
+      return "unknown";
+    }
+    if (
+      metadata.headShaMatches === false ||
+      metadata.headRefNameMatches === false ||
+      metadata.headRepositoryMatches === false
+    ) {
+      return "other";
+    }
+    return metadata.headShaMatches === true &&
+      metadata.headRefNameMatches === true &&
+      metadata.headRepositoryMatches === true
+      ? "current"
+      : "unknown";
+  };
+
+  const isAuthenticatedAdvisoryPrReviewCheck = (check: StatusCheck): boolean => {
+    const checkName = check.name ?? "";
+    if (
+      check.__typename !== "CheckRun" ||
+      check.workflowName !== PR_REVIEW_ADVISOR_WORKFLOW_NAME ||
+      (!ADVISORY_PR_REVIEW_ADVISOR_JOB_NAMES.has(checkName) &&
+        !ADVISORY_PR_REVIEW_ADVISOR_SPECIALIST_JOB.test(checkName))
+    ) {
+      return false;
+    }
+    const identity = actionRunJobIdentity(check);
+    if (!identity) return false;
+    const run = actionRunMetadata(identity.runId);
+    const job = latestAttemptJobs(identity.runId)?.get(identity.jobId);
+    const checkStatus = check.status?.toUpperCase() ?? null;
+    const checkConclusion = check.conclusion?.toUpperCase() ?? null;
+    const currentPrBinding =
+      run?.event === "workflow_run"
+        ? run.immutablePrDiff === true
+        : run?.hasPullRequests === true && run.exactDiff === true
+          ? true
+          : exactDiff.headRepository !== repo &&
+            run !== null &&
+            run.status === "COMPLETED" &&
+            run.conclusion !== null &&
+            associationLessHeadBinding(run) === "current";
+    return Boolean(
+      run &&
+      job &&
+      (run.event === "pull_request_target" || run.event === "workflow_run") &&
+      run.path === PR_REVIEW_ADVISOR_WORKFLOW_PATH &&
+      currentPrBinding &&
+      job.name === checkName &&
+      job.status === checkStatus &&
+      job.conclusion === checkConclusion,
+    );
+  };
 
   function runIdentityEvidence(
     runId: string,
@@ -951,21 +923,24 @@ function currentCheckRollup(
   ): "current" | "other" | "unknown" {
     const metadata = actionRunMetadata(runId);
     if (!metadata?.event || !metadata.path) return "unknown";
+    const headBinding = associationLessHeadBinding(metadata);
     if (
       metadata.event === "pull_request" &&
-      metadata.path === ".github/workflows/installer-hash-check.yaml"
+      (metadata.path === ".github/workflows/installer-hash-check.yaml" ||
+        metadata.path === ".github/workflows/pr.yaml")
     ) {
       if (
         metadata.immutablePrDiff === false ||
         metadata.exactDiff === false ||
-        metadata.headShaMatches === false
+        metadata.headShaMatches === false ||
+        headBinding === "other"
       ) {
         return "other";
       }
       if (
         metadata.immutablePrDiff === true &&
         metadata.headShaMatches === true &&
-        (metadata.exactDiff === true || metadata.hasPullRequests === false)
+        (metadata.exactDiff === true || headBinding === "current")
       ) {
         return "current";
       }
@@ -973,21 +948,14 @@ function currentCheckRollup(
     }
     if (metadata.exactDiff === true) {
       if (metadata.headShaMatches === true) {
-        if (metadata.event === "pull_request" && metadata.path === ".github/workflows/pr.yaml") {
-          if (metadata.immutablePrDiff === true) return "current";
-          if (metadata.immutablePrDiff === false) return "other";
-          return "unknown";
-        }
         return "current";
       }
       if (metadata.headShaMatches === false) return "other";
       return "unknown";
     }
     if (metadata.exactDiff === false) return "other";
-    const e2eHeadBinding = e2eControllerHeadBinding(metadata);
-    if (e2eHeadBinding === "other") return "other";
-    if (e2eHeadBinding === "current") {
-      return e2eCoordinationIsEnclosed(metadata) ? "current" : "unknown";
+    if (exactDiff.headRepository !== repo && headBinding !== "unknown") {
+      return headBinding;
     }
     if (
       !requiresExactDiff &&
@@ -1000,22 +968,25 @@ function currentCheckRollup(
     return "unknown";
   }
 
+  const mergeRelevantStatusChecks = statusCheckRollup.filter(
+    (check) => !isAuthenticatedAdvisoryPrReviewCheck(check),
+  );
   const allActionRunIds = new Set(
-    statusCheckRollup.map(actionRunId).filter((runId): runId is string => Boolean(runId)),
+    mergeRelevantStatusChecks.map(actionRunId).filter((runId): runId is string => Boolean(runId)),
   );
   const hasMeaningfulAlternateRun = (runId: string): boolean => {
     const { event, path } = actionRunMetadata(runId) ?? {};
     return Boolean(
       event &&
-        path &&
-        [...allActionRunIds].some(
-          (otherRunId) => otherRunId !== runId && isMeaningfulExactDiffRun(otherRunId, event, path),
-        ),
+      path &&
+      [...allActionRunIds].some(
+        (otherRunId) => otherRunId !== runId && isMeaningfulExactDiffRun(otherRunId, event, path),
+      ),
     );
   };
 
   const groups = new Map<string, StatusCheck[]>();
-  for (const check of statusCheckRollup) {
+  for (const check of mergeRelevantStatusChecks) {
     const identity = JSON.stringify([
       check.__typename ?? (check.context ? "StatusContext" : "CheckRun"),
       check.name ?? check.context ?? "(unknown)",
@@ -1036,9 +1007,18 @@ function currentCheckRollup(
         (check.detailsUrl?.includes("/actions/") ||
           (Boolean(check.workflowName) && !/\/runs\/\d+(?:[/?#]|$)/u.test(check.detailsUrl ?? ""))),
     );
+    const hasActionsCounterpart = mergeRelevantStatusChecks.some(
+      (check) =>
+        check.__typename !== "StatusContext" &&
+        check.name === groupName &&
+        actionRunJobIdentity(check),
+    );
     if (
       (requiredCheck || expectsActionEvidence) &&
-      group.some((check) => !actionRunId(check) && !isTrustedLegacyE2eCheck(check))
+      group.some(
+        (check) =>
+          !actionRunId(check) && (check.__typename !== "StatusContext" || !hasActionsCounterpart),
+      )
     ) {
       incompleteAttemptEvidence.add(groupName);
     }
@@ -1194,25 +1174,100 @@ function currentCheckRollup(
     incompleteAttemptEvidence.add("checks");
     incompleteAttemptEvidence.add("changes");
   }
-  return { checks: current, incompleteAttemptEvidence: [...incompleteAttemptEvidence].sort() };
+  return {
+    checks: current,
+    incompleteAttemptEvidence: [...incompleteAttemptEvidence].sort(),
+  };
 }
 
-function checkCi(
+interface CiGateResult extends GateResult {
+  failingChecks?: string[];
+  pendingChecks?: string[];
+  missingChecks?: string[];
+}
+
+interface RequiredCheckSnapshotRecord {
+  type: string | null;
+  name: string | null;
+  context: string | null;
+  workflowName: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  detailsUrl: string | null;
+  status: string | null;
+  conclusion: string | null;
+  state: string | null;
+}
+
+interface CiEvaluation {
+  gate: CiGateResult;
+  requiredCheckSnapshot: RequiredCheckSnapshotRecord[] | null;
+}
+
+function captureRequiredCheckSnapshot(
+  statusCheckRollup: StatusCheck[] | null,
+): RequiredCheckSnapshotRecord[] | null {
+  if (!statusCheckRollup) return null;
+  const snapshot = statusCheckRollup
+    .filter((check) => REQUIRED_CHECK_NAMES.includes(check.name ?? check.context ?? ""))
+    .map((check) => ({
+      type: check.__typename ?? null,
+      name: check.name ?? null,
+      context: check.context ?? null,
+      workflowName: check.workflowName ?? null,
+      startedAt: check.startedAt ?? null,
+      completedAt: check.completedAt ?? null,
+      detailsUrl: check.detailsUrl ?? null,
+      status: check.status ?? null,
+      conclusion: check.conclusion ?? null,
+      state: check.state ?? null,
+    }));
+  snapshot.sort((left, right) => {
+    const leftKey = JSON.stringify(left);
+    const rightKey = JSON.stringify(right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  return snapshot;
+}
+
+const ADVISORY_E2E_CHECK_NAMES = new Set([
+  "E2E / PR Gate",
+  "E2E / PR Gate / Rollup",
+  "E2E / PR Gate Coordination",
+]);
+const ADVISORY_E2E_WORKFLOW_NAMES = new Set(["E2E / PR Gate Controller"]);
+
+// PR #8445 retired the PR E2E controller and moved live E2E after merges to main.
+// Ignore former rollout contexts here; maintainers evaluate explicitly requested
+// manual E2E separately, as documented in MERGE-GATE.md.
+function isAdvisoryE2eCheck(check: StatusCheck): boolean {
+  return (
+    ADVISORY_E2E_CHECK_NAMES.has(check.name ?? check.context ?? "") &&
+    ADVISORY_E2E_WORKFLOW_NAMES.has(check.workflowName ?? "")
+  );
+}
+
+function evaluateCiRollup(
   statusCheckRollup: StatusCheck[] | null,
   repo: string,
   exactDiff: ExactDiffIdentity,
-): GateResult & { failingChecks?: string[]; pendingChecks?: string[]; missingChecks?: string[] } {
+  actionEvidence = createCiActionEvidenceCache(),
+  allowActionEvidenceReads = true,
+): CiGateResult {
   if (!statusCheckRollup || statusCheckRollup.length === 0) {
     return { pass: false, details: "No status checks found" };
   }
 
-  const e2eCoordinationEvidence = fetchE2eCoordinationEvidence(repo, exactDiff);
-  const rollup = currentCheckRollup(statusCheckRollup, repo, exactDiff, e2eCoordinationEvidence);
+  const mergeRelevantChecks = statusCheckRollup.filter((check) => !isAdvisoryE2eCheck(check));
+  const rollup = currentCheckRollup(
+    mergeRelevantChecks,
+    repo,
+    exactDiff,
+    actionEvidence,
+    allowActionEvidenceReads,
+  );
   const currentChecks = rollup.checks;
   const incompleteAttemptEvidence = new Set(rollup.incompleteAttemptEvidence);
-  if (e2eCoordinationEvidence.valid !== true) {
-    incompleteAttemptEvidence.add("E2E / PR Gate");
-  }
 
   // Check that all required checks are present.
   // Fork PRs from first-time contributors need "Approve and run" before
@@ -1266,7 +1321,11 @@ function checkCi(
     };
   }
   if (pending.length > 0) {
-    return { pass: false, details: `${pending.length} pending check(s)`, pendingChecks: pending };
+    return {
+      pass: false,
+      details: `${pending.length} pending check(s)`,
+      pendingChecks: pending,
+    };
   }
   if (incompleteAttemptEvidence.size > 0) {
     const incompleteNames = [...incompleteAttemptEvidence].sort();
@@ -1276,7 +1335,72 @@ function checkCi(
       failingChecks: incompleteNames.map((name) => `${name}: latest attempt evidence incomplete`),
     };
   }
-  return { pass: true, details: `All ${currentChecks.length} current checks green` };
+  return {
+    pass: true,
+    details: `All ${currentChecks.length} current checks green`,
+  };
+}
+
+function checkCi(
+  statusCheckRollup: StatusCheck[] | null,
+  repo: string,
+  exactDiff: ExactDiffIdentity,
+): CiEvaluation {
+  return {
+    gate: evaluateCiRollup(statusCheckRollup, repo, exactDiff),
+    requiredCheckSnapshot: captureRequiredCheckSnapshot(statusCheckRollup),
+  };
+}
+
+function checkFinalCi(
+  initial: CiEvaluation,
+  finalStatusCheckRollup: StatusCheck[] | null,
+  repo: string,
+  exactDiff: ExactDiffIdentity,
+  actionEvidence: CiActionEvidenceCache,
+): CiGateResult {
+  if (!initial.gate.pass) return initial.gate;
+  const finalGate = evaluateCiRollup(finalStatusCheckRollup, repo, exactDiff, actionEvidence);
+  if (!finalGate.pass) return finalGate;
+  const finalRequiredCheckSnapshot = captureRequiredCheckSnapshot(finalStatusCheckRollup);
+  if (
+    !initial.requiredCheckSnapshot ||
+    !finalRequiredCheckSnapshot ||
+    !isDeepStrictEqual(finalRequiredCheckSnapshot, initial.requiredCheckSnapshot)
+  ) {
+    return {
+      pass: false,
+      details: "Required check rollup changed during gate evaluation",
+      failingChecks: ["Required check rollup changed during gate evaluation"],
+    };
+  }
+  return finalGate;
+}
+
+function checkLastCi(
+  ci: CiGateResult,
+  initial: CiEvaluation,
+  lastStatusCheckRollup: StatusCheck[] | null,
+  repo: string,
+  exactDiff: ExactDiffIdentity,
+  actionEvidence: CiActionEvidenceCache,
+): CiGateResult {
+  if (!ci.pass) return ci;
+  const lastGate = evaluateCiRollup(lastStatusCheckRollup, repo, exactDiff, actionEvidence, false);
+  if (!lastGate.pass) return lastGate;
+  const lastRequiredCheckSnapshot = captureRequiredCheckSnapshot(lastStatusCheckRollup);
+  if (
+    !initial.requiredCheckSnapshot ||
+    !lastRequiredCheckSnapshot ||
+    !isDeepStrictEqual(lastRequiredCheckSnapshot, initial.requiredCheckSnapshot)
+  ) {
+    return {
+      pass: false,
+      details: "Required check rollup changed during final gate evaluation",
+      failingChecks: ["Required check rollup changed during final gate evaluation"],
+    };
+  }
+  return lastGate;
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,31 +1420,24 @@ function checkConflicts(
 } {
   const conflictStatus = (mergeable ?? "UNKNOWN").toUpperCase();
   const status = (mergeStateStatus ?? "UNKNOWN").toUpperCase();
-  const currentBaseStates = new Set(["BLOCKED", "CLEAN", "HAS_HOOKS", "UNSTABLE"]);
+  const permittedMergeStates = new Set(["BEHIND", "BLOCKED", "CLEAN", "HAS_HOOKS", "UNSTABLE"]);
 
   if (!currentBaseSha) {
     return {
       pass: false,
-      details: "Unable to verify the current base branch revision",
+      details: "The gate checker could not verify the base SHA",
       mergeable: conflictStatus,
       mergeStateStatus: status,
       baseSha,
     };
   }
-  if (baseSha !== currentBaseSha) {
-    return {
-      pass: false,
-      details: "PR branch is behind its base branch; refresh it before approval",
-      mergeable: conflictStatus,
-      mergeStateStatus: status,
-      baseSha,
-      currentBaseSha,
-    };
-  }
-  if (conflictStatus === "MERGEABLE" && currentBaseStates.has(status)) {
+  if (conflictStatus === "MERGEABLE" && permittedMergeStates.has(status)) {
     return {
       pass: true,
-      details: "No merge conflicts",
+      details:
+        baseSha === currentBaseSha && status !== "BEHIND"
+          ? "No merge conflicts"
+          : "No merge conflicts; PR branch is behind its base branch",
       mergeable: conflictStatus,
       mergeStateStatus: status,
       baseSha,
@@ -1329,10 +1446,7 @@ function checkConflicts(
   }
   return {
     pass: false,
-    details:
-      status === "BEHIND"
-        ? "PR branch is behind its base branch; refresh it before approval"
-        : `Mergeability: ${conflictStatus}; merge state: ${status}`,
+    details: `Mergeability: ${conflictStatus}; merge state: ${status}`,
     mergeable: conflictStatus,
     mergeStateStatus: status,
     baseSha,
@@ -1360,7 +1474,11 @@ function fetchCurrentBaseSha(repo: string, number: number): string | null {
       }
     }`,
   ]) as {
-    data?: { repository?: { pullRequest?: { baseRef?: { target?: { oid?: unknown } } } } };
+    data?: {
+      repository?: {
+        pullRequest?: { baseRef?: { target?: { oid?: unknown } } };
+      };
+    };
   } | null;
   const oid = response?.data?.repository?.pullRequest?.baseRef?.target?.oid;
   return typeof oid === "string" && /^[0-9a-f]{40}$/i.test(oid) ? oid : null;
@@ -1430,7 +1548,10 @@ function checkCodeRabbit(
 
   // Fail-closed: if we cannot reach the API, do not assume clean
   if (!out) {
-    return { pass: false, details: "Could not fetch review threads (API error — fail-closed)" };
+    return {
+      pass: false,
+      details: "Could not fetch review threads (API error — fail-closed)",
+    };
   }
 
   let data: {
@@ -1440,7 +1561,13 @@ function checkCodeRabbit(
           reviewThreads?: {
             nodes?: Array<{
               isResolved: boolean;
-              comments: { nodes: Array<{ author: { login: string }; body: string; path: string }> };
+              comments: {
+                nodes: Array<{
+                  author: { login: string };
+                  body: string;
+                  path: string;
+                }>;
+              };
             }>;
           };
         };
@@ -1450,7 +1577,10 @@ function checkCodeRabbit(
   try {
     data = JSON.parse(out);
   } catch {
-    return { pass: false, details: "Could not parse review threads (invalid JSON — fail-closed)" };
+    return {
+      pass: false,
+      details: "Could not parse review threads (invalid JSON — fail-closed)",
+    };
   }
 
   const threads = data.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
@@ -1479,7 +1609,10 @@ function checkCodeRabbit(
   }
 
   if (unresolved.length === 0) {
-    return { pass: true, details: "No unresolved major/critical CodeRabbit findings" };
+    return {
+      pass: true,
+      details: "No unresolved major/critical CodeRabbit findings",
+    };
   }
   return {
     pass: false,
@@ -1533,7 +1666,11 @@ interface CommitVerificationRecord {
 
 function normalizeCommitVerification(value: unknown): CommitVerificationRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { sha: "(unknown)", verified: false, reason: "malformed_commit_verification_data" };
+    return {
+      sha: "(unknown)",
+      verified: false,
+      reason: "malformed_commit_verification_data",
+    };
   }
 
   const record = value as Record<string, unknown>;
@@ -1640,7 +1777,7 @@ function checkContributorCompliance(
 // Main
 // ---------------------------------------------------------------------------
 
-interface PrRevisionSnapshot {
+interface PrRevisionIdentity {
   title: string;
   body: string;
   state: string;
@@ -1654,6 +1791,41 @@ interface PrRevisionSnapshot {
   headRepository: string;
 }
 
+interface PrRevisionSnapshot extends PrRevisionIdentity {
+  statusCheckRollup: StatusCheck[];
+}
+
+function parseHeadRepository(headRepository: unknown, headRepositoryOwner: unknown): string | null {
+  if (
+    typeof headRepository !== "object" ||
+    headRepository === null ||
+    Array.isArray(headRepository)
+  ) {
+    return null;
+  }
+  const repository = headRepository as Record<string, unknown>;
+  const direct =
+    typeof repository.nameWithOwner === "string" &&
+    REPOSITORY_NAME_PATTERN.test(repository.nameWithOwner)
+      ? repository.nameWithOwner
+      : null;
+  let derived: string | null = null;
+  if (
+    typeof repository.name === "string" &&
+    /^[A-Za-z0-9_.-]+$/u.test(repository.name) &&
+    typeof headRepositoryOwner === "object" &&
+    headRepositoryOwner !== null &&
+    !Array.isArray(headRepositoryOwner)
+  ) {
+    const login = (headRepositoryOwner as Record<string, unknown>).login;
+    if (typeof login === "string" && /^[A-Za-z0-9_.-]+$/u.test(login)) {
+      derived = `${login}/${repository.name}`;
+    }
+  }
+  if (direct && derived && direct !== derived) return null;
+  return direct ?? derived;
+}
+
 function fetchPrRevisionSnapshot(repo: string, number: number): PrRevisionSnapshot | null {
   const value = ghJson([
     "pr",
@@ -1662,11 +1834,11 @@ function fetchPrRevisionSnapshot(repo: string, number: number): PrRevisionSnapsh
     "--repo",
     repo,
     "--json",
-    "title,body,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefOid,headRefName,baseRefName,headRepository",
+    "title,body,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefOid,headRefName,baseRefName,headRepository,headRepositoryOwner,statusCheckRollup",
   ]);
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  const headRepository = record.headRepository;
+  const headRepository = parseHeadRepository(record.headRepository, record.headRepositoryOwner);
   if (
     typeof record.title !== "string" ||
     typeof record.body !== "string" ||
@@ -1678,10 +1850,11 @@ function fetchPrRevisionSnapshot(repo: string, number: number): PrRevisionSnapsh
     typeof record.baseRefOid !== "string" ||
     typeof record.headRefName !== "string" ||
     typeof record.baseRefName !== "string" ||
-    typeof headRepository !== "object" ||
-    headRepository === null ||
-    Array.isArray(headRepository) ||
-    typeof (headRepository as Record<string, unknown>).nameWithOwner !== "string"
+    !Array.isArray(record.statusCheckRollup) ||
+    record.statusCheckRollup.some(
+      (check) => typeof check !== "object" || check === null || Array.isArray(check),
+    ) ||
+    !headRepository
   ) {
     return null;
   }
@@ -1696,13 +1869,411 @@ function fetchPrRevisionSnapshot(repo: string, number: number): PrRevisionSnapsh
     baseRefOid: record.baseRefOid,
     headRefName: record.headRefName,
     baseRefName: record.baseRefName,
-    headRepository: (headRepository as Record<string, unknown>).nameWithOwner as string,
+    headRepository,
+    statusCheckRollup: record.statusCheckRollup as StatusCheck[],
   };
 }
 
+function fetchFinalPrSnapshot(
+  repo: string,
+  number: number,
+): { revision: PrRevisionSnapshot; currentBaseSha: string } | null {
+  const [owner, name, extra] = repo.split("/");
+  if (!owner || !name || extra) return null;
+
+  const args = [
+    "api",
+    "graphql",
+    "--paginate",
+    "--slurp",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `name=${name}`,
+    "-F",
+    `number=${number}`,
+    "-f",
+    `query=query FinalPrSnapshot($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          title
+          body
+          state
+          isDraft
+          mergeable
+          mergeStateStatus
+          headRefOid
+          baseRefOid
+          headRefName
+          baseRefName
+          headRepository { name nameWithOwner }
+          headRepositoryOwner { login }
+          baseRef { target { oid } }
+          commits(last: 1) {
+            totalCount
+            nodes {
+              commit {
+                oid
+                statusCheckRollup {
+                  contexts(first: 100, after: $endCursor) {
+                    totalCount
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      __typename
+                      ... on CheckRun {
+                        name
+                        status
+                        conclusion
+                        startedAt
+                        completedAt
+                        detailsUrl
+                        checkSuite { workflowRun { workflow { name } } }
+                      }
+                      ... on StatusContext {
+                        context
+                        state
+                        startedAt: createdAt
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+  ];
+  const firstPages = ghJson(args);
+  const finalPages = ghJson(args);
+  if (!isDeepStrictEqual(firstPages, finalPages)) return null;
+  return parseFinalPrSnapshotPages(finalPages);
+}
+
+function parseFinalPrSnapshotPages(
+  pagesValue: unknown,
+): { revision: PrRevisionSnapshot; currentBaseSha: string } | null {
+  if (!Array.isArray(pagesValue) || pagesValue.length === 0) return null;
+
+  let canonicalIdentity: Record<string, unknown> | null = null;
+  let canonicalRecord: Record<string, unknown> | null = null;
+  let contextTotalCount: number | null = null;
+  const contextNodes: unknown[] = [];
+  const seenEndCursors = new Set<string>();
+
+  for (const [pageIndex, pageValue] of pagesValue.entries()) {
+    if (typeof pageValue !== "object" || pageValue === null || Array.isArray(pageValue)) {
+      return null;
+    }
+    const dataValue = (pageValue as Record<string, unknown>).data;
+    if (typeof dataValue !== "object" || dataValue === null || Array.isArray(dataValue))
+      return null;
+    const repositoryValue = (dataValue as Record<string, unknown>).repository;
+    if (
+      typeof repositoryValue !== "object" ||
+      repositoryValue === null ||
+      Array.isArray(repositoryValue)
+    ) {
+      return null;
+    }
+    const recordValue = (repositoryValue as Record<string, unknown>).pullRequest;
+    if (typeof recordValue !== "object" || recordValue === null || Array.isArray(recordValue)) {
+      return null;
+    }
+    const record = recordValue as Record<string, unknown>;
+
+    const headRepository = parseHeadRepository(record.headRepository, record.headRepositoryOwner);
+    const baseRef =
+      typeof record.baseRef === "object" &&
+      record.baseRef !== null &&
+      !Array.isArray(record.baseRef)
+        ? (record.baseRef as Record<string, unknown>)
+        : null;
+    const target =
+      typeof baseRef?.target === "object" &&
+      baseRef.target !== null &&
+      !Array.isArray(baseRef.target)
+        ? (baseRef.target as Record<string, unknown>)
+        : null;
+    const currentBaseSha = target?.oid;
+    if (
+      typeof record.title !== "string" ||
+      typeof record.body !== "string" ||
+      typeof record.state !== "string" ||
+      typeof record.isDraft !== "boolean" ||
+      typeof record.mergeable !== "string" ||
+      typeof record.mergeStateStatus !== "string" ||
+      typeof record.headRefOid !== "string" ||
+      !/^[0-9a-f]{40}$/iu.test(record.headRefOid) ||
+      typeof record.baseRefOid !== "string" ||
+      !/^[0-9a-f]{40}$/iu.test(record.baseRefOid) ||
+      typeof record.headRefName !== "string" ||
+      typeof record.baseRefName !== "string" ||
+      typeof currentBaseSha !== "string" ||
+      !/^[0-9a-f]{40}$/iu.test(currentBaseSha) ||
+      !headRepository
+    ) {
+      return null;
+    }
+
+    const commitsValue = record.commits;
+    if (typeof commitsValue !== "object" || commitsValue === null || Array.isArray(commitsValue)) {
+      return null;
+    }
+    const commits = commitsValue as Record<string, unknown>;
+    if (
+      typeof commits.totalCount !== "number" ||
+      !Number.isInteger(commits.totalCount) ||
+      commits.totalCount < 1 ||
+      !Array.isArray(commits.nodes) ||
+      commits.nodes.length !== 1
+    ) {
+      return null;
+    }
+    const commitNode = commits.nodes[0];
+    if (typeof commitNode !== "object" || commitNode === null || Array.isArray(commitNode)) {
+      return null;
+    }
+    const commitValue = (commitNode as Record<string, unknown>).commit;
+    if (typeof commitValue !== "object" || commitValue === null || Array.isArray(commitValue)) {
+      return null;
+    }
+    const commit = commitValue as Record<string, unknown>;
+    if (commit.oid !== record.headRefOid) return null;
+    const rollupValue = commit.statusCheckRollup;
+    if (typeof rollupValue !== "object" || rollupValue === null || Array.isArray(rollupValue)) {
+      return null;
+    }
+    const contextsValue = (rollupValue as Record<string, unknown>).contexts;
+    if (
+      typeof contextsValue !== "object" ||
+      contextsValue === null ||
+      Array.isArray(contextsValue)
+    ) {
+      return null;
+    }
+    const contexts = contextsValue as Record<string, unknown>;
+    const pageInfoValue = contexts.pageInfo;
+    if (
+      typeof contexts.totalCount !== "number" ||
+      !Number.isInteger(contexts.totalCount) ||
+      contexts.totalCount < 0 ||
+      !Array.isArray(contexts.nodes) ||
+      typeof pageInfoValue !== "object" ||
+      pageInfoValue === null ||
+      Array.isArray(pageInfoValue)
+    ) {
+      return null;
+    }
+    const pageInfo = pageInfoValue as Record<string, unknown>;
+    const isLastPage = pageIndex === pagesValue.length - 1;
+    if (pageInfo.hasNextPage !== !isLastPage) return null;
+    if (!isLastPage) {
+      if (
+        typeof pageInfo.endCursor !== "string" ||
+        pageInfo.endCursor.length === 0 ||
+        seenEndCursors.has(pageInfo.endCursor)
+      ) {
+        return null;
+      }
+      seenEndCursors.add(pageInfo.endCursor);
+    }
+
+    const identity = {
+      title: record.title,
+      body: record.body,
+      state: record.state,
+      isDraft: record.isDraft,
+      mergeable: record.mergeable,
+      mergeStateStatus: record.mergeStateStatus,
+      headRefOid: record.headRefOid,
+      baseRefOid: record.baseRefOid,
+      headRefName: record.headRefName,
+      baseRefName: record.baseRefName,
+      headRepository,
+      currentBaseSha,
+      commitTotalCount: commits.totalCount,
+      contextTotalCount: contexts.totalCount,
+    };
+    if (canonicalIdentity && !isDeepStrictEqual(canonicalIdentity, identity)) return null;
+    canonicalIdentity = identity;
+    canonicalRecord ??= record;
+    contextTotalCount ??= contexts.totalCount;
+    contextNodes.push(...contexts.nodes);
+  }
+
+  if (!canonicalIdentity || !canonicalRecord || contextTotalCount !== contextNodes.length) {
+    return null;
+  }
+  const aggregateCommits = {
+    totalCount: canonicalIdentity.commitTotalCount,
+    nodes: [
+      {
+        commit: {
+          oid: canonicalIdentity.headRefOid,
+          statusCheckRollup: {
+            contexts: {
+              totalCount: contextTotalCount,
+              pageInfo: { hasNextPage: false },
+              nodes: contextNodes,
+            },
+          },
+        },
+      },
+    ],
+  };
+  const statusCheckRollup = parseFinalStatusCheckRollup(
+    aggregateCommits,
+    canonicalIdentity.headRefOid as string,
+  );
+  if (!statusCheckRollup) return null;
+  return {
+    revision: {
+      title: canonicalRecord.title as string,
+      body: canonicalRecord.body as string,
+      state: canonicalRecord.state as string,
+      isDraft: canonicalRecord.isDraft as boolean,
+      mergeable: canonicalRecord.mergeable as string,
+      mergeStateStatus: canonicalRecord.mergeStateStatus as string,
+      headRefOid: canonicalRecord.headRefOid as string,
+      baseRefOid: canonicalRecord.baseRefOid as string,
+      headRefName: canonicalRecord.headRefName as string,
+      baseRefName: canonicalRecord.baseRefName as string,
+      headRepository: canonicalIdentity.headRepository as string,
+      statusCheckRollup,
+    },
+    currentBaseSha: canonicalIdentity.currentBaseSha as string,
+  };
+}
+
+function parseFinalStatusCheckRollup(
+  commitsValue: unknown,
+  expectedHeadSha: string,
+): StatusCheck[] | null {
+  if (typeof commitsValue !== "object" || commitsValue === null || Array.isArray(commitsValue)) {
+    return null;
+  }
+  const commits = commitsValue as Record<string, unknown>;
+  if (
+    typeof commits.totalCount !== "number" ||
+    !Number.isInteger(commits.totalCount) ||
+    commits.totalCount < 1 ||
+    !Array.isArray(commits.nodes) ||
+    commits.nodes.length !== 1
+  ) {
+    return null;
+  }
+  const commitNode = commits.nodes[0];
+  if (typeof commitNode !== "object" || commitNode === null || Array.isArray(commitNode)) {
+    return null;
+  }
+  const commitValue = (commitNode as Record<string, unknown>).commit;
+  if (typeof commitValue !== "object" || commitValue === null || Array.isArray(commitValue)) {
+    return null;
+  }
+  const commit = commitValue as Record<string, unknown>;
+  if (commit.oid !== expectedHeadSha) return null;
+  const rollupValue = commit.statusCheckRollup;
+  if (typeof rollupValue !== "object" || rollupValue === null || Array.isArray(rollupValue)) {
+    return null;
+  }
+  const contextsValue = (rollupValue as Record<string, unknown>).contexts;
+  if (typeof contextsValue !== "object" || contextsValue === null || Array.isArray(contextsValue)) {
+    return null;
+  }
+  const contexts = contextsValue as Record<string, unknown>;
+  const pageInfo = contexts.pageInfo;
+  if (
+    typeof contexts.totalCount !== "number" ||
+    !Number.isInteger(contexts.totalCount) ||
+    contexts.totalCount < 0 ||
+    !Array.isArray(contexts.nodes) ||
+    contexts.nodes.length !== contexts.totalCount ||
+    typeof pageInfo !== "object" ||
+    pageInfo === null ||
+    Array.isArray(pageInfo) ||
+    (pageInfo as Record<string, unknown>).hasNextPage !== false
+  ) {
+    return null;
+  }
+
+  const statusCheckRollup: StatusCheck[] = [];
+  for (const nodeValue of contexts.nodes) {
+    if (typeof nodeValue !== "object" || nodeValue === null || Array.isArray(nodeValue)) {
+      return null;
+    }
+    const node = nodeValue as Record<string, unknown>;
+    if (node.__typename === "CheckRun") {
+      const checkSuite =
+        typeof node.checkSuite === "object" &&
+        node.checkSuite !== null &&
+        !Array.isArray(node.checkSuite)
+          ? (node.checkSuite as Record<string, unknown>)
+          : null;
+      const workflowRun =
+        typeof checkSuite?.workflowRun === "object" &&
+        checkSuite.workflowRun !== null &&
+        !Array.isArray(checkSuite.workflowRun)
+          ? (checkSuite.workflowRun as Record<string, unknown>)
+          : null;
+      const workflow =
+        typeof workflowRun?.workflow === "object" &&
+        workflowRun.workflow !== null &&
+        !Array.isArray(workflowRun.workflow)
+          ? (workflowRun.workflow as Record<string, unknown>)
+          : null;
+      const workflowName = workflow?.name;
+      const scalarFields = [
+        node.name,
+        node.status,
+        node.conclusion,
+        node.startedAt,
+        node.completedAt,
+        node.detailsUrl,
+        workflowName,
+      ];
+      if (
+        typeof node.name !== "string" ||
+        typeof node.status !== "string" ||
+        scalarFields.some(
+          (value) => value !== undefined && value !== null && typeof value !== "string",
+        )
+      ) {
+        return null;
+      }
+      statusCheckRollup.push({
+        __typename: "CheckRun",
+        name: node.name,
+        status: node.status,
+        ...(typeof node.conclusion === "string" ? { conclusion: node.conclusion } : {}),
+        ...(typeof node.startedAt === "string" ? { startedAt: node.startedAt } : {}),
+        ...(typeof node.completedAt === "string" ? { completedAt: node.completedAt } : {}),
+        ...(typeof node.detailsUrl === "string" ? { detailsUrl: node.detailsUrl } : {}),
+        ...(typeof workflowName === "string" ? { workflowName } : {}),
+      });
+      continue;
+    }
+    if (
+      node.__typename !== "StatusContext" ||
+      typeof node.context !== "string" ||
+      typeof node.state !== "string" ||
+      typeof node.startedAt !== "string"
+    ) {
+      return null;
+    }
+    statusCheckRollup.push({
+      __typename: "StatusContext",
+      context: node.context,
+      state: node.state,
+      startedAt: node.startedAt,
+    });
+  }
+  return statusCheckRollup;
+}
+
 function checkFinalRevision(
-  captured: PrRevisionSnapshot,
-  current: PrRevisionSnapshot | null,
+  captured: PrRevisionIdentity,
+  current: PrRevisionIdentity | null,
   currentBaseSha: string | null,
 ): ReturnType<typeof checkConflicts> {
   if (!current) {
@@ -1773,7 +2344,7 @@ function main(): void {
     "--repo",
     repo,
     "--json",
-    "number,title,url,body,files,statusCheckRollup,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefOid,headRefName,baseRefName,headRepository,author",
+    "number,title,url,body,files,statusCheckRollup,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefOid,headRefName,baseRefName,headRepository,headRepositoryOwner,author",
   ]) as {
     number: number;
     title: string;
@@ -1789,7 +2360,8 @@ function main(): void {
     baseRefOid: string;
     headRefName: string;
     baseRefName: string;
-    headRepository: { nameWithOwner: string };
+    headRepository: { name: string; nameWithOwner: string };
+    headRepositoryOwner: { login: string } | null;
     author: PrIdentity | null;
   } | null;
 
@@ -1797,14 +2369,21 @@ function main(): void {
     console.error(`Failed to fetch PR #${prNumber} from ${repo}`);
     process.exit(1);
   }
+  const headRepository = parseHeadRepository(prData.headRepository, prData.headRepositoryOwner);
+  if (!headRepository) {
+    console.error(`Failed to resolve PR #${prNumber} head repository from ${repo}`);
+    process.exit(1);
+  }
 
-  const ci = checkCi(prData.statusCheckRollup, repo, {
+  const exactDiff = {
     number: prNumber,
     headSha: prData.headRefOid,
     baseSha: prData.baseRefOid,
     headRefName: prData.headRefName,
-    headRepository: prData.headRepository.nameWithOwner,
-  });
+    headRepository,
+  };
+  const currentBaseSha = fetchCurrentBaseSha(repo, prNumber);
+  const initialCi = checkCi(prData.statusCheckRollup, repo, exactDiff);
   const coderabbit = checkCodeRabbit(repo, prNumber);
   const riskyCodeTested = checkRiskyCodeTested(prData.files ?? []);
   const contributorCompliance = checkContributorCompliance(
@@ -1818,25 +2397,92 @@ function main(): void {
     prData,
     contributorApprovalHistory,
   );
-  const currentBaseSha = fetchCurrentBaseSha(repo, prNumber);
-  const currentRevision = fetchPrRevisionSnapshot(repo, prNumber);
-  const conflicts = checkFinalRevision(
-    {
-      title: prData.title,
-      body: prData.body,
-      state: prData.state,
-      isDraft: prData.isDraft,
-      mergeable: prData.mergeable,
-      mergeStateStatus: prData.mergeStateStatus,
-      headRefOid: prData.headRefOid,
-      baseRefOid: prData.baseRefOid,
-      headRefName: prData.headRefName,
-      baseRefName: prData.baseRefName,
-      headRepository: prData.headRepository.nameWithOwner,
-    },
-    currentRevision,
-    currentBaseSha,
+  const capturedRevision: PrRevisionSnapshot = {
+    title: prData.title,
+    body: prData.body,
+    state: prData.state,
+    isDraft: prData.isDraft,
+    mergeable: prData.mergeable,
+    mergeStateStatus: prData.mergeStateStatus,
+    headRefOid: prData.headRefOid,
+    baseRefOid: prData.baseRefOid,
+    headRefName: prData.headRefName,
+    baseRefName: prData.baseRefName,
+    headRepository,
+    statusCheckRollup: prData.statusCheckRollup,
+  };
+  const revisionBeforeFinalCi = fetchPrRevisionSnapshot(repo, prNumber);
+  const finalCiActionEvidence = createCiActionEvidenceCache();
+  const evaluatedRollupCi = checkFinalCi(
+    initialCi,
+    revisionBeforeFinalCi?.statusCheckRollup ?? null,
+    repo,
+    exactDiff,
+    finalCiActionEvidence,
   );
+  const evaluatedCi = evaluatedRollupCi;
+  const currentRevision = fetchPrRevisionSnapshot(repo, prNumber);
+  const ciBeforeFinalSnapshot = checkLastCi(
+    evaluatedCi,
+    initialCi,
+    currentRevision?.statusCheckRollup ?? null,
+    repo,
+    exactDiff,
+    finalCiActionEvidence,
+  );
+  const finalSnapshot = fetchFinalPrSnapshot(repo, prNumber);
+  const finalRevision = finalSnapshot?.revision ?? null;
+  const finalCurrentBaseSha = finalSnapshot?.currentBaseSha ?? null;
+  const stableCurrentBaseSha =
+    currentBaseSha && finalCurrentBaseSha && currentBaseSha === finalCurrentBaseSha
+      ? finalCurrentBaseSha
+      : null;
+  const ci = !ciBeforeFinalSnapshot.pass
+    ? ciBeforeFinalSnapshot
+    : !finalRevision
+      ? { pass: false, details: "Unable to verify the final PR checks" }
+      : checkLastCi(
+          ciBeforeFinalSnapshot,
+          initialCi,
+          finalRevision.statusCheckRollup,
+          repo,
+          exactDiff,
+          finalCiActionEvidence,
+        );
+  const baseRevisionGate: ReturnType<typeof checkConflicts> =
+    stableCurrentBaseSha !== null
+      ? {
+          pass: true,
+          details: "The base SHA did not change during gate evaluation",
+          mergeable: capturedRevision.mergeable,
+          mergeStateStatus: capturedRevision.mergeStateStatus,
+          baseSha: capturedRevision.baseRefOid,
+          currentBaseSha: stableCurrentBaseSha,
+        }
+      : {
+          pass: false,
+          details:
+            currentBaseSha && finalCurrentBaseSha
+              ? "The base SHA changed during gate evaluation. Rerun the gate checker."
+              : "The gate checker could not verify the base SHA",
+          mergeable: capturedRevision.mergeable,
+          mergeStateStatus: capturedRevision.mergeStateStatus,
+          baseSha: capturedRevision.baseRefOid,
+          ...(finalCurrentBaseSha ? { currentBaseSha: finalCurrentBaseSha } : {}),
+        };
+  const revisionBeforeFinalCiGate = checkFinalRevision(
+    capturedRevision,
+    revisionBeforeFinalCi,
+    stableCurrentBaseSha,
+  );
+  const revisionAfterFinalEvidenceGate = revisionBeforeFinalCiGate.pass
+    ? checkFinalRevision(revisionBeforeFinalCi!, currentRevision, stableCurrentBaseSha)
+    : revisionBeforeFinalCiGate;
+  const conflicts = !baseRevisionGate.pass
+    ? baseRevisionGate
+    : revisionAfterFinalEvidenceGate.pass
+      ? checkFinalRevision(currentRevision!, finalRevision, stableCurrentBaseSha)
+      : revisionAfterFinalEvidenceGate;
 
   const output: GateOutput = {
     pr: prNumber,
@@ -1848,7 +2494,13 @@ function main(): void {
       coderabbit.pass &&
       riskyCodeTested.pass &&
       contributorCompliance.pass,
-    gates: { ci, conflicts, coderabbit, riskyCodeTested, contributorCompliance },
+    gates: {
+      ci,
+      conflicts,
+      coderabbit,
+      riskyCodeTested,
+      contributorCompliance,
+    },
     advisories: { contributorApprovalOverlap },
   };
 

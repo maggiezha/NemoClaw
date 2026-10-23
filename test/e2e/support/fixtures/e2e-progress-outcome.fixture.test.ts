@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { vi } from "vitest";
 import { test } from "../../fixtures/e2e-test.ts";
 
 const outcome = process.env.NEMOCLAW_E2E_PROGRESS_OUTCOME_FIXTURE;
+const routerDiagnostics = outcome?.startsWith("router-")
+  ? await import("../../live/model-router-provider-routed-inference-helpers.ts")
+  : undefined;
 
 test.runIf(outcome === "failed")(
   "records failed phase outcome",
@@ -49,6 +54,24 @@ test.runIf(outcome === "cleanup-failed")(
   },
 );
 
+test.runIf(outcome === "cleanup-stalled")(
+  "stalls after cleanup starts",
+  {
+    meta: {
+      e2ePhases: ["enter stalled cleanup case", "run stalled E2E cleanup"],
+    },
+  },
+  ({ cleanup, expect, progress }) => {
+    const timeoutReady = process.env.NEMOCLAW_E2E_PROGRESS_TIMEOUT_READY;
+    expect(timeoutReady, "timeout-ready marker path is required").toBeTruthy();
+    progress.phase("run stalled E2E cleanup");
+    cleanup.add("deterministic stalled cleanup", async () => {
+      fs.writeFileSync(timeoutReady!, "ready");
+      await sleep(60_000);
+    });
+  },
+);
+
 test.runIf(outcome === "soft-failed")(
   "records soft failure on its originating phase",
   {
@@ -70,4 +93,45 @@ test.runIf(outcome === "incomplete")(
     },
   },
   () => undefined,
+);
+
+test.runIf(outcome === "redacted-event")(
+  "redacts progress identities and explicit events",
+  {
+    meta: {
+      e2ePhases: ["prepare redacted progress event", "finish redacted progress event"],
+    },
+  },
+  ({ expect, progress }) => {
+    const secret = process.env.NEMOCLAW_E2E_PROGRESS_EVENT_SECRET;
+    expect(secret, "redacted-event fixture secret is required").toBeTruthy();
+    progress.event(`retry cleanup for ${secret}`);
+    progress.phase("finish redacted progress event");
+  },
+);
+
+const routerOutcomes: Record<string, () => void> = {
+  "router-primary": () => {
+    throw new Error("original completion failure");
+  },
+  "router-success": () => {},
+};
+
+test.runIf(outcome?.startsWith("router-"))(
+  "router diagnostic failure preserves the test outcome and sandbox cleanup",
+  async ({ artifacts, cleanup, progress }) => {
+    vi.spyOn(artifacts, "writeJson").mockImplementationOnce(async () => {
+      await artifacts.writeText("diagnostics-attempted.txt", "before destruction");
+      throw new Error("diagnostic storage unavailable");
+    });
+    cleanup.add("destroy fake sandbox", async () => {
+      await artifacts.writeText(
+        "sandbox-destroyed.txt",
+        fs.readFileSync(artifacts.pathFor("diagnostics-attempted.txt"), "utf8"),
+      );
+    });
+    routerDiagnostics!.registerRouterDiagnostics(cleanup, artifacts, {});
+    progress.phase("record E2E fixture support outcome");
+    routerOutcomes[outcome!]!();
+  },
 );

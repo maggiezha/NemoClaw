@@ -10,14 +10,19 @@ export const NVIDIA_FEATURED_MODELS_URL =
   "https://assets.ngc.nvidia.com/products/api-catalog/featured-models.json";
 // NVIDIA Endpoints retirement contract: the public featured feed and
 // authenticated /models catalog can lag a runtime retirement. The repository
-// authority is CLOUD_MODEL_OPTIONS plus the provider-boundary assertion in
-// test/inference-options-docs.test.ts, which keeps independently available
-// Hermes Provider models separate from NVIDIA Endpoints choices. Keep entries
+// authority for live-catalog filtering is RETIRED_NVIDIA_FEATURED_MODEL_IDS.
+// CLOUD_MODEL_OPTIONS owns the bundled fallback list.
+// nvidia-featured-models.test.ts verifies the featured-feed filter, and
+// config.test.ts verifies that retired model IDs remain absent from NVIDIA
+// Endpoints choices. Keep entries
 // in this policy deny-list until a deliberate product change confirms that the
 // NVIDIA chat-completions route is available again or names a live successor.
 const RETIRED_NVIDIA_FEATURED_MODEL_IDS = new Set([
   "z-ai/glm-5.1", // Retired from NVIDIA Endpoints in #6069.
+  "z-ai/glm-5.2", // Featured feed still lists it; authenticated /v1/models does not (#10222).
   "moonshotai/kimi-k2.6", // Catalogs still list it after its backing route was removed.
+  "deepseek-ai/deepseek-v4-pro", // Retired from NVIDIA Endpoints on 2026-08-07; its route returns HTTP 410.
+  "minimaxai/minimax-m3", // Featured feed still lists it; authenticated /v1/models does not (#11364).
 ]);
 const MAX_NVIDIA_FEATURED_CATALOG_BYTES = 1024 * 1024;
 const MAX_NVIDIA_FEATURED_MODELS = 100;
@@ -29,6 +34,8 @@ const UNSAFE_TERMINAL_TEXT_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu;
 export interface NvidiaFeaturedModelOptions {
   catalogLabel?: string;
   catalogUrl?: string;
+  fallbackModelOptions?: readonly FeaturedModelOption[];
+  modelIdAliases?: ReadonlyMap<string, string>;
   retiredModelIds?: RetiredFeaturedModelIds;
   runCurlProbeImpl?: (argv: string[]) => CurlProbeResult;
   warn?: (message: string) => void;
@@ -48,7 +55,7 @@ export type FeaturedModelOption = {
   label: string;
 };
 
-type RetiredFeaturedModelIds = ReadonlySet<string> | readonly string[];
+export type RetiredFeaturedModelIds = ReadonlySet<string> | readonly string[];
 
 export type FeaturedModelFetchResult =
   | {
@@ -65,14 +72,6 @@ export type FeaturedModelFetchResult =
 /** Normalizes NVIDIA featured-model catalog IDs into endpoint model IDs. */
 function normalizeFeaturedModelId(model: string): string {
   const trimmed = model.trim();
-  // Minimax rollout contract (#5827): the external feed has emitted the stale
-  // M2.7 ID/label while CLOUD_MODEL_OPTIONS and the task-fit docs define M3 as
-  // the NVIDIA Endpoints choice. This is an upstream-lag bridge; remove this ID
-  // rewrite together with the label rewrite and fixture only once the feed no
-  // longer emits M2.7 and publishes M3 directly.
-  if (trimmed === "minimaxai/minimax-m2.7") {
-    return "minimaxai/minimax-m3";
-  }
   // Nemotron namespace contract (#5827): the external feed has emitted bare
   // nemotron-3-* IDs, while CLOUD_MODEL_OPTIONS and the matching OpenClaw
   // model-specific setup manifest use the canonical nvidia/ endpoint namespace.
@@ -94,20 +93,12 @@ function sanitizeFeaturedCatalogText(value: string, maxLength: number): string {
     .slice(0, maxLength);
 }
 
-/** Normalizes NVIDIA featured-model labels for known catalog lag cases. */
-function normalizeFeaturedModelLabel(id: string, label: string): string {
-  const sanitized = sanitizeFeaturedCatalogText(label, MAX_NVIDIA_FEATURED_MODEL_LABEL_LENGTH);
-  // Keep the display label coupled to the Minimax rollout contract above.
-  if (id === "minimaxai/minimax-m3" && /^minimax m2\.7$/i.test(sanitized)) {
-    return "Minimax M3";
-  }
-  return sanitized;
-}
-
-function isRetiredFeaturedModelId(
-  idKey: string,
-  retiredModelIds: RetiredFeaturedModelIds,
+/** Returns whether an NVIDIA Endpoints model is blocked by the retirement policy. */
+export function isRetiredNvidiaFeaturedModelId(
+  id: string,
+  retiredModelIds: RetiredFeaturedModelIds = RETIRED_NVIDIA_FEATURED_MODEL_IDS,
 ): boolean {
+  const idKey = id.trim().toLowerCase();
   if ("has" in retiredModelIds) {
     return retiredModelIds.has(idKey);
   }
@@ -117,7 +108,7 @@ function isRetiredFeaturedModelId(
 /** Parses NVIDIA's featured-models catalog into safe onboarding menu options. */
 export function parseNvidiaFeaturedModels(
   body: string,
-  options: Pick<NvidiaFeaturedModelOptions, "retiredModelIds"> = {},
+  options: Pick<NvidiaFeaturedModelOptions, "retiredModelIds" | "modelIdAliases"> = {},
 ): FeaturedModelOption[] {
   if (Buffer.byteLength(body, "utf8") > MAX_NVIDIA_FEATURED_CATALOG_BYTES) {
     throw new Error("Unexpected featured model catalog response: body exceeds 1 MiB");
@@ -132,18 +123,20 @@ export function parseNvidiaFeaturedModels(
   const seenIds = new Set<string>();
   const retiredModelIds = options.retiredModelIds ?? RETIRED_NVIDIA_FEATURED_MODEL_IDS;
   for (const item of featuredModels) {
-    const id = typeof item?.model === "string" ? normalizeFeaturedModelId(item.model) : "";
+    const normalizedId =
+      typeof item?.model === "string" ? normalizeFeaturedModelId(item.model) : "";
+    const id = options.modelIdAliases?.get(normalizedId) ?? normalizedId;
     const idKey = id.toLowerCase();
     const label =
       typeof item?.["model-name"] === "string"
-        ? normalizeFeaturedModelLabel(id, item["model-name"])
+        ? sanitizeFeaturedCatalogText(item["model-name"], MAX_NVIDIA_FEATURED_MODEL_LABEL_LENGTH)
         : "";
     if (
       !id ||
       id.length > MAX_NVIDIA_FEATURED_MODEL_ID_LENGTH ||
       !label ||
       !isSafeModelId(id) ||
-      isRetiredFeaturedModelId(idKey, retiredModelIds) ||
+      isRetiredNvidiaFeaturedModelId(idKey, retiredModelIds) ||
       seenIds.has(idKey)
     ) {
       continue;
@@ -213,7 +206,7 @@ export function getNvidiaFeaturedModelOptions(
   (options.warn ?? console.warn)(
     `  Warning: failed to load ${catalogLabel}; falling back to the bundled list (${detail}).`,
   );
-  return CLOUD_MODEL_OPTIONS;
+  return [...(options.fallbackModelOptions ?? CLOUD_MODEL_OPTIONS)];
 }
 
 function buildNvidiaFeaturedModelPromptOptions(

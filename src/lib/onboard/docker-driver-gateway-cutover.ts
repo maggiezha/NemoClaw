@@ -3,10 +3,14 @@
 
 import type { DockerDriverGatewayPortListenerScan } from "./docker-driver-gateway-port-listener";
 
-interface GatewayHealthSnapshot {
-  status: string;
-  namedInfo: string;
-  activeInfo: string;
+export type GatewayHealthSnapshot =
+  import("../adapters/openshell/gateway-reuse").OpenShellGatewayReuseObservation;
+
+export async function readDockerDriverGatewayHealth(
+  observer: import("../adapters/openshell/gateway-reuse").OpenShellGatewayReuseObserver,
+  gatewayName: string,
+): Promise<GatewayHealthSnapshot> {
+  return observer.observeGatewayReuse({ target: { kind: "named", gatewayName } });
 }
 
 export interface DockerDriverGatewayCutoverInput {
@@ -24,20 +28,19 @@ export interface DockerDriverGatewayCutoverInput {
 
 export interface DockerDriverGatewayCutoverDeps {
   isDockerDriverGatewayProcessAlive(): boolean;
-  isGatewayHealthy(status: string, namedInfo: string, activeInfo: string): boolean;
   getDockerDriverGatewayRuntimeDrift(
     pid: number,
     desiredEnv: Record<string, string>,
     gatewayBin: string | null,
   ): { reason: string } | null;
   logDockerDriverGatewayRestart(reason: string): void;
-  registerDockerDriverGatewayEndpoint(): boolean;
+  registerDockerDriverGatewayEndpoint(): Promise<boolean>;
   isDockerDriverGatewayHttpReady(): Promise<boolean>;
   verifySandboxBridgeGatewayReachableOrExit(
     exitOnFailure: boolean,
     options: { skip: boolean },
   ): Promise<void>;
-  readGatewayHealth(): GatewayHealthSnapshot;
+  readGatewayHealth(): Promise<GatewayHealthSnapshot>;
   rememberDockerDriverGatewayPid(pid: number): void;
   reapDuplicateHostGatewaysExceptOrFail(
     keepPid: number,
@@ -55,6 +58,14 @@ export interface DockerDriverGatewayCutoverDeps {
   reportUntrustedGatewayPort(message: string): never;
   reportMissingGatewayBinary(): never;
   log(message: string): void;
+}
+
+export async function runDockerDriverGatewayManagedFallback(
+  startManagedGateway: () => Promise<boolean>,
+  runStandaloneCutover: () => Promise<"reused" | "launch">,
+): Promise<"managed" | "reused" | "launch"> {
+  if (await startManagedGateway()) return "managed";
+  return runStandaloneCutover();
 }
 
 /**
@@ -89,17 +100,15 @@ export async function runDockerDriverGatewayCutover(
     input.pidFileGatewayPid !== null &&
     portListenerPids[0] === input.pidFileGatewayPid &&
     pidFileGatewayAlive &&
-    deps.isGatewayHealthy(
-      input.initialHealth.status,
-      input.initialHealth.namedInfo,
-      input.initialHealth.activeInfo,
-    )
+    !input.initialHealth.error &&
+    input.initialHealth.healthy &&
+    input.initialHealth.namedMetadata
   ) {
     const drift = pidFileGatewayDrift;
     if (drift) {
       deps.logDockerDriverGatewayRestart(drift.reason);
     } else if (
-      deps.registerDockerDriverGatewayEndpoint() &&
+      (await deps.registerDockerDriverGatewayEndpoint()) &&
       (await deps.isDockerDriverGatewayHttpReady())
     ) {
       await deps.verifySandboxBridgeGatewayReachableOrExit(input.exitOnFailure, {
@@ -126,10 +135,12 @@ export async function runDockerDriverGatewayCutover(
     if (drift) deps.logDockerDriverGatewayRestart(drift.reason);
     else deps.rememberDockerDriverGatewayPid(portListenerPid);
 
-    if (!drift && deps.registerDockerDriverGatewayEndpoint()) {
-      const health = deps.readGatewayHealth();
+    if (!drift && (await deps.registerDockerDriverGatewayEndpoint())) {
+      const health = await deps.readGatewayHealth();
       if (
-        deps.isGatewayHealthy(health.status, health.namedInfo, health.activeInfo) &&
+        !health.error &&
+        health.healthy &&
+        health.namedMetadata &&
         (await deps.isDockerDriverGatewayHttpReady())
       ) {
         deps.reapDuplicateHostGatewaysExceptOrFail(

@@ -3,7 +3,13 @@
 
 import { canonicalEndpoint, type EndpointFlavor } from "../core/url-utils";
 import { resolveSandboxGatewayName } from "../onboard/gateway-binding";
+import { isSharedGatewayRouteParticipant } from "../state/registry/route-reservation";
 import type { SandboxEntry } from "../state/registry";
+
+export {
+  nativeInferenceProviderForSandbox,
+  normalizeNativeNvidiaProviderAttachment,
+} from "./native-nvidia";
 
 export type GatewayInferenceRoute = Pick<
   SandboxEntry,
@@ -65,10 +71,15 @@ export type GatewayRouteDiscoveryResult =
 export type CurrentGatewayRouteDiscoveryPreflight = (
   request: Omit<CurrentGatewayRouteCompatibilityRequest, "route"> & {
     route: Omit<GatewayInferenceRoute, "model"> & { model: string | null };
+    nativeLocalSelection?: boolean;
   },
 ) => GatewayRouteDiscoveryResult;
 
-const CUSTOM_ROUTE_PROVIDERS = new Set(["compatible-endpoint", "compatible-anthropic-endpoint"]);
+const CUSTOM_ROUTE_PROVIDERS = new Set([
+  "compatible-endpoint",
+  "compatible-anthropic-endpoint",
+  "llama-cpp-local",
+]);
 
 const SUPPORTED_INFERENCE_APIS = new Set([
   "openai-completions",
@@ -92,6 +103,14 @@ function endpointFlavor(provider: string): EndpointFlavor {
   return provider === "compatible-anthropic-endpoint" ? "anthropic" : "openai";
 }
 
+/** Canonical endpoint identity shared by route compatibility and read-only route reporting. */
+export function canonicalGatewayRouteEndpoint(
+  provider: string,
+  endpointUrl: string | null | undefined,
+): string | null {
+  return canonicalEndpoint(endpointUrl, endpointFlavor(provider));
+}
+
 function normalizedInferenceApi(value: unknown): string | null {
   const api = nonEmptyString(value);
   return api && SUPPORTED_INFERENCE_APIS.has(api) ? api : null;
@@ -102,9 +121,8 @@ function customRouteConflict(
   requested: GatewayInferenceRoute,
   recorded: GatewayInferenceRoute,
 ): GatewayRouteConflictReason | null {
-  const flavor = endpointFlavor(provider);
-  const requestedEndpoint = canonicalEndpoint(requested.endpointUrl, flavor);
-  const recordedEndpoint = canonicalEndpoint(recorded.endpointUrl, flavor);
+  const requestedEndpoint = canonicalGatewayRouteEndpoint(provider, requested.endpointUrl);
+  const recordedEndpoint = canonicalGatewayRouteEndpoint(provider, recorded.endpointUrl);
   const requestedApi = normalizedInferenceApi(requested.preferredInferenceApi);
   const recordedApi = normalizedInferenceApi(recorded.preferredInferenceApi);
   if (!requestedEndpoint || !recordedEndpoint || !requestedApi || !recordedApi) {
@@ -123,6 +141,43 @@ function providerCredentialConflict(
 }
 
 /**
+ * Compare the complete shared-gateway route identity used by both mutation
+ * compatibility and read-only endpoint reporting.
+ */
+export function gatewayRouteIdentityConflictReasons(
+  requestedRoute: GatewayInferenceRoute,
+  recordedRoute: GatewayInferenceRoute,
+): GatewayRouteConflictReason[] {
+  const requested = configuredRoute(requestedRoute);
+  const recorded = configuredRoute(recordedRoute);
+  if (!requested || !recorded) return ["incomplete-route"];
+
+  if (
+    CUSTOM_ROUTE_PROVIDERS.has(recorded.provider) &&
+    customRouteConflict(recorded.provider, recordedRoute, recordedRoute) ===
+      "incomplete-custom-route"
+  ) {
+    return ["incomplete-custom-route"];
+  }
+
+  const conflicts: GatewayRouteConflictReason[] = [];
+  if (recorded.provider === requested.provider) {
+    if (CUSTOM_ROUTE_PROVIDERS.has(requested.provider)) {
+      const reason = customRouteConflict(requested.provider, requestedRoute, recordedRoute);
+      if (reason) conflicts.push(reason);
+    }
+    if (providerCredentialConflict(requestedRoute, recordedRoute)) {
+      conflicts.push("provider-credential");
+    }
+    if (conflicts.length > 0) return conflicts;
+  }
+
+  return recorded.provider !== requested.provider || recorded.model !== requested.model
+    ? ["provider-model"]
+    : [];
+}
+
+/**
  * Constrain read-only route discovery from durable same-gateway registry peers.
  * Missing requested model/API fields are allowed only when the gateway has no
  * configured peer, or when every peer supplies one identical value that
@@ -138,6 +193,7 @@ export function preflightGatewayRouteDiscovery(
   const peers: SandboxEntry[] = [];
   const discoveryConflicts: GatewayRouteConflict[] = [];
   for (const sandbox of request.sandboxes) {
+    if (!isSharedGatewayRouteParticipant(sandbox)) continue;
     if (sandbox.name === request.sandboxName) continue;
     let recordedGatewayName: string;
     try {
@@ -151,8 +207,20 @@ export function preflightGatewayRouteDiscovery(
       continue;
     }
     if (recordedGatewayName !== request.gatewayName) continue;
-    if (configuredRoute(sandbox)) peers.push(sandbox);
-    else {
+    const recorded = configuredRoute(sandbox);
+    if (recorded) {
+      peers.push(sandbox);
+      if (
+        request.nativeLocalSelection &&
+        gatewayRouteIdentityConflictReasons(sandbox, sandbox).includes("incomplete-custom-route")
+      ) {
+        discoveryConflicts.push({
+          sandboxName: sandbox.name,
+          reason: "incomplete-custom-route",
+          scope: "registered",
+        });
+      }
+    } else {
       discoveryConflicts.push({
         sandboxName: sandbox.name,
         reason: "incomplete-route",
@@ -171,6 +239,16 @@ export function preflightGatewayRouteDiscovery(
         route: { provider, model: requestedModel ?? "model discovery pending" },
         conflicts: discoveryConflicts,
       },
+    };
+  }
+  // A native provider does not change the gateway-wide inference route, but
+  // malformed shared peers must still be rejected before selection.
+  if (request.nativeLocalSelection) {
+    return {
+      ok: true,
+      requiredModel: null,
+      requiredEndpointUrl: null,
+      requiredInferenceApi: null,
     };
   }
   if (peers.length === 0) {
@@ -222,7 +300,7 @@ export function preflightGatewayRouteDiscovery(
 }
 
 /**
- * Compare a requested route with every durable registry row on the same
+ * Compare a requested route with every published durable registry row on the same
  * OpenShell gateway. Registry rows are intentionally used without a live-state
  * filter because stopped sandboxes still depend on the gateway route when they
  * restart. The requested route must already carry the target agent's effective
@@ -238,7 +316,7 @@ export function checkGatewayRouteCompatibility(
   }
   if (
     CUSTOM_ROUTE_PROVIDERS.has(requested.provider) &&
-    (!canonicalEndpoint(request.route.endpointUrl, endpointFlavor(requested.provider)) ||
+    (!canonicalGatewayRouteEndpoint(requested.provider, request.route.endpointUrl) ||
       !normalizedInferenceApi(request.route.preferredInferenceApi))
   ) {
     return {
@@ -258,6 +336,7 @@ export function checkGatewayRouteCompatibility(
 
   const conflicts: GatewayRouteConflict[] = [];
   for (const sandbox of request.sandboxes) {
+    if (!isSharedGatewayRouteParticipant(sandbox)) continue;
     if (sandbox.name === request.sandboxName) continue;
     let recordedGatewayName: string;
     try {
@@ -281,52 +360,14 @@ export function checkGatewayRouteCompatibility(
       continue;
     }
 
-    if (
-      CUSTOM_ROUTE_PROVIDERS.has(recorded.provider) &&
-      (!canonicalEndpoint(sandbox.endpointUrl, endpointFlavor(recorded.provider)) ||
-        !normalizedInferenceApi(sandbox.preferredInferenceApi))
-    ) {
-      conflicts.push({
-        sandboxName: sandbox.name,
-        reason: "incomplete-custom-route",
-        scope: "registered",
-        recordedRoute: recorded,
-      });
-      continue;
-    }
-
     // A provider/model-only mutation cannot safely replace provider-global
     // endpoint, API-family, or credential identity. Compare that fingerprint
     // first so a simultaneous model difference cannot hide a provider mutation.
-    if (recorded.provider === requested.provider) {
-      let providerIdentityConflict = false;
-      if (CUSTOM_ROUTE_PROVIDERS.has(requested.provider)) {
-        const reason = customRouteConflict(requested.provider, request.route, sandbox);
-        if (reason) {
-          conflicts.push({
-            sandboxName: sandbox.name,
-            reason,
-            scope: "registered",
-            recordedRoute: recorded,
-          });
-          providerIdentityConflict = true;
-        }
-      }
-      if (providerCredentialConflict(request.route, sandbox)) {
-        conflicts.push({
-          sandboxName: sandbox.name,
-          reason: "provider-credential",
-          scope: "registered",
-          recordedRoute: recorded,
-        });
-        providerIdentityConflict = true;
-      }
-      if (providerIdentityConflict) continue;
-    }
-    if (recorded.provider !== requested.provider || recorded.model !== requested.model) {
+    const identityConflicts = gatewayRouteIdentityConflictReasons(request.route, sandbox);
+    for (const reason of identityConflicts) {
       conflicts.push({
         sandboxName: sandbox.name,
-        reason: "provider-model",
+        reason,
         scope: "registered",
         recordedRoute: recorded,
       });
@@ -366,25 +407,10 @@ export function isAdvisoryGatewayRouteConflict(
   );
 }
 
-/**
- * True only when a provider/model-only route mutation can safely reconcile the
- * conflict. Provider-global endpoint, API-family, and credential changes stay
- * fail-closed while another registered sandbox depends on the current identity.
- */
-export function isAdvisoryProviderModelRouteConflict(
-  result: Exclude<GatewayRouteCompatibilityResult, { ok: true }>,
-): boolean {
-  return (
-    result.conflicts.length > 0 &&
-    result.conflicts.every(
-      (conflict) => conflict.scope !== "requested" && conflict.reason === "provider-model",
-    )
-  );
-}
-
 /** Explain the single-gateway side effect immediately before route mutation. */
 export function formatGatewayRouteImpactWarning(
   result: Exclude<GatewayRouteCompatibilityResult, { ok: true }>,
+  operation: "onboard" | "inference-set" = "onboard",
 ): string {
   const affected = [...result.conflicts]
     .sort((left, right) => left.sandboxName.localeCompare(right.sandboxName))
@@ -395,9 +421,14 @@ export function formatGatewayRouteImpactWarning(
         : name;
     })
     .join(", ");
-  const target = result.sandboxName
-    ? `Onboarding '${safeDisplay(result.sandboxName)}'`
-    : "This onboarding run";
+  const target =
+    operation === "inference-set"
+      ? result.sandboxName
+        ? `Changing inference for '${safeDisplay(result.sandboxName)}'`
+        : "This inference change"
+      : result.sandboxName
+        ? `Onboarding '${safeDisplay(result.sandboxName)}'`
+        : "This onboarding run";
   const nextRoute = `${safeDisplay(result.route.provider)} / ${safeDisplay(result.route.model)}`;
   return (
     `Warning: ${target} will re-point the one shared inference route on OpenShell gateway ` +
@@ -491,3 +522,5 @@ export function assertGatewayRouteCompatibility(request: GatewayRouteCompatibili
   const result = checkGatewayRouteCompatibility(request);
   if (!result.ok) throw new GatewayRouteConflictError(result);
 }
+
+export { normalizeNativeLocalProviderAttachment } from "./native-local/contract";

@@ -32,16 +32,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           languages: ${{ matrix.language }}
           queries: security-and-quality
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
 
   shellcheck:
     name: ShellCheck SARIF
@@ -49,45 +51,62 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: source
           persist-credentials: false
+          path: source
 
       - name: Check out the trusted ShellCheck converter
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.workflow_sha }}
           path: trusted-shellcheck-converter
-          persist-credentials: false
           sparse-checkout: |
             scripts/shellcheck-json1-to-sarif.mts
           sparse-checkout-cone-mode: false
 
-      - name: Detect trusted ShellCheck converter
-        id: converter
-        run: |
-          set -euo pipefail
-          if [ -f trusted-shellcheck-converter/scripts/shellcheck-json1-to-sarif.mts ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "Trusted base revision does not yet contain the ShellCheck converter; conversion and upload begin after this helper lands on the base branch."
-          fi
-
       - name: Setup Node.js
-        if: steps.converter.outputs.present == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.0.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22.19.0
+          node-version: 24.18.1
+
+      - name: Install reviewed npm
+        uses: NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@98669f24d35f18e49b6b2769cd68709509ea24f2
 
       - name: Install ShellCheck
-        if: steps.converter.outputs.present == 'true'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/shellcheck-json1-probe.sh"
+          printf '#!/bin/sh\ntrue\n' > "$probe"
+          if command -v shellcheck >/dev/null 2>&1 &&
+            shellcheck --format=json1 "$probe" >/dev/null 2>&1; then
+            echo "Using preinstalled ShellCheck"
+            shellcheck --version
+          else
+            apt_options=(
+              -o Acquire::Retries=3
+              -o Acquire::http::Timeout=15
+              -o Acquire::https::Timeout=15
+            )
+            if ! sudo apt-get "${apt_options[@]}" update; then
+              echo "Failed to update apt package indexes for ShellCheck" >&2
+              exit 1
+            fi
+            if ! sudo apt-get "${apt_options[@]}" install -y shellcheck; then
+              echo "Failed to install ShellCheck" >&2
+              exit 1
+            fi
+            if ! shellcheck --format=json1 "$probe" >/dev/null 2>&1; then
+              echo "Installed ShellCheck does not support --format=json1" >&2
+              exit 1
+            fi
+            echo "Using installed ShellCheck"
+            shellcheck --version
+          fi
 
       - name: Collect shell files
         id: shell-files
-        if: steps.converter.outputs.present == 'true'
         working-directory: source
         run: |
           git ls-files -z -- '*.sh' 'install.sh' 'uninstall.sh' | sort -zu > "$GITHUB_WORKSPACE/shell-files.txt"
@@ -98,7 +117,7 @@ jobs:
           fi
 
       - name: Generate ShellCheck SARIF
-        if: steps.converter.outputs.present == 'true' && steps.shell-files.outputs.has_files == 'true'
+        if: steps.shell-files.outputs.has_files == 'true'
         working-directory: source
         run: |
           # Ubuntu's packaged ShellCheck may not support --format=sarif.
@@ -124,7 +143,7 @@ jobs:
           esac
 
           conversion_exit=0
-          if env -i PATH="$PATH" node --experimental-strip-types \
+          if env -i PATH="$PATH" node \
             "$GITHUB_WORKSPACE/trusted-shellcheck-converter/scripts/shellcheck-json1-to-sarif.mts" \
             "$GITHUB_WORKSPACE/shellcheck.json" "$GITHUB_WORKSPACE/shellcheck.sarif"; then
             conversion_exit=0
@@ -140,7 +159,7 @@ jobs:
 
       - name: Check SARIF has runs
         id: sarif-runs
-        if: steps.converter.outputs.present == 'true' && steps.shell-files.outputs.has_files == 'true'
+        if: steps.shell-files.outputs.has_files == 'true'
         run: |
           run_count="$(jq '.runs | length' shellcheck.sarif)"
           if [ "$run_count" -gt 0 ]; then
@@ -151,8 +170,8 @@ jobs:
           fi
 
       - name: Upload ShellCheck SARIF
-        if: steps.converter.outputs.present == 'true' && steps.shell-files.outputs.has_files == 'true' && steps.sarif-runs.outputs.has_runs == 'true'
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        if: steps.shell-files.outputs.has_files == 'true' && steps.sarif-runs.outputs.has_runs == 'true'
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: shellcheck.sarif
           checkout_path: source

@@ -5,13 +5,14 @@
 set -Eeuo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2026-07-18.1"
+readonly SCRIPT_VERSION="2026-07-20.1"
 readonly REBOOT_REQUIRED_EXIT=10
 readonly LOGIN_REQUIRED_EXIT=11
 readonly MIN_FREE_KIB=$((20 * 1024 * 1024))
 readonly GB300_PCI_VENDOR="0x10de"
 readonly -a GB300_PCI_DEVICES=("0x31c2" "0x31c3")
 readonly GB300_PCI_CLASS_PREFIX="0x03"
+readonly STATION_IDENTITY_VALUE_MAX_BYTES=256
 STATION_HOST_PROFILE="generic-ubuntu"
 FORCE_STATION_INSTALL=0
 # The qualified generic image currently ships this OEM telemetry bootcmd. Its
@@ -36,6 +37,7 @@ readonly TOOLKIT_VERSION="1.19.1"
 readonly STATION_PACKAGE_ARCH="arm64"
 readonly FACTORY_DKMS_VERSION="3.0.11-1ubuntu13"
 readonly TARGET_DKMS_VERSION="1:3.4.0-1ubuntu1"
+readonly DRIVER_PIN_PACKAGE_SPEC="nvidia-driver-pinning-610=610-2ubuntu1"
 # NemoClaw DGX Station maintainers own this allowlist. The qualified tuple below
 # binds each retained revision to the complete generic-Ubuntu package contract.
 # Update both only after requalification; remove an entry when runtime
@@ -50,6 +52,9 @@ readonly -a RETAINED_DKMS_VERSIONS=(
 readonly ACCEPTANCE_IMAGE="docker.io/library/ubuntu@sha256:7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab"
 readonly STATE_DIR="${HOME}/.local/state/station-bootstrap"
 readonly INSTALL_BOOT_MARKER="${STATE_DIR}/install-boot-id"
+readonly NEMOCLAW_CONFIG_DIR="/etc/nemoclaw"
+readonly DUAL_STATION_CONTROLLER_UID_FILE="${NEMOCLAW_CONFIG_DIR}/dual-station-controller-uid"
+readonly DUAL_STATION_CONTROLLER_UID_MODE="0644"
 DOCKER_BASELINE_CAPTURED=0
 DOCKER_CONTAINER_BASELINE=""
 DOCKER_CONTAINER_BASELINE_TOTAL=0
@@ -61,7 +66,7 @@ PACKAGEKIT_WAS_ACTIVE=0
 
 readonly -a PACKAGE_SPECS=(
   "dkms=${TARGET_DKMS_VERSION}"
-  "nvidia-driver-pinning-610=610-2ubuntu1"
+  "${DRIVER_PIN_PACKAGE_SPEC}"
   "nvidia-driver-open=610.43.02-1ubuntu1"
   "containerd.io=2.2.6-1~ubuntu.24.04~noble"
   "docker-buildx-plugin=0.35.0-1~ubuntu.24.04~noble"
@@ -75,7 +80,7 @@ readonly -a PACKAGE_SPECS=(
 
 readonly -a RETAINED_DKMS_QUALIFIED_PACKAGE_SPECS=(
   "dkms=1:3.4.0-1ubuntu1"
-  "nvidia-driver-pinning-610=610-2ubuntu1"
+  "${DRIVER_PIN_PACKAGE_SPEC}"
   "nvidia-driver-open=610.43.02-1ubuntu1"
   "containerd.io=2.2.6-1~ubuntu.24.04~noble"
   "docker-buildx-plugin=0.35.0-1~ubuntu.24.04~noble"
@@ -108,21 +113,21 @@ readonly -a BASEOS_PACKAGE_SPECS=(
   "sssd-common=2.9.4-1.1ubuntu6.4"
 )
 
-readonly BASEOS_CLOUD_CFG_SHA256="038ba435093de59f4a21021caf6c921d63344e9aae3b88795ee5b2659f43f437"
-readonly BASEOS_CLOUD_INIT_UNIT_SHA256="e13dd95a7bfac6407ea1ce45ed6683c0f4e84c791840d305c937d38ae77d9456"
-readonly BASEOS_FLUENT_BIT_UNIT_SHA256="1854339f563e518894c156d081912595d2d6e175a1ed6692e74e88224b6bad5f"
-readonly BASEOS_FLUENT_BIT_CFG_NORMALIZED_SHA256="ffec8b1bcc628877b9a230c6b26313b5ee6b25c20398580832133dbb15349551"
-readonly BASEOS_FLUENT_BIT_PARSERS_SHA256="760e6a347874a6cbdc10c6cd21d82d1ee5388c8573ddfaab05ef37904749dbe1"
-readonly BASEOS_FLUENT_BIT_PLUGINS_SHA256="9d5aad2c1be151b4d35de53a460f9783f98ac3cc815ebc638b0e8489f4ecd577"
-readonly BASEOS_FWUPD_UNIT_SHA256="835e7c291761c247d3cd5c64652b768c6a7fdc7cc72fea1bf70fc92e4cb3cfd5"
-readonly BASEOS_FWUPD_CFG_SHA256="a25bd457c86be85a286cd175d94e30fa152eb119c95b2a7db8a495886cdd7654"
-readonly BASEOS_FWUPD_LVFS_TESTING_SHA256="f50a44def594f256a8192c1d048e08aa94f0287de804262f680b73fa62d97787"
-readonly BASEOS_FWUPD_LVFS_SHA256="c4e62d855e41dbf777972b4249da5b2b968fc723e8c7d0d55f932ba47764e98c"
-readonly BASEOS_FWUPD_VENDOR_SHA256="0f5a62990f2ddb1681349c01373b3208131e5254a0e734e6090c249c5af9a73f"
-readonly BASEOS_SSSD_AUTOFS_UNIT_SHA256="d1be2c2c33e1591ac2fa0bf656bf8dc3d52083a7e9569902e777aea827baeb1f"
-readonly BASEOS_SSSD_NSS_UNIT_SHA256="bd432f92436f5c1c142c5824fce66aded6b8be80db4fdfbbed60f222c3a97d9e"
-readonly BASEOS_SSSD_PAM_UNIT_SHA256="6760940940471d5bb1b09652b1632db1251b90c3a028efcf11a1b731bb0ab43c"
-readonly BASEOS_SSSD_PAM_PRIV_UNIT_SHA256="851fc28d7ab5ac38cd56fcad1f4125cfeb46e8ee62bbf6cbc6376c592faeb51a"
+readonly FACTORY_CLOUD_CFG_SHA256="038ba435093de59f4a21021caf6c921d63344e9aae3b88795ee5b2659f43f437"
+readonly FACTORY_CLOUD_INIT_UNIT_SHA256="e13dd95a7bfac6407ea1ce45ed6683c0f4e84c791840d305c937d38ae77d9456"
+readonly FACTORY_FLUENT_BIT_UNIT_SHA256="1854339f563e518894c156d081912595d2d6e175a1ed6692e74e88224b6bad5f"
+readonly FACTORY_FLUENT_BIT_CFG_NORMALIZED_SHA256="ffec8b1bcc628877b9a230c6b26313b5ee6b25c20398580832133dbb15349551"
+readonly FACTORY_FLUENT_BIT_PARSERS_SHA256="760e6a347874a6cbdc10c6cd21d82d1ee5388c8573ddfaab05ef37904749dbe1"
+readonly FACTORY_FLUENT_BIT_PLUGINS_SHA256="9d5aad2c1be151b4d35de53a460f9783f98ac3cc815ebc638b0e8489f4ecd577"
+readonly FACTORY_FWUPD_UNIT_SHA256="835e7c291761c247d3cd5c64652b768c6a7fdc7cc72fea1bf70fc92e4cb3cfd5"
+readonly FACTORY_FWUPD_CFG_SHA256="a25bd457c86be85a286cd175d94e30fa152eb119c95b2a7db8a495886cdd7654"
+readonly FACTORY_FWUPD_LVFS_TESTING_SHA256="f50a44def594f256a8192c1d048e08aa94f0287de804262f680b73fa62d97787"
+readonly FACTORY_FWUPD_LVFS_SHA256="c4e62d855e41dbf777972b4249da5b2b968fc723e8c7d0d55f932ba47764e98c"
+readonly FACTORY_FWUPD_VENDOR_SHA256="0f5a62990f2ddb1681349c01373b3208131e5254a0e734e6090c249c5af9a73f"
+readonly FACTORY_SSSD_AUTOFS_UNIT_SHA256="d1be2c2c33e1591ac2fa0bf656bf8dc3d52083a7e9569902e777aea827baeb1f"
+readonly FACTORY_SSSD_NSS_UNIT_SHA256="bd432f92436f5c1c142c5824fce66aded6b8be80db4fdfbbed60f222c3a97d9e"
+readonly FACTORY_SSSD_PAM_UNIT_SHA256="6760940940471d5bb1b09652b1632db1251b90c3a028efcf11a1b731bb0ab43c"
+readonly FACTORY_SSSD_PAM_PRIV_UNIT_SHA256="851fc28d7ab5ac38cd56fcad1f4125cfeb46e8ee62bbf6cbc6376c592faeb51a"
 
 dgx_station_release_path() {
   printf '%s' /etc/dgx-release
@@ -134,6 +139,18 @@ station_os_release_path() {
 
 station_product_name_path() {
   printf '%s' /sys/class/dmi/id/product_name
+}
+
+station_product_family_path() {
+  printf '%s' /sys/class/dmi/id/product_family
+}
+
+station_board_name_path() {
+  printf '%s' /sys/class/dmi/id/board_name
+}
+
+station_device_tree_model_path() {
+  printf '%s' /sys/firmware/devicetree/base/model
 }
 
 station_pci_devices_path() {
@@ -216,8 +233,13 @@ dgx_station_release_value() {
   printf '%s' "$value"
 }
 
+dgx_station_no_ota_stock_version_is_supported() {
+  local version=${1:-}
+  [[ "$version" =~ ^7\.6\.[0-9]+$ ]]
+}
+
 dgx_station_release_profile() {
-  local path=$1 ota_pretty="" pretty version build_date platform
+  local path=$1 ota_pretty="" ota_key version build_date platform
   dgx_station_release_schema_is_valid "$path" || return 1
   platform="$(dgx_station_release_value "$path" DGX_PLATFORM)" || return 1
   [[ "$platform" == "DGX Server for GALAXY-GB300" ]] || return 1
@@ -225,19 +247,13 @@ dgx_station_release_profile() {
   # DGX OS keeps its upgrade history in the DGX_OTA_* fields, so a host that has
   # an OTA history is classified by the most recent OTA version it applied.
   #
-  # A host provisioned from a full DGX OS image also carries the identity field
-  # DGX_OTA_PRETTY_NAME="DGX OS"; when that field is present it must read exactly
-  # "DGX OS". It is absent on a host that was first installed from an older base
-  # image (for example 7.4.1-GB300ws) and later OTA-upgraded, because an OTA
-  # upgrade never adds that field. In that case, fall back to the hardware
-  # identity and require DGX_PRETTY_NAME="NVIDIA DGX GB300WS" so that other
-  # release lineages that also emit DGX_OTA_* fields stay fail-closed.
+  # A host provisioned from a full DGX OS image also carries the lineage field
+  # DGX_OTA_PRETTY_NAME="DGX OS". When present, it must match. OTA upgrades can
+  # omit that field, so the hardware, platform, and latest OTA version own the
+  # fallback. DGX_PRETTY_NAME remains diagnostic release text.
   if dgx_station_release_value "$path" DGX_OTA_VERSION >/dev/null 2>&1; then
     if ota_pretty="$(dgx_station_release_value "$path" DGX_OTA_PRETTY_NAME 2>/dev/null)"; then
       [[ "$ota_pretty" == "DGX OS" ]] || return 1
-    else
-      pretty="$(dgx_station_release_value "$path" DGX_PRETTY_NAME)" || return 1
-      [[ "$pretty" == "NVIDIA DGX GB300WS" ]] || return 1
     fi
     version="$(dgx_station_release_value "$path" DGX_OTA_VERSION)" || return 1
     case "$version" in
@@ -247,23 +263,59 @@ dgx_station_release_profile() {
     return 0
   fi
 
-  # No-OTA factory images are separate, exact profiles. Do not infer support
-  # merely from a missing OTA identity: internal BaseOS and customer images
-  # use different software stacks and qualification evidence.
-  dgx_station_release_value "$path" DGX_OTA_DATE >/dev/null 2>&1 && return 1
-  pretty="$(dgx_station_release_value "$path" DGX_PRETTY_NAME)" || return 1
+  # Stock DGX OS 7.6 omits DGX_OTA_* metadata. Hardware, platform, version, and
+  # the factory-runtime checks own qualification. DGX_PRETTY_NAME remains
+  # diagnostic text. Other no-OTA factory images remain exact build profiles
+  # because they carry separately qualified stacks.
+  for ota_key in DGX_OTA_PRETTY_NAME DGX_OTA_VERSION DGX_OTA_DATE; do
+    dgx_station_release_value "$path" "$ota_key" >/dev/null 2>&1 && return 1
+  done
   version="$(dgx_station_release_value "$path" DGX_SWBUILD_VERSION)" || return 1
   build_date="$(dgx_station_release_value "$path" DGX_SWBUILD_DATE)" || return 1
 
-  case "${pretty}|${version}|${build_date}" in
-    "NVIDIA DGX Server|7.5.0-GB300ws-GB200ws|2026-04-02-08-20-16")
+  if dgx_station_no_ota_stock_version_is_supported "$version"; then
+    printf '%s' supported-dgx-os
+    return 0
+  fi
+
+  case "${version}|${build_date}" in
+    "7.5.0-GB300ws-GB200ws|2026-04-02-08-20-16")
       printf '%s' supported-colossus-baseos
       ;;
-    "NVIDIA DGX GB300WS|7.5.0|2026-06-16-11-48-10")
+    "7.5.0|2026-05-13-18-42-38" | \
+      "7.5.0|2026-06-16-11-48-10")
       printf '%s' supported-ai-developer-tools
       ;;
     *) return 1 ;;
   esac
+}
+
+dgx_station_release_contents_are_complete_station_profile() {
+  local path=$1 ota_key ota_pretty="" platform
+  dgx_station_release_schema_is_valid "$path" || return 1
+  platform="$(dgx_station_release_value "$path" DGX_PLATFORM)" || return 1
+  [[ "$platform" == "DGX Server for GALAXY-GB300" ]] || return 1
+
+  if dgx_station_release_value "$path" DGX_OTA_VERSION >/dev/null 2>&1; then
+    if ota_pretty="$(dgx_station_release_value "$path" DGX_OTA_PRETTY_NAME 2>/dev/null)"; then
+      [[ "$ota_pretty" == "DGX OS" ]] || return 1
+    fi
+    dgx_station_release_value "$path" DGX_OTA_DATE >/dev/null
+    return
+  fi
+
+  for ota_key in DGX_OTA_PRETTY_NAME DGX_OTA_VERSION DGX_OTA_DATE; do
+    dgx_station_release_value "$path" "$ota_key" >/dev/null 2>&1 && return 1
+  done
+  dgx_station_release_value "$path" DGX_SWBUILD_VERSION >/dev/null \
+    && dgx_station_release_value "$path" DGX_SWBUILD_DATE >/dev/null
+}
+
+dgx_station_release_is_complete_unrecognized_profile() {
+  local path=$1
+  dgx_station_release_file_is_safe "$path" \
+    && dgx_station_release_contents_are_complete_station_profile "$path" \
+    && ! dgx_station_release_contents_are_supported "$path"
 }
 
 dgx_station_release_contents_are_supported() {
@@ -296,6 +348,7 @@ NETWORK_VALIDATED=0
 PACKAGE_TRANSACTION_SPECS=()
 APT_TRANSACTION_GUARD_DIR=""
 APT_TRANSACTION_HOOK=""
+APT_TRANSACTION_DRIVER_POLICY=""
 GPU_ROWS_ERROR=""
 
 info() {
@@ -311,6 +364,11 @@ fatal() {
   exit 1
 }
 
+existing_vllm_conflict() {
+  printf '[station-prepare] %s ERROR: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+  exit 12
+}
+
 on_error() {
   local rc=$?
   local line=${1:-unknown}
@@ -319,22 +377,38 @@ on_error() {
   exit "$rc"
 }
 
+# Remote pair preparation must never fall back to an interactive sudo prompt.
+# Keep the helper's local behavior unchanged unless its caller explicitly opts
+# into this strict mode after proving `sudo -n true` succeeds.
+sudo() {
+  if [[ "${NEMOCLAW_STATION_PREP_SUDO_NONINTERACTIVE:-0}" == "1" && "${1:-}" != "-n" ]]; then
+    command sudo -n "$@"
+  else
+    command sudo "$@"
+  fi
+}
+
 usage() {
   cat <<'EOF'
-Usage: prepare-dgx-station-host.sh --check|--apply|--verify [--force-station-install]
+Usage: prepare-dgx-station-host.sh --check|--apply|--verify|--bind-controller [--force-station-install]
 
   --check   Read-only eligibility and current-state report.
   --apply   Install exact prerequisites or finish post-reboot runtime setup.
   --verify  Read-only host verification plus ephemeral GPU container tests.
+  --bind-controller
+             Bind only the current non-root controller UID without inspecting
+             or disrupting an already-running managed inference workload.
   --force-station-install
             Bypass only the DGX release-metadata allowlist. ARM64 Ubuntu 24.04,
-            Station GB300 hardware, and all factory-runtime health checks still
-            apply. The existing driver and container runtime are preserved.
+            Station GB300 hardware, workload quiescence, and all factory-runtime
+            health checks still apply. The existing driver and container runtime
+            are preserved.
 
 Exit 10 from --apply means an operator-controlled reboot is required. After
 the reboot, run --apply once more, followed by --verify.
 Exit 11 means Docker-group membership was added. Start a new login session and
 run --apply again; a reboot is not required.
+Exit 12 means an existing vLLM workload requires an installer ownership choice.
 EOF
 }
 
@@ -344,7 +418,7 @@ parse_args() {
   FORCE_STATION_INSTALL=0
   for arg in "$@"; do
     case "$arg" in
-      --check | --apply | --verify | --classify-dgx-release)
+      --check | --apply | --verify | --bind-controller | --classify-dgx-release | --classify-station-hardware)
         [[ -z "$MODE" ]] || return 1
         MODE="$arg"
         ;;
@@ -353,13 +427,107 @@ parse_args() {
     esac
   done
   [[ -n "$MODE" ]] || return 1
-  [[ "$MODE" != "--classify-dgx-release" || "$FORCE_STATION_INSTALL" == "0" ]]
+  [[ "$MODE" != "--classify-dgx-release" || "$FORCE_STATION_INSTALL" == "0" ]] \
+    && [[ "$MODE" != "--classify-station-hardware" || "$FORCE_STATION_INSTALL" == "0" ]] \
+    && [[ "$MODE" != "--bind-controller" || "$FORCE_STATION_INSTALL" == "0" ]]
+}
+
+nvidia_firmware_product_class() {
+  local product=${1:-}
+  if [[ "$product" =~ [Dd][Gg][Xx]([_[:space:]-]+)[Ss][Pp][Aa][Rr][Kk] ]]; then
+    printf '%s' spark
+  elif [[ "$product" =~ (^|[^[:alnum:]])[Ss][Tt][Aa][Tt][Ii][Oo][Nn]([_[:space:]-]+)([Dd][Gg][Xx]([_[:space:]-]+))?[Gg][Bb]300($|[^[:alnum:]]) ||
+    "$product" =~ (^|[^[:alnum:]])[Gg][Bb]300([_[:space:]-]+)([Dd][Gg][Xx]([_[:space:]-]+))?[Ss][Tt][Aa][Tt][Ii][Oo][Nn]($|[^[:alnum:]]) ]]; then
+    printf '%s' station-gb300
+  elif [[ "$product" =~ (^|[^[:alnum:]])[Pp]3830($|[^[:alnum:]]) || "$product" =~ [Dd][Gg][Xx]([_[:space:]-]+)[Ss][Tt][Aa][Tt][Ii][Oo][Nn] ]]; then
+    printf '%s' station-other
+  elif [[ "$product" =~ [Jj][Ee][Tt][Ss][Oo][Nn]|[Tt][Ee][Gg][Rr][Aa]|[Tt][Hh][Oo][Rr]|[Oo][Rr][Ii][Nn]|[Xx][Aa][Vv][Ii][Ee][Rr] ]]; then
+    printf '%s' jetson
+  else
+    return 1
+  fi
 }
 
 is_station_gb300_product() {
-  local product=${1:-}
-  [[ "$product" =~ (^|[^[:alnum:]])[Ss][Tt][Aa][Tt][Ii][Oo][Nn]([^[:alnum:]]|$) &&
-    "$product" =~ (^|[^[:alnum:]])[Gg][Bb]300([^[:alnum:]]|$) ]]
+  [[ "$(nvidia_firmware_product_class "${1:-}" 2>/dev/null || true)" == "station-gb300" ]]
+}
+
+station_firmware_value_is_printable() {
+  local printable value=${1:-}
+  printable="$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\037\177')"
+  [[ "$printable" == "$value" ]]
+}
+
+station_bounded_line_value() {
+  local byte_count control_count last_byte newline_count path=$1
+  byte_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 2)) "$path" 2>/dev/null | wc -c | tr -d '[:space:]')"
+  [[ "$byte_count" =~ ^[0-9]+$ ]] && ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES + 1)) || return 1
+  control_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000-\037\177' | wc -c | tr -d '[:space:]')"
+  [[ "$control_count" =~ ^[0-9]+$ ]] || return 1
+  if ((control_count > 0)); then
+    newline_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\012' | wc -c | tr -d '[:space:]')"
+    [[ "$newline_count" == "1" && "$control_count" == "1" ]] || return 1
+    last_byte="$(tail -c 1 "$path" 2>/dev/null | od -An -tu1 | tr -d '[:space:]')"
+    [[ "$last_byte" == "10" ]] || return 1
+  fi
+  head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | tr -d '\n'
+}
+
+station_device_tree_model_value() {
+  local byte_count control_count last_byte nul_count path=$1
+  byte_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 2)) "$path" 2>/dev/null | wc -c | tr -d '[:space:]')"
+  [[ "$byte_count" =~ ^[0-9]+$ ]] && ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES + 1)) || return 1
+  control_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000-\037\177' | wc -c | tr -d '[:space:]')"
+  [[ "$control_count" =~ ^[0-9]+$ ]] || return 1
+  nul_count="$(head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | LC_ALL=C tr -cd '\000' | wc -c | tr -d '[:space:]')"
+  [[ "$nul_count" =~ ^[0-9]+$ ]] || return 1
+  ((byte_count <= STATION_IDENTITY_VALUE_MAX_BYTES || nul_count == 1)) || return 1
+  if ((control_count > 0)); then
+    ((control_count == 1 && nul_count == 1)) || return 1
+    last_byte="$(tail -c 1 "$path" 2>/dev/null | od -An -tu1 | tr -d '[:space:]')"
+    [[ "$last_byte" == "0" ]] || return 1
+  fi
+  head -c $((STATION_IDENTITY_VALUE_MAX_BYTES + 1)) "$path" 2>/dev/null | tr -d '\000'
+}
+
+station_firmware_identity() {
+  local LC_ALL=C class="" output=${1:?firmware identity output is required} path recognized="" station_product="" value
+  for path in "$(station_product_name_path)" "$(station_product_family_path)" "$(station_board_name_path)" "$(station_device_tree_model_path)"; do
+    [[ -r "$path" ]] || continue
+    if [[ "$path" == "$(station_device_tree_model_path)" ]]; then
+      value="$(station_device_tree_model_value "$path")" || continue
+    else
+      value="$(station_bounded_line_value "$path")" || continue
+    fi
+    [[ ${#value} -le STATION_IDENTITY_VALUE_MAX_BYTES ]] || continue
+    station_firmware_value_is_printable "$value" || continue
+    class="$(nvidia_firmware_product_class "$value" 2>/dev/null || true)"
+    [[ -n "$class" ]] || continue
+    if [[ -n "$recognized" && "$recognized" != "$class" ]]; then
+      if [[ "$output" == "state" ]]; then
+        printf '%s' conflicting
+        return 0
+      fi
+      return 2
+    fi
+    recognized=$class
+    [[ "$class" != "station-gb300" || -n "$station_product" ]] || station_product=$value
+  done
+  if [[ "$output" == "state" ]]; then
+    printf '%s' "${recognized:-not-station}"
+    return 0
+  fi
+  [[ "$output" == "product" ]] || return 1
+  [[ "$recognized" == "station-gb300" && -n "$station_product" ]] || return 1
+  printf '%s' "$station_product"
+}
+
+station_firmware_product() {
+  station_firmware_identity product
+}
+
+station_firmware_identity_state() {
+  station_firmware_identity state
 }
 
 normalize_nvidia_pci_bus_id() {
@@ -399,20 +567,38 @@ station_pci_device_is_gb300() {
     -r "$pci_path/vendor" &&
     -r "$pci_path/device" &&
     -r "$pci_path/class" ]] || return 1
-  IFS= read -r vendor <"$pci_path/vendor" || return 1
-  IFS= read -r device <"$pci_path/device" || return 1
-  IFS= read -r class <"$pci_path/class" || return 1
+  vendor="$(station_bounded_line_value "$pci_path/vendor")" || return 1
+  device="$(station_bounded_line_value "$pci_path/device")" || return 1
+  class="$(station_bounded_line_value "$pci_path/class")" || return 1
   [[ "$vendor" == "$GB300_PCI_VENDOR" ]] || return 1
   gb300_pci_device_is_known "$device" || return 1
-  [[ "$class" == "${GB300_PCI_CLASS_PREFIX}"* ]]
+  [[ "$class" =~ ^${GB300_PCI_CLASS_PREFIX}[0-9a-fA-F]{4}$ ]]
 }
 
 station_has_exact_gb300_pci_gpu() {
   local pci_root=${1:-/sys/bus/pci/devices} pci_path
+  local -a pci_paths=()
   for pci_path in "$pci_root"/*; do
+    [[ -d "$pci_path" ]] || continue
+    pci_paths+=("$pci_path")
+  done
+  ((${#pci_paths[@]} > 0 && ${#pci_paths[@]} <= 256)) || return 1
+  for pci_path in "${pci_paths[@]}"; do
     station_pci_device_is_gb300 "${pci_path##*/}" "$pci_root" && return 0
   done
   return 1
+}
+
+station_hardware_identity_state() {
+  local firmware_state
+  firmware_state="$(station_firmware_identity_state)"
+  if [[ "$firmware_state" != "station-gb300" ]]; then
+    printf '%s' "$firmware_state"
+  elif station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)"; then
+    printf '%s' station-gb300
+  else
+    printf '%s' station-gb300-pci-missing
+  fi
 }
 
 is_preparation_critical_unit() {
@@ -437,15 +623,17 @@ root_owned_file_is_not_writable_by_group_or_other() {
   (((8#$mode & 0022) == 0))
 }
 
-cloud_init_failure_is_qualified() {
-  local actual_sha
-  ((NETWORK_VALIDATED == 1)) || return 1
+cloud_init_telemetry_failure_is_qualified() {
   root_owned_file_is_not_writable_by_group_or_other "$FACTORY_CLOUD_INIT_TELEMETRY" \
     || return 1
   root_owned_file_is_not_writable_by_group_or_other "$FACTORY_CLOUD_INIT_RESULT" || return 1
-  actual_sha="$(sha256sum "$FACTORY_CLOUD_INIT_TELEMETRY" 2>/dev/null | awk '{print $1}')"
-  [[ "$actual_sha" == "$FACTORY_CLOUD_INIT_TELEMETRY_SHA256" ]] || return 1
+  file_sha256_matches "$FACTORY_CLOUD_INIT_TELEMETRY" "$FACTORY_CLOUD_INIT_TELEMETRY_SHA256" \
+    || return 1
   grep -Fq "\"('bootcmd', ProcessExecutionError(" "$FACTORY_CLOUD_INIT_RESULT"
+}
+
+cloud_init_failure_is_qualified() {
+  ((NETWORK_VALIDATED == 1)) && cloud_init_telemetry_failure_is_qualified
 }
 
 network_wait_failure_is_qualified() {
@@ -472,7 +660,7 @@ file_sha256_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
-baseos_fluent_bit_config_matches() {
+factory_fluent_bit_config_matches() {
   local path=$1 expected=$2 actual
   root_owned_file_is_not_writable_by_group_or_other "$path" || return 1
   actual="$({
@@ -493,7 +681,7 @@ systemd_property_matches() {
   [[ "$actual" == "$expected" ]]
 }
 
-baseos_failed_unit_matches() {
+factory_failed_unit_matches() {
   local unit=$1 fragment=$2 unit_hash=$3 unit_state=$4 exec_status=${5:-}
   systemd_property_matches "$unit" LoadState loaded \
     && systemd_property_matches "$unit" ActiveState failed \
@@ -506,47 +694,45 @@ baseos_failed_unit_matches() {
   [[ -z "$exec_status" ]] || systemd_property_matches "$unit" ExecMainStatus "$exec_status"
 }
 
-baseos_cloud_init_failure_is_qualified() {
-  local result=/run/cloud-init/result.json
+factory_cloud_init_failure_is_qualified() {
   ((NETWORK_VALIDATED == 1)) \
-    && baseos_failed_unit_matches cloud-init.service \
-      /usr/lib/systemd/system/cloud-init.service "$BASEOS_CLOUD_INIT_UNIT_SHA256" enabled 1 \
-    && file_sha256_matches /etc/cloud/cloud.cfg "$BASEOS_CLOUD_CFG_SHA256" \
-    && root_owned_file_is_not_writable_by_group_or_other "$result" \
-    && grep -Fq '"datasource": "DataSourceConfigDrive ' "$result" \
-    && grep -Fq "\"('bootcmd', ProcessExecutionError(" "$result"
+    && factory_failed_unit_matches cloud-init.service \
+      /usr/lib/systemd/system/cloud-init.service "$FACTORY_CLOUD_INIT_UNIT_SHA256" enabled 1 \
+    && file_sha256_matches /etc/cloud/cloud.cfg "$FACTORY_CLOUD_CFG_SHA256" \
+    && grep -Fq '"datasource": "DataSourceConfigDrive ' "$FACTORY_CLOUD_INIT_RESULT" \
+    && cloud_init_telemetry_failure_is_qualified
 }
 
-baseos_fluent_bit_failure_is_qualified() {
-  baseos_failed_unit_matches fluent-bit.service \
-    /usr/lib/systemd/system/fluent-bit.service "$BASEOS_FLUENT_BIT_UNIT_SHA256" enabled 1 \
-    && baseos_fluent_bit_config_matches \
-      /etc/fluent-bit/fluent-bit.conf "$BASEOS_FLUENT_BIT_CFG_NORMALIZED_SHA256" \
-    && file_sha256_matches /etc/fluent-bit/parsers.conf "$BASEOS_FLUENT_BIT_PARSERS_SHA256" \
-    && file_sha256_matches /etc/fluent-bit/plugins.conf "$BASEOS_FLUENT_BIT_PLUGINS_SHA256"
+factory_fluent_bit_failure_is_qualified() {
+  factory_failed_unit_matches fluent-bit.service \
+    /usr/lib/systemd/system/fluent-bit.service "$FACTORY_FLUENT_BIT_UNIT_SHA256" enabled 1 \
+    && factory_fluent_bit_config_matches \
+      /etc/fluent-bit/fluent-bit.conf "$FACTORY_FLUENT_BIT_CFG_NORMALIZED_SHA256" \
+    && file_sha256_matches /etc/fluent-bit/parsers.conf "$FACTORY_FLUENT_BIT_PARSERS_SHA256" \
+    && file_sha256_matches /etc/fluent-bit/plugins.conf "$FACTORY_FLUENT_BIT_PLUGINS_SHA256"
 }
 
-baseos_fwupd_failure_is_qualified() {
+factory_fwupd_failure_is_qualified() {
   ((NETWORK_VALIDATED == 1)) \
-    && baseos_failed_unit_matches fwupd-refresh.service \
-      /usr/lib/systemd/system/fwupd-refresh.service "$BASEOS_FWUPD_UNIT_SHA256" static 1 \
-    && file_sha256_matches /etc/fwupd/fwupd.conf "$BASEOS_FWUPD_CFG_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/lvfs-testing.conf "$BASEOS_FWUPD_LVFS_TESTING_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/lvfs.conf "$BASEOS_FWUPD_LVFS_SHA256" \
-    && file_sha256_matches /etc/fwupd/remotes.d/vendor-directory.conf "$BASEOS_FWUPD_VENDOR_SHA256"
+    && factory_failed_unit_matches fwupd-refresh.service \
+      /usr/lib/systemd/system/fwupd-refresh.service "$FACTORY_FWUPD_UNIT_SHA256" static 1 \
+    && file_sha256_matches /etc/fwupd/fwupd.conf "$FACTORY_FWUPD_CFG_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/lvfs-testing.conf "$FACTORY_FWUPD_LVFS_TESTING_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/lvfs.conf "$FACTORY_FWUPD_LVFS_SHA256" \
+    && file_sha256_matches /etc/fwupd/remotes.d/vendor-directory.conf "$FACTORY_FWUPD_VENDOR_SHA256"
 }
 
-baseos_sssd_socket_failure_is_qualified() {
+factory_sssd_socket_failure_is_qualified() {
   local unit=$1 hash
   [[ ! -e /etc/sssd/sssd.conf && ! -L /etc/sssd/sssd.conf ]] || return 1
   case "$unit" in
-    sssd-autofs.socket) hash="$BASEOS_SSSD_AUTOFS_UNIT_SHA256" ;;
-    sssd-nss.socket) hash="$BASEOS_SSSD_NSS_UNIT_SHA256" ;;
-    sssd-pam.socket) hash="$BASEOS_SSSD_PAM_UNIT_SHA256" ;;
-    sssd-pam-priv.socket) hash="$BASEOS_SSSD_PAM_PRIV_UNIT_SHA256" ;;
+    sssd-autofs.socket) hash="$FACTORY_SSSD_AUTOFS_UNIT_SHA256" ;;
+    sssd-nss.socket) hash="$FACTORY_SSSD_NSS_UNIT_SHA256" ;;
+    sssd-pam.socket) hash="$FACTORY_SSSD_PAM_UNIT_SHA256" ;;
+    sssd-pam-priv.socket) hash="$FACTORY_SSSD_PAM_PRIV_UNIT_SHA256" ;;
     *) return 1 ;;
   esac
-  baseos_failed_unit_matches "$unit" "/usr/lib/systemd/system/${unit}" "$hash" enabled
+  factory_failed_unit_matches "$unit" "/usr/lib/systemd/system/${unit}" "$hash" enabled
 }
 
 is_qualified_factory_failed_unit() {
@@ -564,14 +750,16 @@ is_qualified_factory_failed_unit() {
         *) return 1 ;;
       esac
       ;;
-    colossus-baseos)
-      all_baseos_packages_exact || return 1
+    stock-dgx-os | colossus-baseos)
+      if [[ "$STATION_HOST_PROFILE" == "colossus-baseos" ]]; then
+        all_baseos_packages_exact || return 1
+      fi
       case "${1:-}" in
-        cloud-init.service) baseos_cloud_init_failure_is_qualified ;;
-        fluent-bit.service) baseos_fluent_bit_failure_is_qualified ;;
-        fwupd-refresh.service) baseos_fwupd_failure_is_qualified ;;
+        cloud-init.service) factory_cloud_init_failure_is_qualified ;;
+        fluent-bit.service) factory_fluent_bit_failure_is_qualified ;;
+        fwupd-refresh.service) factory_fwupd_failure_is_qualified ;;
         sssd-autofs.socket | sssd-nss.socket | sssd-pam.socket | sssd-pam-priv.socket)
-          baseos_sssd_socket_failure_is_qualified "$1"
+          factory_sssd_socket_failure_is_qualified "$1"
           ;;
         *) return 1 ;;
       esac
@@ -786,7 +974,7 @@ file_mode() {
 }
 
 check_platform() {
-  local arch os_release_path product product_name_path release_path release_state
+  local arch firmware_status=0 os_release_path product release_path release_state
   arch="$(uname -m)"
   [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || fatal "Expected ARM64, found ${arch}"
 
@@ -796,10 +984,17 @@ check_platform() {
   source "$os_release_path"
   [[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "24.04" ]] \
     || fatal "Expected Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
-  product_name_path="$(station_product_name_path)"
-  [[ -r "$product_name_path" ]] || fatal "DGX Station product identity is unavailable"
-  product="$(<"$product_name_path")"
-  is_station_gb300_product "$product" || fatal "Expected DGX Station GB300 DMI, found ${product}"
+  if product="$(station_firmware_product)"; then
+    :
+  else
+    firmware_status=$?
+    if ((firmware_status == 2)); then
+      fatal "DGX Station firmware identity conflicts across product, family, board, or device-tree fields"
+    fi
+    fatal "DGX Station GB300 firmware identity is unavailable"
+  fi
+  station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
+    || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display))"
   release_path="$(dgx_station_release_path)"
   release_state="$(dgx_station_release_state "$release_path")"
   if ((FORCE_STATION_INSTALL == 1)); then
@@ -807,12 +1002,14 @@ check_platform() {
       generic-ubuntu | supported-dgx-os | supported-colossus-baseos | supported-ai-developer-tools)
         fatal "--force-station-install is only for unrecognized DGX Station release metadata. This host is already supported (${release_state}); omit --force-station-install."
         ;;
+      unsupported-dgx-os)
+        dgx_station_release_is_complete_unrecognized_profile "$release_path" \
+          || fatal "--force-station-install requires a trusted, complete DGX Station release marker with an unrecognized profile tuple"
+        ;;
     esac
   fi
   case "$release_state" in
     generic-ubuntu)
-      station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
-        || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display)) before generic Ubuntu preparation"
       STATION_HOST_PROFILE="generic-ubuntu"
       ;;
     supported-dgx-os) STATION_HOST_PROFILE="stock-dgx-os" ;;
@@ -820,8 +1017,6 @@ check_platform() {
     supported-ai-developer-tools) STATION_HOST_PROFILE="ai-developer-tools" ;;
     *)
       if ((FORCE_STATION_INSTALL == 1)); then
-        station_has_exact_gb300_pci_gpu "$(station_pci_devices_path)" \
-          || fatal "Expected an NVIDIA GB300 PCI GPU (${GB300_PCI_VENDOR#0x}:$(gb300_pci_device_display)) before forced factory-runtime validation"
         STATION_HOST_PROFILE="forced-factory-runtime"
         warn "DGX release metadata allowlist bypassed by explicit --force-station-install intent; all hardware and factory-runtime health checks remain required"
       else
@@ -829,6 +1024,7 @@ check_platform() {
       fi
       ;;
   esac
+  info "station_hardware=confirmed firmware_product=${product}"
   info "platform=${product} profile=${STATION_HOST_PROFILE} release=${release_state} os=${PRETTY_NAME} arch=${arch} kernel=$(uname -r)"
 }
 
@@ -894,8 +1090,10 @@ check_package_managers_idle() {
   local phase=${1:-Station preflight} active locks process_pattern
   process_pattern='^(apt|apt-get|apt.systemd.dai|apt.systemd.daily|dpkg|unattended-upgr|unattended-upgrade)$'
   # Ubuntu keeps packagekitd resident after APT refreshes. Generic apply mode
-  # quiesces it separately before the repository/package critical section.
-  if [[ "$STATION_HOST_PROFILE" != "generic-ubuntu" ]]; then
+  # quiesces it before package mutation, while stock DGX OS and AI Developer
+  # Tools preserve factory packages. BaseOS keeps its existing fail-closed
+  # process gate because that profile validates an exact package inventory.
+  if [[ "$STATION_HOST_PROFILE" == "colossus-baseos" ]]; then
     process_pattern='^(apt|apt-get|apt.systemd.dai|apt.systemd.daily|dpkg|packagekitd|unattended-upgr|unattended-upgrade)$'
   fi
   active="$(ps -eo pid=,comm= | awk -v pattern="$process_pattern" '$2 ~ pattern {print}')"
@@ -905,12 +1103,53 @@ check_package_managers_idle() {
       || fatal "Unable to inspect APT and dpkg locks during ${phase}"
     [[ -z "$locks" ]] || fatal "An APT or dpkg lock is active during ${phase}: ${locks}"
   fi
+  check_factory_packagekit_transactions_idle "$phase"
   info "package_manager=idle phase=${phase// /_}"
 }
 
 packagekit_unit_property() {
   local property=$1
   systemctl show "$PACKAGEKIT_UNIT" -p "$property" --value 2>/dev/null
+}
+
+check_factory_packagekit_transactions_idle() {
+  local phase=$1 load_state active_state transaction_output transaction_type transaction_count transaction_paths
+  case "$STATION_HOST_PROFILE" in
+    stock-dgx-os | ai-developer-tools) ;;
+    *) return 0 ;;
+  esac
+
+  load_state="$(packagekit_unit_property LoadState)" \
+    || fatal "Unable to inspect the PackageKit service during ${phase}"
+  if [[ "$load_state" == "not-found" ]]; then
+    info "packagekit=not_installed"
+    return 0
+  fi
+  [[ "$load_state" == "loaded" ]] \
+    || fatal "PackageKit service has an unexpected load state during ${phase}: ${load_state}"
+
+  active_state="$(packagekit_unit_property ActiveState)" \
+    || fatal "Unable to inspect the PackageKit runtime state during ${phase}"
+  if [[ "$active_state" == "inactive" ]]; then
+    info "packagekit_transactions=none phase=${phase// /_}"
+    return 0
+  fi
+  [[ "$active_state" == "active" ]] \
+    || fatal "PackageKit is not in a stable state during ${phase}: ${active_state}"
+
+  require_command busctl
+  transaction_output="$(busctl --system call \
+    org.freedesktop.PackageKit /org/freedesktop/PackageKit \
+    org.freedesktop.PackageKit GetTransactionList 2>/dev/null)" \
+    || fatal "Unable to query active PackageKit transactions during ${phase}"
+  read -r transaction_type transaction_count transaction_paths <<<"$transaction_output"
+  [[ "$transaction_type" == "ao" && "$transaction_count" =~ ^[0-9]+$ ]] \
+    || fatal "PackageKit returned malformed transaction state during ${phase}: ${transaction_output}"
+  ((transaction_count == 0)) \
+    || fatal "An active PackageKit transaction blocks ${phase}: ${transaction_output}"
+  [[ -z "$transaction_paths" ]] \
+    || fatal "PackageKit returned inconsistent empty transaction state during ${phase}: ${transaction_output}"
+  info "packagekit_transactions=none phase=${phase// /_}"
 }
 
 restore_packagekit_after_transaction() {
@@ -1069,17 +1308,25 @@ host_docker_sudo() {
 }
 
 query_host_docker() {
-  local output
+  local output allow_sudo=0
   DOCKER_QUERY_OUTPUT=""
   command -v docker >/dev/null 2>&1 || return 2
   if output="$(host_docker "$@" 2>/dev/null)"; then
     DOCKER_QUERY_OUTPUT="$output"
     return 0
   fi
-  if [[ "$MODE" == "--apply" ]] && output="$(host_docker_sudo "$@" 2>/dev/null)"; then
+  if [[ "$MODE" == "--apply" ||
+    ("$MODE" == "--check" && "${NEMOCLAW_STATION_PREP_SUDO_NONINTERACTIVE:-0}" == "1") ]]; then
+    allow_sudo=1
+  fi
+  if ((allow_sudo == 1)) && output="$(host_docker_sudo "$@" 2>/dev/null)"; then
     DOCKER_QUERY_OUTPUT="$output"
     if ((DOCKER_QUERY_USES_SUDO == 0)); then
-      info "docker_access=sudo_until_group_membership_is_active"
+      if [[ "$MODE" == "--check" ]]; then
+        info "docker_access=sudo_for_noninteractive_read_only_check"
+      else
+        info "docker_access=sudo_until_group_membership_is_active"
+      fi
       DOCKER_QUERY_USES_SUDO=1
     fi
     return 0
@@ -1145,7 +1392,7 @@ require_no_running_docker_containers() {
   command -v docker >/dev/null 2>&1 || return 0
   query_host_docker ps --format '{{.ID}} {{.Names}}'
   [[ -z "$DOCKER_QUERY_OUTPUT" ]] \
-    || fatal "Running Docker containers block ${action}: ${DOCKER_QUERY_OUTPUT}"
+    || fatal "Running Docker containers block ${action}: ${DOCKER_QUERY_OUTPUT}. Stop the listed containers before Station Express. Then rerun the installer."
   info "running_docker_containers=none action=${action}"
 }
 
@@ -1217,27 +1464,100 @@ check_failed_units() {
   ((blocking == 0)) || fatal "Unqualified failed system units block Station preparation"
 }
 
-check_agent_and_inference_conflicts() {
-  local processes matches listeners
-  processes="$(ps -eo pid=,ppid=,comm=,args=)"
-  matches="$(awk -v self="$$" -v parent="$PPID" '
+check_vllm_container_conflicts() {
+  local vllm_containers=""
+  if command -v docker >/dev/null 2>&1; then
+    query_host_docker ps --no-trunc --format '{{.ID}}|{{.Image}}|{{.Command}}'
+    vllm_containers="$(awk -F '|' '
+      tolower($2 " " $3) ~ /(^|[^[:alnum:]_])vllm([^[:alnum:]_]|$)/ {
+        print "container_id=" substr($1, 1, 12) " stop_command=\047docker stop -- " substr($1, 1, 12) "\047"
+      }
+    ' <<<"$DOCKER_QUERY_OUTPUT")"
+  fi
+  [[ -z "$vllm_containers" ]] \
+    || existing_vllm_conflict "vLLM inference workload is active: ${vllm_containers}. NemoClaw did not stop or modify it."
+}
+
+agent_process_conflicts() {
+  local processes=$1 effective_uid=$2 sudo_uid=$3 self=$4 parent=$5
+  local scope_by_uid=1 scoped_uid
+  if [[ "$effective_uid" == "0" && -z "$sudo_uid" ]]; then
+    scope_by_uid=0
+    scoped_uid=0
+  else
+    scoped_uid="$(preparation_controller_uid_for "$effective_uid" "$sudo_uid")"
+  fi
+  awk -v scope_by_uid="$scope_by_uid" -v scoped_uid="$scoped_uid" -v self="$self" -v parent="$parent" '
     {
-      pid=$1
-      ppid=$2
-      comm=tolower($3)
-      $1=$2=$3=""
+      owner_uid=$1
+      pid=$2
+      ppid=$3
+      comm=tolower($4)
+      $1=$2=$3=$4=""
+      args=tolower($0)
+      if ((scope_by_uid && owner_uid != scoped_uid) || pid == self || pid == parent) next
+      if (comm ~ /^(nemoclaw|openshell)$/ ||
+          args ~ /(^|[[:space:]\/])(nemoclaw|openshell)([[:space:]:]|\.js([[:space:]]|$)|$)/) {
+        print "pid=" pid " process=" comm
+      }
+    }
+  ' <<<"$processes"
+}
+
+check_agent_and_inference_conflicts() {
+  local processes agent_matches inference_matches listeners vllm_port
+  vllm_port="$(printf '%s' "${NEMOCLAW_VLLM_PORT:-8000}" | awk '{gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}')"
+  if [[ ! "$vllm_port" =~ ^[1-9][0-9]{3,4}$ ]] \
+    || ((10#$vllm_port < 1024 || 10#$vllm_port > 65535)); then
+    fatal "NEMOCLAW_VLLM_PORT must be an integer from 1024 to 65535."
+  fi
+  vllm_port="$((10#$vllm_port))"
+  processes="$(ps -eo euid=,pid=,ppid=,comm=,args=)"
+  agent_matches="$(agent_process_conflicts "$processes" "$EUID" "${SUDO_UID:-}" "$$" "$PPID")"
+  [[ -z "$agent_matches" ]] \
+    || fatal "Agent workload is active: ${agent_matches}. Stop the listed agent process before Station Express. Then rerun the installer."
+
+  if [[ "${1:-}" == "--prefer-container-guidance" ]]; then
+    check_vllm_container_conflicts
+  fi
+
+  inference_matches="$(awk -v current_uid="$EUID" -v self="$$" -v parent="$PPID" '
+    {
+      owner_uid=$1
+      pid=$2
+      ppid=$3
+      comm=tolower($4)
+      executable=tolower($5)
+      sub(/^.*\//, "", executable)
+      $1=$2=$3=$4=""
       args=tolower($0)
       if (pid == self || pid == parent) next
-      if (comm ~ /^(vllm|nemoclaw|openshell)$/ ||
-          args ~ /(^|[[:space:]\/])(vllm|nemoclaw|openshell)([[:space:]:]|\.js([[:space:]]|$)|$)/) print
+      python_module=(comm ~ /^python([0-9]+([.][0-9]+)*)?$/ &&
+                     args ~ /(^|[[:space:]])-m[[:space:]]+vllm([[:space:].]|$)/)
+      docker_init=(comm == "docker-init" &&
+                   args ~ /(^|[[:space:]])--[[:space:]]+([^[:space:]]*\/)?vllm([[:space:]]|$)/)
+      if (comm == "vllm" || executable == "vllm" || python_module || docker_init) {
+        if (owner_uid == current_uid) {
+          print "pid=" pid " process=" comm " stop_command=\047kill -- " pid "\047"
+        } else {
+          print "pid=" pid " process=" comm " owner_uid=" owner_uid " action=ask_owner_or_host_administrator_to_stop"
+        }
+      }
     }
   ' <<<"$processes")"
-  [[ -z "$matches" ]] || fatal "Agent or inference workload is active: ${matches}"
+  [[ -z "$inference_matches" ]] \
+    || existing_vllm_conflict "vLLM inference workload is active: ${inference_matches}. NemoClaw did not stop or modify it."
 
-  listeners="$(ss -H -ltn 2>/dev/null | awk '$4 ~ /:8000$/ {print}')"
-  [[ -z "$listeners" ]] || fatal "Port 8000 is already listening: ${listeners}"
+  listeners="$(ss -H -ltn 2>/dev/null | awk -v port="$vllm_port" '$4 ~ (":" port "$") {print}')"
+  [[ -z "$listeners" ]] \
+    || fatal "Port ${vllm_port} is already listening: ${listeners}. Stop the service that owns port ${vllm_port} before Station Express. Then rerun the installer."
 
-  info "agent_inference_workloads=none port_8000=free"
+  info "agent_inference_workloads=none vllm_port=${vllm_port} free"
+}
+
+check_initial_workload_quiescence() {
+  check_agent_and_inference_conflicts --prefer-container-guidance
+  require_no_running_docker_containers "initial Station host preparation"
 }
 
 require_docker_mutation_quiescence() {
@@ -1405,9 +1725,8 @@ common_preflight() {
   check_capacity
   check_network
   check_failed_units
-  check_agent_and_inference_conflicts
   capture_docker_container_baseline
-  require_no_running_docker_containers "initial Station host preparation"
+  check_initial_workload_quiescence
 }
 
 verify_file_sha256() {
@@ -1521,6 +1840,112 @@ install_exact_file_or_reuse() {
   info "${label}=installed path=${target}"
 }
 
+preparation_controller_uid_for() {
+  local effective_uid=${1:-} sudo_uid=${2:-} uid
+  if [[ "$effective_uid" == "0" ]]; then
+    uid="$sudo_uid"
+  else
+    uid="$effective_uid"
+  fi
+  if ! [[ "$uid" =~ ^[1-9][0-9]*$ && ${#uid} -le 10 ]] || ((10#$uid > 4294967295)); then
+    fatal "Station preparation must be run by a non-root controller account"
+  fi
+  printf '%s\n' "$uid"
+}
+
+preparation_controller_uid() {
+  preparation_controller_uid_for "$EUID" "${SUDO_UID:-}"
+}
+
+root_directory_is_safe_unprivileged() {
+  local path=$1 expected_mode=${2:-} metadata uid gid mode
+  test ! -L "$path" || return 1
+  test -d "$path" || return 1
+  metadata="$(stat -c '%u %g %a' -- "$path")" || return 1
+  read -r uid gid mode <<<"$metadata"
+  [[ "$uid" == "0" && "$gid" == "0" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (((8#$mode & 0022) == 0)) || return 1
+  [[ -z "$expected_mode" || "$mode" == "${expected_mode#0}" ]]
+}
+
+root_regular_file_is_safe_unprivileged() {
+  local path=$1 expected_mode=$2 metadata uid gid mode
+  test ! -L "$path" || return 1
+  test -f "$path" || return 1
+  metadata="$(stat -c '%u %g %a' -- "$path")" || return 1
+  read -r uid gid mode <<<"$metadata"
+  [[ "$uid" == "0" && "$gid" == "0" && "$mode" == "${expected_mode#0}" ]]
+}
+
+verify_dual_station_controller_uid_binding() {
+  local expected_uid=${1:-} config_dir=${2:-$NEMOCLAW_CONFIG_DIR}
+  local binding_file=${3:-$DUAL_STATION_CONTROLLER_UID_FILE}
+  [[ -n "$expected_uid" ]] || expected_uid="$(preparation_controller_uid)"
+  root_directory_is_safe_unprivileged "$config_dir" 0755 \
+    || fatal "NemoClaw configuration directory must be root-owned with mode 0755 so the prepared controller can read its binding: ${config_dir}"
+  root_regular_file_is_safe_unprivileged "$binding_file" "$DUAL_STATION_CONTROLLER_UID_MODE" \
+    || fatal "Dual-Station controller UID binding must be a root-owned regular file with mode ${DUAL_STATION_CONTROLLER_UID_MODE}: ${binding_file}"
+  if ! printf '%s\n' "$expected_uid" | cmp -s - "$binding_file"; then
+    fatal "Dual-Station is already bound to a different controller UID; an administrator must remove ${binding_file} before rebinding"
+  fi
+  info "dual_station_controller_uid=verified uid=${expected_uid} path=${binding_file}"
+}
+
+ensure_dual_station_controller_uid_binding() {
+  local config_dir=${1:-$NEMOCLAW_CONFIG_DIR}
+  local binding_file=${2:-$DUAL_STATION_CONTROLLER_UID_FILE}
+  local expected_uid parent tmp published=0
+  expected_uid="$(preparation_controller_uid)"
+  parent="$(dirname "$config_dir")"
+  ensure_root_directory_safe \
+    "$config_dir" "$parent" 0755 "NemoClaw configuration directory"
+  root_directory_is_safe_unprivileged "$config_dir" 0755 \
+    || fatal "NemoClaw configuration directory must be root-owned with mode 0755 before binding the controller: ${config_dir}"
+  sudo test ! -L "$binding_file" \
+    || fatal "Dual-Station controller UID binding must not be a symbolic link: ${binding_file}"
+  if sudo test -e "$binding_file"; then
+    verify_dual_station_controller_uid_binding "$expected_uid" "$config_dir" "$binding_file"
+    return 0
+  fi
+
+  tmp="$(sudo mktemp "${config_dir}/.dual-station-controller-uid.XXXXXXXXXX")" \
+    || fatal "Could not create the root-owned Dual-Station controller UID candidate"
+  if [[ "$tmp" != "${config_dir}/.dual-station-controller-uid."* || "$tmp" == *$'\n'* ]]; then
+    sudo rm -f -- "$tmp" || true
+    fatal "Root-owned Dual-Station controller UID candidate path was invalid"
+  fi
+  if ! printf '%s\n' "$expected_uid" | sudo tee "$tmp" >/dev/null; then
+    sudo rm -f -- "$tmp" || true
+    fatal "Could not write the Dual-Station controller UID candidate"
+  fi
+  if ! sudo chown root:root "$tmp" || ! sudo chmod "$DUAL_STATION_CONTROLLER_UID_MODE" "$tmp"; then
+    sudo rm -f -- "$tmp" || true
+    fatal "Could not secure the Dual-Station controller UID candidate"
+  fi
+  if ! root_regular_file_is_safe "$tmp" "$DUAL_STATION_CONTROLLER_UID_MODE"; then
+    sudo rm -f -- "$tmp" || true
+    fatal "Dual-Station controller UID candidate metadata was unsafe"
+  fi
+  if ! printf '%s\n' "$expected_uid" | sudo cmp -s - "$tmp"; then
+    sudo rm -f -- "$tmp" || true
+    fatal "Dual-Station controller UID candidate content was invalid"
+  fi
+  if sudo ln -- "$tmp" "$binding_file" 2>/dev/null; then
+    published=1
+  fi
+  sudo rm -f -- "$tmp" \
+    || fatal "Could not remove the Dual-Station controller UID candidate"
+  if ((published == 0)); then
+    sudo test ! -L "$binding_file" \
+      || fatal "Dual-Station controller UID binding must not be a symbolic link: ${binding_file}"
+    sudo test -e "$binding_file" \
+      || fatal "Could not publish the Dual-Station controller UID binding without replacement"
+  else
+    info "dual_station_controller_uid=installed uid=${expected_uid} path=${binding_file}"
+  fi
+  verify_dual_station_controller_uid_binding "$expected_uid" "$config_dir" "$binding_file"
+}
+
 ensure_docker_repository_source() {
   local docker_asc=$1 docker_gpg=$2 docker_gpg_list=$3 docker_asc_list=$4
   local source_target=/etc/apt/sources.list.d/docker.list
@@ -1586,10 +2011,11 @@ configure_repositories() {
   info "repository_keys=verified"
 }
 
-collect_package_transaction_specs() {
+collect_remaining_package_transaction_specs() {
   local spec state
   PACKAGE_TRANSACTION_SPECS=()
   for spec in "${PACKAGE_SPECS[@]}"; do
+    [[ "$spec" == "$DRIVER_PIN_PACKAGE_SPEC" ]] && continue
     state="$(package_state "$spec")"
     case "$state" in
       missing | approved-transition) PACKAGE_TRANSACTION_SPECS+=("$spec") ;;
@@ -1597,8 +2023,6 @@ collect_package_transaction_specs() {
       *) fatal "Package transaction contains an unapproved prerequisite state: ${spec} (${state})" ;;
     esac
   done
-  ((${#PACKAGE_TRANSACTION_SPECS[@]} > 0)) \
-    || fatal "Package transaction has no missing or approved-transition prerequisites"
 }
 
 validate_package_availability() {
@@ -1732,6 +2156,7 @@ cleanup_apt_transaction_guard() {
   local guard_dir=${APT_TRANSACTION_GUARD_DIR:-}
   APT_TRANSACTION_GUARD_DIR=""
   APT_TRANSACTION_HOOK=""
+  APT_TRANSACTION_DRIVER_POLICY=""
   [[ -n "$guard_dir" ]] || return 0
   if [[ ! "$guard_dir" =~ ^/run/nemoclaw-apt-transaction\.[A-Za-z0-9]+$ ]]; then
     warn "refusing to clean unexpected APT transaction guard path: ${guard_dir}"
@@ -1755,7 +2180,7 @@ cleanup_station_prepare() {
 }
 
 create_apt_transaction_guard() {
-  local spec state name expected allowed_old native_arch targets="" hook_path targets_path
+  local spec state name expected allowed_old native_arch targets="" hook_path targets_path policy_path
   native_arch="$(sudo dpkg --print-architecture)"
   [[ "$native_arch" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
     || fatal "Could not determine the native package architecture"
@@ -1777,6 +2202,7 @@ create_apt_transaction_guard() {
     || fatal "APT transaction guard returned an unexpected path: ${APT_TRANSACTION_GUARD_DIR}"
   hook_path="${APT_TRANSACTION_GUARD_DIR}/verify-plan"
   targets_path="${APT_TRANSACTION_GUARD_DIR}/targets"
+  policy_path="${APT_TRANSACTION_GUARD_DIR}/driver-policy"
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
     declare -f apt_guard_fatal
@@ -1786,12 +2212,31 @@ create_apt_transaction_guard() {
     printf '%s\n' 'validate_apt_preinstall_plan "${0%/*}/targets"'
   } | sudo tee "$hook_path" >/dev/null
   printf '%s' "$targets" | sudo tee "$targets_path" >/dev/null
+  printf '%s\n' \
+    'Package: src:nvidia-graphics-drivers:any src:nvidia-kmod-open:any' \
+    "Pin: version ${DRIVER_VERSION}-1ubuntu1" \
+    'Pin-Priority: 1001' \
+    '' \
+    'Package: src:nvidia-modprobe src:nvidia-persistenced src:nvidia-settings src:nvidia-xconfig' \
+    "Pin: version ${DRIVER_VERSION}-1ubuntu1" \
+    'Pin-Priority: 1001' \
+    '' \
+    'Package: src:cuda-drivers:any src:nvidia-open:any' \
+    "Pin: version ${DRIVER_VERSION}-1ubuntu1" \
+    'Pin-Priority: 1001' \
+    '' \
+    'Package: src:libnvidia-nscq src:libnvsdm src:nvidia-fabricmanager src:nvidia-imex' \
+    "Pin: version ${DRIVER_VERSION}-1ubuntu1" \
+    'Pin-Priority: 1001' \
+    | sudo tee "$policy_path" >/dev/null
   sudo chmod 0700 "$hook_path"
-  sudo chmod 0600 "$targets_path"
+  sudo chmod 0600 "$targets_path" "$policy_path"
   assert_root_directory_safe "$APT_TRANSACTION_GUARD_DIR" "APT transaction guard directory"
   assert_root_regular_file_safe "$hook_path" 0700 "APT transaction guard"
   assert_root_regular_file_safe "$targets_path" 0600 "APT transaction target manifest"
+  assert_root_regular_file_safe "$policy_path" 0600 "APT qualified driver policy"
   APT_TRANSACTION_HOOK="/bin/bash ${hook_path}"
+  APT_TRANSACTION_DRIVER_POLICY="$policy_path"
 }
 
 validate_apt_simulation() {
@@ -1852,10 +2297,12 @@ validate_apt_simulation() {
 simulate_install() {
   local simulation
   [[ "$APT_TRANSACTION_GUARD_DIR" =~ ^/run/nemoclaw-apt-transaction\.[A-Za-z0-9]+$ &&
-    "$APT_TRANSACTION_HOOK" == "/bin/bash ${APT_TRANSACTION_GUARD_DIR}/verify-plan" ]] \
+    "$APT_TRANSACTION_HOOK" == "/bin/bash ${APT_TRANSACTION_GUARD_DIR}/verify-plan" &&
+    "$APT_TRANSACTION_DRIVER_POLICY" == "${APT_TRANSACTION_GUARD_DIR}/driver-policy" ]] \
     || fatal "APT transaction guard is not ready"
   simulation="$(sudo env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
     apt-get -s install --no-install-recommends --no-remove \
+    -o "Dir::Etc::Preferences=${APT_TRANSACTION_DRIVER_POLICY}" \
     -o "DPkg::Pre-Install-Pkgs::=${APT_TRANSACTION_HOOK}" \
     -o "DPkg::Tools::options::/bin/bash::Version=3" "$@")" \
     || fatal "APT simulation failed"
@@ -1864,28 +2311,66 @@ simulate_install() {
   info "apt_simulation=missing_only retained_packages=unchanged"
 }
 
+activate_driver_package_pin() {
+  local state
+  state="$(package_state "$DRIVER_PIN_PACKAGE_SPEC")"
+  case "$state" in
+    exact)
+      info "driver_package_pin=active package=${DRIVER_PIN_PACKAGE_SPEC}"
+      return 0
+      ;;
+    missing | approved-transition) ;;
+    *)
+      fatal "Driver package pin has an unapproved prerequisite state: ${DRIVER_PIN_PACKAGE_SPEC} (${state})"
+      ;;
+  esac
+
+  PACKAGE_TRANSACTION_SPECS=("$DRIVER_PIN_PACKAGE_SPEC")
+  validate_package_availability "$DRIVER_PIN_PACKAGE_SPEC"
+  create_apt_transaction_guard
+  assert_package_transaction_ready "Station driver package pin simulation"
+  simulate_install "$DRIVER_PIN_PACKAGE_SPEC"
+  assert_package_transaction_ready "Station driver package pin installation"
+  info "Installing the pinned Station driver package policy"
+  sudo env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
+    apt-get install -y --no-install-recommends --no-remove \
+    -o "Dir::Etc::Preferences=${APT_TRANSACTION_DRIVER_POLICY}" \
+    -o "DPkg::Pre-Install-Pkgs::=${APT_TRANSACTION_HOOK}" \
+    -o "DPkg::Tools::options::/bin/bash::Version=3" \
+    "$DRIVER_PIN_PACKAGE_SPEC"
+  cleanup_apt_transaction_guard
+  check_dpkg_database_health
+  package_is_exact "$DRIVER_PIN_PACKAGE_SPEC" \
+    || fatal "Driver package pin did not reach the exact configured state: ${DRIVER_PIN_PACKAGE_SPEC}"
+  info "driver_package_pin=activated package=${DRIVER_PIN_PACKAGE_SPEC}"
+}
+
 install_packages() {
   quiesce_packagekit_for_transaction
   assert_package_transaction_ready "Station repository configuration"
   configure_repositories
   assert_package_transaction_ready "APT metadata refresh"
-  collect_package_transaction_specs
   info "Refreshing package metadata"
   sudo apt-get update
-  validate_package_availability "${PACKAGE_TRANSACTION_SPECS[@]}"
-  create_apt_transaction_guard
-  assert_package_transaction_ready "APT transaction simulation"
-  simulate_install "${PACKAGE_TRANSACTION_SPECS[@]}"
-  require_docker_restart_quiescence "Station prerequisite package installation"
-  assert_package_transaction_ready "Station prerequisite package installation"
-  info "Installing missing pinned Station prerequisites"
-  sudo env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
-    apt-get install -y --no-install-recommends --no-remove \
-    -o "DPkg::Pre-Install-Pkgs::=${APT_TRANSACTION_HOOK}" \
-    -o "DPkg::Tools::options::/bin/bash::Version=3" \
-    "${PACKAGE_TRANSACTION_SPECS[@]}"
-  cleanup_apt_transaction_guard
-  check_dpkg_database_health
+  activate_driver_package_pin
+  collect_remaining_package_transaction_specs
+  if ((${#PACKAGE_TRANSACTION_SPECS[@]} > 0)); then
+    validate_package_availability "${PACKAGE_TRANSACTION_SPECS[@]}"
+    create_apt_transaction_guard
+    assert_package_transaction_ready "APT transaction simulation"
+    simulate_install "${PACKAGE_TRANSACTION_SPECS[@]}"
+    require_docker_restart_quiescence "Station prerequisite package installation"
+    assert_package_transaction_ready "Station prerequisite package installation"
+    info "Installing missing pinned Station prerequisites"
+    sudo env DEBIAN_FRONTEND=noninteractive LC_ALL=C \
+      apt-get install -y --no-install-recommends --no-remove \
+      -o "Dir::Etc::Preferences=${APT_TRANSACTION_DRIVER_POLICY}" \
+      -o "DPkg::Pre-Install-Pkgs::=${APT_TRANSACTION_HOOK}" \
+      -o "DPkg::Tools::options::/bin/bash::Version=3" \
+      "${PACKAGE_TRANSACTION_SPECS[@]}"
+    cleanup_apt_transaction_guard
+    check_dpkg_database_health
+  fi
 
   local spec
   for spec in "${PACKAGE_SPECS[@]}"; do
@@ -2170,10 +2655,10 @@ verify_dgx_os_runtime_sudo() {
     || fatal "The local Docker daemon is not reachable with sudo on the Station factory image"
   station_sudo_local_default_docker buildx version >/dev/null 2>&1 \
     || fatal "Docker Buildx is unavailable on the Station factory image"
-  # The June 2026 AI Developer Tools factory image can leave its packaged CDI
-  # refresh units disabled. Image production owns that source state; remove
-  # this repair after clean-host qualification consistently supplies the CDI
-  # device at boot.
+  # The qualified May and June 2026 AI Developer Tools factory images can leave
+  # their packaged CDI refresh units disabled. Image production owns that
+  # source state; remove this repair after clean-host qualification consistently
+  # supplies the CDI device at boot.
   if [[ "$STATION_HOST_PROFILE" == "ai-developer-tools" ]]; then
     if sudo nvidia-ctk cdi list | grep -Fxq 'nvidia.com/gpu=all'; then
       info "cdi=nvidia.com/gpu=all source=factory_runtime"
@@ -2410,6 +2895,7 @@ run_apply() {
 
 run_verify() {
   common_preflight
+  require_command cmp
   require_command docker
   require_command nvidia-ctk
   require_command nvidia-smi
@@ -2426,6 +2912,17 @@ run_verify() {
   verify_host
 }
 
+run_bind_controller() {
+  require_command cmp
+  require_command stat
+  require_command sudo
+  check_platform
+  acquire_sudo
+  ensure_dual_station_controller_uid_binding \
+    "$NEMOCLAW_CONFIG_DIR" "$DUAL_STATION_CONTROLLER_UID_FILE"
+  info "CONTROLLER_UID_BINDING_READY"
+}
+
 main() {
   if ! parse_args "$@"; then
     usage >&2
@@ -2435,8 +2932,14 @@ main() {
     dgx_station_release_state
     return 0
   fi
+  if [[ "$MODE" == "--classify-station-hardware" ]]; then
+    station_hardware_identity_state
+    return 0
+  fi
   if [[ "$MODE" == "--apply" ]]; then
     setup_log
+  elif [[ "$MODE" == "--bind-controller" ]]; then
+    info "version=${SCRIPT_VERSION} mode=${MODE} log=disabled_binding_only"
   else
     info "version=${SCRIPT_VERSION} mode=${MODE} log=disabled_read_only"
   fi
@@ -2446,6 +2949,7 @@ main() {
     --check) run_check ;;
     --apply) run_apply ;;
     --verify) run_verify ;;
+    --bind-controller) run_bind_controller ;;
   esac
 }
 

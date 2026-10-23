@@ -64,6 +64,21 @@ describe("sandbox base-image resolution key", () => {
     expect(createSandboxBaseImageResolutionKey(options(root))).not.toBe(before);
   });
 
+  it("isolates build args without exposing their values (#8119)", () => {
+    const root = fixture();
+    const base = options(root);
+    const first = createSandboxBaseImageResolutionKey({
+      ...base,
+      buildArgs: { NEMOCLAW_CORPORATE_CA_B64: "first-public-ca" },
+    });
+    const second = createSandboxBaseImageResolutionKey({
+      ...base,
+      buildArgs: { NEMOCLAW_CORPORATE_CA_B64: "second-public-ca" },
+    });
+
+    expect(second).not.toBe(first);
+  });
+
   it("changes when a Dockerfile-copied runtime helper changes", () => {
     const root = fixture();
     const helper = path.join(root, "scripts", "lib", "sandbox-rlimits.sh");
@@ -80,11 +95,11 @@ describe("sandbox base-image resolution key", () => {
     const root = fixture();
     const lockfile = path.join(root, "agents", "langchain-deepagents-code", "requirements.lock");
     fs.mkdirSync(path.dirname(lockfile), { recursive: true });
-    fs.writeFileSync(lockfile, "deepagents-code==0.1.34\n");
+    fs.writeFileSync(lockfile, "deepagents-code==0.1.55\n");
     const keyedOptions = { ...options(root), inputPaths: [lockfile] };
     const before = createSandboxBaseImageResolutionKey(keyedOptions);
 
-    fs.writeFileSync(lockfile, "deepagents-code==0.1.34\ntransitive-dependency==2.0.0\n");
+    fs.writeFileSync(lockfile, "deepagents-code==0.1.55\ntransitive-dependency==2.0.0\n");
 
     expect(createSandboxBaseImageResolutionKey(keyedOptions)).not.toBe(before);
   });
@@ -135,14 +150,14 @@ describe("sandbox base-image resolution key", () => {
     expect(second).not.toBe(first);
   });
 
-  it("isolates pinned-first resolution policy", () => {
+  it("isolates required pinned resolution policy", () => {
     const root = fixture();
     const base = {
       ...options(root),
       pinnedRemoteRef: "example/base@sha256:first",
     };
 
-    expect(createSandboxBaseImageResolutionKey({ ...base, preferPinnedRemoteRef: true })).not.toBe(
+    expect(createSandboxBaseImageResolutionKey({ ...base, requirePinnedRemoteRef: true })).not.toBe(
       createSandboxBaseImageResolutionKey(base),
     );
   });
@@ -151,7 +166,7 @@ describe("sandbox base-image resolution key", () => {
     const root = fixture();
     const base = options(root);
 
-    expect(createSandboxBaseImageResolutionKey({ ...base, preferPinnedRemoteRef: false })).toBe(
+    expect(createSandboxBaseImageResolutionKey({ ...base, requirePinnedRemoteRef: false })).toBe(
       createSandboxBaseImageResolutionKey(base),
     );
   });

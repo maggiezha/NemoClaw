@@ -13,15 +13,16 @@
 // onboard-probes.test.ts.
 
 const trace = require("../trace");
+const { retryUntil } = require("../core/retry");
 
 const CURL_TIMEOUT_STATUS = 28;
 const NODE_SPAWN_TIMEOUT_STATUS = -110;
 
-// 429 = Too Many Requests; 502/503/504 = upstream gateway/availability flakes
-// (NVIDIA Endpoints and other hosted providers periodically emit these for
-// minutes at a time). All four are transient — retry with backoff before
-// surfacing a hard failure to the wizard. See issues #2980 and #3033.
-const RETRIABLE_HTTP_PROBE_STATUSES = new Set([429, 502, 503, 504]);
+// Which statuses are transient is shared policy, not a wizard-local decision:
+// the sandbox status probe classifies the same four (#10709). The definition
+// and its rationale live in ./probe/transient-http-policy; this module keeps
+// re-exporting the set so existing consumers are unaffected.
+const { RETRIABLE_HTTP_PROBE_STATUSES } = require("./probe/transient-http-policy");
 const HTTP_PROBE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 
 function sleepSync(ms) {
@@ -37,6 +38,7 @@ function shouldRetryHttpProbe(result) {
   return (
     result &&
     !result.ok &&
+    result.reasoningRetryAttempted !== true &&
     result.curlStatus === 0 &&
     RETRIABLE_HTTP_PROBE_STATUSES.has(result.httpStatus)
   );
@@ -60,6 +62,7 @@ function isTimeoutOrConnFailureStatus(curlStatus) {
 }
 
 function isRetriableProbeResult(result) {
+  if (result.reasoningRetryAttempted === true) return false;
   return (
     isTimeoutOrConnFailureStatus(result.curlStatus) ||
     RETRIABLE_HTTP_PROBE_STATUSES.has(result.httpStatus)
@@ -71,34 +74,38 @@ function executeProbeWithHttpRetry(probe) {
     "nemoclaw.inference.validation_probe",
     { probe_name: probe.name, api: probe.api || null },
     () => {
-      let attempt = 1;
-      let result = probe.execute();
-      trace.addTraceEvent("probe_result", {
-        attempt,
-        ok: result.ok,
-        http_status: result.httpStatus,
-        curl_status: result.curlStatus,
-      });
-      for (const delayMs of HTTP_PROBE_RETRY_DELAYS_MS) {
-        if (!shouldRetryHttpProbe(result)) break;
-        console.log(
-          `  ${probe.name} validation returned HTTP ${result.httpStatus}; retrying in ${Math.round(delayMs / 1000)}s...`,
-        );
-        trace.addTraceEvent("probe_retry_sleep", {
-          delay_ms: delayMs,
-          http_status: result.httpStatus,
-        });
-        sleepSync(delayMs);
-        attempt += 1;
-        result = probe.execute();
-        trace.addTraceEvent("probe_result", {
-          attempt,
-          ok: result.ok,
-          http_status: result.httpStatus,
-          curl_status: result.curlStatus,
-        });
-      }
-      return result;
+      let customRetryReason;
+      return retryUntil(
+        (attempt) => {
+          const result = probe.execute();
+          trace.addTraceEvent("probe_result", {
+            attempt,
+            ok: result.ok,
+            http_status: result.httpStatus,
+            curl_status: result.curlStatus,
+          });
+          return result;
+        },
+        {
+          accept: (result) => {
+            customRetryReason = probe.retryReason?.(result);
+            return !shouldRetryHttpProbe(result) && !customRetryReason;
+          },
+          retryDelaysMs: HTTP_PROBE_RETRY_DELAYS_MS,
+          onRetry: (result, delayMs) => {
+            const reason = customRetryReason || `returned HTTP ${result.httpStatus}`;
+            console.log(
+              `  ${probe.name} validation ${reason}; retrying in ${Math.round(delayMs / 1000)}s...`,
+            );
+            trace.addTraceEvent("probe_retry_sleep", {
+              delay_ms: delayMs,
+              http_status: result.httpStatus,
+              retry_reason: customRetryReason ? "semantic_readiness" : "http_status",
+            });
+          },
+          sleep: sleepSync,
+        },
+      );
     },
   );
 }
@@ -108,21 +115,19 @@ function executeProbeWithHttpRetry(probe) {
 // final probe result. Logs the same "retrying in Xs" notice the responses
 // retry loop emits so users on slow links see consistent progress messages.
 function runChatCompletionsRetryLoop(runProbe) {
-  let result = runProbe();
-  if (result.ok) return result;
-  for (const delayMs of HTTP_PROBE_RETRY_DELAYS_MS) {
-    if (!isRetriableProbeResult(result)) break;
-    const reason = isTimeoutOrConnFailureStatus(result.curlStatus)
-      ? "timed out"
-      : `returned HTTP ${result.httpStatus}`;
-    console.log(
-      `  Chat Completions API validation ${reason}; retrying in ${Math.round(delayMs / 1000)}s...`,
-    );
-    sleepSync(delayMs);
-    result = runProbe();
-    if (result.ok) return result;
-  }
-  return result;
+  return retryUntil(runProbe, {
+    accept: (result) => result.ok || !isRetriableProbeResult(result),
+    retryDelaysMs: HTTP_PROBE_RETRY_DELAYS_MS,
+    onRetry: (result, delayMs) => {
+      const reason = isTimeoutOrConnFailureStatus(result.curlStatus)
+        ? "timed out"
+        : `returned HTTP ${result.httpStatus}`;
+      console.log(
+        `  Chat Completions API validation ${reason}; retrying in ${Math.round(delayMs / 1000)}s...`,
+      );
+    },
+    sleep: sleepSync,
+  });
 }
 
 module.exports = {

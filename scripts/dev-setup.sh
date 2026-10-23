@@ -15,6 +15,8 @@ WARN_COUNT=0
 FAIL_COUNT=0
 OUTPUT_FORMAT="human"
 JSON_RESULTS=""
+NODE_HEAP_REMEDIATION_CLI="Run: NODE_OPTIONS=--max-old-space-size=8192 npm run typecheck:cli"
+NODE_HEAP_REMEDIATION_PLUGIN="Run: NODE_OPTIONS=--max-old-space-size=8192 npm --prefix nemoclaw run build"
 
 usage() {
   cat <<'EOF'
@@ -227,14 +229,40 @@ check_executable() {
   fi
 }
 
-check_quiet_command() {
+is_node_heap_oom_output() {
+  local output_file="$1"
+
+  grep -Eq \
+    "JavaScript heap out of memory|Ineffective mark-compacts near heap limit|Allocation failed - JavaScript heap out of memory" \
+    "${output_file}" 2>/dev/null
+}
+
+print_node_heap_oom_guidance() {
+  local remediation="$1"
+
+  printf 'Node.js exhausted its V8 heap while running this type check.\n' >&2
+  printf 'Next: %s\n' "${remediation}" >&2
+}
+
+check_quiet_command_with_heap_hint() {
   local label="$1"
   local remediation="$2"
-  shift 2
+  local heap_remediation="$3"
+  local output_file
+  shift 3
 
-  if "$@" >/dev/null 2>&1; then
+  output_file="$(mktemp "${TMPDIR:-/tmp}/nemoclaw-dev-doctor.XXXXXX")" || {
+    fail "${label}: failed" "${remediation}"
+    return
+  }
+  if "$@" >"${output_file}" 2>&1; then
+    rm -f "${output_file}"
     pass "${label}"
+  elif is_node_heap_oom_output "${output_file}"; then
+    rm -f "${output_file}"
+    fail "${label}: ran out of Node.js heap" "${heap_remediation}"
   else
+    rm -f "${output_file}"
     fail "${label}: failed" "${remediation}"
   fi
 }
@@ -313,6 +341,31 @@ run_setup_step() {
   return 1
 }
 
+run_setup_step_with_heap_hint() {
+  local label="$1"
+  local heap_remediation="$2"
+  local output_file
+  shift 2
+
+  printf '\n==> %s\n' "${label}"
+  output_file="$(mktemp "${TMPDIR:-/tmp}/nemoclaw-dev-setup.XXXXXX")" || {
+    printf 'Setup stopped while attempting: %s\n' "${label}" >&2
+    return 1
+  }
+  if "$@" >"${output_file}" 2>&1; then
+    rm -f "${output_file}"
+    return 0
+  fi
+  if is_node_heap_oom_output "${output_file}"; then
+    print_node_heap_oom_guidance "${heap_remediation}"
+  else
+    cat "${output_file}" >&2
+  fi
+  rm -f "${output_file}"
+  printf 'Setup stopped while attempting: %s\n' "${label}" >&2
+  return 1
+}
+
 repair_repository() {
   local setup_failed=0 hooks_path
 
@@ -357,14 +410,20 @@ repair_repository() {
     printf 'Next: Run git config --show-origin --get core.hooksPath, then remove it in that scope with your approval.\n' >&2
     return 1
   fi
-  run_setup_step "Install root dependencies" npm install --include=dev --ignore-scripts || return 1
+  run_setup_step "Prepare the required OpenShell SDK" \
+    node "${REPO_ROOT}/scripts/lib/openshell-sdk-install.mts" prepare || return 1
+  run_setup_step "Install root dependencies" npm install --include=dev --ignore-scripts --prefer-offline --include=optional --@nvidia:registry=https://npm.pkg.github.com || return 1
+  run_setup_step "Verify the required OpenShell SDK" \
+    node "${REPO_ROOT}/scripts/lib/openshell-sdk-install.mts" check || return 1
   run_setup_step "Install plugin dependencies" \
     npm --prefix nemoclaw install --include=dev --ignore-scripts || return 1
   run_setup_step "Build the CLI" npm run build:cli || return 1
   run_setup_step "Build and type-check the plugin" npm --prefix nemoclaw run build || return 1
   # Keep the explicit checks aligned with the broader pre-push and CI contracts.
-  run_setup_step "Type-check the CLI" npm run typecheck:cli || return 1
-  run_setup_step "Type-check the plugin without emitting files" \
+  run_setup_step_with_heap_hint "Type-check the CLI" "${NODE_HEAP_REMEDIATION_CLI}" \
+    npm run typecheck:cli || return 1
+  run_setup_step_with_heap_hint "Type-check the plugin without emitting files" \
+    "${NODE_HEAP_REMEDIATION_PLUGIN}" \
     "${REPO_ROOT}/nemoclaw/node_modules/.bin/tsc" --noEmit \
     -p "${REPO_ROOT}/nemoclaw/tsconfig.json" || return 1
   run_setup_step "Install repository Git hooks" "${REPO_ROOT}/node_modules/.bin/prek" install || return 1
@@ -391,7 +450,7 @@ check_git_configuration() {
       "Set repository-local user.name and user.email before committing."
   fi
 
-  sign_enabled="$(git_config commit.gpgsign)"
+  sign_enabled="$(git -C "${REPO_ROOT}" config --get --type=bool commit.gpgsign 2>/dev/null || true)"
   if ! sign_format="$(git -C "${REPO_ROOT}" config --get gpg.format 2>/dev/null)"; then
     sign_format="openpgp"
   fi
@@ -576,6 +635,11 @@ run_doctor() {
   check_command "GitHub CLI" gh "Install GitHub CLI."
   check_command "hadolint" hadolint "Install hadolint (macOS: brew install hadolint)."
 
+  if node "${REPO_ROOT}/scripts/lib/openshell-sdk-install.mts" check >/dev/null 2>&1; then
+    pass "OpenShell SDK"
+  else
+    fail "OpenShell SDK: missing, incompatible, or cannot load" "Run: npm run dev:setup"
+  fi
   root_tsc="${REPO_ROOT}/node_modules/.bin/tsc"
   plugin_tsc="${REPO_ROOT}/nemoclaw/node_modules/.bin/tsc"
   check_executable "Root TypeScript dependencies" "${root_tsc}" \
@@ -593,11 +657,13 @@ run_doctor() {
     "Run: cd nemoclaw && npm run build" "${REPO_ROOT}/nemoclaw/src" \
     "${REPO_ROOT}/nemoclaw/tsconfig.json" "${REPO_ROOT}/nemoclaw/package.json"
   if [ -x "${root_tsc}" ]; then
-    check_quiet_command "CLI type check" "Run: npm run typecheck:cli" \
+    check_quiet_command_with_heap_hint "CLI type check" "Run: npm run typecheck:cli" \
+      "${NODE_HEAP_REMEDIATION_CLI}" \
       "${root_tsc}" -p "${REPO_ROOT}/tsconfig.cli.json"
   fi
   if [ -x "${plugin_tsc}" ]; then
-    check_quiet_command "Plugin type check" "Run: npm --prefix nemoclaw run build" \
+    check_quiet_command_with_heap_hint "Plugin type check" "Run: npm --prefix nemoclaw run build" \
+      "${NODE_HEAP_REMEDIATION_PLUGIN}" \
       "${plugin_tsc}" --noEmit -p "${REPO_ROOT}/nemoclaw/tsconfig.json"
   fi
 

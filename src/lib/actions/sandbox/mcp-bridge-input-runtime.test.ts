@@ -2,16 +2,53 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from "vitest";
+import { createCliOpenShellProviderAdapter } from "../../adapters/openshell/provider-adapter-cli";
+import { selectedOpenShellGateway } from "../../adapters/openshell/sandbox-observer";
+import * as portableAgentLifecycle from "../../onboard/experimental/portable-agent-lifecycle";
 
 import {
   addMcpBridge,
-  buildMcpBridgeProviderArgs,
   dispatchMcpBridgeCommand,
   redactCredentialValuesForDisplay,
+  removeMcpBridge,
+  restartMcpBridge,
   resolveCredentialEnv,
+  updateMcpBridgeDenyTools,
 } from "./mcp-bridge";
 
 describe("MCP input runtime boundaries", () => {
+  it("rejects schema-5 MCP mutations inside their lifecycle fences (#9203)", async ({
+    onTestFinished,
+  }) => {
+    const guard = vi
+      .spyOn(portableAgentLifecycle, "assertHermesPortableCommandUnavailable")
+      .mockImplementation(() => {
+        throw new Error("schema-5 rejected");
+      });
+    onTestFinished(() => guard.mockRestore());
+
+    await expect(
+      addMcpBridge("missing-sandbox", {
+        server: "github",
+        url: "https://mcp.example.test/mcp",
+        env: [{ name: "TOKEN" }],
+      }),
+    ).rejects.toThrow("schema-5 rejected");
+    await expect(removeMcpBridge("missing-sandbox", "github")).rejects.toThrow("schema-5 rejected");
+    await expect(restartMcpBridge("missing-sandbox", "github")).rejects.toThrow(
+      "schema-5 rejected",
+    );
+    await expect(
+      updateMcpBridgeDenyTools("missing-sandbox", "github", ["delete_*"]),
+    ).rejects.toThrow("schema-5 rejected");
+    expect(guard.mock.calls.map((call) => call[1])).toEqual([
+      "sandbox:mcp:add",
+      "sandbox:mcp:remove",
+      "sandbox:mcp:restart",
+      "sandbox:mcp:update",
+    ]);
+  });
+
   it("rejects unauthenticated direct add callers before sandbox or network side effects", async () => {
     await expect(
       addMcpBridge("missing-sandbox", {
@@ -53,21 +90,27 @@ describe("MCP input runtime boundaries", () => {
     expect(output).not.toContain("inline-secret-value");
   });
 
-  it("passes MCP provider credentials by environment name, not argv value", () => {
-    const args = buildMcpBridgeProviderArgs(
-      "create",
-      "alpha-mcp-github",
-      [{ name: "TOKEN", value: "inline-secret-value" }],
-      { TOKEN: "inline-secret-value" },
-    );
+  it("passes MCP provider credentials by environment name, not argv value", async () => {
+    const run = vi.fn((_args: string[]) => ({ status: 0, stdout: "", stderr: "" }));
+    const adapter = createCliOpenShellProviderAdapter({ run });
 
+    await adapter.createProvider({
+      name: "alpha-mcp-github",
+      type: "nemoclaw-mcp-v1",
+      credentials: [{ name: "TOKEN", value: "inline-secret-value" }],
+      config: [],
+      fromExisting: false,
+      target: selectedOpenShellGateway(),
+    });
+
+    const args = run.mock.calls[0]?.[0] ?? [];
     expect(args).toEqual([
       "provider",
       "create",
       "--name",
       "alpha-mcp-github",
       "--type",
-      "generic",
+      "nemoclaw-mcp-v1",
       "--credential",
       "TOKEN",
     ]);
@@ -127,9 +170,7 @@ describe("MCP input runtime boundaries", () => {
     try {
       await dispatchMcpBridgeCommand("missing-sandbox", ["remove", "--help"]);
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "Best-effort owned cleanup; preserves registry state when residuals remain",
-        ),
+        expect.stringContaining("Best-effort source cleanup; preserves ambiguous providers"),
       );
       expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("stale registry removal"));
     } finally {

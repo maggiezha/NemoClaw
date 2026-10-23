@@ -111,9 +111,6 @@ export function resolveRuntimeInferenceApi(options: {
   if (agentApi) return normalizeInferenceApi(agentApi);
 
   const sameProvider = currentProvider === provider;
-  const sessionApi = sameProvider ? sessionRouteApi(session, sandboxName, provider) : null;
-  if (sessionApi) return sessionApi;
-
   const configApi =
     sameProvider && agentName === "hermes"
       ? readHermesRouteApi(config)
@@ -122,20 +119,9 @@ export function resolveRuntimeInferenceApi(options: {
         : null;
   if (configApi) return configApi;
 
+  const sessionApi = sameProvider ? sessionRouteApi(session, sandboxName, provider) : null;
+  if (sessionApi) return sessionApi;
+
   if (provider === "compatible-anthropic-endpoint") return "anthropic-messages";
   return null;
-}
-
-export function hermesApiMode(inferenceApi: string): string | null {
-  switch (inferenceApi) {
-    case "":
-    case "openai-completions":
-      return null;
-    case "anthropic-messages":
-      return "anthropic_messages";
-    case "openai-responses":
-      return "codex_responses";
-    default:
-      return null;
-  }
 }

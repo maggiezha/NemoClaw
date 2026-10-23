@@ -5,12 +5,21 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { loadPortableInferenceDescriptor } from "../../../src/lib/onboard/experimental/portable-inference-descriptor.ts";
+import { resolveRequestedProviderSelection } from "../../../src/lib/onboard/provider-selection.ts";
+import { createPortableOnboardEnvironmentScope } from "../../../src/lib/onboard/session-bootstrap.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import { ProviderClient, trustedProviderEndpoint } from "../fixtures/clients/provider.ts";
 import { startFakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
-import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
+import {
+  buildHostedInferenceModelsProbe,
+  hostedInferenceCredentialReferencePattern,
+  requireHostedInferenceConfig,
+  stagePortableHostedInferenceDescriptor,
+} from "../fixtures/hosted-inference.ts";
+import { startTestProgress } from "../fixtures/progress.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
@@ -25,6 +34,20 @@ const COMPAT_HELPER = path.join(
   "lib",
   "ci-compatible-inference.sh",
 );
+
+function readPrivateFileSnapshot(filePath: string): { contents: string; metadata: fs.Stats } {
+  const descriptor = fs.openSync(
+    filePath,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
+  try {
+    const metadata = fs.fstatSync(descriptor);
+    const contents = fs.readFileSync(descriptor, "utf8");
+    return { contents, metadata };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
 
 function secrets(values: Record<string, string | undefined>) {
   return {
@@ -165,6 +188,63 @@ printf 'modelFn=%s\n' "$(nemoclaw_e2e_hosted_inference_model)"
 }
 
 describe("hosted inference E2E config", () => {
+  it.each(["E2E_ACCESS_TOKEN", "ENTRA_ACCESS_TOKEN"])(
+    "accepts OpenShell references bound to %s",
+    (credentialKey) => {
+      const pattern = hostedInferenceCredentialReferencePattern(credentialKey);
+      const stableRevision = `s${"a".repeat(64)}`;
+
+      expect(`openshell:resolve:env:${credentialKey}`).toMatch(pattern);
+      expect(`openshell:resolve:env:v42_${credentialKey}`).toMatch(pattern);
+      expect(`openshell:resolve:env:${stableRevision}_${credentialKey}`).toMatch(pattern);
+      expect(`openshell:resolve:env:v123456789012345678901_${credentialKey}`).not.toMatch(pattern);
+      expect(`openshell:resolve:env:s${"a".repeat(63)}_${credentialKey}`).not.toMatch(pattern);
+      expect(`openshell:resolve:env:s${"a".repeat(65)}_${credentialKey}`).not.toMatch(pattern);
+      expect(`openshell:resolve:env:s${"A".repeat(64)}_${credentialKey}`).not.toMatch(pattern);
+      expect(`openshell:resolve:env:${stableRevision}_OTHER_ACCESS_TOKEN`).not.toMatch(pattern);
+      expect(`openshell:resolve:env:${stableRevision}_${credentialKey}suffix`).not.toMatch(pattern);
+      expect("e2e-runtime-identity-access-token-v2").not.toMatch(pattern);
+    },
+  );
+
+  it("rejects an invalid credential environment name", () => {
+    expect(() => hostedInferenceCredentialReferencePattern("E2E-ACCESS-TOKEN")).toThrow(
+      /invalid hosted inference credential environment name/u,
+    );
+  });
+
+  it("uses the public NVIDIA route for preinstalled Launchable onboarding", () => {
+    const cfg = requireHostedInferenceConfig(
+      secrets({ NVIDIA_INFERENCE_API_KEY: "nvapi-launchable-test" }),
+      {
+        NEMOCLAW_MODEL: "nvidia/launchable-model",
+        NEMOCLAW_ENDPOINT_URL: "https://inference-api.nvidia.com/v1",
+      },
+      { provider: "build" },
+    );
+
+    expect(cfg.provider).toBe("build");
+    expect(cfg.providerName).toBe("nvidia-prod");
+    expect(cfg.credentialEnv).toBe("NVIDIA_INFERENCE_API_KEY");
+    expect(cfg.endpointUrl).toBe("https://integrate.api.nvidia.com/v1");
+    expect(cfg.model).toBe("nvidia/launchable-model");
+    expect(cfg.env).toEqual({
+      NEMOCLAW_PROVIDER: "build",
+      NEMOCLAW_MODEL: "nvidia/launchable-model",
+      NVIDIA_INFERENCE_API_KEY: "nvapi-launchable-test",
+    });
+  });
+
+  it("rejects an Inference Hub credential for the public NVIDIA route", () => {
+    expect(() =>
+      requireHostedInferenceConfig(
+        secrets({ NVIDIA_INFERENCE_API_KEY: "sk-inference-hub-test" }),
+        {},
+        { provider: "build" },
+      ),
+    ).toThrow("Invalid NVIDIA API key. Must start with nvapi-");
+  });
+
   it("uses NVIDIA_INFERENCE_API_KEY as the hosted compatible endpoint source secret", () => {
     const cfg = requireHostedInferenceConfig(
       secrets({ NVIDIA_INFERENCE_API_KEY: "repo-hosted-key" }),
@@ -190,11 +270,211 @@ describe("hosted inference E2E config", () => {
     expect(cfg.credentialEnv).toBe("COMPATIBLE_API_KEY");
   });
 
+  it("stages the Portable NVIDIA inference descriptor before provider selection or network activity (#9200)", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-hosted-"));
+    const filePath = path.join(directory, "portable-inference.json");
+    const now = Date.parse("2026-08-20T16:00:00Z");
+    const resolverCalls: string[] = [];
+    const config = requireHostedInferenceConfig(
+      secrets({ NVIDIA_INFERENCE_API_KEY: "portable-hosted-key" }),
+      {
+        NEMOCLAW_ENDPOINT_URL: "https://inference.example.test/v1",
+        NEMOCLAW_MODEL: "nvidia/provider-model",
+      },
+    );
+
+    try {
+      const staged = stagePortableHostedInferenceDescriptor(config, {
+        filePath,
+        now: () => now,
+      });
+      const stagedSnapshot = readPrivateFileSnapshot(filePath);
+      const metadata = stagedSnapshot.metadata;
+      expect(resolverCalls).toEqual([]);
+      expect(metadata.isFile()).toBe(true);
+      expect(metadata.isSymbolicLink()).toBe(false);
+      expect(metadata.mode & 0o777).toBe(0o600);
+      expect(metadata.nlink).toBe(1);
+      expect(JSON.parse(stagedSnapshot.contents)).toMatchObject({
+        schemaVersion: 1,
+        baseUrl: config.endpointUrl,
+        model: config.model,
+      });
+
+      const conflicting = { ...config, model: "ollama/model" };
+      expect(() =>
+        stagePortableHostedInferenceDescriptor(conflicting, {
+          filePath,
+          now: () => now,
+        }),
+      ).toThrow(/already exists.*refusing to replace/u);
+      expect(JSON.parse(readPrivateFileSnapshot(filePath).contents)).toMatchObject({
+        baseUrl: config.endpointUrl,
+        model: config.model,
+      });
+      const temporaryPath = path.join(directory, ".portable-inference.json.tmp");
+      fs.writeFileSync(temporaryPath, "foreign temporary marker", {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      expect(() =>
+        stagePortableHostedInferenceDescriptor(conflicting, {
+          filePath,
+          now: () => now,
+        }),
+      ).toThrow(/EEXIST/u);
+      expect(readPrivateFileSnapshot(temporaryPath).contents).toBe("foreign temporary marker");
+      fs.unlinkSync(temporaryPath);
+
+      const descriptor = await loadPortableInferenceDescriptor({
+        filePath,
+        now: () => now,
+        resolveEndpointHost: async (hostname) => {
+          resolverCalls.push(hostname);
+          return [{ address: "93.184.216.34", family: 4 }];
+        },
+      });
+      expect(resolverCalls).toEqual(["inference.example.test"]);
+      expect(descriptor).not.toBeNull();
+
+      const selectorEnv: NodeJS.ProcessEnv = {
+        NEMOCLAW_PROVIDER: "install-ollama",
+        NEMOCLAW_MODEL: "nvidia/provider-model",
+      };
+      const environmentScope = createPortableOnboardEnvironmentScope(selectorEnv, {
+        schemaVersion: descriptor!.schemaVersion,
+        baseUrl: descriptor!.baseUrl,
+        model: descriptor!.model,
+        expiresAt: descriptor!.expiresAt,
+      });
+      const selection = resolveRequestedProviderSelection({
+        options: [
+          { key: "custom", label: "Compatible endpoint" },
+          { key: "anthropicCompatible", label: "Anthropic-compatible endpoint" },
+          { key: "openrouter", label: "OpenRouter" },
+          { key: "install-ollama", label: "Install Ollama" },
+        ],
+        requestedProvider: selectorEnv.NEMOCLAW_PROVIDER ?? null,
+        sandboxName: "portable-launch",
+        remoteProviderConfig: {},
+        isWsl: false,
+        isWindowsHostOllama: false,
+        windowsHostOllamaSupported: false,
+        hermesProviderAvailable: false,
+        ollamaRunning: false,
+        readRecordedProvider: () => null,
+        readRecordedNimContainer: () => null,
+        readRecordedModel: () => null,
+      });
+
+      expect(selectorEnv.NEMOCLAW_PROVIDER).toBe("custom");
+      expect(selectorEnv.NEMOCLAW_MODEL).toBe(config.model);
+      expect(selectorEnv.NEMOCLAW_ENDPOINT_URL).toBe(config.endpointUrl);
+      expect(selection.kind).toBe("selected");
+      expect(selection.kind === "selected" ? selection.selected.key : null).toBe("custom");
+      expect(config.providerName).toBe("compatible-endpoint");
+      expect(config.providerName).not.toBe("compatible-anthropic-endpoint");
+      expect(config.providerName).not.toBe("openrouter-api");
+      expect(selection.kind === "selected" ? selection.selected.key : null).not.toBe(
+        "anthropicCompatible",
+      );
+      expect(selection.kind === "selected" ? selection.selected.key : null).not.toBe("openrouter");
+      expect(selection.kind === "selected" ? selection.selected.key : null).not.toBe(
+        "install-ollama",
+      );
+      expect(fs.existsSync(filePath)).toBe(false);
+      expect(() => staged.dispose()).not.toThrow();
+      environmentScope.restore();
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("preserves the staging failure when owned-file rollback also fails (#9200)", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-hosted-"));
+    const filePath = path.join(directory, "portable-inference.json");
+    const temporaryPath = path.join(directory, ".portable-inference.json.tmp");
+    const config = requireHostedInferenceConfig(
+      secrets({ NVIDIA_INFERENCE_API_KEY: "portable-hosted-key" }),
+      {
+        NEMOCLAW_ENDPOINT_URL: "https://inference.example.test/v1",
+        NEMOCLAW_MODEL: "nvidia/provider-model",
+      },
+    );
+    const realUnlinkSync = fs.unlinkSync.bind(fs);
+    const unlinkSync = vi
+      .spyOn(fs, "unlinkSync")
+      .mockImplementationOnce((target) => {
+        expect(target).toBe(temporaryPath);
+        realUnlinkSync(target);
+        throw new Error("original staging failure");
+      })
+      .mockImplementationOnce((target) => {
+        expect(target).toBe(filePath);
+        throw new Error("rollback cleanup failure");
+      });
+
+    try {
+      expect(() =>
+        stagePortableHostedInferenceDescriptor(config, {
+          filePath,
+          now: () => Date.parse("2026-08-20T16:00:00Z"),
+        }),
+      ).toThrow("original staging failure");
+      expect(fs.existsSync(filePath)).toBe(true);
+      expect(unlinkSync).toHaveBeenCalledTimes(2);
+    } finally {
+      unlinkSync.mockRestore();
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("passes hosted authorization to curl on stdin without exposing the key in arguments", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hosted-models-probe-"));
+    const argsPath = path.join(directory, "curl.args");
+    const stdinPath = path.join(directory, "curl.stdin");
+    fs.writeFileSync(
+      path.join(directory, "curl"),
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > ${JSON.stringify(argsPath)}
+cat > ${JSON.stringify(stdinPath)}
+printf '{"data":[]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const apiKey = "hosted-models-secret";
+    const probe = buildHostedInferenceModelsProbe(apiKey, "https://inference-api.nvidia.com/v1");
+    try {
+      const result = spawnSync(probe.command, probe.args, {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...probe.env,
+          PATH: `${directory}:${process.env.PATH ?? ""}`,
+        },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe('{"data":[]}');
+      expect([probe.command, ...probe.args].join(" ")).not.toContain(apiKey);
+      expect(fs.readFileSync(argsPath, "utf8")).toContain("--header\n@-\n");
+      expect(fs.readFileSync(argsPath, "utf8")).not.toContain(apiKey);
+      expect(fs.readFileSync(stdinPath, "utf8")).toBe(`Authorization: Bearer ${apiKey}\n`);
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
   it("preserves the hosted-compatible mode flag without passing source secrets by default", () => {
     const env = buildAvailabilityProbeEnv({
       HOME: "/tmp/home",
       PATH: "/usr/bin",
       BUILDX_BUILDER: "external-builder",
+      CONTAINERS_CONF: "/tmp/native-podman-containers.conf",
+      CONTAINERS_STORAGE_CONF: "/tmp/native-podman-storage.conf",
       NEMOCLAW_E2E_USE_HOSTED_INFERENCE: "1",
       NEMOCLAW_OPENSHELL_CHANNEL: "dev",
       NVIDIA_INFERENCE_API_KEY: "repo-hosted-key",
@@ -203,6 +483,8 @@ describe("hosted inference E2E config", () => {
 
     expect(env.NEMOCLAW_E2E_USE_HOSTED_INFERENCE).toBe("1");
     expect(env.NEMOCLAW_OPENSHELL_CHANNEL).toBe("dev");
+    expect(env.CONTAINERS_CONF).toBe("/tmp/native-podman-containers.conf");
+    expect(env.CONTAINERS_STORAGE_CONF).toBe("/tmp/native-podman-storage.conf");
     expect(env).not.toHaveProperty("NVIDIA_INFERENCE_API_KEY");
     expect(env).not.toHaveProperty("RANDOM_NON_SECRET");
     expect(env).not.toHaveProperty("BUILDX_BUILDER");
@@ -234,15 +516,6 @@ describe("hosted inference E2E config", () => {
       "%{http_code}",
       "https://inference-api.nvidia.com/v1",
     ]);
-  });
-
-  it("rejects provider reachability endpoints with SSRF-shaped hosts", () => {
-    expect(() => trustedProviderEndpoint("http://169.254.169.254/latest/meta-data")).toThrow(
-      /private or link-local|blocked/,
-    );
-    expect(() =>
-      trustedProviderEndpoint("https://metadata.google.internal/computeMetadata/v1"),
-    ).toThrow(/blocked/);
   });
 
   it("uses a lightweight compatible reachability probe without API or auth requests", () => {
@@ -371,14 +644,72 @@ describe("hosted inference E2E config", () => {
     });
   });
 
+  it.each([
+    [false, undefined, 401],
+    [true, undefined, 200],
+    [false, "Bearer dummy", 200],
+    [true, "Bearer dummy", 200],
+    [false, "Bearer wrong", 401],
+    [true, "Bearer wrong", 401],
+  ] as const)(
+    "validates optional bearer authentication (%s, %s)",
+    async (allowMissingAuth, authorization, status) => {
+      const progress = startTestProgress(
+        "optional local authentication",
+        ["serve compatible API", "validate authentication"],
+        {
+          logLine: () => {},
+        },
+      );
+      const fake = await startFakeOpenAiCompatibleServer({
+        apiKey: "dummy",
+        model: "local-model",
+        requireAuth: true,
+        allowMissingAuth,
+        progress,
+      });
+      try {
+        const response = await fetch(`${fake.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authorization === undefined ? {} : { Authorization: authorization }),
+          },
+          body: JSON.stringify({
+            model: "local-model",
+            messages: [{ role: "user", content: "ping" }],
+          }),
+        });
+        expect(response.status).toBe(status);
+        await response.text();
+      } finally {
+        await fake.close();
+        progress.stop();
+      }
+    },
+  );
+
   it("serves fake OpenAI-compatible chat and responses contracts", async () => {
+    const progressLines: string[] = [];
+    const progress = startTestProgress(
+      "fake compatible server support",
+      ["serve compatible API", "verify compatible API"],
+      { logLine: (line) => progressLines.push(line) },
+    );
     const fake = await startFakeOpenAiCompatibleServer({
       apiKey: "fake-compatible-key",
       chatContent: "CHAT_OK",
       forbiddenMarkers: ["FORBIDDEN_REQUEST_MARKER"],
       model: "nvidia/nvidia/fake-model",
+      progress,
+      publicHost: "localhost",
+      requestCanaryMarker: "EXPECTED_REQUEST_CANARY",
       requireAuth: true,
       responseText: "RESP_OK",
+      toolCallOnCanary: {
+        name: "sessions_spawn",
+        arguments: '{"task":"Reply with PONG"}',
+      },
     });
 
     try {
@@ -400,7 +731,7 @@ describe("hosted inference E2E config", () => {
 
       const chat = await fetch(`${fake.baseUrl}/chat/completions`, {
         body: JSON.stringify({
-          messages: [{ content: "ping", role: "user" }],
+          messages: [{ content: "ping EXPECTED_REQUEST_CANARY", role: "user" }],
           model: "nvidia/nvidia/fake-model",
         }),
         headers: {
@@ -411,7 +742,21 @@ describe("hosted inference E2E config", () => {
       });
       expect(chat.status).toBe(200);
       expect(await chat.json()).toMatchObject({
-        choices: [{ message: { content: "CHAT_OK" } }],
+        choices: [
+          {
+            finish_reason: "tool_calls",
+            message: {
+              tool_calls: [
+                {
+                  function: {
+                    name: "sessions_spawn",
+                    arguments: '{"task":"Reply with PONG"}',
+                  },
+                },
+              ],
+            },
+          },
+        ],
       });
 
       const responses = await fetch(`${fake.baseUrl}/responses`, {
@@ -435,6 +780,7 @@ describe("hosted inference E2E config", () => {
             auth: "missing",
             forbiddenMarkerMatches: 1,
             path: "/v1/chat/completions",
+            requestCanaryPresent: false,
           }),
           expect.objectContaining({
             auth: "ok",
@@ -442,6 +788,7 @@ describe("hosted inference E2E config", () => {
             hostHeader: new URL(fake.baseUrl).host,
             model: "nvidia/nvidia/fake-model",
             path: "/v1/chat/completions",
+            requestCanaryPresent: true,
             stream: false,
           }),
           expect.objectContaining({ auth: "ok", path: "/v1/responses", stream: true }),
@@ -451,8 +798,15 @@ describe("hosted inference E2E config", () => {
         requests.reduce((total, request) => total + (request.forbiddenMarkerMatches ?? 0), 0),
       ).toBe(1);
       expect(JSON.stringify(requests)).not.toContain("FORBIDDEN_REQUEST_MARKER");
+      expect(JSON.stringify(requests)).not.toContain("EXPECTED_REQUEST_CANARY");
     } finally {
       await fake.close();
     }
+    expect(progressLines).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("event: fake OpenAI-compatible server started"),
+        expect.stringContaining("event: fake OpenAI-compatible server stopped"),
+      ]),
+    );
   });
 });

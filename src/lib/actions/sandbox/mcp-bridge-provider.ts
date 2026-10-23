@@ -5,27 +5,30 @@ export type {
   McpProviderAttachment,
   McpProviderAttachmentInspection,
   McpProviderInspection,
+  McpProviderInspectionRuntimeSelection,
 } from "./mcp-bridge-provider-inspection";
 export {
   assertMcpProviderRecoverable,
-  assertNoAttachedProviderCredentialCollision,
+  assertNoAttachedProviderCredentialCollisions,
+  assertNoProviderCredentialCollisions,
+  assertNoRegisteredProviderCredentialCollisions,
+  getMcpProviderInspectionRuntimeSelection,
   inspectMcpProvider,
   inspectMcpProviderAttachments,
-  parseMcpProviderAttachmentNames,
-  parseMcpProviderMetadata,
+  MCP_BRIDGE_PROVIDER_TYPE,
   preflightMcpEntryTargets,
   providerAttached,
   providerMatchesCredential,
+  providerMatchesManagedCredential,
   providerShapeDetail,
 } from "./mcp-bridge-provider-inspection";
 export type { ProviderDetachOutcome } from "./mcp-bridge-provider-mutation";
 export {
   attachProvider,
-  buildMcpBridgeProviderArgs,
-  deleteProvider,
   detachMissingProviderReference,
   detachProvider,
-  providerDetachChangedState,
+  ensureMcpBridgeProviderProfile,
+  refreshMcpProviderEnvironment,
   upsertMcpProvider,
 } from "./mcp-bridge-provider-mutation";
 export type { McpCredentialRevisionObservation } from "./mcp-bridge-provider-readiness";

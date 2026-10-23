@@ -25,6 +25,10 @@ export function inspectLocalImageMetadata(imageRef: string): LocalImageMetadata 
   }
 }
 
+function isExactSameRepositoryDigestRef(imageName: string, digest: string, ref: string): boolean {
+  return /^sha256:[0-9a-f]{64}$/u.test(digest) && ref === `${imageName}@${digest}`;
+}
+
 export function validateSandboxBaseImageResolutionMetadata(input: {
   metadata: SandboxBaseImageResolutionMetadata;
   expectedKey: string;
@@ -32,9 +36,9 @@ export function validateSandboxBaseImageResolutionMetadata(input: {
   pinnedRemoteRef?: string;
   requireOpenshellSandboxAbi: boolean;
   minGlibcVersion: string;
-  inspected: LocalImageMetadata | null;
+  inspectLocalImage: () => LocalImageMetadata | null;
 }): BaseImageResolutionValidation {
-  const { metadata, inspected } = input;
+  const { metadata } = input;
   if (metadata.key !== input.expectedKey || metadata.imageName !== input.imageName) {
     return { ok: false, reason: "key_mismatch" };
   }
@@ -56,6 +60,7 @@ export function validateSandboxBaseImageResolutionMetadata(input: {
   if (metadata.digest === null && metadata.source !== "local") {
     return { ok: false, reason: "repo_digest_missing" };
   }
+  const inspected = input.inspectLocalImage();
   if (
     !inspected ||
     inspected.Id !== metadata.imageId ||
@@ -67,7 +72,10 @@ export function validateSandboxBaseImageResolutionMetadata(input: {
   if (metadata.digest) {
     const expectedRepoDigest = `${input.imageName}@${metadata.digest}`;
     const repoDigests = Array.isArray(inspected.RepoDigests) ? inspected.RepoDigests : [];
-    if (!repoDigests.some((entry) => String(entry) === expectedRepoDigest)) {
+    if (
+      !isExactSameRepositoryDigestRef(input.imageName, metadata.digest, metadata.ref) &&
+      !repoDigests.some((entry) => String(entry) === expectedRepoDigest)
+    ) {
       return { ok: false, reason: "repo_digest_missing" };
     }
   }
@@ -89,7 +97,19 @@ export function createSandboxBaseImageResolutionMetadata(
   if (resolution.digest) {
     const expectedRepoDigest = `${options.imageName}@${resolution.digest}`;
     const repoDigests = Array.isArray(inspected?.RepoDigests) ? inspected.RepoDigests : [];
-    if (!repoDigests.some((entry) => String(entry) === expectedRepoDigest)) return null;
+    // Docker may omit RepoDigests after resolving an exact platform manifest.
+    // The resolver's exact same-repository digest ref remains immutable proof.
+    const exactResolvedReference = isExactSameRepositoryDigestRef(
+      options.imageName,
+      resolution.digest,
+      resolution.ref,
+    );
+    if (
+      !exactResolvedReference &&
+      !repoDigests.some((entry) => String(entry) === expectedRepoDigest)
+    ) {
+      return null;
+    }
   }
 
   return {
@@ -114,8 +134,30 @@ export function finalizeSandboxBaseImageResolution(
   key: string,
   resolution: SandboxBaseImageResolution,
 ): SandboxBaseImageResolution {
-  const metadata = createSandboxBaseImageResolutionMetadata(options, key, resolution);
-  return metadata ? { ...resolution, metadata } : resolution;
+  let locallyProvenResolution = resolution;
+  const preserveExactOverride =
+    resolution.source === "override" &&
+    resolution.digest !== null &&
+    isExactSameRepositoryDigestRef(options.imageName, resolution.digest, resolution.ref);
+  if (resolution.digest && !preserveExactOverride) {
+    const inspected = inspectLocalImageMetadata(resolution.ref);
+    const expectedRepoDigest = `${options.imageName}@${resolution.digest}`;
+    const matchingRepoDigests = Array.isArray(inspected?.RepoDigests)
+      ? inspected.RepoDigests.map(String).filter((entry) =>
+          entry.startsWith(`${options.imageName}@sha256:`),
+        )
+      : [];
+    if (!matchingRepoDigests.includes(expectedRepoDigest) && matchingRepoDigests.length === 1) {
+      const ref = matchingRepoDigests[0];
+      locallyProvenResolution = {
+        ...resolution,
+        ref,
+        digest: ref.slice(ref.indexOf("@") + 1),
+      };
+    }
+  }
+  const metadata = createSandboxBaseImageResolutionMetadata(options, key, locallyProvenResolution);
+  return metadata ? { ...locallyProvenResolution, metadata } : resolution;
 }
 
 export function reuseSandboxBaseImageResolutionHint(
@@ -131,13 +173,19 @@ export function reuseSandboxBaseImageResolutionHint(
     pinnedRemoteRef: options.pinnedRemoteRef,
     requireOpenshellSandboxAbi: options.requireOpenshellSandboxAbi === true,
     minGlibcVersion: options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC,
-    inspected: inspectLocalImageMetadata(hint.ref),
+    inspectLocalImage: () => inspectLocalImageMetadata(hint.ref),
   });
   if (!validation.ok) {
     addTraceEvent("nemoclaw.sandbox_base_image.cache_stale", { reason: validation.reason });
     return null;
   }
-  if (options.validateImage && !options.validateImage(hint.ref)) {
+  if (
+    options.validateImage &&
+    !options.validateImage(hint.ref, {
+      source: hint.source,
+      ...(hint.pinnedRemoteRef ? { pinnedRemoteRef: hint.pinnedRemoteRef } : {}),
+    })
+  ) {
     addTraceEvent("nemoclaw.sandbox_base_image.cache_stale", {
       reason: "custom_validation_failed",
     });

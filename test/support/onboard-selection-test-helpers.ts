@@ -14,6 +14,11 @@ import type {
   ProviderSelectionSuccess,
 } from "../../src/lib/onboard/provider-selection.js";
 import type { DetectWindowsHostOllamaDeps } from "../../src/lib/onboard/windows-host-ollama.js";
+import {
+  createHostProcessWorkspace,
+  trailingJsonPayload,
+} from "../helpers/host-process-harness.js";
+import { onboardChildRuntimeSource } from "../helpers/onboard-child-runtime.js";
 
 const PROVIDER_CREDENTIAL_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
@@ -33,6 +38,111 @@ const PROVIDER_CREDENTIAL_ENV_KEYS = new Set([
   "OPENAI_API_KEY",
   "OPENROUTER_API_KEY",
 ]);
+
+export type OllamaPullScenario = {
+  answers: readonly string[];
+  environment?: NodeJS.ProcessEnv;
+  listAfter: { attempts: number } | { model: string } | "first-pull";
+};
+
+export type OllamaPullScenarioResult = {
+  payload: {
+    result: { provider: string; model: string };
+    messages: string[];
+    lines: string[];
+    listAttempts: number;
+  };
+  pulls: string;
+};
+
+export function runOllamaPullScenario(
+  scenario: OllamaPullScenario,
+  curlResponse: string,
+): OllamaPullScenarioResult {
+  const repoRoot = path.join(import.meta.dirname, "..", "..");
+  const workspace = createHostProcessWorkspace("nemoclaw-onboard-ollama-pull-");
+  const pullLog = workspace.path("pulls.log");
+  const curlResponsePath = workspace.path("curl-response.json");
+  fs.writeFileSync(curlResponsePath, curlResponse);
+  const onboardPath = JSON.stringify(path.join(repoRoot, "src", "lib", "onboard.ts"));
+  const credentialsPath = JSON.stringify(
+    path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
+  );
+  const runnerPath = JSON.stringify(path.join(repoRoot, "src", "lib", "runner.ts"));
+  const listResult =
+    scenario.listAfter === "first-pull"
+      ? `fs.existsSync(pullLog) ? "qwen3.5:9b" : ""`
+      : "attempts" in scenario.listAfter
+        ? `fs.existsSync(pullLog) && ++listAttempts >= ${scenario.listAfter.attempts} ? "qwen3.5:9b" : ""`
+        : `fs.existsSync(pullLog) && fs.readFileSync(pullLog, "utf8").includes(${JSON.stringify(scenario.listAfter.model)}) ? ${JSON.stringify(scenario.listAfter.model)} : ""`;
+
+  workspace.writeExecutable(
+    "curl",
+    `#!/usr/bin/env bash
+status="200"
+outfile=""
+url=""
+has_config=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) outfile="$2"; shift 2 ;;
+    --config) has_config=1; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+if [ "$has_config" -eq 0 ] && [[ "$url" == *:11435/* ]]; then status="401"; fi
+if [ -n "$outfile" ]; then cat ${JSON.stringify(curlResponsePath)} > "$outfile"; fi
+printf '%s' "$status"
+`,
+  );
+  workspace.writeExecutable(
+    "ollama",
+    `#!/usr/bin/env bash
+if [ "$1" = "pull" ]; then echo "$2" >> ${JSON.stringify(pullLog)}; exit 0; fi
+exit 0
+`,
+  );
+
+  const source = String.raw`
+const fs = require("fs");
+${onboardChildRuntimeSource}
+const credentials = require(${credentialsPath});
+const runner = require(${runnerPath});
+const { messages } = installPromptQueue(credentials, ${JSON.stringify(scenario.answers)});
+const pullLog = ${JSON.stringify(pullLog)};
+let listAttempts = 0;
+runner.runCapture = (command) => {
+  const cmd = Array.isArray(command) ? command.join(" ") : command;
+  const ollamaMetadata = supportedOllamaHostMetadataOutput(cmd); if (ollamaMetadata) return ollamaMetadata;
+  if (cmd.includes("127.0.0.1:11434/api/tags")) return JSON.stringify({ models: [] });
+  if (cmd.includes("ollama list")) return ${listResult};
+  if (cmd.includes("127.0.0.1:8000/v1/models")) return "";
+  if (cmd.includes("api/generate")) return '{"response":"hello"}';
+  if (cmd.includes("-o args=")) return "node ollama-auth-proxy.js";
+  return "";
+};
+const { setupNim } = require(${onboardPath});
+reportChildScenario(async () => {
+  const result = await setupNim(null);
+  return { result, messages, listAttempts };
+});
+`;
+
+  try {
+    const result = workspace.runNodeSource(source, {
+      cwd: repoRoot,
+      env: workspace.environment(scenario.environment),
+    });
+    if (result.status !== 0) throw new Error(`Ollama pull scenario failed: ${result.stderr}`);
+    return {
+      payload: trailingJsonPayload<OllamaPullScenarioResult["payload"]>(result.stdout),
+      pulls: fs.existsSync(pullLog) ? fs.readFileSync(pullLog, "utf8").trim() : "",
+    };
+  } finally {
+    workspace.remove();
+  }
+}
 
 export function requirePresent<T>(value: T | null | undefined, message: string): T {
   if (value === null || value === undefined) throw new Error(message);
@@ -68,8 +178,10 @@ function createIsolatedOnboardEnv(tmpDir: string, provider: string): NodeJS.Proc
   return {
     ...env,
     HOME: tmpDir,
+    PATH: `${tmpDir}${path.delimiter}${env.PATH ?? ""}`,
     NEMOCLAW_MODEL: "qwen3:8b",
     NEMOCLAW_NON_INTERACTIVE: "1",
+    NEMOCLAW_OLLAMA_INSTALL_MODE: "user",
     NEMOCLAW_PROVIDER: provider,
     NEMOCLAW_YES: "1",
   };
@@ -86,12 +198,14 @@ export function runNativeDockerWindowsProviderBoundary(options: {
     path.join(os.tmpdir(), "nemoclaw-onboard-native-docker-windows-provider-"),
   );
   const scriptPath = path.join(tmpDir, "provider-boundary-check.js");
+  const zstdPath = path.join(tmpDir, "zstd");
   const onboardPath = JSON.stringify(path.join(repoRoot, "src", "lib", "onboard.ts"));
   const credentialsPath = JSON.stringify(
     path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
   );
   const runnerPath = JSON.stringify(path.join(repoRoot, "src", "lib", "runner.ts"));
   const platformPath = JSON.stringify(path.join(repoRoot, "src", "lib", "platform.ts"));
+  const waitPath = JSON.stringify(path.join(repoRoot, "src", "lib", "core", "wait.ts"));
   const topologyPath = JSON.stringify(
     path.join(repoRoot, "src", "lib", "onboard", "local-inference-topology.ts"),
   );
@@ -103,22 +217,20 @@ export function runNativeDockerWindowsProviderBoundary(options: {
 
   const script = String.raw`
 const scenario = ${scenario};
-const credentials = require(${credentialsPath});
 const runner = require(${runnerPath});
 const platform = require(${platformPath});
-const topology = require(${topologyPath});
-const local = require(${localPath});
-const windows = require(${windowsPath});
+const wait = require(${waitPath});
 
 platform.isWsl = () => true;
-topology.getContainerRuntime = () => "docker";
-credentials.prompt = async () => {
-  throw new Error("Unexpected prompt in non-interactive test");
+wait.waitForHttp = () => {
+  console.error("OLLAMA_READINESS_PROBED");
+  return true;
 };
-credentials.ensureApiKey = async () => {};
+wait.sleepSeconds = () => {};
 runner.runCapture = (command) => {
   const cmd = Array.isArray(command) ? command.join(" ") : String(command);
   if (cmd.includes("command -v ollama")) return "";
+  if (Array.isArray(command) && command.at(-1) === "zstd") return "zstd";
   if (cmd.includes("127.0.0.1:8000/v1/models")) return "";
   if (cmd.includes("docker images")) return "";
   if (cmd.includes("powershell.exe") && cmd.includes("Get-Command ollama.exe")) {
@@ -134,6 +246,17 @@ runner.runCapture = (command) => {
 };
 runner.run = () => ({ status: 0 });
 runner.runShell = () => ({ status: 0 });
+
+const credentials = require(${credentialsPath});
+const topology = require(${topologyPath});
+const local = require(${localPath});
+const windows = require(${windowsPath});
+
+topology.getContainerRuntime = () => "docker";
+credentials.prompt = async () => {
+  throw new Error("Unexpected prompt in non-interactive test");
+};
+credentials.ensureApiKey = async () => {};
 local.resetOllamaHostCache();
 if (scenario.reachable) local.setResolvedOllamaHost(local.OLLAMA_HOST_DOCKER_INTERNAL);
 local.getOllamaModelOptions = () => {
@@ -142,16 +265,17 @@ local.getOllamaModelOptions = () => {
 };
 windows.installOllamaOnWindowsHost = async () => {
   console.error("WINDOWS_INSTALL_CALLED");
-  return { ok: true, path: "C:\\Users\\tester\\AppData\\Local\\Programs\\Ollama\\ollama.exe" };
+  return {
+    ok: true,
+    path: "C:\\Users\\tester\\AppData\\Local\\Programs\\Ollama\\ollama.exe",
+    commit: () => {},
+    rollback: () => {},
+  };
 };
-windows.setupWindowsOllamaWith0000Binding = () => {
+windows.setupWindowsOllamaLoopbackBinding = () => {
   console.error("WINDOWS_SETUP_CALLED");
-  return true;
+  return { ok: true, commit: () => {}, rollback: () => {} };
 };
-windows.switchToWindowsOllamaHost = () => {
-  console.error("WINDOWS_SWITCH_CALLED");
-};
-
 const { setupNim } = require(${onboardPath});
 
 (async () => {
@@ -163,6 +287,7 @@ const { setupNim } = require(${onboardPath});
 `;
 
   try {
+    fs.writeFileSync(zstdPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     fs.writeFileSync(scriptPath, script);
     return spawnSync(process.execPath, [scriptPath], {
       cwd: repoRoot,

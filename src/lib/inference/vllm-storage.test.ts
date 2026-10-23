@@ -13,6 +13,7 @@ import {
   imageStorageRequirementBytes,
   managedVllmStorageEstimateBytes,
   measureDirectorySizeBytes,
+  measureReclaimableDirectorySizeBytes,
   modelStorageRequirementBytes,
   probeDockerStorage,
   probeHostStorage,
@@ -310,6 +311,30 @@ describe("host cache-storage detection", () => {
     ).toBe(0n);
   });
 
+  it("does not count a root symlink as reclaimable directory storage (#8973)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-reclaimable-root-"));
+    tempDirs.push(root);
+    const target = path.join(root, "target");
+    const link = path.join(root, "venv");
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, "packages.bin"), Buffer.alloc(4096));
+    fs.symlinkSync(target, link, "dir");
+
+    expect(measureReclaimableDirectorySizeBytes(link)).toBe(0n);
+  });
+
+  it("counts allocated blocks instead of a sparse file's logical size (#8973)", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-reclaimable-sparse-"));
+    tempDirs.push(root);
+    const sparseFile = path.join(root, "sparse.bin");
+    fs.closeSync(fs.openSync(sparseFile, "w"));
+    fs.truncateSync(sparseFile, 4 * 1024 ** 3);
+    const stat = fs.lstatSync(sparseFile, { bigint: true });
+
+    expect(measureReclaimableDirectorySizeBytes(root)).toBe(stat.blocks * 512n);
+    expect(measureReclaimableDirectorySizeBytes(root)).toBeLessThan(stat.size);
+  });
+
   it("measures the filesystem containing an existing cache directory", () => {
     const statfs = vi.fn(() => ({ bavail: 400n, bsize: GIB }));
 
@@ -475,7 +500,7 @@ describe("Docker image-storage detection", () => {
     });
   });
 
-  it("honors a named DOCKER_CONTEXT over DOCKER_HOST (#6757)", () => {
+  it("honors a local DOCKER_HOST over a named DOCKER_CONTEXT (#12223)", () => {
     expect(
       resolveDockerStorageLocations(nativeDockerInfo(), {
         ...nativeHost,
@@ -483,13 +508,12 @@ describe("Docker image-storage detection", () => {
         dockerHost: "unix:///run/docker.sock",
       }),
     ).toEqual({
-      ok: false,
-      reason:
-        "Docker uses a named context (remote-builder) whose host filesystem cannot be inspected",
+      ok: true,
+      locations: [{ path: "/var/lib/docker", source: "Docker root directory" }],
     });
   });
 
-  it("honors an explicit default DOCKER_CONTEXT over a remote DOCKER_HOST (#6757)", () => {
+  it("honors a remote DOCKER_HOST over an explicit default DOCKER_CONTEXT (#12223)", () => {
     expect(
       resolveDockerStorageLocations(nativeDockerInfo(), {
         ...nativeHost,
@@ -497,8 +521,8 @@ describe("Docker image-storage detection", () => {
         dockerHost: "ssh://builder.example.test",
       }),
     ).toEqual({
-      ok: true,
-      locations: [{ path: "/var/lib/docker", source: "Docker root directory" }],
+      ok: false,
+      reason: "Docker uses a remote endpoint (ssh://builder.example.test)",
     });
   });
 
@@ -521,7 +545,10 @@ describe("Docker image-storage detection", () => {
         ...nativeHost,
         platform: "darwin",
       }),
-    ).toEqual({ ok: false, reason: "Docker runs behind a darwin host boundary" });
+    ).toEqual({
+      ok: false,
+      reason: "Docker runs behind a darwin host boundary",
+    });
     expect(
       resolveDockerStorageLocations(nativeDockerInfo({ OSType: "windows" }), nativeHost),
     ).toEqual({ ok: false, reason: "Docker is not using a Linux engine" });

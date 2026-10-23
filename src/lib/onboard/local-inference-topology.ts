@@ -6,6 +6,9 @@ import {
   applyOllamaRuntimeContextWindow,
   findReachableOllamaHost,
   isLocalProviderHostHealthy,
+  loadPersistedOllamaHost,
+  OLLAMA_HOST_DOCKER_INTERNAL,
+  shouldFrontOllamaWithProxy,
   validateOllamaModel,
 } from "../inference/local";
 import { ensureOllamaAuthProxy, isProxyHealthy } from "../inference/ollama/proxy";
@@ -13,7 +16,7 @@ import {
   MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW,
   resolveOllamaContextWindowFloor,
 } from "../inference/ollama-runtime-context";
-import { type ContainerRuntime, containerCanReachHostLoopback } from "../platform";
+import type { ContainerRuntime } from "../platform";
 import { ensureOllamaLoopbackSystemdOverride } from "./ollama-systemd";
 
 export function getContainerRuntime(): ContainerRuntime {
@@ -71,12 +74,11 @@ export function getWindowsHostOllamaDockerRequirement(
     return {
       supported: true,
       detectedRuntime: "not applicable",
-      installLabel: "Install Ollama on Windows host (recommended)",
+      installLabel: "Install Ollama on Windows host (loopback only)",
       startLabel(opts) {
         if (opts.reachable) return "Use Ollama on Windows host - running (suggested)";
-        if (opts.loopbackOnly)
-          return "Restart Ollama on Windows host with 0.0.0.0 binding (suggested)";
-        return "Start Ollama on Windows host (suggested)";
+        if (opts.loopbackOnly) return "Restart loopback-only Ollama on Windows host";
+        return "Restart Ollama on Windows host with loopback-only binding";
       },
     };
   }
@@ -85,12 +87,11 @@ export function getWindowsHostOllamaDockerRequirement(
     return {
       supported: true,
       detectedRuntime,
-      installLabel: "Install Ollama on Windows host (recommended)",
+      installLabel: "Install Ollama on Windows host (loopback only)",
       startLabel(opts) {
         if (opts.reachable) return "Use Ollama on Windows host - running (suggested)";
-        if (opts.loopbackOnly)
-          return "Restart Ollama on Windows host with 0.0.0.0 binding (suggested)";
-        return "Start Ollama on Windows host (suggested)";
+        if (opts.loopbackOnly) return "Restart loopback-only Ollama on Windows host";
+        return "Restart Ollama on Windows host with loopback-only binding";
       },
     };
   }
@@ -104,13 +105,13 @@ export function getWindowsHostOllamaDockerRequirement(
     supported: false,
     detectedRuntime,
     labelSuffix,
-    installLabel: `Install Ollama on Windows host${labelSuffix}`,
+    installLabel: `Install Ollama on Windows host with loopback-only binding${labelSuffix}`,
     startLabel(opts) {
       if (opts.reachable) return `Use Ollama on Windows host - running${labelSuffix}`;
       if (opts.loopbackOnly) {
-        return `Restart Ollama on Windows host with 0.0.0.0 binding${labelSuffix}`;
+        return `Restart loopback-only Ollama on Windows host${labelSuffix}`;
       }
-      return `Start Ollama on Windows host${labelSuffix}`;
+      return `Restart Ollama on Windows host with loopback-only binding${labelSuffix}`;
     },
     reason,
     hint,
@@ -143,14 +144,6 @@ export function rejectUnsupportedWindowsHostOllama(
   return requirement.reject(providerKey, isNonInteractive, abortNonInteractive);
 }
 
-// True when the sandbox container needs the local Ollama auth proxy in front
-// of raw Ollama. False only under Docker Desktop on WSL, where the docker-
-// desktop VM publishes the host's 127.0.0.1 back into containers through
-// host.docker.internal. (#3695)
-export function shouldFrontOllamaWithProxy(): boolean {
-  return !containerCanReachHostLoopback(getContainerRuntime());
-}
-
 export interface RepairLocalInferenceSystemdOverrideOptions {
   provider: string | null | undefined;
   model: string | null | undefined;
@@ -163,6 +156,15 @@ function failOllamaResumeRepair(message: string): never {
   throw new Error(message);
 }
 
+// Discovery returns host.docker.internal only after revalidating the Windows
+// listener, Docker Desktop route, Ollama response, and hostile Host rejection.
+// Under mirrored networking it also distinguishes a Windows-forwarded loopback
+// response from a Linux-owned listener before returning that qualified route.
+function protectedWindowsHostOllamaIsReachable(): boolean {
+  const host = findReachableOllamaHost(undefined, {}, undefined, { revalidate: true });
+  return host === OLLAMA_HOST_DOCKER_INTERNAL;
+}
+
 // Repair the Ollama systemd loopback override for recorded ollama-local
 // providers. Agents with a strict context floor also warm the exact recorded
 // model and verify the running daemon before resume can skip provider setup.
@@ -173,11 +175,27 @@ export function repairLocalInferenceSystemdOverrideOrExit(
   const { provider, model, isNonInteractive } = options;
   if (provider !== "ollama-local") return;
   const contextWindowFloor = resolveOllamaContextWindowFloor(options.contextWindowFloor);
-  const state = ensureOllamaLoopbackSystemdOverride({ isNonInteractive, contextWindowFloor });
-  if (state === "failed") {
+  const recordedWindowsHost = loadPersistedOllamaHost() === OLLAMA_HOST_DOCKER_INTERNAL;
+  // A Windows-host Ollama daemon reached at host.docker.internal is not a Linux
+  // systemd service, so the override restarts an unrelated ollama.service and
+  // exits 1. Provider selection already skips it, but it records the same
+  // "ollama-local" provider for both topologies, so resume carries no Windows
+  // marker and has to re-derive the distinction here (#8596).
+  const windowsHostReachable = protectedWindowsHostOllamaIsReachable();
+  if (!windowsHostReachable && recordedWindowsHost) {
     failOllamaResumeRepair(
-      "Ollama systemd restart did not recover after applying the loopback override.",
+      "Recorded Windows-host Ollama no longer passes its loopback listener, local Docker " +
+        "Desktop route, and Host-header validation checks. Repair the Windows-host Ollama " +
+        "route, then run `nemoclaw onboard --resume` again.",
     );
+  }
+  if (!windowsHostReachable) {
+    const state = ensureOllamaLoopbackSystemdOverride({ isNonInteractive, contextWindowFloor });
+    if (state === "failed") {
+      failOllamaResumeRepair(
+        "Ollama systemd restart did not recover after applying the loopback override.",
+      );
+    }
   }
   if (contextWindowFloor <= MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW) return;
   if (!model) {

@@ -6,13 +6,29 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const authority = vi.hoisted(() => ({ digests: [] as string[] }));
+
+vi.mock("./candidate-authority", () => ({
+  CANDIDATE_QUALIFICATION_RECEIPT_DIGESTS: { pi: authority.digests },
+  acceptedCandidateReceiptDigests: () => authority.digests,
+}));
+
+import {
+  type CandidateQualificationFixture,
+  candidateQualificationEnvironment,
+} from "./candidate-test-fixture";
+import YAML from "yaml";
+
 import {
   AGENTS_DIR,
   getAgentChoices,
+  listAgents,
   loadAgent,
+  requireAgentPolicyAdditionsPath,
   resolveAgentName,
   resolveAgentNameAlias,
 } from "./defs";
+import { resolveAgent } from "./onboard";
 
 const tempAgentDirs: string[] = [];
 
@@ -23,9 +39,14 @@ function writeTempAgentManifest(name: string, contents: string): void {
   fs.writeFileSync(path.join(agentDir, "manifest.yaml"), contents);
 }
 
+const qualificationFixtures: CandidateQualificationFixture[] = [];
+
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.NEMOCLAW_AGENT;
+  delete process.env.NEMOCLAW_CUA_ENABLED;
+  authority.digests.splice(0, authority.digests.length);
+  while (qualificationFixtures.length > 0) qualificationFixtures.pop()?.cleanup();
   while (tempAgentDirs.length > 0) {
     const agentDir = tempAgentDirs.pop();
     if (agentDir) {
@@ -35,10 +56,148 @@ afterEach(() => {
 });
 
 describe("agent definitions", () => {
+  it("exposes NemoCUA only behind the exact experimental feature flag (#9649)", () => {
+    expect(fs.existsSync(path.join(AGENTS_DIR, "nemocua", "manifest.yaml"))).toBe(true);
+    expect(listAgents({})).not.toContain("nemocua");
+    expect(listAgents({ NEMOCLAW_CUA_ENABLED: "true" })).not.toContain("nemocua");
+    expect(() => loadAgent("nemocua", {})).toThrow("NemoCUA is disabled");
+
+    const enabledEnv = { NEMOCLAW_CUA_ENABLED: "1" };
+    expect(listAgents(enabledEnv)).toContain("nemocua");
+    expect(loadAgent("nemocua", enabledEnv)).toMatchObject({
+      name: "nemocua",
+      runtime: {
+        kind: "terminal",
+        headless_command: "python3 /app/run_with_harness.py",
+      },
+    });
+  });
+
+  it("keeps NemoCUA out of choices and direct resolution until enabled (#9649)", () => {
+    expect(getAgentChoices().map((choice) => choice.name)).not.toContain("nemocua");
+    expect(() => resolveAgent({ agentFlag: "nemocua" })).toThrow("Unknown agent 'nemocua'");
+
+    vi.stubEnv("NEMOCLAW_CUA_ENABLED", "1");
+
+    expect(getAgentChoices().map((choice) => choice.name)).toContain("nemocua");
+    expect(resolveAgent({ agentFlag: "nemocua" })?.name).toBe("nemocua");
+  });
+
+  it("keeps the Pi candidate manifest out of agent selection by default (#7925)", () => {
+    expect(fs.existsSync(path.join(AGENTS_DIR, "pi", "manifest.yaml"))).toBe(true);
+
+    expect(listAgents({})).not.toContain("pi");
+    expect(getAgentChoices().map((choice) => choice.name)).not.toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents({}))).toBeNull();
+    expect(() => loadAgent("pi", {})).toThrow(
+      "Agent 'pi' is a release candidate and is not selectable in this release",
+    );
+  });
+
+  it("does not let an ordinary environment setting expose Pi (#7925)", () => {
+    const ordinaryEnv = { NEMOCLAW_PI_QUALIFICATION: "1" };
+
+    expect(listAgents(ordinaryEnv)).not.toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents(ordinaryEnv))).toBeNull();
+    expect(() => loadAgent("pi", ordinaryEnv)).toThrow(
+      "Agent 'pi' is a release candidate and is not selectable in this release",
+    );
+  });
+
+  it("selects Pi only with protected candidate qualification authority (#7927)", () => {
+    const fixture = candidateQualificationEnvironment();
+    qualificationFixtures.push(fixture);
+    authority.digests.push(fixture.receiptDigest);
+
+    expect(listAgents(fixture.env)).toContain("pi");
+    expect(resolveAgentNameAlias("pi", listAgents(fixture.env))).toBe("pi");
+    expect(loadAgent("pi", fixture.env).name).toBe("pi");
+  });
+
+  it("withholds Pi from a receipt the repository has not published (#7927)", () => {
+    const fixture = candidateQualificationEnvironment();
+    qualificationFixtures.push(fixture);
+
+    expect(listAgents(fixture.env)).not.toContain("pi");
+    expect(() => loadAgent("pi", fixture.env)).toThrow("is not selectable in this release");
+  });
+
+  it("does not expose Pi from the protected flag alone (#7927)", () => {
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "1" })).not.toContain("pi");
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "0" })).not.toContain("pi");
+    expect(listAgents({ NEMOCLAW_CANDIDATE_AGENTS: "true" })).not.toContain("pi");
+  });
+
+  it("keeps the Pi candidate manifest readable without public resolution (#7925)", () => {
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(AGENTS_DIR, "pi", "manifest.yaml"), "utf8"),
+    ) as {
+      name: string;
+      expected_version: string;
+      runtime: { kind: string };
+      config: { dir: string };
+      state_dirs?: unknown;
+      state_files?: unknown;
+    };
+
+    expect(manifest.name).toBe("pi");
+    expect(manifest.expected_version).toBe("0.84.1");
+    expect(manifest.runtime.kind).toBe("terminal");
+    expect(manifest.config.dir).toBe("/sandbox/.pi/agent");
+    expect(manifest.state_dirs).toBeUndefined();
+    expect(manifest.state_files).toBeUndefined();
+  });
+
   it("orders OpenClaw first in interactive choices", () => {
     const choices = getAgentChoices();
     expect(choices[0]?.name).toBe("openclaw");
     expect(choices.map((choice) => choice.name)).toContain("hermes");
+  });
+
+  it("loads deferred onboarding as an explicit agent-manifest capability", () => {
+    expect(loadAgent("hermes").deferred_onboarding).toBe(true);
+    expect(loadAgent("langchain-deepagents-code").deferred_onboarding).toBe(true);
+    expect(loadAgent("openclaw").deferred_onboarding).toBe(false);
+  });
+
+  it("rejects a non-boolean deferred onboarding capability", () => {
+    const agentName = `invalid-deferred-onboarding-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "deferred_onboarding: enabled"].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/deferred_onboarding/);
+  });
+
+  it("uses agent display names in interactive choices", () => {
+    const choices = getAgentChoices();
+    expect(choices).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "openclaw", displayName: "OpenClaw" }),
+        expect.objectContaining({ name: "hermes", displayName: "Hermes Agent" }),
+      ]),
+    );
+  });
+
+  it("requires a readable regular policy-additions file for non-OpenClaw baselines (#7194)", () => {
+    const agentName = `missing-baseline-${String(Date.now())}`;
+    writeTempAgentManifest(agentName, `name: ${agentName}\ndisplay_name: Missing Baseline\n`);
+    const agent = loadAgent(agentName);
+    const policyPath = path.join(AGENTS_DIR, agentName, "policy-additions.yaml");
+
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+
+    fs.mkdirSync(policyPath);
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+    fs.rmSync(policyPath, { recursive: true });
+    fs.writeFileSync(policyPath, "version: 1\nnetwork_policies: {}\n");
+
+    expect(requireAgentPolicyAdditionsPath(agent)).toBe(policyPath);
   });
 
   it("falls back to openclaw when session references an unknown agent", () => {
@@ -84,18 +243,34 @@ describe("agent definitions", () => {
     expect(() => loadAgent(agentName)).toThrow(/YAML object/);
   });
 
-  it("rejects invalid forward_ports values in manifests", () => {
-    for (const port of [1023, 70000]) {
-      const agentName = `invalid-forward-port-${String(port)}-${String(Date.now())}`;
+  it.each(["state_dirs", "state_files", "runtime_auth_state_dirs"])(
+    "rejects the retired %s inventory",
+    (field) => {
+      const agentName = `retired-state-inventory-${String(Date.now())}`;
       writeTempAgentManifest(
         agentName,
-        [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", `  - ${port}`].join(
-          "\n",
-        ),
+        [
+          `name: ${agentName}`,
+          "display_name: Retired State Inventory",
+          `${field}:`,
+          "  - identity",
+        ].join("\n"),
       );
 
-      expect(() => loadAgent(agentName)).toThrow(/forward_ports\[0\]/);
-    }
+      expect(() => loadAgent(agentName)).toThrow(new RegExp(`${field}.*retired`));
+    },
+  );
+
+  it.each([1023, 70000])("rejects invalid forward_ports value %s in manifests", (port) => {
+    const agentName = `invalid-forward-port-${String(port)}-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", `  - ${port}`].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/forward_ports\[0\]/);
   });
 
   it("rejects invalid health_probe.port values in manifests", () => {
@@ -197,23 +372,23 @@ describe("agent definitions", () => {
     expect(() => loadAgent(agentName)).toThrow(/inference\.provider_type/);
   });
 
-  it.each([
-    "42",
-    '"bad model"',
-  ])("rejects invalid inference default models in manifests (%s)", (defaultModel) => {
-    const agentName = `invalid-inference-default-model-${String(Date.now())}-${defaultModel.length}`;
-    writeTempAgentManifest(
-      agentName,
-      [
-        `name: ${agentName}`,
-        "display_name: Broken Inference Default",
-        "inference:",
-        `  default_model: ${defaultModel}`,
-      ].join("\n"),
-    );
+  it.each(["42", '"bad model"'])(
+    "rejects invalid inference default models in manifests (%s)",
+    (defaultModel) => {
+      const agentName = `invalid-inference-default-model-${String(Date.now())}-${defaultModel.length}`;
+      writeTempAgentManifest(
+        agentName,
+        [
+          `name: ${agentName}`,
+          "display_name: Broken Inference Default",
+          "inference:",
+          `  default_model: ${defaultModel}`,
+        ].join("\n"),
+      );
 
-    expect(() => loadAgent(agentName)).toThrow(/inference\.default_model/);
-  });
+      expect(() => loadAgent(agentName)).toThrow(/inference\.default_model/);
+    },
+  );
 
   it("rejects invalid MCP bridge adapter declarations in manifests", () => {
     const agentName = `invalid-mcp-adapter-${String(Date.now())}`;

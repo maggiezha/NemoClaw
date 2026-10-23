@@ -11,9 +11,19 @@ import type {
   SandboxStatusRouteDrift,
   ServingProcessHealth,
 } from "../../src/lib/actions/sandbox/status-snapshot";
+import type { LlamaCppRouteDetails } from "../../src/lib/inference/config";
 import type { ProviderHealthStatus } from "../../src/lib/inference/health";
+import type { SandboxHostMount } from "../../src/lib/state/registry";
 
-type ShowSandboxStatus = typeof import("../../src/lib/actions/sandbox/status")["showSandboxStatus"];
+type ShowSandboxStatus =
+  (typeof import("../../src/lib/actions/sandbox/status"))["showSandboxStatus"];
+type GetSandboxStatusReport =
+  (typeof import("../../src/lib/actions/sandbox/status"))["getSandboxStatusReport"];
+type PortableAgentReceiptDisposition = ReturnType<
+  (typeof import("../../src/lib/onboard/experimental/portable-agent-lifecycle"))["inspectPortableAgentReceiptDisposition"]
+>;
+type WithMcpLifecycleLock =
+  (typeof import("../../src/lib/state/mcp-lifecycle-lock-acquisition"))["withMcpLifecycleLock"];
 
 const requireDist = createRequire(import.meta.url);
 const statusModulePath = "../../src/lib/actions/sandbox/status.js";
@@ -28,16 +38,19 @@ export type StatusFlowHarness = {
   collectSandboxStatusSnapshotSpy: MockInstance;
   getActiveSandboxSessionsSpy: MockInstance;
   getSandboxDockerRuntimeSpy: MockInstance;
+  getSandboxStatusReport: GetSandboxStatusReport;
+  qualifyPortableAgentLifecycleAuthoritySpy: MockInstance;
+  isSandboxGatewayRunningForStatusSpy: MockInstance;
   logSpy: MockInstance;
   removeSandboxSpy: MockInstance;
   showSandboxStatus: ShowSandboxStatus;
+  withMcpLifecycleLockSpy: MockInstance;
 };
 
 const baseSandboxEntry = {
   name: "alpha",
   model: "nvidia/nemotron",
   provider: "ollama-local",
-  policies: ["npm", "telegram"],
   hostGpuDetected: true,
   gpuEnabled: true,
   sandboxGpuEnabled: true,
@@ -50,6 +63,9 @@ const baseSandboxEntry = {
   },
   openshellDriver: "docker",
   openshellVersion: "0.1.2",
+  gatewayName: "nemoclaw",
+  lifecycleGeneration: "generation-1",
+  lifecycleLiveIdentityFingerprint: "fingerprint-1",
   dashboardPort: 18789,
   agentVersion: "0.1.0",
 };
@@ -57,21 +73,35 @@ const baseSandboxEntry = {
 export type StatusFlowHarnessOptions = {
   currentModel?: string;
   currentProvider?: string;
+  gatewayPresets?: string[] | null;
   routeDrift?: SandboxStatusRouteDrift | null;
+  llamaCpp?: LlamaCppRouteDetails | null;
   inferenceHealth?: ProviderHealthStatus | null;
   servingProcessHealth?: ServingProcessHealth | null;
+  portableDisposition?:
+    | PortableAgentReceiptDisposition
+    | Error
+    | (() => PortableAgentReceiptDisposition | Error);
+  registryEntry?: "present" | "missing";
+  publishedAcrossGatewayRoots?: boolean;
+  withMcpLifecycleLock?: WithMcpLifecycleLock;
   lookup?: SandboxGatewayState;
   lookupState?: "present" | "missing";
+  gatewayRunning?: boolean;
   preflight?: SandboxStatusPreflightResult;
-  sandboxEntry?: Partial<Omit<typeof baseSandboxEntry, "agentVersion">> & {
-    agent?: string | null;
-    agentVersion?: string | null;
-    dcodeAutoApprovalMode?: "disabled" | "thread-opt-in";
-  };
-  shieldsPosture?: {
-    mode: "locked" | "mutable_default" | "mutable";
-    detail: string;
-  };
+  postRecoveryPreflight?: SandboxStatusPreflightResult;
+  /** `null` models a sandbox name that the local registry does not hold. */
+  sandboxEntry?:
+    | (Partial<Omit<typeof baseSandboxEntry, "agentVersion">> & {
+        agent?: string | null;
+        agentVersion?: string | null;
+        dcodeAutoApprovalMode?: "disabled" | "thread-opt-in";
+        preferredInferenceApi?: string | null;
+        compatibleEndpointReasoningEffort?: "low" | "medium" | "high" | null;
+        hostMounts?: SandboxHostMount[];
+        dashboardRemoteBindPrepared?: boolean;
+      })
+    | null;
   versionCheck?: {
     sandboxVersion?: string | null;
     expectedVersion?: string | null;
@@ -95,13 +125,20 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
   const statusPreflight = requireDist("../../src/lib/actions/sandbox/status-preflight.js");
   const statusSnapshot = requireDist("../../src/lib/actions/sandbox/status-snapshot.js");
   const dockerHealth = requireDist("../../src/lib/actions/sandbox/docker-health.js");
-  const processRecovery = requireDist("../../src/lib/actions/sandbox/process-recovery.js");
+  const statusProcessRecovery = requireDist(
+    "../../src/lib/actions/sandbox/status/process-recovery.js",
+  );
+  const portableAgentLifecycle = requireDist(
+    "../../src/lib/onboard/experimental/portable-agent-lifecycle.js",
+  );
+  const lifecycleLock = requireDist("../../src/lib/state/mcp-lifecycle-lock-acquisition.js");
   const resolve = requireDist("../../src/lib/adapters/openshell/resolve.js");
   const agentRuntime = requireDist("../../src/lib/agent/runtime.js");
   const nim = requireDist("../../src/lib/inference/nim.js");
+  const policy = requireDist("../../src/lib/policy/index.js");
   const sandboxVersion = requireDist("../../src/lib/sandbox/version.js");
-  const shields = requireDist("../../src/lib/shields/index.js");
   const registry = requireDist("../../src/lib/state/registry.js");
+  const crossPortRegistry = requireDist("../../src/lib/state/registry/cross-port.js");
   const sandboxSession = requireDist("../../src/lib/state/sandbox-session.js");
 
   const lookup: SandboxGatewayState =
@@ -122,9 +159,45 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
           recoverySandboxVia: "docker unpause",
         });
 
-  const sandboxEntry = { ...baseSandboxEntry, ...options.sandboxEntry };
+  const sandboxEntry =
+    options.sandboxEntry === null ? null : { ...baseSandboxEntry, ...options.sandboxEntry };
+  const qualifyPortableAgentLifecycleAuthority =
+    portableAgentLifecycle.qualifyPortableAgentLifecycleAuthority;
+  const qualifyPortableAgentLifecycleAuthoritySpy = vi
+    .spyOn(portableAgentLifecycle, "qualifyPortableAgentLifecycleAuthority")
+    .mockImplementation(((sandboxName: string) => {
+      const disposition =
+        typeof options.portableDisposition === "function"
+          ? options.portableDisposition()
+          : options.portableDisposition;
+      if (disposition instanceof Error) throw disposition;
+      return qualifyPortableAgentLifecycleAuthority(sandboxName, {
+        inspectReceiptDisposition: () => disposition ?? { kind: "absent" },
+        readRegistry: () => (options.registryEntry === "missing" ? null : sandboxEntry),
+      });
+    }) as never);
 
-  vi.spyOn(registry, "getSandbox").mockReturnValue(sandboxEntry);
+  const withMcpLifecycleLockSpy = vi
+    .spyOn(lifecycleLock, "withMcpLifecycleLock")
+    .mockImplementation(
+      (options.withMcpLifecycleLock ??
+        (async (_sandboxName: string, operation: () => unknown) => await operation())) as never,
+    );
+
+  vi.spyOn(registry, "getSandbox").mockReturnValue(
+    options.registryEntry === "missing" ? null : sandboxEntry,
+  );
+  vi.spyOn(crossPortRegistry, "findSandboxAcrossGatewayRoots").mockReturnValue(
+    options.registryEntry === "missing" && !options.publishedAcrossGatewayRoots
+      ? null
+      : sandboxEntry
+        ? {
+            entry: sandboxEntry,
+            gatewayPort: null,
+            registryFile: "/test/sandboxes.json",
+          }
+        : null,
+  );
   const removeSandboxSpy = vi.spyOn(registry, "removeSandbox").mockImplementation(() => undefined);
   vi.spyOn(statusPreflight, "getSandboxStatusPreflight").mockResolvedValue(
     options.preflight ?? {
@@ -140,17 +213,18 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
       sb: sandboxEntry,
       lookup,
       rpcIssue: null,
-      currentModel: options.currentModel ?? sandboxEntry.model,
+      currentModel: options.currentModel ?? sandboxEntry?.model,
       currentProvider: options.currentProvider ?? "ollama-local",
       recordedRoute: {
-        provider: sandboxEntry.provider,
-        model: sandboxEntry.model,
+        provider: sandboxEntry?.provider,
+        model: sandboxEntry?.model,
       },
       liveRoute: {
         provider: options.currentProvider ?? "ollama-local",
-        model: options.currentModel ?? sandboxEntry.model,
+        model: options.currentModel ?? sandboxEntry?.model,
       },
       routeDrift: options.routeDrift ?? null,
+      llamaCpp: options.llamaCpp ?? null,
       inferenceHealth:
         options.inferenceHealth === undefined
           ? {
@@ -175,10 +249,13 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
       terminalRuntimeHealth: null,
       servingProcessHealth:
         options.servingProcessHealth === undefined
-          ? sandboxEntry.agent === "langchain-deepagents-code"
+          ? sandboxEntry?.agent === "langchain-deepagents-code"
             ? null
             : { checked: false }
           : options.servingProcessHealth,
+      ...(options.postRecoveryPreflight
+        ? { postRecoveryPreflight: options.postRecoveryPreflight }
+        : {}),
     });
   const getSandboxDockerRuntimeSpy = vi
     .spyOn(dockerHealth, "getSandboxDockerRuntime")
@@ -186,8 +263,12 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
       containerName: "openshell-alpha",
       health: "unhealthy",
       paused: false,
+      running: true,
+      containerAbsenceConfirmed: false,
     });
-  vi.spyOn(processRecovery, "isSandboxGatewayRunningForStatus").mockResolvedValue(false);
+  const isSandboxGatewayRunningForStatusSpy = vi
+    .spyOn(statusProcessRecovery, "isSandboxGatewayRunningForStatus")
+    .mockResolvedValue(options.gatewayRunning ?? false);
   vi.spyOn(resolve, "resolveOpenshell").mockReturnValue("/usr/bin/openshell");
   vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue({ name: "openclaw" });
   vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw");
@@ -203,18 +284,15 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
     container: null,
   });
   vi.spyOn(nim, "shouldShowNimLine").mockReturnValue(true);
-  const checkAgentVersionSpy = vi.spyOn(sandboxVersion, "checkAgentVersion").mockReturnValue(
+  vi.spyOn(policy, "getGatewayPresets").mockReturnValue(
+    options.gatewayPresets === undefined ? ["npm", "telegram"] : options.gatewayPresets,
+  );
+  const checkAgentVersionSpy = vi.spyOn(sandboxVersion, "checkAgentVersion").mockResolvedValue(
     options.versionCheck ?? {
       sandboxVersion: "0.1.0",
       expectedVersion: "0.2.0",
       isStale: true,
       detectionMethod: "runtime",
-    },
-  );
-  vi.spyOn(shields, "getShieldsPosture").mockReturnValue(
-    options.shieldsPosture ?? {
-      mode: "mutable_default",
-      detail: "mutable default",
     },
   );
   const getActiveSandboxSessionsSpy = vi
@@ -226,13 +304,19 @@ export function createStatusFlowHarness(options: StatusFlowHarnessOptions = {}):
 
   logSpy.mockClear();
 
+  const statusModule = requireDist(statusModulePath);
+
   return {
     checkAgentVersionSpy,
     collectSandboxStatusSnapshotSpy,
     getActiveSandboxSessionsSpy,
     getSandboxDockerRuntimeSpy,
+    getSandboxStatusReport: statusModule.getSandboxStatusReport,
+    qualifyPortableAgentLifecycleAuthoritySpy,
+    isSandboxGatewayRunningForStatusSpy,
     logSpy,
     removeSandboxSpy,
-    showSandboxStatus: requireDist(statusModulePath).showSandboxStatus,
+    showSandboxStatus: statusModule.showSandboxStatus,
+    withMcpLifecycleLockSpy,
   } satisfies StatusFlowHarness;
 }

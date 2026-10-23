@@ -4,758 +4,372 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+
 import YAML from "yaml";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "pr-review-advisor.yaml");
-const DEFAULT_PACKAGE_LOCK_PATH = join(REPO_ROOT, "package-lock.json");
-const TRUSTED_WORKFLOW_REF = "${{ github.workflow_sha }}";
-const CANONICAL_ADVISOR_NPM_CI = "npm ci --ignore-scripts --no-audit --no-fund";
-const PINNED_SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
-const CANONICAL_PREPARE_TARGET_PR = `node --experimental-strip-types "$ADVISOR_DIR/tools/pr-review-advisor/prepare-target-pr.mts"`;
-const CANONICAL_RUN_ANALYSIS = `cd "$ADVISOR_WORKDIR"
-node --experimental-strip-types "$ADVISOR_DIR/tools/pr-review-advisor/run-analysis.mts"`;
-const CANONICAL_VALIDATE_ARTIFACTS = `node --experimental-strip-types "$ADVISOR_DIR/tools/pr-review-advisor/validate-artifacts.mts"`;
-const FORBIDDEN_ARTIFACT_DOWNLOAD_WITH_KEYS = [
-  "run-id",
-  "github-token",
-  "repository",
-  "pattern",
-  "merge-multiple",
-] as const;
-const ADVISOR_RUNTIME_PACKAGE_PINS = [
-  { packageName: "@earendil-works/pi-coding-agent", envName: "PI_SDK_VERSION", version: "0.80.6" },
-  { packageName: "typebox", envName: "TYPEBOX_VERSION", version: "1.1.38" },
-  { packageName: "yaml", envName: "YAML_VERSION", version: "2.8.3" },
-  { packageName: "vitest", envName: "VITEST_VERSION", version: "4.1.9" },
-] as const;
+const EXPECTED_GATE_CONDITION =
+  "${{ github.repository == 'NVIDIA/NemoClaw' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.path == '.github/workflows/pr.yaml' && endsWith(github.event.workflow_run.display_title, ' gate true'))) }}";
+const EXPECTED_ENTRY_CONDITION = "${{ github.repository == 'NVIDIA/NemoClaw' }}";
+const EXPECTED_FAILURE_RECEIPT_COMMAND =
+  'node --no-warnings "$ADVISOR_DIR/tools/pr-review-advisor/failure-artifacts.mts"';
+const EXPECTED_FAILURE_RECEIPT_ENV = {
+  ADVISOR_PREPARATION_CLASSIFICATION: "${{ steps.prepare-analysis.outputs.classification }}",
+  ADVISOR_DISPATCH_CHECKOUT_OUTCOME: "${{ steps.dispatch-checkout.outcome }}",
+  ADVISOR_DEFAULT_WORKDIR_OUTCOME: "${{ steps.default-workdir.outcome }}",
+  ADVISOR_NODE_SETUP_OUTCOME: "${{ steps.setup-node.outcome }}",
+  ADVISOR_NPM_SETUP_OUTCOME: "${{ steps.setup-npm.outcome }}",
+  ADVISOR_RUNTIME_IMAGE_OUTCOME: "${{ steps.runtime-image.outcome }}",
+  ADVISOR_PREPARATION_OUTCOME: "${{ steps.prepare-analysis.outcome }}",
+  ADVISOR_REMOVE_SYMLINKS_OUTCOME: "${{ steps.remove-symlinks.outcome }}",
+  ADVISOR_RUNTIME_DOWNLOAD_OUTCOME: "${{ steps.download-runtime.outcome }}",
+  ADVISOR_RUNTIME_RESTORE_OUTCOME: "${{ steps.restore-runtime.outcome }}",
+  ADVISOR_CONTEXT_DOWNLOAD_OUTCOME: "${{ steps.download-context.outcome }}",
+  ADVISOR_SANDBOX_INPUTS_OUTCOME: "${{ steps.sandbox-inputs.outcome }}",
+  ADVISOR_OPENSHELL_INSTALL_OUTCOME: "${{ steps.install-openshell.outcome }}",
+  ADVISOR_ANALYSIS_OUTCOME: "${{ steps.specialist-analysis.outcome }}",
+  EXPECTED_HEAD_SHA: "${{ needs.require-green-checks.outputs.head_sha }}",
+};
 
-type WorkflowRecord = Record<string, unknown>;
-type WorkflowStep = WorkflowRecord & {
+type WorkflowPermissions = Record<string, unknown> | string;
+type WorkflowStep = {
+  if?: string;
+  env?: Record<string, unknown>;
   name?: string;
   run?: string;
   uses?: string;
-  with?: WorkflowRecord;
+  with?: Record<string, unknown>;
+};
+type WorkflowJob = {
+  env?: Record<string, unknown>;
+  if?: string;
+  name?: string;
+  needs?: unknown;
+  outputs?: Record<string, unknown>;
+  permissions?: WorkflowPermissions;
+  steps?: WorkflowStep[];
+};
+type AdvisorWorkflow = {
+  jobs: Record<string, WorkflowJob>;
+  permissions?: WorkflowPermissions;
+  on?: {
+    pull_request_target?: unknown;
+    workflow_run?: { types?: unknown; workflows?: unknown };
+  };
 };
 
-function asRecord(value: unknown): WorkflowRecord {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as WorkflowRecord)
-    : {};
+function needs(job: WorkflowJob): string[] {
+  return Array.isArray(job.needs)
+    ? job.needs.filter((name): name is string => typeof name === "string")
+    : typeof job.needs === "string"
+      ? [job.needs]
+      : [];
 }
 
-function asSteps(value: unknown): WorkflowStep[] {
-  return Array.isArray(value)
-    ? (value.filter((entry) => asRecord(entry) === entry) as WorkflowStep[])
-    : [];
+function sameMembers(left: readonly string[], right: readonly string[]): boolean {
+  const sorted = (values: readonly string[]) => [...values].sort((a, b) => a.localeCompare(b));
+  return JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : "";
+function permissionMap(permissions: WorkflowPermissions | undefined): Record<string, unknown> {
+  return permissions !== null && typeof permissions === "object" ? permissions : {};
 }
 
-function booleanValue(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function namedStep(steps: readonly WorkflowStep[], name: string): WorkflowStep | undefined {
-  return steps.find((step) => step.name === name);
-}
-
-function usesPinnedAction(uses: string): boolean {
-  return /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}(?:\s*#.*)?$/.test(uses);
-}
-
-function requireStep(
-  errors: string[],
-  steps: readonly WorkflowStep[],
-  name: string,
-): WorkflowStep | undefined {
-  const step = namedStep(steps, name);
-  if (!step) errors.push(`missing workflow step: ${name}`);
-  return step;
-}
-
-function requireWith(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  key: string,
-  expected: string | boolean | number,
-): void {
-  if (!step) return;
-  if (asRecord(step.with)[key] !== expected) {
-    errors.push(`step '${step.name ?? "<unnamed>"}' expected with.${key}=${String(expected)}`);
-  }
-}
-
-function requireRunContains(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  expected: string,
-): void {
-  if (step && !stringValue(step.run).includes(expected)) {
-    errors.push(`step '${step.name ?? "<unnamed>"}' run script must include ${expected}`);
-  }
-}
-
-function requireRunLine(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  expected: string,
-  message: string,
-): void {
-  if (!step) return;
-  const lines = stringValue(step.run)
-    .split(/\r?\n/u)
-    .map((line) => line.trim());
-  if (!lines.includes(expected)) errors.push(message);
-}
-
-function normalizedRunScript(value: unknown): string {
-  return stringValue(value)
-    .trim()
-    .replace(/\\\r?\n[ \t]*/gu, " ")
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .map((line) => line.replace(/[ \t]+/gu, " "))
-    .filter(Boolean)
-    .join("\n");
-}
-
-function requireCanonicalRun(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  expected: string,
-  message: string,
-): void {
-  if (step && normalizedRunScript(step.run) !== expected) errors.push(message);
-}
-
-function requireRunOrder(
-  errors: string[],
-  step: WorkflowStep | undefined,
-  before: string,
-  after: string,
-): void {
-  if (!step) return;
-  const run = stringValue(step.run);
-  const beforeIndex = run.indexOf(before);
-  const afterIndex = run.indexOf(after);
-  if (beforeIndex < 0 || afterIndex < 0 || beforeIndex > afterIndex) {
-    errors.push(`step '${step.name ?? "<unnamed>"}' must check ${before} before ${after}`);
-  }
-}
-
-function rejectUntrustedAdvisorHelperExecution(
-  errors: string[],
-  steps: readonly WorkflowStep[],
-): void {
-  const untrustedHelperPatterns = [
-    /\$\{?ADVISOR_WORKDIR\}?\/tools\/pr-review-advisor\//u,
-    /(^|[\s"'`])(?:\.\/)?tools\/pr-review-advisor\/[^\s"'`]+\.mts/u,
-  ] as const;
-  for (const step of steps) {
-    if (untrustedHelperPatterns.some((pattern) => pattern.test(stringValue(step.run)))) {
-      errors.push(
-        `review step '${step.name ?? "<unnamed>"}' must not execute pr-review-advisor helpers from ADVISOR_WORKDIR`,
-      );
-    }
-  }
-}
-
-function requireEnv(
-  errors: string[],
-  owner: string,
-  record: WorkflowRecord,
-  key: string,
-  expected: string,
-): void {
-  if (asRecord(record.env)[key] !== expected) {
-    errors.push(`${owner} env.${key} must be ${expected}`);
-  }
-}
-
-function requirePermissions(
-  errors: string[],
-  jobName: string,
-  job: WorkflowRecord,
-  expected: Readonly<Record<string, string>>,
-): void {
-  const actual = asRecord(job.permissions);
-  for (const [permission, level] of Object.entries(expected)) {
-    if (actual[permission] !== level) {
-      errors.push(`${jobName} job permissions.${permission} must be ${level}`);
-    }
-  }
-  for (const permission of Object.keys(actual)) {
-    if (!Object.hasOwn(expected, permission)) {
-      errors.push(`${jobName} job permissions.${permission} is not allowed`);
-    }
-  }
-}
-
-function checkAdvisorRuntimePackageLock(errors: string[], packageLockPath: string): void {
-  let lock: WorkflowRecord;
-  try {
-    lock = asRecord(JSON.parse(readFileSync(packageLockPath, "utf8")));
-  } catch {
-    errors.push(`failed to read or parse advisor package lock: ${packageLockPath}`);
-    return;
-  }
-  const packages = asRecord(lock.packages);
-  for (const { packageName, version } of ADVISOR_RUNTIME_PACKAGE_PINS) {
-    const actualVersion = asRecord(packages[`node_modules/${packageName}`]).version;
-    if (actualVersion !== version) {
-      errors.push(`advisor package lock must pin ${packageName}@${version}`);
-    }
-  }
-}
-
-function requireActionPins(
-  errors: string[],
-  jobName: string,
-  steps: readonly WorkflowStep[],
-): void {
-  for (const step of steps) {
-    if (step.uses && !usesPinnedAction(step.uses)) {
-      errors.push(
-        `${jobName} step '${step.name ?? step.uses}' must pin action uses to a full commit SHA`,
-      );
-    }
-  }
-}
-
-function advisorMatrixEntries(errors: string[], reviewJob: WorkflowRecord): WorkflowRecord[] {
-  const advisor = asRecord(asRecord(reviewJob.strategy).matrix).advisor;
-  if (!Array.isArray(advisor)) {
-    errors.push("advisor matrix must declare strategy.matrix.advisor entries");
-    return [];
-  }
-  const entries = advisor.filter((entry) => asRecord(entry) === entry) as WorkflowRecord[];
-  if (entries.length < 2) errors.push("advisor matrix must include at least two lanes");
-  return entries;
-}
-
-function requireUniqueMatrixField(
-  errors: string[],
-  entries: readonly WorkflowRecord[],
-  field: string,
-): void {
-  const seen = new Set<string>();
-  for (const [index, entry] of entries.entries()) {
-    const value = stringValue(entry[field]).trim();
-    if (!value) {
-      errors.push(`advisor matrix entry ${index + 1} missing ${field}`);
-    } else if (seen.has(value)) {
-      errors.push(`advisor matrix field ${field} must be unique: ${value}`);
-    }
-    seen.add(value);
-  }
-}
-
-function checkTargetTriggers(errors: string[], workflow: WorkflowRecord): void {
-  const triggers = asRecord(workflow.on ?? workflow[true as unknown as string]);
-  if (!Object.hasOwn(triggers, "pull_request_target")) {
-    errors.push("workflow must run automatic reviews on pull_request_target");
-  }
-  if (Object.hasOwn(triggers, "pull_request")) {
-    errors.push("workflow must not duplicate automatic reviews on pull_request");
-  }
-  if (!Object.hasOwn(triggers, "workflow_dispatch")) {
-    errors.push("workflow must retain workflow_dispatch support");
-  }
-}
-
-function checkPrivilegeDomains(
-  errors: string[],
-  workflow: WorkflowRecord,
-  reviewJob: WorkflowRecord,
-  publishJob: WorkflowRecord,
-): void {
-  if (Object.keys(asRecord(workflow.permissions)).length !== 0) {
-    errors.push(
-      "workflow-level permissions must be empty so each job declares its privilege domain",
-    );
-  }
-  requirePermissions(errors, "review", reviewJob, {
-    actions: "read",
-    checks: "read",
-    contents: "read",
-    issues: "read",
-    "pull-requests": "read",
-  });
-  requirePermissions(errors, "publish", publishJob, {
-    contents: "read",
-    "pull-requests": "write",
-  });
-
-  const jobs = asRecord(workflow.jobs);
-  for (const [jobName, rawJob] of Object.entries(jobs)) {
-    const permissions = asRecord(asRecord(rawJob).permissions);
-    if (permissions["pull-requests"] === "write" && jobName !== "publish") {
-      errors.push("publish must be the only job with pull-requests: write");
-    }
-  }
-  if (JSON.stringify(publishJob).includes("PR_REVIEW_ADVISOR_API_KEY")) {
-    errors.push("publish job must not receive the advisor model credential");
-  }
-  if (JSON.stringify(publishJob).includes("ADVISOR_WORKDIR")) {
-    errors.push("publish job must not receive the untrusted analysis worktree");
-  }
-}
-
-function checkAnalysisJob(errors: string[], reviewJob: WorkflowRecord): void {
-  if (stringValue(reviewJob["runs-on"]) !== "ubuntu-24.04") {
-    errors.push("review job must pin the Ubuntu runner used by runtime package versions");
-  }
-  if (stringValue(reviewJob["continue-on-error"]) !== "${{ !matrix.advisor.publish_comment }}") {
-    errors.push("review job failures must be non-blocking only for non-publishing advisor lanes");
-  }
-
-  const entries = advisorMatrixEntries(errors, reviewJob);
-  for (const [index, entry] of entries.entries()) {
-    if (booleanValue(entry.publish_comment) === undefined) {
-      errors.push(`advisor matrix entry ${index + 1} missing boolean publish_comment`);
-    }
-  }
-  if (entries.filter((entry) => booleanValue(entry.publish_comment) === true).length !== 1) {
-    errors.push("advisor matrix must identify one primary artifact lane");
-  }
-  for (const field of ["model", "artifact_dir", "artifact_name"]) {
-    requireUniqueMatrixField(errors, entries, field);
-  }
-
-  requireEnv(
-    errors,
-    "review job",
-    reviewJob,
-    "PR_REVIEW_ADVISOR_MODEL",
-    "${{ matrix.advisor.model }}",
-  );
-  requireEnv(errors, "review job", reviewJob, "FD_FIND_VERSION", "9.0.0-1");
-  requireEnv(errors, "review job", reviewJob, "RIPGREP_VERSION", "14.1.0-1");
-  for (const { envName, version } of ADVISOR_RUNTIME_PACKAGE_PINS) {
-    requireEnv(errors, "review job", reviewJob, envName, version);
-  }
-  requireEnv(
-    errors,
-    "review job",
-    reviewJob,
-    "PR_REVIEW_ADVISOR_ARTIFACT_DIR",
-    "${{ matrix.advisor.artifact_dir }}",
-  );
-  requireEnv(
-    errors,
-    "review job",
-    reviewJob,
-    "PR_REVIEW_ADVISOR_WORKFLOW_NAME",
-    "PR Review / Advisor",
-  );
-  requireEnv(errors, "review job", reviewJob, "PR_REVIEW_ADVISOR_LOAD_PREVIOUS_REVIEW", "false");
-
-  const steps = asSteps(reviewJob.steps);
-  if (steps.length === 0) errors.push("review job must declare steps");
-  requireActionPins(errors, "review", steps);
-  rejectUntrustedAdvisorHelperExecution(errors, steps);
-
-  if (steps.some((step) => step.name === "Checkout PR workspace (read-only data)")) {
-    errors.push("pull_request_target data must be fetched manually, not with actions/checkout");
-  }
-  const trustedCheckout = requireStep(
-    errors,
-    steps,
-    "Checkout trusted advisor code (workflow revision)",
-  );
-  requireWith(errors, trustedCheckout, "repository", "NVIDIA/NemoClaw");
-  requireWith(errors, trustedCheckout, "ref", TRUSTED_WORKFLOW_REF);
-  requireWith(errors, trustedCheckout, "path", "advisor");
-  requireWith(errors, trustedCheckout, "persist-credentials", false);
-  requireWith(errors, trustedCheckout, "lfs", false);
-  requireWith(errors, trustedCheckout, "submodules", false);
-
-  const dispatchCheckout = requireStep(
-    errors,
-    steps,
-    "Checkout dispatch workspace (read-only data)",
-  );
-  requireWith(errors, dispatchCheckout, "ref", "${{ github.sha }}");
-  requireWith(errors, dispatchCheckout, "path", "pr-workdir");
-  requireWith(errors, dispatchCheckout, "persist-credentials", false);
-  requireWith(errors, dispatchCheckout, "lfs", false);
-  requireWith(errors, dispatchCheckout, "submodules", false);
-
-  const prepare = requireStep(errors, steps, "Prepare isolated analysis workspace");
-  const prepareEnv = asRecord(prepare?.env);
-  if (prepareEnv.GIT_LFS_SKIP_SMUDGE !== "1") {
-    errors.push("Prepare isolated analysis workspace must disable LFS smudging");
-  }
-  // The fetch/validate/checkout logic lives in the trusted, unit-tested helper
-  // (prepare-target-pr.mts); the workflow must invoke it from the pinned advisor
-  // checkout ($ADVISOR_DIR), never from PR-controlled content.
-  requireCanonicalRun(
-    errors,
-    prepare,
-    CANONICAL_PREPARE_TARGET_PR,
-    "step 'Prepare isolated analysis workspace' must use the canonical trusted prepare helper command",
-  );
-  // The base and head must be bound to the immutable SHAs in the triggering
-  // event so the helper's fail-closed SHA verification cannot be silently
-  // disabled by dropping the environment binding.
-  if (
-    prepare &&
-    !stringValue(prepareEnv.EXPECTED_HEAD_SHA).includes("github.event.pull_request.head.sha")
-  ) {
-    errors.push(
-      "Prepare isolated analysis workspace must bind EXPECTED_HEAD_SHA to the triggering PR head",
-    );
-  }
-  if (
-    prepare &&
-    !stringValue(prepareEnv.PR_BASE_SHA).includes("github.event.pull_request.base.sha")
-  ) {
-    errors.push(
-      "Prepare isolated analysis workspace must bind PR_BASE_SHA to the triggering PR base",
-    );
-  }
-
-  const removeSymlinks = requireStep(errors, steps, "Remove symlinks from analysis workspace");
-  if (removeSymlinks && stringValue(removeSymlinks.shell) !== "bash") {
-    errors.push("Remove symlinks from analysis workspace must use the bash shell");
-  }
-  const expectedSymlinkRemoval = `while IFS= read -r -d '' link; do
-  rm -- "$link"
-done < <(find "$ADVISOR_WORKDIR" -type l -print0)`;
-  if (removeSymlinks && stringValue(removeSymlinks.run).trim() !== expectedSymlinkRemoval) {
-    errors.push(
-      "Remove symlinks from analysis workspace must use the canonical fail-closed cleanup script",
-    );
-  }
-
-  const install = requireStep(errors, steps, "Install Pi SDK");
-  requireRunContains(errors, install, "sudo apt-get install -y --no-install-recommends");
-  requireRunContains(errors, install, '"fd-find=${FD_FIND_VERSION}"');
-  requireRunContains(errors, install, '"ripgrep=${RIPGREP_VERSION}"');
-  requireRunContains(errors, install, "sudo apt-get update -qq");
-  requireRunContains(errors, install, "dpkg-query -W -f='${Version}' fd-find");
-  requireRunContains(errors, install, "dpkg-query -W -f='${Version}' ripgrep");
-  requireRunContains(errors, install, '"$INSTALLED_FD_FIND_VERSION" != "$FD_FIND_VERSION"');
-  requireRunContains(errors, install, '"$INSTALLED_RIPGREP_VERSION" != "$RIPGREP_VERSION"');
-  requireRunContains(errors, install, "command -v fdfind");
-  requireRunContains(errors, install, "command -v rg");
-  requireRunContains(errors, install, 'FD_BINARY_VERSION="$(fdfind --version)"');
-  requireRunContains(errors, install, 'RG_BINARY_VERSION="$(rg --version)"');
-  requireRunContains(
-    errors,
-    install,
-    '"$FD_BINARY_VERSION" != "fdfind $EXPECTED_FD_BINARY_VERSION"',
-  );
-  requireRunContains(
-    errors,
-    install,
-    '"$RG_BINARY_VERSION" != "ripgrep $EXPECTED_RG_BINARY_VERSION"',
-  );
-  requireRunContains(errors, install, "npm ci");
-  requireRunContains(errors, install, 'cd "$ADVISOR_DIR"');
-  requireRunContains(errors, install, "--ignore-scripts");
-  requireRunContains(errors, install, "--no-audit");
-  requireRunContains(errors, install, "--no-fund");
-  requireRunLine(
-    errors,
-    install,
-    CANONICAL_ADVISOR_NPM_CI,
-    "step 'Install Pi SDK' must use the canonical lockfile-only npm ci command",
-  );
-  requireRunOrder(errors, install, 'cd "$ADVISOR_DIR"', CANONICAL_ADVISOR_NPM_CI);
-
-  const analyze = requireStep(errors, steps, "Run PR review advisor");
-  requireCanonicalRun(
-    errors,
-    analyze,
-    CANONICAL_RUN_ANALYSIS,
-    "step 'Run PR review advisor' must use the canonical trusted analysis command",
-  );
-  if (analyze && booleanValue(analyze["continue-on-error"]) !== true) {
-    errors.push("Run PR review advisor must continue-on-error until artifacts are uploaded");
-  }
-  const analyzeEnv = asRecord(analyze?.env);
-  if (analyzeEnv.PR_REVIEW_ADVISOR_API_KEY !== "${{ secrets.PR_REVIEW_ADVISOR_API_KEY }}") {
-    errors.push("Run PR review advisor must receive only secrets.PR_REVIEW_ADVISOR_API_KEY");
-  }
-  if (Object.hasOwn(analyzeEnv, "OPENAI_API_KEY")) {
-    errors.push("Run PR review advisor must not receive OPENAI_API_KEY");
-  }
-  const modelSecretSteps = steps.filter((step) =>
-    JSON.stringify(step).includes("PR_REVIEW_ADVISOR_API_KEY"),
-  );
-  if (modelSecretSteps.length !== 1 || modelSecretSteps[0] !== analyze) {
-    errors.push("only the analysis step may receive the advisor model credential");
-  }
-
-  const symlinkIndex = steps.findIndex(
-    (step) => step.name === "Remove symlinks from analysis workspace",
-  );
-  if (symlinkIndex >= 0) {
-    for (const workspaceStepName of [
-      "Checkout dispatch workspace (read-only data)",
-      "Set default advisor workdir",
-      "Prepare isolated analysis workspace",
-    ]) {
-      const workspaceStepIndex = steps.findIndex((step) => step.name === workspaceStepName);
-      if (workspaceStepIndex >= 0 && symlinkIndex < workspaceStepIndex) {
-        errors.push(
-          `Remove symlinks from analysis workspace must run after workspace-selection step '${workspaceStepName}'`,
-        );
-      }
-    }
-  }
-  const analyzeIndex = steps.findIndex((step) => step.name === "Run PR review advisor");
-  const installIndex = steps.findIndex((step) => step.name === "Install Pi SDK");
-  if (installIndex < 0 || analyzeIndex < 0 || installIndex > analyzeIndex) {
-    errors.push("pinned advisor tools must be installed before the model credential is exposed");
-  }
-  if (symlinkIndex < 0 || analyzeIndex < 0 || symlinkIndex > analyzeIndex) {
-    errors.push(
-      "analysis workspace symlinks must be removed before the model credential is exposed",
-    );
-  }
-  if (steps.some((step) => step.name === "Post PR review advisor comment")) {
-    errors.push("analysis job must not publish PR comments");
-  }
-
-  const upload = requireStep(errors, steps, "Upload advisor artifacts");
-  requireWith(errors, upload, "name", "${{ matrix.advisor.artifact_name }}");
-  requireWith(errors, upload, "path", "artifacts/${{ matrix.advisor.artifact_dir }}/");
-  const outcome = requireStep(errors, steps, "Verify advisor analysis outcome");
-  if (outcome && booleanValue(outcome["continue-on-error"]) === true) {
-    errors.push("Verify advisor analysis outcome must not continue on error");
-  }
-  requireRunContains(errors, outcome, 'if [ "$ANALYSIS_OUTCOME" != "success" ]');
-  const uploadIndex = steps.findIndex((step) => step.name === "Upload advisor artifacts");
-  const outcomeIndex = steps.findIndex((step) => step.name === "Verify advisor analysis outcome");
-  if (uploadIndex >= 0 && outcomeIndex >= 0 && outcomeIndex < uploadIndex) {
-    errors.push("Verify advisor analysis outcome must run after Upload advisor artifacts");
-  }
-}
-
-function checkPublishJob(errors: string[], publishJob: WorkflowRecord): void {
-  if (booleanValue(publishJob["continue-on-error"]) !== true) {
-    errors.push("publish job must be best-effort so it cannot mask the primary analysis outcome");
-  }
-  if (publishJob.needs !== "review") errors.push("publish job must depend on the review matrix");
-  const publishIf = stringValue(publishJob.if);
-  if (!publishIf.includes("always()") || !publishIf.includes("pull_request_target")) {
-    errors.push("publish job must run best-effort only for pull_request_target events");
-  }
-  for (const [key, expected] of Object.entries({
-    PR_REVIEW_ADVISOR_WORKFLOW_NAME: "PR Review / Advisor",
-    PR_REVIEW_ADVISOR_WORKFLOW_PATH: ".github/workflows/pr-review-advisor.yaml",
-    PR_REVIEW_ADVISOR_EVENT_NAME: "${{ github.event_name }}",
-    PR_REVIEW_ADVISOR_RUN_ID: "${{ github.run_id }}",
-    PR_REVIEW_ADVISOR_RUN_ATTEMPT: "${{ github.run_attempt }}",
-    PR_NUMBER: "${{ github.event.pull_request.number }}",
-    EXPECTED_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
-    TRUSTED_WORKFLOW_SHA: "${{ github.workflow_sha }}",
-    PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
-    PUBLISH_ARTIFACT_DIR: "${{ github.workspace }}/publish-artifacts/pr-review-advisor",
-    SECONDARY_PUBLISH_ARTIFACT_DIR:
-      "${{ github.workspace }}/publish-artifacts/pr-review-advisor-nemotron-ultra",
-  })) {
-    requireEnv(errors, "publish job", publishJob, key, expected);
-  }
-
-  const steps = asSteps(publishJob.steps);
-  requireActionPins(errors, "publish", steps);
-  const checkout = requireStep(
-    errors,
-    steps,
-    "Checkout trusted comment publisher (workflow revision)",
-  );
-  requireWith(errors, checkout, "repository", "NVIDIA/NemoClaw");
-  requireWith(errors, checkout, "ref", TRUSTED_WORKFLOW_REF);
-  requireWith(errors, checkout, "path", "advisor");
-  requireWith(errors, checkout, "persist-credentials", false);
-  requireWith(errors, checkout, "lfs", false);
-  requireWith(errors, checkout, "submodules", false);
-
-  const setupNode = requireStep(errors, steps, "Setup Node for trusted publisher");
-  if (setupNode && stringValue(setupNode.uses) !== PINNED_SETUP_NODE_ACTION) {
-    errors.push("Setup Node for trusted publisher must use the pinned actions/setup-node action");
-  }
-  requireWith(errors, setupNode, "node-version", "22");
-
-  const install = requireStep(errors, steps, "Install trusted publisher dependencies");
-  if (install && stringValue(install["working-directory"]) !== "advisor") {
-    errors.push("Install trusted publisher dependencies must run in the trusted advisor checkout");
-  }
-  requireCanonicalRun(
-    errors,
-    install,
-    CANONICAL_ADVISOR_NPM_CI,
-    "step 'Install trusted publisher dependencies' must use the canonical lockfile-only npm ci command",
-  );
-
-  const download = requireStep(errors, steps, "Download primary advisor artifact");
-  requireWith(errors, download, "name", "pr-review-advisor");
-  requireWith(errors, download, "path", "publish-artifacts/pr-review-advisor");
-  if (download && booleanValue(download["continue-on-error"]) === true) {
-    errors.push("primary advisor artifact download must fail closed");
-  }
-  for (const forbidden of FORBIDDEN_ARTIFACT_DOWNLOAD_WITH_KEYS) {
-    if (Object.hasOwn(asRecord(download?.with), forbidden)) {
-      errors.push(`Download primary advisor artifact must not set with.${forbidden}`);
-    }
-  }
-
-  const secondaryDownload = requireStep(errors, steps, "Download secondary advisor artifact");
-  requireWith(errors, secondaryDownload, "name", "pr-review-advisor-nemotron-ultra");
-  requireWith(
-    errors,
-    secondaryDownload,
-    "path",
-    "publish-artifacts/pr-review-advisor-nemotron-ultra",
-  );
-  if (stringValue(secondaryDownload?.id) !== "download-secondary-advisor-artifact") {
-    errors.push(
-      "Download secondary advisor artifact id must be download-secondary-advisor-artifact",
-    );
-  }
-  if (secondaryDownload && booleanValue(secondaryDownload["continue-on-error"]) !== true) {
-    errors.push("secondary advisor artifact download must remain non-blocking");
-  }
-  for (const forbidden of FORBIDDEN_ARTIFACT_DOWNLOAD_WITH_KEYS) {
-    if (Object.hasOwn(asRecord(secondaryDownload?.with), forbidden)) {
-      errors.push(`Download secondary advisor artifact must not set with.${forbidden}`);
-    }
-  }
-
-  const validate = requireStep(errors, steps, "Validate advisor artifacts");
-  if (stringValue(validate?.id) !== "validate-advisor-artifacts") {
-    errors.push("Validate advisor artifacts id must be validate-advisor-artifacts");
-  }
-  if (
-    asRecord(validate?.env).SECONDARY_ARTIFACT_OUTCOME !==
-    "${{ steps.download-secondary-advisor-artifact.outcome }}"
-  ) {
-    errors.push("Validate advisor artifacts must use the trusted secondary download step outcome");
-  }
-  requireCanonicalRun(
-    errors,
-    validate,
-    CANONICAL_VALIDATE_ARTIFACTS,
-    "step 'Validate advisor artifacts' must use the canonical trusted validation command",
-  );
-
-  const comment = requireStep(errors, steps, "Post PR review advisor comment");
-  if (
-    asRecord(comment?.env).SECONDARY_ARTIFACT_VALIDATED !==
-    "${{ steps.validate-advisor-artifacts.outputs.secondary_artifact_validated }}"
-  ) {
-    errors.push(
-      "Post PR review advisor comment must use the trusted secondary artifact validation output",
-    );
-  }
-  requireRunContains(errors, comment, '"$ADVISOR_DIR/tools/pr-review-advisor/comment.mts"');
-  requireRunContains(
-    errors,
-    comment,
-    '--summary "$PUBLISH_ARTIFACT_DIR/pr-review-advisor-summary.md"',
-  );
-  requireRunContains(
-    errors,
-    comment,
-    '--result "$PUBLISH_ARTIFACT_DIR/pr-review-advisor-final-result.json"',
-  );
-  requireRunContains(
-    errors,
-    comment,
-    '--analysis-result "$PUBLISH_ARTIFACT_DIR/pr-review-advisor-result.json"',
-  );
-  requireRunContains(errors, comment, 'if [ "$SECONDARY_ARTIFACT_VALIDATED" = "true" ]');
-  requireRunContains(
-    errors,
-    comment,
-    '--second-opinion-analysis-result "$SECONDARY_PUBLISH_ARTIFACT_DIR/pr-review-advisor-result.json"',
-  );
-  requireRunContains(
-    errors,
-    comment,
-    '--second-opinion-result "$SECONDARY_PUBLISH_ARTIFACT_DIR/pr-review-advisor-final-result.json"',
-  );
-  requireRunContains(errors, comment, '"${SECONDARY_ARGS[@]}"');
-  const checkoutIndex = steps.findIndex(
-    (step) => step.name === "Checkout trusted comment publisher (workflow revision)",
-  );
-  const setupNodeIndex = steps.findIndex(
-    (step) => step.name === "Setup Node for trusted publisher",
-  );
-  const installIndex = steps.findIndex(
-    (step) => step.name === "Install trusted publisher dependencies",
-  );
-  const primaryDownloadIndex = steps.findIndex(
-    (step) => step.name === "Download primary advisor artifact",
-  );
-  const secondaryDownloadIndex = steps.findIndex(
-    (step) => step.name === "Download secondary advisor artifact",
-  );
-  const validateIndex = steps.findIndex((step) => step.name === "Validate advisor artifacts");
-  const commentIndex = steps.findIndex((step) => step.name === "Post PR review advisor comment");
-  if (
-    checkoutIndex < 0 ||
-    setupNodeIndex < 0 ||
-    installIndex < 0 ||
-    validateIndex < 0 ||
-    checkoutIndex > setupNodeIndex ||
-    setupNodeIndex > installIndex ||
-    installIndex > validateIndex
-  ) {
-    errors.push(
-      "trusted publisher Node and dependencies must be installed from the trusted checkout before artifact validation",
-    );
-  }
-  if (
-    primaryDownloadIndex < 0 ||
-    secondaryDownloadIndex < 0 ||
-    validateIndex < 0 ||
-    commentIndex < 0 ||
-    primaryDownloadIndex > validateIndex ||
-    secondaryDownloadIndex > validateIndex ||
-    validateIndex > commentIndex
-  ) {
-    errors.push(
-      "same-run advisor artifacts and live PR identity must be validated before the trusted comment script",
-    );
-  }
-}
-
-export function validatePrReviewAdvisorWorkflowBoundary(
-  workflowPath = DEFAULT_WORKFLOW_PATH,
-  packageLockPath = DEFAULT_PACKAGE_LOCK_PATH,
-): string[] {
+export function validatePrReviewAdvisorWorkflow(workflowPath = DEFAULT_WORKFLOW_PATH): string[] {
   const errors: string[] = [];
-  let workflow: WorkflowRecord;
-  try {
-    workflow = asRecord(YAML.parse(readFileSync(workflowPath, "utf-8")));
-  } catch {
-    return [`failed to read or parse workflow: ${workflowPath}`];
+  const source = readFileSync(workflowPath, "utf8");
+  const advisor = YAML.parse(source) as AdvisorWorkflow;
+  const permissionBlocks = [
+    advisor.permissions,
+    ...Object.values(advisor.jobs ?? {}).map((job) => job.permissions),
+  ];
+  if (
+    permissionBlocks.some(
+      (permissions) =>
+        permissions === "write-all" || permissionMap(permissions).actions === "write",
+    )
+  ) {
+    errors.push("Unified advisor must not hold actions: write");
   }
-
-  if (workflow.name !== "PR Review / Advisor") {
-    errors.push("workflow name must remain PR Review / Advisor");
+  if (/createWorkflowDispatch|workflow_dispatches/u.test(source)) {
+    errors.push("Unified advisor must not auto-dispatch workflows");
   }
-  checkAdvisorRuntimePackageLock(errors, packageLockPath);
-  checkTargetTriggers(errors, workflow);
-  const concurrencyGroup = stringValue(asRecord(workflow.concurrency).group);
-  if (!concurrencyGroup.includes("github.event_name")) {
-    errors.push("workflow concurrency must distinguish event types");
+  if (
+    advisor.on?.pull_request_target !== undefined ||
+    !isDeepStrictEqual(advisor.on?.workflow_run?.workflows, ["CI / Pull Request"]) ||
+    !isDeepStrictEqual(advisor.on?.workflow_run?.types, ["completed"]) ||
+    !source.includes("format('Advisor after {0}', github.event.workflow_run.display_title)")
+  ) {
+    errors.push("Unified advisor must retain completed CI / Pull Request identity");
   }
-
-  const jobs = asRecord(workflow.jobs);
-  const reviewJob = asRecord(jobs.review);
-  const publishJob = asRecord(jobs.publish);
-  if (Object.keys(reviewJob).length === 0) errors.push("workflow must declare the review job");
-  if (Object.keys(publishJob).length === 0) errors.push("workflow must declare the publish job");
-  checkPrivilegeDomains(errors, workflow, reviewJob, publishJob);
-  checkAnalysisJob(errors, reviewJob);
-  checkPublishJob(errors, publishJob);
+  const gate = advisor.jobs?.["require-green-checks"] ?? {};
+  const entryJobs = ["discover-specialists", "build-advisor-runtime", "review-specialists"];
+  if (
+    !sameMembers(needs(advisor.jobs?.["discover-specialists"] ?? {}), ["require-green-checks"]) ||
+    !sameMembers(needs(advisor.jobs?.["build-advisor-runtime"] ?? {}), ["require-green-checks"]) ||
+    !needs(advisor.jobs?.["review-specialists"] ?? {}).includes("require-green-checks") ||
+    !needs(advisor.jobs?.publish ?? {}).includes("require-green-checks")
+  ) {
+    errors.push("Unified advisor entry jobs must depend on the green checks gate");
+  }
+  if (entryJobs.some((name) => advisor.jobs?.[name]?.if !== EXPECTED_ENTRY_CONDITION)) {
+    errors.push("Unified advisor entry jobs must retain fail-closed conditions");
+  }
+  if (gate.if !== EXPECTED_GATE_CONDITION) {
+    errors.push("Unified advisor green checks gate must require the exact successful CI condition");
+  }
+  if (
+    !isDeepStrictEqual(permissionMap(gate.permissions), {
+      contents: "read",
+      "pull-requests": "read",
+    }) ||
+    JSON.stringify(gate).includes("PR_REVIEW_ADVISOR_API_KEY")
+  ) {
+    errors.push("Unified advisor green checks gate must retain read-only source permissions");
+  }
+  if (
+    !isDeepStrictEqual(gate.outputs, {
+      pr_number: "${{ steps.target.outputs.pr_number || steps.manual-target.outputs.pr_number }}",
+      head_sha: "${{ steps.target.outputs.head_sha || steps.manual-target.outputs.head_sha }}",
+      base_sha: "${{ steps.target.outputs.base_sha || steps.manual-target.outputs.base_sha }}",
+    })
+  ) {
+    errors.push("Unified advisor green checks gate must expose the checked PR revision");
+  }
+  const targetStep = (gate.steps ?? []).find((step) => step.name === "Resolve checked PR revision");
+  for (const fragment of [
+    'gh api --method GET "repos/$GITHUB_REPOSITORY/pulls"',
+    '-f state=open -f "head=${head_owner}:${RUN_HEAD_BRANCH}" -f per_page=100',
+    ".head.repo.full_name == $repo",
+    ".head.ref == $branch",
+    ".head.sha == $sha",
+    ".base.repo.full_name == $base",
+    ".base.sha == $base_sha",
+    'if length == 1 then .[0] else error("CI run must identify one open PR") end',
+    'run_base_sha="${RUN_BASE_SHA:-}"',
+    "sed -En 's/^.* base ([0-9a-f]{40}) gate true$/\\1/p'",
+    '"pr_number=\\(.number)\\nhead_sha=\\(.head.sha)\\nbase_sha=\\($base_sha)"',
+  ]) {
+    if (!String(targetStep?.run ?? "").includes(fragment)) {
+      errors.push(`Unified advisor green checks gate must retain ${fragment}`);
+    }
+  }
+  if (
+    targetStep?.env?.GH_TOKEN !== "${{ github.token }}" ||
+    targetStep.env?.RUN_HEAD_BRANCH !== "${{ github.event.workflow_run.head_branch }}" ||
+    targetStep.env?.RUN_HEAD_REPOSITORY !==
+      "${{ github.event.workflow_run.head_repository.full_name }}" ||
+    targetStep.env?.RUN_HEAD_SHA !== "${{ github.event.workflow_run.head_sha }}" ||
+    targetStep.env?.RUN_BASE_SHA !== "${{ github.event.workflow_run.pull_requests[0].base.sha }}" ||
+    targetStep.env?.RUN_DISPLAY_TITLE !== "${{ github.event.workflow_run.display_title }}"
+  ) {
+    errors.push("Unified advisor green checks gate must resolve the source run PR");
+  }
+  const manualTarget = (gate.steps ?? []).find(
+    (step) => step.name === "Resolve manual review revision",
+  );
+  if (
+    manualTarget?.env?.GH_TOKEN !== "${{ github.token }}" ||
+    manualTarget.env?.INPUT_BASE_REF !== "${{ inputs.base_ref }}" ||
+    manualTarget.env?.INPUT_HEAD_REF !== "${{ inputs.head_ref }}" ||
+    manualTarget.env?.TARGET_BASE !== "${{ inputs.target_base }}" ||
+    manualTarget.env?.TARGET_PR !== "${{ inputs.target_pr }}" ||
+    manualTarget.env?.TARGET_REPO !== "${{ inputs.target_repo }}" ||
+    manualTarget.env?.WORKFLOW_SHA !== "${{ github.sha }}"
+  ) {
+    errors.push("Unified advisor manual dispatch must bind the selected review revision");
+  }
+  for (const fragment of [
+    'pull="$(gh api --method GET "repos/$TARGET_REPO/pulls/$TARGET_PR")"',
+    '.state == "open" and .base.repo.full_name == $repo and .base.ref == $base',
+    'head_sha="$(jq -r \'.head.sha\' <<< "$pull")"',
+    'base_sha="$(jq -r \'.base.sha\' <<< "$pull")"',
+    '[[ "$INPUT_HEAD_REF" == "HEAD" ]] && head_sha="$WORKFLOW_SHA"',
+    '-f "sha=${INPUT_HEAD_REF#origin/}" -f per_page=1',
+    '-f "sha=${INPUT_BASE_REF#origin/}" -f per_page=1',
+    '[[ "$head_sha" =~ ^[0-9a-f]{40}$ && "$base_sha" =~ ^[0-9a-f]{40}$ ]]',
+    "pr_number=%s\\nhead_sha=%s\\nbase_sha=%s\\n",
+  ]) {
+    if (!String(manualTarget?.run ?? "").includes(fragment)) {
+      errors.push(`Unified advisor manual dispatch must retain ${fragment}`);
+    }
+  }
+  const specialist = advisor.jobs?.["review-specialists"] ?? {};
+  const specialistSteps = specialist.steps ?? [];
+  const dispatchCheckout = specialistSteps.find(
+    (step) => step.name === "Checkout dispatch workspace (read-only data)",
+  );
+  const targetPreparation = specialistSteps.find(
+    (step) => step.name === "Prepare isolated analysis workspace",
+  );
+  const sandboxPreparation = specialistSteps.find(
+    (step) => step.name === "Prepare advisor sandbox inputs",
+  );
+  if (dispatchCheckout?.with?.ref !== "${{ needs.require-green-checks.outputs.head_sha }}") {
+    errors.push("Unified advisor ref dispatch must check out the resolved head SHA");
+  }
+  if (
+    targetPreparation?.env?.TARGET_REPO !==
+      "${{ github.event_name == 'workflow_run' && github.repository || inputs.target_repo }}" ||
+    targetPreparation.env?.TARGET_PR !==
+      "${{ github.event_name == 'workflow_run' && needs.require-green-checks.outputs.pr_number || inputs.target_pr }}" ||
+    targetPreparation.env?.TARGET_BASE !==
+      "${{ github.event_name == 'workflow_run' && 'main' || inputs.target_base }}" ||
+    targetPreparation.env?.PR_BASE_SHA !==
+      "${{ needs.require-green-checks.outputs.pr_number != '' && needs.require-green-checks.outputs.base_sha || '' }}" ||
+    targetPreparation.env?.EXPECTED_HEAD_SHA !==
+      "${{ needs.require-green-checks.outputs.pr_number != '' && needs.require-green-checks.outputs.head_sha || '' }}"
+  ) {
+    errors.push("Unified advisor must prepare the resolved PR revision");
+  }
+  const specialistEnv = specialist.env ?? {};
+  const resolvedBaseRef =
+    "${{ needs.require-green-checks.outputs.pr_number != '' && 'target/base' || needs.require-green-checks.outputs.base_sha }}";
+  const resolvedHeadRef =
+    "${{ needs.require-green-checks.outputs.pr_number != '' && 'HEAD' || needs.require-green-checks.outputs.head_sha }}";
+  if (
+    specialistEnv.BASE_REF !== resolvedBaseRef ||
+    specialistEnv.HEAD_REF !== resolvedHeadRef ||
+    sandboxPreparation?.env?.BASE_REF !== resolvedBaseRef ||
+    sandboxPreparation.env?.HEAD_REF !== resolvedHeadRef
+  ) {
+    errors.push("Unified advisor specialists must analyze the resolved revisions");
+  }
+  const discoverySteps = advisor.jobs?.["discover-specialists"]?.steps ?? [];
+  const contextUpload = discoverySteps.find((step) => step.name === "Upload GitHub review context");
+  const contextDownload = specialistSteps.find(
+    (step) => step.name === "Download GitHub review context",
+  );
+  const specialistUpload = specialistSteps.find((step) => step.name === "Upload specialist review");
+  const failureReceipt = specialistSteps.find(
+    (step) => step.name === "Preserve specialist failure status",
+  );
+  if (
+    !failureReceipt ||
+    failureReceipt.if !== "${{ failure() }}" ||
+    failureReceipt.run !== EXPECTED_FAILURE_RECEIPT_COMMAND ||
+    !isDeepStrictEqual(failureReceipt.env, EXPECTED_FAILURE_RECEIPT_ENV) ||
+    specialistUpload?.if !== "${{ always() && matrix.advisor.interest != '' }}" ||
+    specialistSteps.indexOf(specialistUpload) <= specialistSteps.indexOf(failureReceipt)
+  ) {
+    errors.push("Unified advisor failure receipt must run before upload after a failed step");
+  }
+  const contextArtifactName = "pr-review-advisor-context-${{ github.run_id }}";
+  if (
+    contextUpload?.with?.name !== contextArtifactName ||
+    contextDownload?.with?.name !== contextArtifactName ||
+    contextUpload?.with?.overwrite !== true
+  ) {
+    errors.push("Unified advisor context artifact must survive failed-job and full reruns");
+  }
+  if (
+    specialistUpload?.with?.name !== "${{ matrix.advisor.artifact_name }}-${{ github.run_attempt }}"
+  ) {
+    errors.push("Unified advisor specialist artifacts must be unique per rerun attempt");
+  }
+  const blockerGate = advisor.jobs?.["advisor-blockers"] ?? {};
+  const blockerGateSteps = blockerGate.steps ?? [];
+  const blockerDownload = blockerGateSteps.find(
+    (step) => step.name === "Download specialist reviews",
+  );
+  const blockerEvaluation = blockerGateSteps.find(
+    (step) => step.name === "Require clear specialist evidence",
+  );
+  if (
+    blockerGate.name !== "Require no Advisor blockers" ||
+    !sameMembers(needs(blockerGate), [
+      "require-green-checks",
+      "build-advisor-runtime",
+      "review-specialists",
+    ]) ||
+    blockerGate.if !==
+      "${{ always() && github.repository == 'NVIDIA/NemoClaw' && needs.build-advisor-runtime.result == 'success' && needs.review-specialists.result == 'success' }}" ||
+    !isDeepStrictEqual(permissionMap(blockerGate.permissions), {
+      actions: "read",
+      contents: "read",
+    })
+  ) {
+    errors.push("Unified advisor blocker gate must fail closed after every specialist");
+  }
+  if (
+    blockerDownload?.with?.pattern !== "pr-review-specialist-*-${{ github.run_attempt }}" ||
+    blockerEvaluation?.env?.PR_REVIEW_ADVISOR_ARTIFACTS !==
+      "${{ runner.temp }}/pr-review-specialists" ||
+    blockerEvaluation.run !==
+      'node --no-warnings "$ADVISOR_DIR/tools/pr-review-advisor/blocker-gate.mts" --attempt "$GITHUB_RUN_ATTEMPT"' ||
+    blockerGate.env?.EXPECTED_HEAD_SHA !== "${{ needs.require-green-checks.outputs.head_sha }}" ||
+    blockerGate.env?.EXPECTED_BASE_SHA !== "${{ needs.require-green-checks.outputs.base_sha }}"
+  ) {
+    errors.push("Unified advisor blocker gate must validate exact-attempt specialist evidence");
+  }
+  const coordinator = advisor.jobs?.["coordinator-shadow"] ?? {};
+  const coordinatorSteps = coordinator.steps ?? [];
+  const coordinatorContext = coordinatorSteps.find(
+    (step) => step.name === "Download GitHub review context",
+  );
+  const coordinatorArtifacts = coordinatorSteps.find(
+    (step) => step.name === "Download specialist reviews",
+  );
+  const coordinatorEvaluation = coordinatorSteps.find(
+    (step) => step.name === "Evaluate read-only coordinator decision",
+  );
+  const coordinatorUpload = coordinatorSteps.find(
+    (step) => step.name === "Upload coordinator shadow decision",
+  );
+  const coordinatorCondition =
+    "${{ always() && github.repository == 'NVIDIA/NemoClaw' && needs.require-green-checks.outputs.pr_number != '' && needs.build-advisor-runtime.result == 'success' && needs.review-specialists.result == 'success' }}";
+  if (
+    coordinator.name !== "Evaluate review coordinator shadow" ||
+    !sameMembers(needs(coordinator), [
+      "require-green-checks",
+      "build-advisor-runtime",
+      "review-specialists",
+      "advisor-blockers",
+    ]) ||
+    coordinator.if !== coordinatorCondition ||
+    !isDeepStrictEqual(permissionMap(coordinator.permissions), {
+      actions: "read",
+      contents: "read",
+    })
+  ) {
+    errors.push("Unified advisor coordinator shadow must remain read-only and exact-head bound");
+  }
+  if (
+    coordinatorContext?.with?.name !== contextArtifactName ||
+    coordinatorArtifacts?.with?.pattern !== "pr-review-specialist-*-${{ github.run_attempt }}" ||
+    coordinatorEvaluation?.env?.PR_REVIEW_ADVISOR_ARTIFACTS !==
+      "${{ runner.temp }}/pr-review-specialists" ||
+    coordinatorEvaluation.env?.PR_REVIEW_ADVISOR_GITHUB_CONTEXT_PATH !==
+      "${{ runner.temp }}/pr-review-context/github-context.json" ||
+    coordinatorEvaluation.run !==
+      'node --no-warnings "$ADVISOR_DIR/tools/pr-review-coordinator/shadow.mts"' ||
+    coordinator.env?.EXPECTED_HEAD_SHA !== "${{ needs.require-green-checks.outputs.head_sha }}" ||
+    coordinator.env?.EXPECTED_BASE_SHA !== "${{ needs.require-green-checks.outputs.base_sha }}" ||
+    coordinator.env?.COORDINATOR_REQUIRED_CHECKS !==
+      "${{ github.event_name == 'workflow_run' && 'pass' || 'pending' }}" ||
+    coordinator.env?.PR_NUMBER !== "${{ needs.require-green-checks.outputs.pr_number }}"
+  ) {
+    errors.push("Unified advisor coordinator shadow must consume exact-attempt trusted evidence");
+  }
+  if (
+    coordinatorUpload?.uses !==
+      "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" ||
+    coordinatorUpload.with?.name !== "pr-review-coordinator-shadow-${{ github.run_attempt }}" ||
+    coordinatorUpload.with?.path !== "artifacts/pr-review-coordinator-shadow/decision.json" ||
+    coordinatorUpload.with?.["if-no-files-found"] !== "error"
+  ) {
+    errors.push("Unified advisor coordinator shadow must retain its decision artifact");
+  }
+  const publisher = advisor.jobs?.publish ?? {};
+  if (
+    !needs(publisher).includes("advisor-blockers") ||
+    !needs(publisher).includes("coordinator-shadow") ||
+    publisher.if !==
+      "${{ always() && github.event_name == 'workflow_run' && needs.review-specialists.result == 'success' }}"
+  ) {
+    errors.push("Unified advisor publisher must run after a red blocker gate");
+  }
   return errors;
 }

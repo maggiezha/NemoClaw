@@ -98,9 +98,19 @@ const BASE_ARGS = [
   "ARG NEMOCLAW_WEB_SEARCH_ENABLED=0",
   "ARG NEMOCLAW_OPENCLAW_OTEL=0",
   "ARG NEMOCLAW_DISABLE_DEVICE_AUTH=0",
+  "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
 ];
 
-function patch(dockerfilePath: string): void {
+const OPENCLAW_STARTUP = [
+  "USER ${NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER}",
+  'ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]',
+];
+
+function openClawDockerfileWith(argLines: string[]): string {
+  return dockerfileWith([...BASE_ARGS, ...argLines, ...OPENCLAW_STARTUP]);
+}
+
+function patch(dockerfilePath: string, agentName = "openclaw"): void {
   patchStagedDockerfile(
     dockerfilePath,
     "custom-model",
@@ -113,6 +123,7 @@ function patch(dockerfilePath: string): void {
     false,
     null,
     [],
+    { agentName },
   );
 }
 
@@ -123,10 +134,17 @@ function corporateCaArgLine(dockerfilePath: string): string | undefined {
     .find((entry) => entry.startsWith("ARG NEMOCLAW_CORPORATE_CA_B64="));
 }
 
+function runtimeUserArgLine(dockerfilePath: string): string | undefined {
+  return fs
+    .readFileSync(dockerfilePath, "utf-8")
+    .split("\n")
+    .find((entry) => entry.startsWith("ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER="));
+}
+
 describe("dockerfile patch — corporate CA baking (#6210)", () => {
-  it("bakes an explicit host corporate CA into NEMOCLAW_CORPORATE_CA_B64", () => {
+  it("bakes an explicit corporate CA while preserving sandbox startup", () => {
     process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
-    const dockerfilePath = dockerfileWith([...BASE_ARGS, "ARG NEMOCLAW_CORPORATE_CA_B64="]);
+    const dockerfilePath = openClawDockerfileWith(["ARG NEMOCLAW_CORPORATE_CA_B64="]);
 
     patch(dockerfilePath);
 
@@ -135,22 +153,28 @@ describe("dockerfile patch — corporate CA baking (#6210)", () => {
     const encoded = line.slice("ARG NEMOCLAW_CORPORATE_CA_B64=".length);
     expect(encoded).not.toBe("");
     expect(Buffer.from(encoded, "base64").toString("utf8")).toBe(CA_PEM);
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
   });
 
   it("bakes a fallback REQUESTS_CA_BUNDLE corporate CA", () => {
     process.env.REQUESTS_CA_BUNDLE = writeCa();
-    const dockerfilePath = dockerfileWith([...BASE_ARGS, "ARG NEMOCLAW_CORPORATE_CA_B64="]);
+    const dockerfilePath = openClawDockerfileWith(["ARG NEMOCLAW_CORPORATE_CA_B64="]);
 
     patch(dockerfilePath);
 
     const line = corporateCaArgLine(dockerfilePath);
     expect(line?.slice("ARG NEMOCLAW_CORPORATE_CA_B64=".length)).not.toBe("");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
   });
 
   it("logs the fallback source env var and path when baking a fallback CA", () => {
     const caPath = writeCa();
     process.env.REQUESTS_CA_BUNDLE = caPath;
-    const dockerfilePath = dockerfileWith([...BASE_ARGS, "ARG NEMOCLAW_CORPORATE_CA_B64="]);
+    const dockerfilePath = openClawDockerfileWith(["ARG NEMOCLAW_CORPORATE_CA_B64="]);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     patch(dockerfilePath);
@@ -163,25 +187,183 @@ describe("dockerfile patch — corporate CA baking (#6210)", () => {
   });
 
   it("leaves NEMOCLAW_CORPORATE_CA_B64 empty when no corporate CA is configured", () => {
-    const dockerfilePath = dockerfileWith([...BASE_ARGS, "ARG NEMOCLAW_CORPORATE_CA_B64="]);
+    const dockerfilePath = openClawDockerfileWith(["ARG NEMOCLAW_CORPORATE_CA_B64="]);
 
     patch(dockerfilePath);
 
     expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
+  });
+
+  it("rejects an explicit corporate CA when the Dockerfile lacks managed startup selection", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS.filter((line) => !line.startsWith("ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=")),
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      ...OPENCLAW_STARTUP,
+    ]);
+
+    expect(() => patch(dockerfilePath)).toThrow(/NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER/);
+    expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+  });
+
+  it("rejects an explicit corporate CA when USER ignores the runtime-user argument (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS,
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      "USER sandbox",
+      'ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]',
+    ]);
+
+    expect(() => patch(dockerfilePath)).toThrow(
+      /USER \$\{NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER\}.*before ENTRYPOINT/,
+    );
+    expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
+  });
+
+  it("rejects an explicit corporate CA when ENTRYPOINT bypasses the trusted startup script (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS,
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      "USER ${NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER}",
+      'ENTRYPOINT ["/usr/local/bin/custom-start"]',
+    ]);
+
+    expect(() => patch(dockerfilePath)).toThrow(
+      /ENTRYPOINT \["\/usr\/local\/bin\/nemoclaw-start"\]/,
+    );
+    expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
+  });
+
+  it("accepts a lowercase ARG instruction for the exact runtime-user argument (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS.filter((line) => !line.startsWith("ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=")),
+      "arg NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      ...OPENCLAW_STARTUP,
+    ]);
+
+    patch(dockerfilePath);
+
+    expect(
+      corporateCaArgLine(dockerfilePath)?.slice("ARG NEMOCLAW_CORPORATE_CA_B64=".length),
+    ).not.toBe("");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
+  });
+
+  it("rejects corporate CA baking when the staged Dockerfile agent identity is absent (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = openClawDockerfileWith(["ARG NEMOCLAW_CORPORATE_CA_B64="]);
+    const original = fs.readFileSync(dockerfilePath, "utf8");
+
+    expect(() =>
+      patchStagedDockerfile(
+        dockerfilePath,
+        "custom-model",
+        "https://chat.example",
+        "build-1",
+        "compatible-endpoint",
+        null,
+        null,
+        null,
+        false,
+        null,
+        [],
+      ),
+    ).toThrow(/without the staged Dockerfile agent identity/);
+    expect(fs.readFileSync(dockerfilePath, "utf8")).toBe(original);
+  });
+
+  it("rejects an explicit corporate CA when USER references a differently cased argument (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS,
+      "ARG nemoclaw_managed_image_runtime_user=sandbox",
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      "USER ${nemoclaw_managed_image_runtime_user}",
+      'ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]',
+    ]);
+
+    expect(() => patch(dockerfilePath)).toThrow(
+      /USER \$\{NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER\}.*before ENTRYPOINT/,
+    );
+    expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
+  });
+
+  it("does not bake a fallback corporate CA without managed startup selection", () => {
+    const caPath = writeCa();
+    process.env.REQUESTS_CA_BUNDLE = caPath;
+    const dockerfilePath = dockerfileWith([
+      ...BASE_ARGS.filter((line) => !line.startsWith("ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=")),
+      "ARG NEMOCLAW_CORPORATE_CA_B64=",
+      ...OPENCLAW_STARTUP,
+    ]);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    patch(dockerfilePath);
+    const messages = errorSpy.mock.calls.map((call) => String(call[0]));
+    errorSpy.mockRestore();
+
+    expect(corporateCaArgLine(dockerfilePath)).toBe("ARG NEMOCLAW_CORPORATE_CA_B64=");
+    const warning = messages.find((message) => message.includes("WARNING"));
+    assert.ok(warning, "expected a dropped corporate CA warning (#8454)");
+    expect(warning).toContain("REQUESTS_CA_BUNDLE");
+    expect(warning).toContain(caPath);
+    expect(warning).toContain("NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER");
+  });
+
+  it("keeps Deep Agents Code sandbox startup when baking a corporate CA (#8803)", () => {
+    process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
+    const dockerfilePath = dockerfileWith([...BASE_ARGS, "ARG NEMOCLAW_CORPORATE_CA_B64="]);
+
+    patch(dockerfilePath, "langchain-deepagents-code");
+
+    expect(
+      corporateCaArgLine(dockerfilePath)?.slice("ARG NEMOCLAW_CORPORATE_CA_B64=".length),
+    ).not.toBe("");
+    expect(runtimeUserArgLine(dockerfilePath)).toBe(
+      "ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox",
+    );
   });
 
   it("fails loudly when an explicit CA is set but the Dockerfile lacks the ARG", () => {
     process.env.NEMOCLAW_CORPORATE_CA_BUNDLE = writeCa();
-    const dockerfilePath = dockerfileWith(BASE_ARGS);
+    const dockerfilePath = openClawDockerfileWith([]);
 
     expect(() => patch(dockerfilePath)).toThrow(/missing ARG NEMOCLAW_CORPORATE_CA_B64/);
   });
 
   it("stays a no-op for a fallback CA when a custom Dockerfile lacks the ARG", () => {
-    process.env.CURL_CA_BUNDLE = writeCa();
-    const dockerfilePath = dockerfileWith(BASE_ARGS);
+    const caPath = writeCa();
+    process.env.CURL_CA_BUNDLE = caPath;
+    const dockerfilePath = openClawDockerfileWith([]);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     expect(() => patch(dockerfilePath)).not.toThrow();
+    const messages = errorSpy.mock.calls.map((call) => String(call[0]));
+    errorSpy.mockRestore();
+
     expect(corporateCaArgLine(dockerfilePath)).toBeUndefined();
+    const warning = messages.find((message) => message.includes("WARNING"));
+    assert.ok(warning, "expected a dropped corporate CA warning (#8454)");
+    expect(warning).toContain("CURL_CA_BUNDLE");
+    expect(warning).toContain(caPath);
+    expect(warning).toContain("NEMOCLAW_CORPORATE_CA_B64");
   });
 });

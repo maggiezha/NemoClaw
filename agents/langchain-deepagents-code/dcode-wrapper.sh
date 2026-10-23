@@ -7,7 +7,7 @@
 set -euo pipefail
 
 if [ "${1:-}" = "--nemoclaw-mcp-capability" ] && [ "$#" -eq 1 ]; then
-  printf '%s\n' 'NEMOCLAW_DEEPAGENTS_MCP_CAPABILITY=2'
+  printf '%s\n' 'NEMOCLAW_DEEPAGENTS_MCP_CAPABILITY=3'
   exit 0
 fi
 
@@ -35,6 +35,7 @@ export LANGCHAIN_TRACING_V2=false
 export DEEPAGENTS_CODE_OFFLINE=1
 export DEEPAGENTS_CODE_RIPGREP_INSTALLER=system
 export DEEPAGENTS_CODE_OPENAI_API_KEY="${DEEPAGENTS_CODE_OPENAI_API_KEY:-nemoclaw-managed-inference}"
+unset NEMOCLAW_ATTACHED_PROVIDER_API_KEY
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://inference.local/v1}"
 unset PYTHONHOME PYTHONPATH
 
@@ -136,11 +137,12 @@ run_dcode() {
 #       identifiers (e.g. with hyphens) are still classified.
 #     * OpenShell credential placeholders are allowed only when the complete
 #       value names the same valid env key, either canonically or with an
-#       OpenShell `v<digits>_` revision prefix. Any other occurrence is refused.
-# - Regression: test/langchain-deepagents-code-secret-pattern-parity.test.ts
+#       OpenShell `v<digits>_` revision prefix or `s<64 lowercase hex>_` stable
+#       handle. Any other occurrence is refused.
+# - Regression: test/agents/deepagents/langchain-deepagents-code-secret-pattern-parity.test.ts
 #   pins the canonical TOKEN_PREFIX_PATTERNS, CONTEXT_PATTERNS, and
 #   SECRET_BLOCK_PATTERNS fingerprints (source + flags), while
-#   test/langchain-deepagents-code-image-credentials.test.ts feeds the shared
+#   test/agents/deepagents/langchain-deepagents-code-image-credentials.test.ts feeds the shared
 #   positive corpus through this wrapper. Any canonical change trips the parity
 #   gate and forces this matcher (and its samples) to update.
 #   The live no-network acceptance clause is covered by
@@ -236,6 +238,9 @@ is_managed_token_value_for_name() {
   case "$name" in
     DEEPAGENTS_CODE_OPENAI_API_KEY)
       [ "$value" = "nemoclaw-managed-inference" ] && return 0
+      ;;
+    NEMOCLAW_ATTACHED_PROVIDER_API_KEY)
+      [ "$value" = "nemoclaw-openshell-provider" ] && return 0
       ;;
     SLACK_BOT_TOKEN)
       case "$value" in
@@ -437,7 +442,12 @@ is_dynamic_dotenv_value() {
 is_openshell_env_placeholder_for_name() {
   local name="$1"
   local value="$2"
-  local canonical revision_prefix revision_suffix versioned revision
+  local canonical revision_prefix stable_prefix generation_suffix versioned revision stable handle
+
+  if [ "$name" = "NEMOCLAW_ATTACHED_PROVIDER_API_KEY" ]; then
+    [ "$value" = "${NVIDIA_INFERENCE_API_KEY:-}" ] || return 1
+    name=NVIDIA_INFERENCE_API_KEY
+  fi
 
   # OPENSHELL_TLS_KEY is supervisor infrastructure, not a provider credential.
   # Never let a provider placeholder bypass that supervisor-only boundary.
@@ -452,18 +462,34 @@ is_openshell_env_placeholder_for_name() {
   esac
 
   canonical="${OPENSHELL_ENV_PLACEHOLDER_PREFIX}${name}"
-  [ "$value" = "$canonical" ] && return 0
+  if [ "$value" = "$canonical" ]; then
+    [ "$name" != "NEMOCLAW_LOCAL_INFERENCE_TOKEN" ]
+    return $?
+  fi
 
   revision_prefix="${OPENSHELL_ENV_PLACEHOLDER_PREFIX}v"
-  revision_suffix="_${name}"
+  stable_prefix="${OPENSHELL_ENV_PLACEHOLDER_PREFIX}s"
+  generation_suffix="_${name}"
   versioned="${value#"$revision_prefix"}"
-  [ "$versioned" != "$value" ] || return 1
-  revision="${versioned%"$revision_suffix"}"
-  [ "$revision" != "$versioned" ] || return 1
-  [ "$versioned" = "$revision$revision_suffix" ] || return 1
-  [ "${#revision}" -le 20 ] || return 1
-  case "$revision" in
-    "" | *[!0-9]*) return 1 ;;
+  if [ "$versioned" != "$value" ]; then
+    revision="${versioned%"$generation_suffix"}"
+    [ "$revision" != "$versioned" ] || return 1
+    [ "$versioned" = "$revision$generation_suffix" ] || return 1
+    [ "${#revision}" -le 20 ] || return 1
+    case "$revision" in
+      "" | *[!0-9]*) return 1 ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  stable="${value#"$stable_prefix"}"
+  [ "$stable" != "$value" ] || return 1
+  handle="${stable%"$generation_suffix"}"
+  [ "$handle" != "$stable" ] || return 1
+  [ "$stable" = "$handle$generation_suffix" ] || return 1
+  [ "${#handle}" -eq 64 ] || return 1
+  case "$handle" in
+    *[!0123456789abcdef]*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -637,7 +663,7 @@ try:
 except Exception:
     sys.exit(1)
 # Schema pin: detection assumes a truthy top-level "credentials" key,
-# matching the auth.json shape in deepagents-code==0.1.34. Nested or
+# matching the auth.json shape reviewed for deepagents-code==0.1.71. Nested or
 # renamed shapes ({"auth":{...}}, {"state":{"credentials":...}}, top-level
 # list) are not detected. When bumping the upstream pin, re-review this
 # assumption against the new auth.json schema.
@@ -661,6 +687,17 @@ assert_no_codex_auth_credentials() {
   fi
 }
 
+# Restored native config.toml files can still reference the old environment key.
+# Keep that consumer on the current supervisor placeholder, never a fixed token.
+# Remove this alias when supported restored configs no longer use the old key.
+if is_openshell_env_placeholder_for_name NVIDIA_INFERENCE_API_KEY "${NVIDIA_INFERENCE_API_KEY:-}"; then
+  export NEMOCLAW_ATTACHED_PROVIDER_API_KEY="$NVIDIA_INFERENCE_API_KEY"
+fi
+
+if [ "${NEMOCLAW_LOCAL_INFERENCE_TOKEN+x}" = x ] && ! is_openshell_env_placeholder_for_name NEMOCLAW_LOCAL_INFERENCE_TOKEN "$NEMOCLAW_LOCAL_INFERENCE_TOKEN"; then
+  refuse_invalid_openshell_placeholder "runtime environment variable" NEMOCLAW_LOCAL_INFERENCE_TOKEN
+fi
+
 assert_no_secret_runtime_env
 assert_no_secret_env_file
 assert_no_auth_store_credentials
@@ -677,7 +714,7 @@ assert_no_codex_auth_credentials
 #   canonical TypeScript filters or a full TOML parser without adding a process
 #   and dependency. It therefore reads only known generated sections and exact
 #   quoted scalars; arrays, inline comments, and other forms are not accepted.
-# - Regression: test/dcode-wrapper-identity.test.ts covers malformed scalars,
+# - Regression: test/agents/deepagents/dcode-wrapper-identity.test.ts covers malformed scalars,
 #   terminal controls, oversized and secret-shaped metadata, and unsafe endpoint
 #   forms. The composed startup/status handoff has a separate integration test.
 # - Removal condition: replace these local readers/filters when upstream dcode
@@ -841,6 +878,8 @@ NemoClaw-managed commands:
   dcode status      Show managed sandbox and dcode runtime identity
   dcode whoami      Alias for dcode status
   dcode identity    Alias for dcode status
+  dcode tools call-read-only TOOL --json
+                    Call one exact, coherently read-only MCP tool
 
 EOF
 }
@@ -859,7 +898,36 @@ case "${1:-}" in
     ;;
 esac
 
-unset DEEPAGENTS_CODE_SHELL_ALLOW_LIST
+is_non_interactive_long_option() {
+  case "$1" in
+    --non | --non- | --non-i | --non-in | --non-int | --non-inte | --non-inter | --non-intera | --non-interac | --non-interact | --non-interacti | --non-interactiv | --non-interactive)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+managed_headless=false
+for arg in "$@"; do
+  case "$arg" in
+    -n | -n?*)
+      managed_headless=true
+      break
+      ;;
+    *)
+      if is_non_interactive_long_option "${arg%%=*}"; then
+        managed_headless=true
+        break
+      fi
+      ;;
+  esac
+done
+
+if [ "$managed_headless" = true ]; then
+  unset DEEPAGENTS_CODE_SHELL_ALLOW_LIST
+fi
 
 reject_managed_override() {
   local posture="$1"
@@ -880,8 +948,8 @@ case "${1:-}" in
     ;;
   tools)
     case "${2:-}" in
-      list | help | "" | -h | --help)
-        : # read-only inspection subcommands pass through
+      list | call-read-only | help | "" | -h | --help)
+        : # managed read-only subcommands pass through
         ;;
       *)
         reject_managed_override "managed tool set posture" "tools ${2:-}"
@@ -908,7 +976,9 @@ for arg in "$@"; do
       reject_managed_override "MCP posture" "$arg"
       ;;
     --shell-allow-list | --shell-allow-list=* | -S | -S?*)
-      reject_managed_override "shell allow-list posture" "$arg"
+      if [ "$managed_headless" = true ]; then
+        reject_managed_override "headless shell posture" "$arg"
+      fi
       ;;
     --u | --up | --upd | --upda | --updat | --update | --update=*)
       reject_managed_override "dependency update posture" "$arg"
@@ -926,16 +996,22 @@ for arg in "$@"; do
       reject_managed_override "rubric model posture" "$arg"
       ;;
     --sta | --sta=* | --star | --star=* | --start | --start=* | --startu | --startu=* | --startup | --startup=* | --startup-*)
-      reject_managed_override "startup command posture" "$arg"
+      if [ "$managed_headless" = true ]; then
+        reject_managed_override "headless startup command posture" "$arg"
+      fi
       ;;
     --interpreter)
-      reject_managed_override "interpreter posture" "$arg"
+      if [ "$managed_headless" = true ]; then
+        reject_managed_override "headless interpreter posture" "$arg"
+      fi
       ;;
     --interpreter-t | --interpreter-t=* | --interpreter-to | --interpreter-to=* | --interpreter-too | --interpreter-too=* | --interpreter-tool | --interpreter-tool=* | --interpreter-tools | --interpreter-tools=*)
-      reject_managed_override "interpreter posture" "$arg"
+      if [ "$managed_headless" = true ]; then
+        reject_managed_override "headless interpreter posture" "$arg"
+      fi
       ;;
-    -y | --auto-a | --auto-ap | --auto-app | --auto-appr | --auto-appro | --auto-approv | --auto-approve)
-      if [ "$MANAGED_DCODE_AUTO_APPROVAL_MODE" != "thread-opt-in" ]; then
+    -y | --auto-a | --auto-ap | --auto-app | --auto-appr | --auto-appro | --auto-approv | --auto-approve | --yolo)
+      if [ "$managed_headless" = true ] || [ "$MANAGED_DCODE_AUTO_APPROVAL_MODE" != "thread-opt-in" ]; then
         reject_managed_override "tool approval posture" "$arg"
       fi
       ;;
@@ -980,14 +1056,25 @@ while [ "$arg_index" -lt "${#dcode_args[@]}" ]; do
       arg_index=$((value_index + 1))
       continue
       ;;
-    --non-interactive=*)
-      if prompt_is_blank "${current_arg#--non-interactive=}"; then
-        reject_empty_non_interactive "--non-interactive"
-      fi
-      ;;
     -n?*)
       if prompt_is_blank "${current_arg#-n}"; then
         reject_empty_non_interactive "-n"
+      fi
+      ;;
+    *)
+      current_name="${current_arg%%=*}"
+      if is_non_interactive_long_option "$current_name"; then
+        if [ "$current_name" = "$current_arg" ]; then
+          value_index=$((arg_index + 1))
+          if [ "$value_index" -lt "${#dcode_args[@]}" ] && prompt_is_blank "${dcode_args[value_index]}"; then
+            reject_empty_non_interactive "$current_name"
+          fi
+          arg_index=$((value_index + 1))
+          continue
+        fi
+        if prompt_is_blank "${current_arg#*=}"; then
+          reject_empty_non_interactive "$current_name"
+        fi
       fi
       ;;
   esac
@@ -1002,5 +1089,14 @@ extra_args=(--sandbox none --no-mcp)
 # could consume it.
 # `--no-mcp` also keeps upstream auto-discovery fail-closed until the managed
 # entrypoint replaces it with the integrity-bound /proc/self/fd path.
+
+if [ "${1:-}" = "tools" ] && [ "${2:-}" = "call-read-only" ]; then
+  shift 2
+  unset PYTHONHOME PYTHONPATH
+  # The managed command returns one bounded JSON envelope on stdout. Suppress
+  # child MCP stderr so an untrusted server cannot create an unbounded or
+  # credential-bearing diagnostic channel outside that envelope.
+  exec /opt/venv/bin/python3 -I /usr/local/lib/nemoclaw/nemoclaw_read_only_mcp.py "$@" 2>/dev/null
+fi
 
 run_dcode "${extra_args[@]}" "$@"

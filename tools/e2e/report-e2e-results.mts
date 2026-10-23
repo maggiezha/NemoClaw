@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { normalizeE2eSelectorCsv } from "./selector-aliases.mts";
+
 export type ReportApiJob = {
   completed_at?: string | null;
   conclusion?: string | null;
@@ -16,6 +18,13 @@ export type ReportNeedResult = { result?: string };
 export type ReportNeeds = Record<string, ReportNeedResult>;
 
 export type ReportEnv = {
+  JOB_CHECKOUT_SHA?: string;
+  JOB_CHECKOUT_REPOSITORY?: string;
+  JOB_BASE_SHA?: string;
+  JOB_WORKFLOW_SHA?: string;
+  WORKFLOW_SHA?: string;
+  MATRIX_RESULT?: string;
+  SELECTED_WORKFLOW_JOBS?: string;
   EXPLICIT_ONLY_JOBS?: string;
   JOBS?: string;
   JOB_PR_NUMBER?: string;
@@ -49,11 +58,13 @@ export type ReportGithub = {
       }) => Promise<unknown>;
     };
     pulls: {
-      get: (input: {
-        owner: string;
-        repo: string;
-        pull_number: number;
-      }) => Promise<{ data: { state?: string } }>;
+      get: (input: { owner: string; repo: string; pull_number: number }) => Promise<{
+        data: {
+          state?: string;
+          head?: { sha?: string; repo?: { full_name?: string } };
+          base?: { sha?: string; ref?: string; repo?: { full_name?: string } };
+        };
+      }>;
       list: (input: {
         owner: string;
         repo: string;
@@ -72,6 +83,37 @@ type ReportEntry = { result?: string; jobUrl?: string; wallClockRange?: WallCloc
 
 const TERMINAL_CONCLUSIONS = ["success", "failure", "cancelled", "skipped"];
 const PASSING_JOB_CONCLUSIONS = ["success", "skipped", "neutral"];
+const CATALOGUE_CREDENTIAL_BOUNDARIES = {
+  "catalogue-standard": "no provider credential",
+  "catalogue-nvidia-api": "NVIDIA API key",
+  "catalogue-nvidia-inference": "NVIDIA inference API key",
+  "catalogue-hosted-inference": "selected hosted inference API key",
+  "catalogue-github-read": "GitHub read token",
+} as const;
+
+function validHostedCandidateContext(env: ReportEnv, context: ReportContext): boolean {
+  let selectedJobs: unknown;
+  try {
+    selectedJobs = JSON.parse(env.SELECTED_WORKFLOW_JOBS || "[]");
+  } catch {
+    return false;
+  }
+  return (
+    context.repo.owner === "NVIDIA" &&
+    context.repo.repo === "NemoClaw" &&
+    context.ref === "refs/heads/main" &&
+    env.MATRIX_RESULT === "success" &&
+    Array.isArray(selectedJobs) &&
+    (selectedJobs.includes("catalogue-hosted-inference") ||
+      selectedJobs.includes("llama-cpp-dgx-spark-qualification")) &&
+    env.JOB_CHECKOUT_REPOSITORY === "NVIDIA/NemoClaw" &&
+    Boolean(env.JOB_PR_NUMBER) &&
+    [env.JOB_CHECKOUT_SHA, env.JOB_BASE_SHA, env.JOB_WORKFLOW_SHA].every((sha) =>
+      /^[a-f0-9]{40}$/.test(sha || ""),
+    ) &&
+    env.JOB_WORKFLOW_SHA === env.WORKFLOW_SHA
+  );
+}
 
 export async function resolveReportPr(input: {
   github: ReportGithub;
@@ -82,6 +124,11 @@ export async function resolveReportPr(input: {
   const { github, context, core, env } = input;
   const workflowBranch = context.ref.replace("refs/heads/", "");
   const prNumberInput = env.JOB_PR_NUMBER || "";
+  const candidateRun = Boolean(env.JOB_CHECKOUT_SHA);
+  if (candidateRun && !validHostedCandidateContext(env, context)) {
+    core.setFailed("Candidate reporting requires an authorized hosted dispatch from trusted main.");
+    return undefined;
+  }
   if (prNumberInput) {
     if (!/^[1-9][0-9]*$/.test(prNumberInput)) {
       core.setFailed(
@@ -100,6 +147,17 @@ export async function resolveReportPr(input: {
         repo: context.repo.repo,
         pull_number: prNumber,
       });
+      if (
+        candidateRun &&
+        (suppliedPr.head?.sha !== env.JOB_CHECKOUT_SHA ||
+          suppliedPr.head?.repo?.full_name !== env.JOB_CHECKOUT_REPOSITORY ||
+          suppliedPr.base?.sha !== env.JOB_BASE_SHA ||
+          suppliedPr.base?.ref !== "main" ||
+          suppliedPr.base?.repo?.full_name !== "NVIDIA/NemoClaw")
+      ) {
+        core.setFailed("Candidate report identity no longer matches the PR head and base.");
+        return undefined;
+      }
       if (suppliedPr.state !== "open") {
         core.setFailed(
           `PR #${prNumber} is ${suppliedPr.state}; E2E reports only comment on open PRs.`,
@@ -173,43 +231,12 @@ export function renderE2eReport(input: {
   const rawRequestedTargets = env.JOB_TARGETS || "";
   const rawRequestedTestIds = env.JOBS || "";
   const selectorValidationPassed = needs["generate-matrix"]?.result === "success";
-  const requestedTargets = selectorValidationPassed ? rawRequestedTargets : "";
-  const requestedTestIdsCsv = selectorValidationPassed ? rawRequestedTestIds : "";
-  const explicitOnlyReasons: Record<string, { job: string; target: string; reason: string }> = {
-    "openshell-gateway-auth-contract": {
-      job: "openshell-gateway-auth-contract",
-      target: "openshell-gateway-auth-contract",
-      reason:
-        "default dispatch excludes the resource-heavy OpenShell auth-contract probe unless selected",
-    },
-    "mcp-bridge-dev": {
-      job: "mcp-bridge-dev",
-      target: "mcp-bridge-dev",
-      reason: "default dispatch excludes moving OpenShell dev artifacts unless explicitly selected",
-    },
-    "jetson-nvmap-gpu": {
-      job: "jetson-nvmap-gpu",
-      target: "jetson-nvmap-gpu",
-      reason:
-        "default dispatch excludes Jetson; explicit dispatch requires allow_jetson_runner_queue=true after confirming an online Jetson runner because queued jobs do not honor timeout-minutes before assignment",
-    },
-    "sandbox-rlimits-connect": {
-      job: "sandbox-rlimits-connect",
-      target: "sandbox-rlimits-connect",
-      reason: "default dispatch excludes the destructive rlimit fork/connect probe unless selected",
-    },
-  };
-  const explicitOnlySkippedJobs = (env.EXPLICIT_ONLY_JOBS || "")
-    .split(",")
-    .filter(Boolean)
-    .map(
-      (job) =>
-        explicitOnlyReasons[job] ?? {
-          job,
-          target: job,
-          reason: "default dispatch excludes this explicit-only job unless selected",
-        },
-    );
+  const requestedTargets = selectorValidationPassed
+    ? normalizeE2eSelectorCsv(rawRequestedTargets)
+    : "";
+  const requestedTestIdsCsv = selectorValidationPassed
+    ? normalizeE2eSelectorCsv(rawRequestedTestIds)
+    : "";
   const targetsRejected = Boolean(rawRequestedTargets) && !selectorValidationPassed;
   const testIdsRejected = Boolean(rawRequestedTestIds) && !selectorValidationPassed;
 
@@ -289,10 +316,10 @@ export function renderE2eReport(input: {
     const jobName = job.name || "";
     const match = /^Shared E2E \(([A-Za-z0-9_-]+)\)$/.exec(jobName);
     const aggregateJobName = aggregateJobNames.find((name) => jobName.startsWith(`${name} (`));
-    const reportEntryName =
-      match?.[1] ??
-      aggregateJobName ??
-      (/^OpenShell gateway upgrade \(.+\)$/.test(jobName) ? "openshell-gateway-upgrade" : jobName);
+    const catalogueJobName = Object.entries(CATALOGUE_CREDENTIAL_BOUNDARIES).find(
+      ([name, boundary]) => needs[name] && jobName.endsWith(` / ${boundary}`),
+    )?.[0];
+    const reportEntryName = match?.[1] ?? aggregateJobName ?? catalogueJobName ?? jobName;
     recordWallClockRange(reportEntryName, job);
     recordJobLink(reportEntryName, job);
     if (!match || !selectedTestIds.has(match[1])) continue;
@@ -359,19 +386,34 @@ export function renderE2eReport(input: {
   const missingRequestedTestIds = selectorValidationPassed
     ? requestedTestIds.filter((testId) => !allEntries.some(([name]) => name === testId))
     : [];
+  const isSelectiveReportEntry = ([name, { result }]: [string, ReportEntry]) =>
+    (name === "catalogue-hosted-inference" && validHostedCandidateContext(env, context)) ||
+    (result !== "skipped" &&
+      (name !== "generate-matrix" || result === "failure" || result === "cancelled"));
+  const sparkSelected =
+    requestedTestIdSet.has("llama-cpp-dgx-spark-qualification") ||
+    (validHostedCandidateContext(env, context) &&
+      (JSON.parse(env.SELECTED_WORKFLOW_JOBS || "[]") as string[]).includes(
+        "llama-cpp-dgx-spark-qualification",
+      ));
   const selectedEntries =
     requestedTestIds.length > 0
-      ? allEntries.filter(([name]) => requestedTestIdSet.has(name))
+      ? allEntries.filter(
+          ([name]) =>
+            requestedTestIdSet.has(name) ||
+            (sparkSelected &&
+              (name === "llama-cpp-dgx-spark-plan" ||
+                name === "llama-cpp-dgx-spark-qualification")) ||
+            (name === "catalogue-hosted-inference" && validHostedCandidateContext(env, context)),
+        )
       : selectiveDispatch
-        ? allEntries.filter(
-            ([name, { result }]) => result !== "skipped" && name !== "generate-matrix",
-          )
+        ? allEntries.filter(isSelectiveReportEntry)
         : allEntries;
   const reportedEntries =
     selectedEntries.length > 0
       ? selectedEntries
       : selectiveDispatch
-        ? allEntries.filter(([, { result }]) => result !== "skipped")
+        ? allEntries.filter(isSelectiveReportEntry)
         : allEntries;
   const rows = reportedEntries.map(([name, { jobUrl, result, wallClockRange }]) => {
     const label = result === "failure" ? `[${name}](${jobUrl ?? runUrl})` : name;
@@ -389,12 +431,20 @@ export function renderE2eReport(input: {
   const unknown = ran.filter(([, v]) => v.result === "unknown");
   const sharedJobAggregateFailed = sharedJobAggregateResult === "failure";
   const sharedJobAggregateCancelled = sharedJobAggregateResult === "cancelled";
+  const noResultEntries = reportedEntries.length === 0 && missingRequestedTestIds.length === 0;
+  const resultsUnavailable = !apiJobsLoaded && noResultEntries;
+  const noResultsReported = apiJobsLoaded && noResultEntries;
+  if (noResultsReported) {
+    warnings.push(
+      "No E2E target reported a result. The check remains successful but provides no affirmative E2E qualification evidence.",
+    );
+  }
   const passingStatus =
     requestedTestIds.length > 0
       ? "✅ All requested tests passed"
       : selectiveDispatch
         ? "✅ All selected tests passed"
-        : "✅ All default tests passed";
+        : "✅ All tests selected by empty selectors passed";
   const status =
     failed.length > 0 || missingRequestedTestIds.length > 0 || sharedJobAggregateFailed
       ? "❌ Some tests failed"
@@ -404,9 +454,15 @@ export function renderE2eReport(input: {
           ? "⚠️ Some tests cancelled — partial pass"
           : unknown.length > 0
             ? "⚠️ Per-test results incomplete"
-            : skipped.length > 0 && passed.length === 0
-              ? "⚠️ No selected tests ran"
-              : passingStatus;
+            : resultsUnavailable
+              ? "⚠️ E2E results unavailable"
+              : noResultsReported
+                ? "⚠️ No E2E results reported"
+                : skipped.length > 0 && passed.length === 0
+                  ? "⚠️ No selected tests ran"
+                  : skipped.length > 0 && validHostedCandidateContext(env, context)
+                    ? "⚠️ Some selected tests did not run"
+                    : passingStatus;
 
   const lines = [
     `### E2E Target Results — ${status}`,
@@ -417,26 +473,27 @@ export function renderE2eReport(input: {
       ? "**Requested targets:** _(selector rejected by workflow validation)_"
       : requestedTargets
         ? `**Requested targets:** \`${requestedTargets}\``
-        : "**Requested targets:** _(default — all supported)_",
+        : "**Requested targets:** _(no target selector)_",
     testIdsRejected
       ? "**Requested test IDs:** _(selector rejected by workflow validation)_"
       : requestedTestIdsCsv
         ? `**Requested test IDs:** \`${requestedTestIdsCsv}\``
-        : "**Requested test IDs:** _(default — all default-enabled tests; explicit-only tests `openshell-gateway-auth-contract`, `mcp-bridge-dev`, `hermes-gpu-startup`, `sandbox-rlimits-connect`, and `jetson-nvmap-gpu` are skipped unless selected)_",
+        : "**Requested test IDs:** _(no test ID selector)_",
     `**Summary:** ${passed.length} passed, ${failed.length} failed, ${cancelled.length} cancelled, ${skipped.length} skipped, ${unknown.length} unknown`,
     "",
     "| Test | Result | Total wall clock time |",
     "|-----|--------|-----------------------|",
     ...rows,
   ];
-  if (!selectiveDispatch) {
-    const skippedJobHints = explicitOnlySkippedJobs
-      .map(
-        ({ job, target, reason }) =>
-          `\`${job}\` (${reason}; validate with \`jobs=${job}\` or \`targets=${target}\`)`,
-      )
-      .join(", ");
-    lines.push("", `> **Explicit-only jobs skipped:** ${skippedJobHints}.`);
+  if (env.JOB_CHECKOUT_SHA) {
+    lines.splice(
+      5,
+      0,
+      `**Candidate commit:** \`${env.JOB_CHECKOUT_SHA}\``,
+      `**Base commit:** \`${env.JOB_BASE_SHA}\``,
+      `**Trusted workflow commit:** \`${env.JOB_WORKFLOW_SHA}\``,
+      `**Evidence and cleanup:** [Run artifacts](${runUrl}#artifacts) contain the dispatch receipt, scenario evidence manifest, and per-sandbox \`cleanup.json\` when produced. Missing cleanup evidence is not a cleanup pass.`,
+    );
   }
   if (failed.length > 0) {
     const failedLinks = failed

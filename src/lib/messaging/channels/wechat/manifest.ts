@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChannelManifest } from "../../manifest";
+import { WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT } from "./contract.ts";
 
 export const wechatManifest = {
   schemaVersion: 1,
@@ -68,7 +69,13 @@ export const wechatManifest = {
       placeholder: "openshell:resolve:env:WECHAT_BOT_TOKEN",
     },
   ],
-  policyPresets: [{ name: "wechat", policyKeys: ["wechat_bridge"] }],
+  state: {
+    openclaw: ["wechat", "openclaw-weixin"],
+    hermes: ["platforms/wechat"],
+  },
+  // Both agent policies bind the endpointless provider. Apply it before boot
+  // so OpenShell injects WECHAT_BOT_TOKEN into the agent process environment.
+  policyPresets: [{ name: "wechat", policyKeys: ["wechat_bridge"], requiredAtCreate: true }],
   render: [
     {
       id: "wechat-openclaw-plugin",
@@ -83,12 +90,21 @@ export const wechatManifest = {
       },
     },
     {
+      id: "wechat-openclaw-channel",
+      kind: "json-fragment",
+      agent: "openclaw",
+      target: "openclaw.json",
+      fragment: {
+        path: "channels.openclaw-weixin",
+        value: { enabled: true },
+      },
+    },
+    {
       id: "wechat-hermes-env",
       kind: "env-lines",
       agent: "hermes",
       target: "~/.hermes/.env",
       lines: [
-        "WEIXIN_TOKEN={{credential.wechatBotToken.placeholder}}",
         "WEIXIN_ACCOUNT_ID={{wechatConfig.accountId}}",
         "WEIXIN_BASE_URL={{wechatConfig.baseUrl}}",
         "WEIXIN_ALLOWED_USERS={{allowedIds.wechat.csv}}",
@@ -116,6 +132,11 @@ export const wechatManifest = {
       },
       nodePreloads: [
         {
+          module: "wechat-account-placeholder",
+          injectInto: ["boot"],
+          optional: false,
+        },
+        {
           module: "wechat-diagnostics",
           injectInto: ["boot", "connect"],
           optional: false,
@@ -125,18 +146,28 @@ export const wechatManifest = {
         },
       ],
     },
+    hermes: {
+      envAliases: [
+        {
+          envKey: "WECHAT_BOT_TOKEN",
+          targetEnvKey: "WEIXIN_TOKEN",
+          match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_WECHAT_BOT_TOKEN$",
+          value: "openshell:resolve:env:WECHAT_BOT_TOKEN",
+        },
+      ],
+    },
   },
   agentPackages: [
     {
       id: "openclawPluginPackage",
       agent: "openclaw",
       manager: "openclaw-plugin",
-      spec: "npm:@tencent-weixin/openclaw-weixin@2.4.3",
+      spec: "npm:@tencent-weixin/openclaw-weixin@2.4.9",
       pin: true,
       integrity:
-        "sha512-dPQbidUNWigC6V10vGW4i+GLH09x+6zUhafZRjuxkJ9GDu8o62WBsnUTojp4KqUH756hz+t2v9khiCRSi0dBDw==",
+        "sha512-SfaYehR1Cwq2VV5HxJBp9sVilMms420VfZlMbF4YjRbWomr5+GxfXp9HkeU6y5TbnOc4Ysq0qPw1yBvJwbenBA==",
       tarballUrl:
-        "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.3.tgz",
+        "https://registry.npmjs.org/@tencent-weixin/openclaw-weixin/-/openclaw-weixin-2.4.9.tgz",
       runtimeLock: {
         cachePath: "/usr/local/share/nemoclaw/wechat-npm-cache",
         installCacheEnvKey: "NEMOCLAW_WECHAT_NPM_INSTALL_CACHE",
@@ -193,9 +224,9 @@ export const wechatManifest = {
       ],
     },
     {
-      id: "wechat-seed-openclaw-account",
+      id: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.planHookId,
       phase: "post-agent-install",
-      handler: "wechat.seedOpenClawAccount",
+      handler: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.handlerId,
       agents: ["openclaw"],
       inputs: [
         "wechatConfig.accountId",
@@ -210,9 +241,9 @@ export const wechatManifest = {
           required: true,
         },
         {
-          id: "openclawWeixinAccountFile",
-          kind: "build-file",
-          required: true,
+          id: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.outputId,
+          kind: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.kind,
+          required: WECHAT_OPENCLAW_ACCOUNT_FILE_CONTRACT.required,
         },
         {
           id: "openclawConfigPatch",

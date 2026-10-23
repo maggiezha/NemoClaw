@@ -3,42 +3,61 @@
 //
 // Host-side sandbox configuration management.
 //
-// All config commands are agent-aware: the sandbox registry records which
-// agent runs in each sandbox (openclaw, hermes, etc.), and agent-defs.ts
-// provides the per-agent config paths and formats. This module resolves
-// those at runtime so the same CLI surface works for any agent.
+// Config reads are agent-aware: the sandbox registry records which agent runs
+// in each sandbox, and agent-defs.ts provides the corresponding paths and
+// formats. Hermes supports host-side config mutation. OpenClaw owns its config;
+// internal host workflows invoke OpenClaw's native config commands.
 //
 // config get:          Read-only inspection with credential redaction.
-// config set:          Host-initiated config mutation with validation.
+// config set:          Validated host mutation for Hermes.
 // config rotate-token: Credential rotation via stdin or env var.
 
-const readline = require("readline");
+import type { AgentConfigTarget } from "./agent-config";
+import type { OpenShellRuntimeSelection } from "../adapters/openshell/client";
+import {
+  recordTelemetryTarget,
+  isTelemetryConfigurationKey,
+  persistConfigurationTelemetry,
+  configSetUnsupportedAgentMessage,
+} from "./config-telemetry";
+export {
+  isTelemetryConfigurationKey,
+  retireNativeConfigurationTelemetry,
+} from "./config-telemetry";
+
+export type { AgentConfigTarget } from "./agent-config";
+
+const {
+  DEFAULT_AGENT_CONFIG,
+  resolveAgentConfig: resolveAgentConfigTarget,
+}: typeof import("./agent-config") = require("./agent-config");
+const {
+  stripAnsi,
+  buildSelectedOpenShellSubprocessEnv,
+}: typeof import("../adapters/openshell/client") = require("../adapters/openshell/client");
 const { createHash } = require("node:crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { promises: dnsPromises } = require("node:dns");
 const { isIP } = require("node:net");
+const { isErrnoException }: typeof import("../core/errno") = require("../core/errno");
 const { validateName } = require("../runner");
 const { shellQuote } = require("../core/shell-quote");
-const { dockerExecFileSync, dockerSpawnSync } = require("../adapters/docker/exec");
 const credentialFilter: typeof import("../security/credential-filter") = require("../security/credential-filter");
 const { stripCredentials, isConfigObject, isConfigValue, isCredentialField } = credentialFilter;
-const { appendAuditEntry } = require("../shields/audit");
-const {
-  withTimerBoundShieldsMutationLock,
-}: typeof import("../shields/timer-bound-lock") = require("../shields/timer-bound-lock");
+const { appendAuditEntry } = require("../state/audit/operational");
 const {
   withSandboxMutationLock,
 }: typeof import("../state/mcp-lifecycle-lock") = require("../state/mcp-lifecycle-lock");
 const {
-  runOpenClawConfigGuard,
-  validateOpenClawConfigCandidate,
-}: typeof import("../shields/openclaw-config-lock") = require("../shields/openclaw-config-lock");
-const { isPrivateHostname, isPrivateIp } = require("../private-networks");
+  isAllowedOpenShellSandboxBridgeUrl,
+  isPrivateHostname,
+  isPrivateIp,
+}: typeof import("../private-networks") = require("../private-networks");
 const {
-  privilegedSandboxExecArgv,
-  resolveDirectSandboxContainer,
+  capturePrivilegedSandboxCommand,
+  withPrivilegedSandboxExecutionLease,
 }: typeof import("./privileged-exec") = require("./privileged-exec");
 const {
   buildHermesUpstreamHeader,
@@ -48,12 +67,24 @@ const {
   serializeConfig,
 }: typeof import("./config-format") = require("./config-format");
 const {
-  OPENSHELL_OPERATION_TIMEOUT_MS,
-}: typeof import("../adapters/openshell/timeouts") = require("../adapters/openshell/timeouts");
-const { redactFull }: typeof import("../security/redact") = require("../security/redact");
+  buildOpenClawNativeConfigBatchInvocation,
+  buildOpenClawNativeConfigSetInvocation,
+  executeOpenClawNativeConfigBatch,
+  executeOpenClawNativeConfigSet,
+  runOpenClawNativeConfigBatchUntilHandleReady,
+  runOpenClawNativeConfigCommand,
+}: typeof import("./openclaw-native-config") = require("./openclaw-native-config");
+const {
+  loadSandboxCredentialRoute,
+  loadRotateTokenSession,
+  readStdin,
+  rotateSandboxToken,
+}: typeof import("./config-rotate-token") = require("./config-rotate-token");
 
 type ConfigObject = import("../security/credential-filter").ConfigObject;
 type ConfigValue = import("../security/credential-filter").ConfigValue;
+import type { OpenClawConfigUpdate } from "./openclaw-native-config";
+export type { OpenClawConfigUpdate } from "./openclaw-native-config";
 const { runOpenshellCommand, captureOpenshellCommand } = require("../adapters/openshell/client");
 
 function parseJson<T>(text: string): T {
@@ -64,28 +95,13 @@ function parseJson<T>(text: string): T {
 // Agent-aware config resolution
 //
 // Each agent defines its own config layout in agents/*/manifest.yaml:
-//   - openclaw: /sandbox/.openclaw/openclaw.json  (JSON)
+//   - openclaw: /sandbox/.openclaw/openclaw.json  (JSON5)
 //   - hermes:   /sandbox/.hermes/config.yaml      (YAML)
 //
 // resolveAgentConfig() looks up the sandbox's agent from the registry,
 // loads the agent definition, and returns the paths and format needed
 // to read/write that agent's config from the host.
 // ---------------------------------------------------------------------------
-
-export interface AgentConfigTarget {
-  /** Agent name (e.g. "openclaw", "hermes") */
-  agentName: string;
-  /** Absolute path inside sandbox to the config file */
-  configPath: string;
-  /** Directory containing the config (for chown after cp) */
-  configDir: string;
-  /** Config file format: "json", "yaml", or "toml" */
-  format: string;
-  /** Config file basename */
-  configFile: string;
-  /** Additional files to lock/unlock alongside the main config (e.g. .env, .config-hash) */
-  sensitiveFiles?: string[];
-}
 
 type LookupFn = (
   hostname: string,
@@ -98,7 +114,16 @@ interface DnsValidatedUrl {
   pinnedUrl: string;
 }
 
-type ManagedGatewayRestart = (sandboxName: string) => { ok: boolean };
+interface ConfigUrlValidationOptions {
+  allowOpenShellBridge?: boolean;
+  allowOpenShellBridgePath?: (path: readonly string[]) => boolean;
+  allowPrivateUrls?: boolean;
+}
+
+type ManagedGatewayRestart = (
+  sandboxName: string,
+  options?: { runtimeSelection: OpenShellRuntimeSelection },
+) => Promise<{ ok: boolean }>;
 
 export class SandboxConfigError extends Error {
   readonly lines: readonly string[];
@@ -117,20 +142,21 @@ function configFail(lines: string | readonly string[], exitCode = 1): never {
   throw new SandboxConfigError(lines, exitCode);
 }
 
-function restartSandboxAgentAfterConfigSet(
+async function restartSandboxAgentAfterConfigSet(
   sandboxName: string,
   agentName: string,
   restartImpl?: ManagedGatewayRestart,
-): void {
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<void> {
   const restart =
     restartImpl ??
     (require("../actions/sandbox/process-recovery").restartSandboxGateway as ManagedGatewayRestart);
-  const result = restart(sandboxName);
+  const result = await restart(sandboxName, ...(runtimeSelection ? [{ runtimeSelection }] : []));
   if (!result.ok) {
-    // The config was already written to disk (the CAS write above succeeded),
-    // but the running agent was not reloaded. Say so plainly and point at the
-    // idempotent retry rather than leaving disk and the live gateway silently
-    // diverged. The restart layer has already printed its own failure detail.
+    // The config write already completed, but the running agent was not
+    // reloaded. Say so plainly and point to the idempotent retry rather than
+    // leaving disk and the live gateway silently diverged. The restart layer
+    // has already printed its own failure detail.
     configFail([
       `  Config was written to disk but NOT applied to the running agent.`,
       `  The ${agentName} gateway restart did not complete for '${sandboxName}' (see the failure above).`,
@@ -139,38 +165,23 @@ function restartSandboxAgentAfterConfigSet(
   }
 }
 
-function buildConfigSetRestartGuidance(sandboxName: string, agentName: string): string[] {
-  if (agentName === "openclaw" || agentName === "hermes") {
-    return [
-      "  Note: Some config changes require a sandbox restart to take effect.",
-      `  Re-run with --restart or run: nemoclaw ${shellQuote(sandboxName)} gateway restart`,
-    ];
-  }
-
+function buildConfigSetRestartGuidance(sandboxName: string): string[] {
   return [
-    "  Note: Some config changes require restarting the agent runtime to take effect.",
-    `  Follow the restart procedure for '${agentName}'; NemoClaw does not manage restarts for this agent.`,
+    "  Note: Hermes may restart its gateway when it applies this configuration.",
+    `  Use --restart to request and verify a restart, or run: nemoclaw ${shellQuote(sandboxName)} gateway restart`,
   ];
 }
 
-class ConfigUrlValidationError extends Error {
+export class ConfigUrlValidationError extends Error {
   constructor(
     readonly urlValue: string,
     message: string,
+    readonly reason: "dns_backed_https_unsupported" | "invalid" = "invalid",
   ) {
     super(message);
     this.name = "ConfigUrlValidationError";
   }
 }
-
-const DEFAULT_AGENT_CONFIG: AgentConfigTarget = {
-  agentName: "openclaw",
-  configPath: "/sandbox/.openclaw/openclaw.json",
-  configDir: "/sandbox/.openclaw",
-  format: "json",
-  configFile: "openclaw.json",
-  sensitiveFiles: ["/sandbox/.openclaw/.config-hash"],
-};
 
 const HERMES_STRICT_HASH_FILE = "/etc/nemoclaw/hermes.config-hash";
 const HERMES_RUNTIME_CONFIG_GUARD = "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py";
@@ -178,7 +189,6 @@ const HERMES_PYTHON = "/opt/hermes/.venv/bin/python";
 const HERMES_RESTART_SEAL_STATE = "/run/nemoclaw/hermes-restart-seal.json";
 const MAX_OPENCLAW_CONFIG_BYTES = 16 * 1024 * 1024;
 const CONFIG_CAPTURE_MAX_BUFFER = MAX_OPENCLAW_CONFIG_BYTES + 1024 * 1024;
-const OPENCLAW_CONFIG_GUARD_TIMEOUT_MS = 6 * 60 * 1000;
 const HERMES_CONFIG_GUARD_TIMEOUT_MS = 150_000;
 const CONFIG_SOURCE_SHA256: unique symbol = Symbol("nemoclaw.configSourceSha256");
 
@@ -188,78 +198,20 @@ function privilegedSandboxExec(
   opts: { input?: string | Buffer; timeout?: number } = {},
 ): string {
   const hasInput = opts.input !== undefined;
-  return dockerExecFileSync(privilegedSandboxExecArgv(sandboxName, cmd, hasInput, true), {
-    input: opts.input,
-    stdio: hasInput ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
-    timeout: opts.timeout ?? 30000,
-  });
-}
-
-function openClawConfigGuardExec(sandboxName: string, expectedContainerId?: string) {
-  return {
-    run: (cmd: string[], input?: string) => {
-      let argv: string[];
-      try {
-        argv = privilegedSandboxExecArgv(
-          sandboxName,
-          cmd,
-          input !== undefined,
-          true,
-          expectedContainerId,
-        );
-      } catch (error) {
-        return {
-          status: null,
-          signal: null,
-          stdout: "",
-          stderr: "",
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-      const result = dockerSpawnSync(argv, {
-        encoding: "utf-8",
-        input,
-        timeout: OPENCLAW_CONFIG_GUARD_TIMEOUT_MS,
-        maxBuffer: 2 * 1024 * 1024,
-      });
-      return {
-        status: result.status,
-        signal: result.signal,
-        stdout: String(result.stdout ?? ""),
-        stderr: String(result.stderr ?? ""),
-        ...(result.error ? { error: result.error.message } : {}),
-      };
-    },
-  };
+  return withPrivilegedSandboxExecutionLease(
+    sandboxName,
+    "sandbox config privileged execution",
+    () =>
+      capturePrivilegedSandboxCommand(sandboxName, cmd, {
+        ...(hasInput ? { input: opts.input } : {}),
+        sanitizeEnvironment: true,
+        timeout: opts.timeout ?? 30000,
+      }).toString("utf8"),
+  );
 }
 
 function resolveAgentConfig(sandboxName: string): AgentConfigTarget {
-  try {
-    const registry = require("../state/registry");
-    const entry = registry.getSandbox(sandboxName);
-    if (!entry || !entry.agent) return DEFAULT_AGENT_CONFIG;
-
-    const agentDefs = require("../agent/defs");
-    const agent = agentDefs.loadAgent(entry.agent);
-    const cfg = agent.configPaths;
-
-    const dir = cfg.dir;
-    const sensitiveFiles = [`${dir}/.config-hash`];
-    // Hermes stores credentials in .env alongside the config
-    if (entry.agent === "hermes") sensitiveFiles.push(`${dir}/.env`);
-
-    return {
-      agentName: entry.agent,
-      configPath: `${dir}/${cfg.configFile}`,
-      configDir: dir,
-      format: cfg.format || "json",
-      configFile: cfg.configFile,
-      sensitiveFiles,
-    };
-  } catch {
-    // Registry or agent-defs unavailable (e.g., during tests) — fall back
-    return DEFAULT_AGENT_CONFIG;
-  }
+  return resolveAgentConfigTarget(sandboxName);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,11 +391,13 @@ function classifyNewKeyGate(inputs: NewKeyGateInputs): NewKeyGate {
  * privileged docker exec path.
  */
 function composeSandboxConfigBody(config: ConfigObject, target: AgentConfigTarget): string {
-  const body = serializeConfig(config, target.format);
   if (target.agentName === "hermes" && target.format === "yaml") {
+    // Hermes/PyYAML reads YAML 1.1. Preserve strings such as tool_search's "on"
+    // when a credential-only restore writes a config sanitized as JSON.
+    const body = require("yaml").stringify(config, { compat: "yaml-1.1" });
     return `${buildHermesUpstreamHeader(config as Record<string, unknown>)}${body}`;
   }
-  return body;
+  return serializeConfig(config, target.format);
 }
 
 /**
@@ -460,17 +414,56 @@ function parseCliConfigValue(rawValue: string): ConfigValue {
 }
 
 /**
+ * True when an OpenShell `sandbox exec` failure detail reports the sandbox
+ * itself is not ready (for example, stopped), rather than an unrelated exec
+ * failure. Normalizes ANSI codes, the CLI's box-drawing error marker, and
+ * line-wrapping whitespace so a wrapped multi-line rendering of the same
+ * message still matches (#10251).
+ */
+function isSandboxNotReadyExecDetail(detail: string): boolean {
+  const normalized = stripAnsi(detail)
+    .replace(/[×│]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return (
+    /sandbox '[^']*' is not ready \(phase: \w+\)/i.test(normalized) ||
+    /^Error: code: 'The system is not in a state required for the operation's execution', message: "sandbox is not ready"$/i.test(
+      normalized,
+    )
+  );
+}
+
+/**
  * Read the agent's config from a running sandbox.
  * Resolves the correct config path based on the agent type.
  */
-function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): ConfigObject {
+function readSandboxConfig(
+  sandboxName: string,
+  target: AgentConfigTarget,
+  gateway?: string | OpenShellRuntimeSelection,
+): ConfigObject {
   const binary = getOpenshellBinary();
   let raw: string;
   try {
     const result = captureOpenshellCommand(
       binary,
-      ["sandbox", "exec", "--name", sandboxName, "--", "cat", target.configPath],
+      [
+        ...(gateway ? ["-g", typeof gateway === "string" ? gateway : gateway.gatewayName] : []),
+        "sandbox",
+        "exec",
+        "--name",
+        sandboxName,
+        "--",
+        "cat",
+        target.configPath,
+      ],
       {
+        ...(!gateway || typeof gateway === "string"
+          ? {}
+          : {
+              env: buildSelectedOpenShellSubprocessEnv(gateway),
+              replaceEnv: true,
+            }),
         ignoreError: true,
         includeStreams: true,
         maxBuffer: CONFIG_CAPTURE_MAX_BUFFER,
@@ -479,15 +472,30 @@ function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): Conf
       },
     );
     if (result.error || result.signal || result.status !== 0) {
-      const detail = result.error?.message || result.stderr?.trim() || result.output;
-      configFail(
-        `  Cannot read ${target.agentName} config (${target.configPath})${detail ? `: ${detail}` : "."}`,
-      );
+      // Diagnostic channels only. `result.output` is stdout-first, and stdout
+      // here is the agent config `cat` printed, so echoing it would put config
+      // contents — credentials included — into a CLI error.
+      const detail = result.error?.message || result.stderr?.trim();
+      // Preserve a failed exec's detail. `configFail` throws, so it must not be
+      // caught and replaced with the generic stopped-sandbox message below.
+      // Exception: a "sandbox is not ready" detail IS the stopped-sandbox case
+      // (#10251, a regression of #6997) — fall through to the generic message
+      // below instead, so the actionable "Is the sandbox running?" / "Start
+      // the sandbox and retry." guidance survives instead of a raw OpenShell
+      // error.
+      if (detail && !isSandboxNotReadyExecDetail(detail)) {
+        configFail(`  Cannot read ${target.agentName} config (${target.configPath}): ${detail}`);
+      }
+      raw = "";
+    } else {
+      // `output` is display-normalized with trim(); the transaction digest must
+      // bind the exact bytes returned by `cat`, including its final newline.
+      raw = result.stdout ?? result.output ?? "";
     }
-    // `output` is display-normalized with trim(); the transaction digest must
-    // bind the exact bytes returned by `cat`, including its final newline.
-    raw = result.stdout ?? result.output ?? "";
-  } catch {
+  } catch (error) {
+    // Only unexpected capture failures become empty reads. A diagnostic raised
+    // above already names the reason and must reach the caller (#9104).
+    if (error instanceof SandboxConfigError) throw error;
     raw = "";
   }
 
@@ -513,20 +521,31 @@ function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): Conf
   }
 }
 
-type ValidatedOpenClawCandidate = {
-  content: string;
-  privileged: import("../shields/state-dir-lock").PrivilegedExec;
-};
+function isHermesCompatHashRecoveryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /compat hash (does not match frozen Hermes inputs|verification failed)/iu.test(message);
+}
+
+function hermesCompatHashRecoveryError(sandboxName: string): SandboxConfigError {
+  return new SandboxConfigError([
+    "  Hermes integrity metadata is not ready for a configuration write.",
+    `  Run: nemoclaw ${shellQuote(sandboxName)} recover`,
+    "  The configuration write was not applied.",
+  ]);
+}
 
 function writeSandboxConfig(
   sandboxName: string,
   target: AgentConfigTarget,
   config: ConfigObject,
-  // Interactive config set supplies this after validating outside the mutation locks.
-  // Other callers retain the existing digest-bound write behavior.
-  validatedOpenClawCandidate?: ValidatedOpenClawCandidate,
+  options: { restoreNativeLocalCredential?: true } = {},
 ): void {
-  const content = validatedOpenClawCandidate?.content ?? composeSandboxConfigBody(config, target);
+  if (target.agentName === "openclaw") {
+    throw new Error(
+      "Refusing a whole-file OpenClaw config write; use OpenClaw's native config commands.",
+    );
+  }
+  const content = composeSandboxConfigBody(config, target);
   if (target.agentName === "hermes") {
     const expectedConfigSha256 = (config as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string })[
       CONFIG_SOURCE_SHA256
@@ -536,59 +555,38 @@ function writeSandboxConfig(
         "Refusing Hermes config write without the digest from the matching sandbox read.",
       );
     }
-    privilegedSandboxExec(
-      sandboxName,
-      [
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=5s",
-        "2m",
-        HERMES_PYTHON,
-        "-I",
-        HERMES_RUNTIME_CONFIG_GUARD,
-        "write-config",
-        "--hermes-dir",
-        target.configDir,
-        "--hash-file",
-        HERMES_STRICT_HASH_FILE,
-        "--state-file",
-        HERMES_RESTART_SEAL_STATE,
-        "--expected-config-sha256",
-        expectedConfigSha256,
-      ],
-      { input: content, timeout: HERMES_CONFIG_GUARD_TIMEOUT_MS },
-    );
-    return;
-  }
-  if (target.agentName === "openclaw") {
-    const expectedConfigSha256 = (config as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string })[
-      CONFIG_SOURCE_SHA256
-    ];
-    if (!expectedConfigSha256) {
-      throw new Error(
-        "Refusing OpenClaw config write without the digest from the matching sandbox read.",
+    try {
+      privilegedSandboxExec(
+        sandboxName,
+        [
+          "timeout",
+          "--signal=TERM",
+          "--kill-after=5s",
+          "2m",
+          HERMES_PYTHON,
+          "-I",
+          HERMES_RUNTIME_CONFIG_GUARD,
+          "write-config",
+          "--hermes-dir",
+          target.configDir,
+          "--hash-file",
+          HERMES_STRICT_HASH_FILE,
+          "--state-file",
+          HERMES_RESTART_SEAL_STATE,
+          "--expected-config-sha256",
+          expectedConfigSha256,
+          ...(options.restoreNativeLocalCredential ? ["--restore-native-local-credential"] : []),
+        ],
+        { input: content, timeout: HERMES_CONFIG_GUARD_TIMEOUT_MS },
       );
-    }
-    const result = runOpenClawConfigGuard(
-      validatedOpenClawCandidate?.privileged ?? openClawConfigGuardExec(sandboxName),
-      "write-config",
-      {
-        expectedConfigSha256,
-        input: content,
-      },
-    );
-    if (result.issues.length > 0) {
-      configFail(result.issues.map((issue) => `  ${issue}`));
-    }
-    const expectedNewDigest = createHash("sha256").update(content).digest("hex");
-    if (result.configSha256 !== expectedNewDigest) {
-      throw new Error(
-        `OpenClaw config guard committed digest ${String(result.configSha256)} (expected ${expectedNewDigest})`,
-      );
+    } catch (error) {
+      if (isHermesCompatHashRecoveryError(error)) {
+        throw hermesCompatHashRecoveryError(sandboxName);
+      }
+      throw error;
     }
     return;
   }
-
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-config-"));
   const tmpFile = path.join(tmpDir, target.configFile);
   try {
@@ -616,8 +614,7 @@ function writeSandboxConfig(
 
 function buildRecomputeSandboxConfigHashScript(target: AgentConfigTarget): string | null {
   // OpenClaw and Hermes write and refresh both hashes inside one fd-pinned sealed
-  // transaction. A second pathname-based hash pass would reopen the race that
-  // transaction is designed to close.
+  // transaction. A second pathname-based hash pass would reopen that race.
   if (target.agentName === "openclaw" || target.agentName === "hermes") return null;
   if (!target.sensitiveFiles?.includes(`${target.configDir}/.config-hash`)) return null;
   return [
@@ -634,165 +631,64 @@ function recomputeSandboxConfigHash(sandboxName: string, target: AgentConfigTarg
   privilegedSandboxExec(sandboxName, ["sh", "-c", script]);
 }
 
-// Absolute path to the Hermes dashboard config seeder inside the sandbox image
-// (installed by the agents/hermes image build). The python resolution order
-// mirrors start.sh's trusted `_HERMES_PYTHON` list.
-const HERMES_DASHBOARD_SEEDER_PATH = "/usr/local/lib/nemoclaw/seed-hermes-dashboard-config.py";
-const HERMES_TRUSTED_PYTHON3 = [
-  "/opt/hermes/.venv/bin/python3",
-  "/usr/local/bin/python3",
-  "/usr/bin/python3",
-] as const;
-const HERMES_DASHBOARD_PATH_ABSENT_STATUS = 3;
-// OpenShell rejects CR/LF in argv, so encode the multiline program inside a
-// single-line Python expression.
-const HERMES_DASHBOARD_PATH_INSPECTION = `exec(${JSON.stringify(
-  [
-    "import os",
-    "import stat",
-    "import sys",
-    "try:",
-    "    mode = os.lstat(sys.argv[1]).st_mode",
-    "except FileNotFoundError:",
-    `    raise SystemExit(${HERMES_DASHBOARD_PATH_ABSENT_STATUS})`,
-    "except OSError as exc:",
-    '    print(f"unable to inspect Hermes dashboard path: {exc}", file=sys.stderr)',
-    "    raise SystemExit(2)",
-    "raise SystemExit(0 if stat.S_ISDIR(mode) else 2)",
-  ].join("\n"),
-)})`;
-
-export type HermesDashboardReseedResult = "converged" | "absent" | "failed";
-
-export interface HermesDashboardReseedDeps {
-  getOpenshellBinary: () => string;
-  captureOpenshellCommand: (
-    binary: string,
-    args: string[],
-    options: import("../adapters/openshell/client").CaptureOpenshellOptions,
-  ) => import("../adapters/openshell/client").CaptureOpenshellResult;
-  reportFailure?: (stage: "python" | "inspection" | "seed", detail: string) => void;
-}
-
-const HERMES_DASHBOARD_RESEED_DIAGNOSTIC_MAX_CHARS = 800;
-
-function hermesDashboardReseedFailureDetail(
-  result: import("../adapters/openshell/client").CaptureOpenshellResult,
-): string {
-  const raw =
-    result.error?.message || result.stderr?.trim() || result.output.trim() || result.stdout?.trim();
-  const detail = redactFull(raw || "no command output")
-    .replace(/\s+/gu, " ")
-    .trim();
-  const bounded = detail.slice(0, HERMES_DASHBOARD_RESEED_DIAGNOSTIC_MAX_CHARS);
-  return [
-    `status=${result.status === null ? "null" : result.status}`,
-    result.signal ? `signal=${result.signal}` : "",
-    bounded ? `detail=${bounded}` : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
-/**
- * Re-run the Hermes dashboard config seeder inside the sandbox so the isolated
- * dashboard-home config (`<configDir>/dashboard-home/config.yaml`) re-mirrors the
- * gateway config's model routing after an in-place `inference set`. Sandbox
- * startup runs the same seeder; without re-running it, Dashboard Chat and its
- * `/api/model/info` endpoint stay on the previous model even though the gateway
- * config, registry, and CLI status all report the new one (#6893).
- *
- * Runs as the sandbox user (non-privileged `sandbox exec`, matching start.sh's
- * step-down before touching sandbox-owned dashboard-home state); the seeder does
- * no-follow atomic writes and refuses symlinked paths. Best-effort: returns
- * `failed` on failure so the caller can warn without aborting the route switch.
- */
-function seedHermesDashboardConfig(
+function setOpenClawConfigValue(
   sandboxName: string,
-  target: AgentConfigTarget,
-  deps: HermesDashboardReseedDeps = { getOpenshellBinary, captureOpenshellCommand },
-): HermesDashboardReseedResult {
-  const dashboardHome = `${target.configDir}/dashboard-home`;
-  const binary = deps.getOpenshellBinary();
-  const capture = (command: string[]) =>
-    deps.captureOpenshellCommand(
-      binary,
-      ["sandbox", "exec", "--name", sandboxName, "--", ...command],
-      {
-        ignoreError: true,
-        includeStreams: true,
-        maxBuffer: CONFIG_CAPTURE_MAX_BUFFER,
-        timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
-      },
-    );
-  const failed = (result: import("../adapters/openshell/client").CaptureOpenshellResult) =>
-    Boolean(result.error || result.signal || result.status !== 0);
-  const reportFailure = (
-    stage: "python" | "inspection" | "seed",
-    result: import("../adapters/openshell/client").CaptureOpenshellResult,
-  ) => {
-    const detail = hermesDashboardReseedFailureDetail(result);
-    if (deps.reportFailure) {
-      deps.reportFailure(stage, detail);
-      return;
-    }
-    console.error(`  Hermes dashboard reseed ${stage} failed: ${detail}`);
-  };
+  dotpath: string,
+  value: ConfigValue,
+  gateway?: string | OpenShellRuntimeSelection,
+): void {
+  validateName(sandboxName, "sandbox name");
+  const validation = validateConfigDotpath(dotpath);
+  if (!validation.ok)
+    throw new Error(`Invalid OpenClaw config key '${dotpath}': ${validation.reason}.`);
+  executeOpenClawNativeConfigSet(
+    getOpenshellBinary(),
+    CONFIG_CAPTURE_MAX_BUFFER,
+    sandboxName,
+    dotpath,
+    value,
+    gateway,
+  );
+}
 
-  let python: (typeof HERMES_TRUSTED_PYTHON3)[number] | null = null;
-  let lastPythonFailure: import("../adapters/openshell/client").CaptureOpenshellResult | undefined;
-  for (const candidate of HERMES_TRUSTED_PYTHON3) {
-    const probe = capture([candidate, "-c", ""]);
-    if (!failed(probe)) {
-      python = candidate;
-      break;
-    }
-    lastPythonFailure = probe;
+function setOpenClawConfigValues(
+  sandboxName: string,
+  updates: readonly OpenClawConfigUpdate[],
+  gateway?: string | OpenShellRuntimeSelection,
+): void {
+  validateName(sandboxName, "sandbox name");
+  if (updates.length === 0)
+    throw new Error("Native OpenClaw config update requires at least one value.");
+  for (const { dotpath } of updates) {
+    const validation = validateConfigDotpath(dotpath);
+    if (!validation.ok)
+      throw new Error(`Invalid OpenClaw config key '${dotpath}': ${validation.reason}.`);
   }
-  if (!python) {
-    if (lastPythonFailure) reportFailure("python", lastPythonFailure);
-    return "failed";
-  }
+  executeOpenClawNativeConfigBatch(
+    getOpenshellBinary(),
+    CONFIG_CAPTURE_MAX_BUFFER,
+    sandboxName,
+    updates,
+    gateway,
+  );
+}
 
-  // lstat distinguishes a genuinely absent profile from a file, a symlink
-  // (including a broken one), or an inspection error. Only the first case is a
-  // clean no-op; everything else fails closed so callers cannot report sync.
-  const inspection = capture([python, "-c", HERMES_DASHBOARD_PATH_INSPECTION, dashboardHome]);
-  if (
-    !inspection.error &&
-    !inspection.signal &&
-    inspection.status === HERMES_DASHBOARD_PATH_ABSENT_STATUS
-  ) {
-    return "absent";
-  }
-  if (failed(inspection)) {
-    reportFailure("inspection", inspection);
-    return "failed";
-  }
-
-  const dashboardConfigPath = `${dashboardHome}/config.yaml`;
-  const seed = capture([
-    python,
-    HERMES_DASHBOARD_SEEDER_PATH,
-    target.configPath,
-    dashboardConfigPath,
-    `${target.configDir}/.env`,
-    `${dashboardHome}/.env`,
-  ]);
-  if (failed(seed)) {
-    reportFailure("seed", seed);
-    return "failed";
-  }
-  const seededMarker = `[dashboard] seeded model routing into ${dashboardConfigPath}`;
-  if (
-    !String(seed.stderr ?? "")
-      .split(/\r?\n/u)
-      .includes(seededMarker)
-  ) {
-    reportFailure("seed", seed);
-    return "failed";
-  }
-  return "converged";
+function unsetOpenClawConfigValue(
+  sandboxName: string,
+  dotpath: string,
+  gateway?: string | OpenShellRuntimeSelection,
+): void {
+  const validation = validateConfigDotpath(dotpath);
+  if (!validation.ok)
+    throw new Error(`Invalid OpenClaw config key '${dotpath}': ${validation.reason}.`);
+  validateName(sandboxName, "sandbox name");
+  runOpenClawNativeConfigCommand(
+    getOpenshellBinary(),
+    CONFIG_CAPTURE_MAX_BUFFER,
+    sandboxName,
+    ["unset", dotpath],
+    gateway,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -836,25 +732,59 @@ function hostnameForDnsLookup(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
 }
 
-function validateUrlValue(value: string): void {
+function validateUrlValue(
+  value: string,
+  options: ConfigUrlValidationOptions = {},
+  pathSegments: readonly string[] = [],
+): void {
   const parsed = parseHttpUrl(value);
   if (!parsed) return;
+  if (options.allowPrivateUrls && isPrivateHostname(parsed.hostname)) return;
+  if (
+    (options.allowOpenShellBridge || options.allowOpenShellBridgePath?.(pathSegments)) &&
+    isAllowedOpenShellSandboxBridgeUrl(parsed)
+  ) {
+    return;
+  }
   assertPublicHost(parsed.hostname);
 }
 
 async function validateUrlValueWithDnsResult(
   value: string,
   lookup: LookupFn = dnsPromises.lookup as LookupFn,
+  options: ConfigUrlValidationOptions = {},
+  pathSegments: readonly string[] = [],
 ): Promise<DnsValidatedUrl | null> {
   const originalUrl = value.trim();
   const parsed = parseHttpUrl(originalUrl);
   if (!parsed) return null;
 
   const hostname = parsed.hostname;
+  if (options.allowPrivateUrls && isPrivateHostname(hostname)) {
+    return {
+      protocol: parsed.protocol as "http:" | "https:",
+      originalUrl,
+      pinnedUrl: originalUrl,
+    };
+  }
+  if (
+    (options.allowOpenShellBridge || options.allowOpenShellBridgePath?.(pathSegments)) &&
+    isAllowedOpenShellSandboxBridgeUrl(parsed)
+  ) {
+    return {
+      protocol: parsed.protocol as "http:" | "https:",
+      originalUrl,
+      pinnedUrl: originalUrl,
+    };
+  }
   assertPublicHost(hostname);
   const lookupHostname = hostnameForDnsLookup(hostname);
   if (isIP(lookupHostname)) {
-    return { protocol: parsed.protocol as "http:" | "https:", originalUrl, pinnedUrl: originalUrl };
+    return {
+      protocol: parsed.protocol as "http:" | "https:",
+      originalUrl,
+      pinnedUrl: originalUrl,
+    };
   }
 
   let addresses: Array<{ address: string; family?: number }>;
@@ -893,8 +823,9 @@ async function validateUrlValueWithDnsResult(
 async function validateUrlValueWithDns(
   value: string,
   lookup: LookupFn = dnsPromises.lookup as LookupFn,
+  options: ConfigUrlValidationOptions = {},
 ): Promise<void> {
-  await validateUrlValueWithDnsResult(value, lookup);
+  await validateUrlValueWithDnsResult(value, lookup, options);
 }
 
 function redactUrlForLogs(urlValue: string): string {
@@ -933,9 +864,42 @@ function formatConfigValueForLogs(value: ConfigValue | undefined): string {
   return JSON.stringify(redactConfigValueForPreview(value));
 }
 
+function hermesConfigAllowsPrivateUrls(config: ConfigObject): boolean {
+  const security = config.security;
+  return isConfigObject(security) && security.allow_private_urls === true;
+}
+
+function configSetAllowsOpenShellBridge(
+  agentName: string,
+  key: string,
+  relativePath: readonly string[] = [],
+): boolean {
+  const segments = [...key.split("."), ...relativePath];
+  if (segments.some((segment) => UNSAFE_KEY_SEGMENTS.has(segment))) return false;
+
+  if (agentName === "hermes") {
+    return segments.length === 2 && segments[0] === "model" && segments[1] === "base_url";
+  }
+
+  if (agentName === "openclaw") {
+    return (
+      segments.length === 4 &&
+      segments[0] === "models" &&
+      segments[1] === "providers" &&
+      segments[2].length > 0 &&
+      !/^\d+$/.test(segments[2]) &&
+      segments[3] === "baseUrl"
+    );
+  }
+
+  return false;
+}
+
 async function rewriteConfigUrlsWithDnsPinning(
   value: ConfigValue,
   lookup: LookupFn = dnsPromises.lookup as LookupFn,
+  options: ConfigUrlValidationOptions = {},
+  pathSegments: readonly string[] = [],
 ): Promise<ConfigValue> {
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -943,36 +907,49 @@ async function rewriteConfigUrlsWithDnsPinning(
     if (!lower.startsWith("http://") && !lower.startsWith("https://")) return value;
 
     try {
-      const validated = await validateUrlValueWithDnsResult(trimmed, lookup);
+      const validated = await validateUrlValueWithDnsResult(trimmed, lookup, options, pathSegments);
       if (!validated) return value;
       // HTTP has no TLS hostname binding, so persist the DNS-pinned URL to avoid
       // a config-time/public → runtime/private DNS-rebinding window. DNS-backed
       // HTTPS endpoints fail closed for generic persisted config because the
       // downstream consumer would otherwise perform a second DNS lookup while
       // NemoClaw cannot pin the peer IP and preserve TLS SNI/Host across the
-      // OpenShell runtime boundary.
+      // OpenShell runtime boundary. This validator handles arbitrary persisted
+      // config values, not just inference endpoints, so the message stays
+      // generic; callers that know the field is an inference endpoint add
+      // their own guidance by checking `reason` on the thrown error.
       if (validated.protocol === "https:" && validated.pinnedUrl !== validated.originalUrl) {
-        throw new Error(
-          "DNS-backed HTTPS URLs are not supported for persisted sandbox config yet. " +
-            "Use an HTTPS IP-literal endpoint, an HTTP endpoint that can be DNS-pinned, " +
-            "or wait for the runtime-aware HTTPS pinning transport.",
+        throw new ConfigUrlValidationError(
+          trimmed,
+          "DNS-backed HTTPS URLs are not supported for arbitrary persisted sandbox config " +
+            "values. Use an HTTPS IP-literal endpoint or an HTTP endpoint that can be " +
+            "DNS-pinned.",
+          "dns_backed_https_unsupported",
         );
       }
       return validated.protocol === "http:" ? validated.pinnedUrl : validated.originalUrl;
     } catch (err: unknown) {
+      if (err instanceof ConfigUrlValidationError) throw err;
       const message = err instanceof Error ? err.message : String(err);
       throw new ConfigUrlValidationError(trimmed, message);
     }
   }
 
   if (Array.isArray(value)) {
-    return Promise.all(value.map((entry) => rewriteConfigUrlsWithDnsPinning(entry, lookup)));
+    return Promise.all(
+      value.map((entry, index) =>
+        rewriteConfigUrlsWithDnsPinning(entry, lookup, options, [...pathSegments, String(index)]),
+      ),
+    );
   }
 
   if (isConfigObject(value)) {
     const rewritten: ConfigObject = {};
     for (const [key, entry] of Object.entries(value)) {
-      rewritten[key] = await rewriteConfigUrlsWithDnsPinning(entry, lookup);
+      rewritten[key] = await rewriteConfigUrlsWithDnsPinning(entry, lookup, options, [
+        ...pathSegments,
+        key,
+      ]);
     }
     return rewritten;
   }
@@ -1003,7 +980,10 @@ function parseConfigGetArgs(args: string[], cliName = "nemoclaw"): ConfigGetPars
     const flag = args[i];
     if (flag === "--key") {
       if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
-        return { ok: false, errors: ["  --key requires a value.", configGetUsage(cliName)] };
+        return {
+          ok: false,
+          errors: ["  --key requires a value.", configGetUsage(cliName)],
+        };
       }
       opts.key = args[++i];
     } else if (flag === "--format") {
@@ -1015,11 +995,17 @@ function parseConfigGetArgs(args: string[], cliName = "nemoclaw"): ConfigGetPars
       }
       const format = args[++i];
       if (format !== "json" && format !== "yaml") {
-        return { ok: false, errors: [`  Unknown format: ${format}. Use json or yaml.`] };
+        return {
+          ok: false,
+          errors: [`  Unknown format: ${format}. Use json or yaml.`],
+        };
       }
       opts.format = format;
     } else {
-      return { ok: false, errors: [`  Unknown flag: ${flag}`, configGetUsage(cliName)] };
+      return {
+        ok: false,
+        errors: [`  Unknown flag: ${flag}`, configGetUsage(cliName)],
+      };
     }
   }
   return { ok: true, opts };
@@ -1075,6 +1061,7 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
       "  Usage: nemoclaw <name> config set --key <dotpath> --value <value>",
     ]);
   }
+  const configKey = opts.key;
 
   if (opts.value === undefined || opts.value === null) {
     configFail([
@@ -1089,30 +1076,13 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
   }
 
   const target = resolveAgentConfig(sandboxName);
-  if (opts.restart && target.agentName !== "openclaw" && target.agentName !== "hermes") {
-    configFail(
-      `  --restart is supported only for OpenClaw and Hermes; '${target.agentName}' config was not changed.`,
-    );
-  }
-  // dcode bakes its config into the sandbox image at build time, so — unlike
-  // OpenClaw/Hermes — it has no host-side config-mutation path (the same reason
-  // inference set refuses it, #6321). config get now reads TOML, but refuse
-  // config set cleanly and point at the only way to change it: re-onboard. #6548
-  if (target.format === "toml") {
-    const { CLI_NAME } = require("../cli/branding");
-    configFail(
-      `  config set is not available for '${target.agentName}': its config is baked into the sandbox image at build time. To change it, re-onboard with the new selection (e.g. ${CLI_NAME} onboard --agent dcode --name ${shellQuote(sandboxName)} --fresh).`,
-    );
-  }
-  if (target.agentName === "openclaw" || target.agentName === "hermes") {
-    const { isShieldsDown }: typeof import("../shields") = require("../shields");
-    if (!isShieldsDown(sandboxName, false)) {
-      configFail(
-        `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
-      );
-    }
-  }
-
+  const unsupportedAgent = configSetUnsupportedAgentMessage(
+    target,
+    sandboxName,
+    configKey,
+    shellQuote,
+  );
+  if (unsupportedAgent) configFail(unsupportedAgent);
   // Read current config
   console.log(`  Reading ${target.agentName} config...`);
   const config = readSandboxConfig(sandboxName, target);
@@ -1168,8 +1138,28 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
       ]);
     }
     if (gate.mode === "prompt") {
-      const confirmed = await confirmYesNo("  Write this new key? [y/N] ");
+      let confirmed: boolean;
+      try {
+        confirmed = await confirmYesNo("  Write this new key? [y/N] ");
+      } catch (error) {
+        // The shared prompt re-raises SIGINT; only EOF needs config-specific remediation here.
+        if (isErrnoException(error) && error.code === "EOF") {
+          configFail([
+            "  No input available on stdin, so config set cannot confirm the new key.",
+            "  Re-run with --config-accept-new-path or set NEMOCLAW_CONFIG_ACCEPT_NEW_PATH=1.",
+          ]);
+        }
+        throw error;
+      }
       if (!confirmed) {
+        if (isTelemetryConfigurationKey(configKey)) {
+          recordTelemetryTarget({
+            scope: "configuration",
+            sandboxName,
+            outcome: "cancelled",
+            state: "unchanged",
+          });
+        }
         configFail("  Aborted.");
       }
     }
@@ -1180,7 +1170,11 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
   // hostname to private/internal space after config-time validation succeeds.
   let safeValue: ConfigValue;
   try {
-    safeValue = await rewriteConfigUrlsWithDnsPinning(parsedValue);
+    safeValue = await rewriteConfigUrlsWithDnsPinning(parsedValue, dnsPromises.lookup as LookupFn, {
+      allowPrivateUrls: target.agentName === "hermes" && hermesConfigAllowsPrivateUrls(config),
+      allowOpenShellBridgePath: (relativePath) =>
+        configSetAllowsOpenShellBridge(target.agentName, configKey, relativePath),
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     const suffix =
@@ -1188,81 +1182,94 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
     configFail(`  URL validation failed${suffix}: ${message}`);
   }
 
-  // Validation can take up to 30 seconds, so keep it outside both mutation locks.
-  let validatedOpenClawCandidate: ValidatedOpenClawCandidate | undefined;
-  if (target.agentName === "openclaw") {
-    setDotpath(config, opts.key, safeValue);
-    const content = composeSandboxConfigBody(config, target);
-    try {
-      const containerId = resolveDirectSandboxContainer(sandboxName, null);
-      const privileged = openClawConfigGuardExec(sandboxName, containerId);
-      const issues = validateOpenClawConfigCandidate(privileged, content);
-      if (issues.length > 0) configFail(issues.map((issue) => `  ${issue}`));
-      validatedOpenClawCandidate = { content, privileged };
-    } catch (error) {
-      if (error instanceof SandboxConfigError) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      configFail(`  OpenClaw schema validation could not start: ${message}`);
+  let telemetryPersistenceVerified = true;
+  const telemetryMetadataErrors: import("../domain/telemetry/event").TelemetryMetadataError[] = [];
+  // Re-read under the sandbox mutation lock and enforce the source digest.
+  await withSandboxMutationLock(sandboxName, () => {
+    const currentConfig = readSandboxConfig(sandboxName, target);
+    const currentConfigSha256 = (
+      currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
+    )[CONFIG_SOURCE_SHA256];
+    if (currentConfigSha256 !== initialConfigSha256) {
+      configFail(
+        `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
+      );
     }
-  }
+    setDotpath(currentConfig, opts.key!, safeValue);
 
-  // Re-read under both mutation locks and enforce the source digest. For
-  // OpenClaw, also require the exact serialized bytes validated above.
-  await withSandboxMutationLock(sandboxName, () =>
-    withTimerBoundShieldsMutationLock(sandboxName, "config set write", () => {
-      const { isShieldsDown }: typeof import("../shields") = require("../shields");
-      if (
-        (target.agentName === "openclaw" || target.agentName === "hermes") &&
-        !isShieldsDown(sandboxName, true)
-      ) {
-        configFail(
-          `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
-        );
-      }
-      const currentConfig = readSandboxConfig(sandboxName, target);
-      const currentConfigSha256 = (
-        currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
-      )[CONFIG_SOURCE_SHA256];
-      if (currentConfigSha256 !== initialConfigSha256) {
-        configFail(
-          `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
-        );
-      }
-      setDotpath(currentConfig, opts.key!, safeValue);
-
-      if (target.agentName === "openclaw") {
-        const currentCandidateContent = composeSandboxConfigBody(currentConfig, target);
-        if (
-          !validatedOpenClawCandidate ||
-          currentCandidateContent !== validatedOpenClawCandidate.content
-        ) {
-          configFail(
-            "  OpenClaw config candidate changed after schema validation. Re-run config set against the current value.",
-          );
-        }
-      }
-
-      console.log(`  Writing config to sandbox (${target.configPath})...`);
-      writeSandboxConfig(sandboxName, target, currentConfig, validatedOpenClawCandidate);
-      recomputeSandboxConfigHash(sandboxName, target);
-
-      appendAuditEntry({
-        action: "config_set",
-        sandbox: sandboxName,
-        timestamp: new Date().toISOString(),
-        reason: `config set ${target.agentName}:${opts.key}`,
+    console.log(`  Writing config to sandbox (${target.configPath})...`);
+    writeSandboxConfig(sandboxName, target, currentConfig);
+    telemetryPersistenceVerified = persistConfigurationTelemetry(
+      sandboxName,
+      configKey,
+      currentConfig,
+      Object.is(oldValue, safeValue) && !opts.restart ? undefined : true,
+      !Object.is(oldValue, safeValue),
+    );
+    if (!telemetryPersistenceVerified) {
+      telemetryMetadataErrors.push({ category: "native_model_source" });
+      if (!Object.is(oldValue, safeValue) || opts.restart)
+        telemetryMetadataErrors.push({ category: "configuration_apply_state" });
+    }
+    if (isTelemetryConfigurationKey(configKey)) {
+      recordTelemetryTarget({
+        scope: "configuration",
+        sandboxName,
+        outcome: Object.is(oldValue, safeValue) && !opts.restart ? "no_change" : "completed",
+        state: Object.is(oldValue, safeValue) && !opts.restart ? "unchanged" : "pending",
+        ...(!telemetryPersistenceVerified
+          ? {
+              verificationStatus: "collection_error" as const,
+              metadataErrors: telemetryMetadataErrors,
+            }
+          : {}),
       });
-    }),
-  );
+    }
+    appendAuditEntry({
+      action: "config_set",
+      sandbox: sandboxName,
+      timestamp: new Date().toISOString(),
+      reason: `config set ${target.agentName}:${opts.key}`,
+    });
+  });
 
   console.log(`  ${target.agentName} config updated.`);
 
   // Restart if requested
   if (opts.restart) {
-    restartSandboxAgentAfterConfigSet(sandboxName, target.agentName);
+    try {
+      await restartSandboxAgentAfterConfigSet(sandboxName, target.agentName);
+    } catch (error) {
+      if (isTelemetryConfigurationKey(configKey)) {
+        recordTelemetryTarget({
+          scope: "configuration",
+          sandboxName,
+          outcome: "failed",
+          state: "partial",
+        });
+      }
+      throw error;
+    }
+    const pendingStateSaved = persistConfigurationTelemetry(sandboxName, configKey, null, false);
+    if (!pendingStateSaved) telemetryMetadataErrors.push({ category: "configuration_apply_state" });
+    telemetryPersistenceVerified = pendingStateSaved && telemetryPersistenceVerified;
+    if (isTelemetryConfigurationKey(configKey)) {
+      recordTelemetryTarget({
+        scope: "configuration",
+        sandboxName,
+        outcome: "completed",
+        state: "applied",
+        ...(!telemetryPersistenceVerified
+          ? {
+              verificationStatus: "collection_error" as const,
+              metadataErrors: telemetryMetadataErrors,
+            }
+          : {}),
+      });
+    }
   } else {
     console.log("");
-    for (const line of buildConfigSetRestartGuidance(sandboxName, target.agentName)) {
+    for (const line of buildConfigSetRestartGuidance(sandboxName)) {
       console.log(line);
     }
   }
@@ -1272,137 +1279,22 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
 // config rotate-token
 // ---------------------------------------------------------------------------
 
-interface RotateTokenOpts {
-  fromEnv?: string | null;
-  fromStdin?: boolean;
-}
+type RotateTokenOpts = import("./config-rotate-token").RotateTokenOpts;
 
 async function configRotateToken(sandboxName: string, opts: RotateTokenOpts = {}): Promise<void> {
-  validateName(sandboxName, "sandbox name");
-
-  // 1. Determine which provider and credentialEnv the sandbox uses.
-  //    Load the onboard session and verify it matches this sandbox.
-  const { loadSession } = require("../state/onboard-session");
-  const session = loadSession();
-
-  if (!session || !session.credentialEnv) {
-    configFail([
-      `  Cannot determine credential for sandbox '${sandboxName}'.`,
-      "  No onboard session found with a credentialEnv.",
-      "  Re-run: nemoclaw onboard --recreate-sandbox",
-    ]);
-  }
-
-  if (session.sandboxName && session.sandboxName !== sandboxName) {
-    configFail(`  Onboard session is for sandbox '${session.sandboxName}', not '${sandboxName}'.`);
-  }
-
-  const target = resolveAgentConfig(sandboxName);
-  const credentialEnv: string = session.credentialEnv;
-  const providerName: string = session.provider || "inference";
-
-  console.log(`  Agent:          ${target.agentName}`);
-  console.log(`  Provider:       ${providerName}`);
-  console.log(`  Credential env: ${credentialEnv}`);
-
-  // 2. Read new token
-  let newToken: string | null = null;
-
-  if (opts.fromEnv) {
-    newToken = process.env[opts.fromEnv] || null;
-    if (!newToken) {
-      configFail(`  Environment variable "${opts.fromEnv}" is not set or empty.`);
-    }
-  } else if (opts.fromStdin) {
-    newToken = await readStdin();
-  } else {
-    const { promptSecret } = require("../credentials/store");
-    newToken = await promptSecret(`  New ${credentialEnv} value: `);
-  }
-
-  if (!newToken || !newToken.trim()) {
-    configFail("  Token cannot be empty.");
-  }
-
-  newToken = newToken.trim();
-
-  // 3. Validate — no whitespace in token
-  if (/\s/.test(newToken)) {
-    configFail("  Token contains whitespace. This is likely a paste error.");
-  }
-
-  // 4. Stage the new value in the current process so the openshell update
-  //    that follows can read it via --credential <ENV>. The OpenShell
-  //    gateway becomes the system of record once the update succeeds.
-  const { saveCredential } = require("../credentials/store");
-  saveCredential(credentialEnv, newToken);
-
-  // 5. Update the openshell provider
-  console.log("  Updating openshell provider...");
-  const binary = getOpenshellBinary();
-  const result = runOpenshellCommand(
-    binary,
-    ["provider", "update", providerName, "--credential", credentialEnv],
-    {
-      env: { [credentialEnv]: newToken },
-      ignoreError: true,
-      errorLine: console.error,
-      exit: (code: number) => process.exit(code),
-    },
-  );
-
-  if (result.status !== 0) {
-    const providerType = session.providerType || "generic";
-    const createResult = runOpenshellCommand(
-      binary,
-      [
-        "provider",
-        "create",
-        "--name",
-        providerName,
-        "--type",
-        providerType,
-        "--credential",
-        credentialEnv,
-      ],
-      {
-        env: { [credentialEnv]: newToken },
-        ignoreError: true,
-        errorLine: console.error,
-        exit: (code: number) => process.exit(code),
-      },
-    );
-
-    if (createResult.status !== 0) {
-      configFail("  Failed to update provider. You may need to re-onboard.");
-    }
-  }
-
-  // 6. Audit log
-  appendAuditEntry({
-    action: "rotate_token",
-    sandbox: sandboxName,
-    timestamp: new Date().toISOString(),
-    reason: `rotate-token ${target.agentName}:${credentialEnv}`,
-  });
-
-  // 7. Output (redacted)
-  const lastFour = newToken.length > 4 ? newToken.slice(-4) : "****";
-  console.log(`  Token rotated: ****${lastFour}`);
-  console.log("");
-  console.log("  The new credential is active immediately for new sandbox requests.");
-}
-
-/**
- * Read all data from stdin until EOF.
- */
-function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
-    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8").trim()));
-    process.stdin.on("error", reject);
-    process.stdin.resume();
+  const { promptSecret, saveCredential } =
+    require("../credentials/store") as typeof import("../credentials/store");
+  return rotateSandboxToken(sandboxName, opts, {
+    appendAuditEntry,
+    captureOpenshellCommand,
+    fail: configFail,
+    loadSandbox: loadSandboxCredentialRoute,
+    loadSession: loadRotateTokenSession,
+    promptSecret,
+    resolveAgentConfig,
+    runOpenshellCommand,
+    saveCredential,
+    validateName,
   });
 }
 
@@ -1410,21 +1302,10 @@ function readStdin(): Promise<string> {
  * Ask a yes/no question on stderr. Returns true only when the answer matches
  * /^y(es)?$/i — empty, "no", or unparseable input is treated as no.
  */
-function confirmYesNo(prompt: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    // Re-attach stdin to the event loop — unref() on exit is sticky and
-    // would otherwise leave a follow-up prompt waiting on a detached handle.
-    if (typeof process.stdin.ref === "function") process.stdin.ref();
-    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-    rl.question(prompt, (answer: string) => {
-      rl.close();
-      // pause+unref so the process exits naturally after the last prompt.
-      // The matching ref() above keeps subsequent prompts working.
-      if (typeof process.stdin.pause === "function") process.stdin.pause();
-      if (typeof process.stdin.unref === "function") process.stdin.unref();
-      resolve(/^y(es)?$/i.test(answer.trim()));
-    });
-  });
+function confirmYesNo(question: string): Promise<boolean> {
+  const { prompt: askPrompt } =
+    require("../credentials/store") as typeof import("../credentials/store");
+  return askPrompt(question).then((answer) => /^y(es)?$/i.test(answer));
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,27 +1314,34 @@ function confirmYesNo(prompt: string): Promise<boolean> {
 
 export {
   buildConfigSetRestartGuidance,
-  buildRecomputeSandboxConfigHashScript,
+  buildOpenClawNativeConfigBatchInvocation,
+  buildOpenClawNativeConfigSetInvocation,
   classifyNewKeyGate,
   composeSandboxConfigBody,
   configGet,
   configRotateToken,
   configSet,
+  configSetAllowsOpenShellBridge,
+  hermesConfigAllowsPrivateUrls,
+  hermesCompatHashRecoveryError,
+  isHermesCompatHashRecoveryError,
   DEFAULT_AGENT_CONFIG,
   extractDotpath,
   findClobberingAncestor,
   formatConfigValueForLogs,
   parseConfig,
   parseConfigGetArgs,
-  privilegedSandboxExecArgv,
   readSandboxConfig,
   readStdin,
   recomputeSandboxConfigHash,
   resolveAgentConfig,
   restartSandboxAgentAfterConfigSet,
   rewriteConfigUrlsWithDnsPinning,
-  seedHermesDashboardConfig,
+  runOpenClawNativeConfigBatchUntilHandleReady,
+  setOpenClawConfigValue,
+  setOpenClawConfigValues,
   setDotpath,
+  unsetOpenClawConfigValue,
   validateConfigDotpath,
   validateUrlValue,
   validateUrlValueWithDns,

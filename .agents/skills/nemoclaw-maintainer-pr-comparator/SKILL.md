@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-maintainer-pr-comparator
-description: Compare open PRs that address the same issue and recommend one to merge. Apply eligibility, correctness, quality, and tie-break checks. Report the score and evidence. Use when an issue has two or more open PRs.
+description: "Compare competing NemoClaw PRs for one issue and recommend a merge or salvage candidate from review evidence."
 user_invocable: true
 ---
 
@@ -20,24 +20,16 @@ Tier 3 resolves ties. If no PR passes Tier 0, rank eligible PRs for salvage.
 ## Repo policy
 
 The defaults use NemoClaw conventions for CODEOWNERS, DCO, CodeRabbit, and `docs/`.
+Read the canonical superseded-PR attribution policy in
+`../nemoclaw-maintainer-policies/references/workflow-policy.md`.
 Edit `repo-policy.md` for another repository.
 
+Execute comparator helpers from a fetched canonical NVIDIA/NemoClaw `main` checkout, or verify
+their executable code and dependencies against that revision before use. Candidate-modified helpers
+must not receive GitHub credentials. Inspect helper source when needed; a section heading does not
+establish trust.
+
 ## Workflow
-
-Copy this checklist into your response and check off each step:
-
-```text
-PR Comparison Progress:
-- [ ] Step 1: Parse issue (body + comments) for acceptance criteria
-- [ ] Step 2: Discover candidate PRs in the defined order
-- [ ] Step 3: Detect supersession (parse PR bodies)
-- [ ] Step 4: Run Tier 0 gates per PR
-- [ ] Step 5: Run Tier 1 correctness checks per PR
-- [ ] Step 6: Run Tier 2 quality checks per PR
-- [ ] Step 7: Compute weighted scores
-- [ ] Step 8: Apply Tier 3 ranking (happy path or degraded mode)
-- [ ] Step 9: Emit verdict using templates/verdict.md
-```
 
 ### Step 1: Parse issue
 
@@ -57,24 +49,47 @@ scripts/find-candidates.sh <issue-number>
 
 Applies a single default order with stop conditions.
 
-### Step 3: Detect supersession
+### Step 3: Detect supersession and transferred work
 
 ```bash
 scripts/parse-supersession.sh <pr-number-1> <pr-number-2> ...
 ```
 
-Parse these statements from each PR body: `supersedes #N`, `replaces #N`, `closes in favor of #N`, and `folds in #N`.
-Use supersession as the first tiebreaker.
+Parse the case-insensitive statement families implemented by `scripts/parse-supersession.sh`:
+
+- `supersed[a-z]*` before `#N`: `supersedes #N` points from the current PR to `#N`; `superseded by #N` points from `#N` to the current PR.
+- `replac[a-z]*` before `#N`: `replaces #N` points from the current PR to `#N`; `replaced by #N` points from `#N` to the current PR.
+- `clos[a-z]* in favor of` before `#N`: `closes in favor of #N` and `closed in favor of #N` point from `#N` to the current PR.
+- `fold[a-z]* in` before `#N`: `folds in #N` points from the current PR to `#N`; `folded into #N` points from `#N` to the current PR.
+
+The bracket expressions describe the parser grammar; they are not literal PR body text.
+A `follow-up to #N` statement is a related-PR signal, not a supersession declaration, unless one of these phrases also appears.
+These statements record a relationship.
+They do not rank a candidate or prove that its diff contains another contributor's work.
+
+For each declared or suspected replacement, compare the commits and diffs and classify the relationship:
+
+- `independent`: The PR implements the issue without carrying material code, tests, or documentation from another contributor.
+- `transferred`: The PR carries material work from another contributor.
+- `unclear`: The available evidence does not establish whether another contributor's work remains.
+
+For `transferred`, apply the canonical superseded-PR attribution policy before setting a winner or recommending that the source PR be closed.
+For `unclear`, leave `winner` null and request maintainer judgment.
 
 ### Step 4: Tier 0 gates
 
 ```bash
 scripts/collect-gates.sh <pr-number>
 scripts/check-coderabbit-threads.sh <pr-number>
-node --experimental-strip-types --no-warnings ../nemoclaw-maintainer-day/scripts/check-gates.ts <pr-number>
+git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+bash <(git show origin/main:.agents/skills/nemoclaw-maintainer-day/scripts/run-trusted-check-gates.sh) <pr-number>
 ```
 
 All six gates are required.
+Gate 3 accepts `BEHIND`, but fails closed on transient `UNSTABLE` evidence and on `BLOCKED` because
+the comparator cannot prove a stable merge result or every GitHub branch-protection condition.
+Separately confirm whether an active rule requires an up-to-date branch. If so, integrate the base
+and rerun all candidate evidence before declaring the PR eligible to merge.
 Treat PR Review Advisor output as input for maintainer review. Do not treat it as merge authorization.
 See `checks/tier-0-gates.md`.
 
@@ -102,6 +117,7 @@ Apply the four model checks in `checks/tier-2-quality.md`.
 Compute the mode from the Tier 0 results. Do not accept a mode from the caller.
 In happy mode, set `winner` only to an eligible PR and set `closest_to_ready` to null.
 Leave `winner` null when the evidence does not support a merge recommendation.
+Do not set `winner` for a replacement with transferred work until the required attribution is present and verified.
 In degraded mode, set `winner` to null.
 Set `closest_to_ready` only to an open PR that passes contributor requirements.
 See `tiebreakers.md`.
@@ -124,7 +140,7 @@ For each judgment, include evidence, the inference, and the score.
 - [templates/verdict.md](templates/verdict.md) — Output template.
 - [validation/backtest.md](validation/backtest.md) — Historical test cases for the skill.
 
-## Scripts (execute, do not read)
+## Scripts
 
 - `scripts/find-candidates.sh` — PR discovery
 - `scripts/collect-gates.sh` — Tier 0 gate evaluation

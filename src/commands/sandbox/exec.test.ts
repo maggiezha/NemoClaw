@@ -9,6 +9,7 @@ vi.mock("../../lib/actions/sandbox/exec", () => ({
 }));
 
 import { log } from "../../lib/cli/logger";
+import * as portableAgentLifecycle from "../../lib/onboard/experimental/portable-agent-lifecycle";
 import SandboxExecCommand from "./exec";
 
 const rootDir = process.cwd();
@@ -30,8 +31,22 @@ describe("SandboxExecCommand oclif parse path", () => {
     expect(execSandboxMock).toHaveBeenCalledWith(
       "alpha",
       ["openclaw", "agent", "--agent", "main", "-m", "hi"],
-      { workdir: undefined, tty: null, timeoutSeconds: undefined, stdin: undefined },
+      { workdir: undefined, tty: false, timeoutSeconds: undefined, stdin: undefined },
     );
+  });
+
+  it("rejects schema-5 inside the user-facing exec lifecycle fence (#9203)", async () => {
+    vi.spyOn(portableAgentLifecycle, "assertHermesPortableCommandUnavailable").mockImplementation(
+      () => {
+        throw new Error("schema-5 rejected");
+      },
+    );
+
+    await expect(SandboxExecCommand.run(["alpha", "--", "true"], rootDir)).rejects.toThrow(
+      "schema-5 rejected",
+    );
+
+    expect(execSandboxMock).not.toHaveBeenCalled();
   });
 
   it("does not assign host meaning to logging flags after --", async () => {
@@ -41,7 +56,7 @@ describe("SandboxExecCommand oclif parse path", () => {
 
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["agent-cli", "--debug", "--quiet"], {
       workdir: undefined,
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
     });
     expect(configure).toHaveBeenCalledWith({ debug: false, quiet: false });
@@ -95,7 +110,7 @@ describe("SandboxExecCommand oclif parse path", () => {
         "-c",
         "pass",
       ],
-      { workdir: undefined, tty: null, timeoutSeconds: undefined, stdin: undefined },
+      { workdir: undefined, tty: false, timeoutSeconds: undefined, stdin: undefined },
     );
   });
 
@@ -106,7 +121,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     );
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["ls", "-la"], {
       workdir: "/sandbox/workspace",
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
       stdin: undefined,
     });
@@ -119,7 +134,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     await SandboxExecCommand.run(["alpha", "--", "bash", "-lc", heredoc], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["bash", "-lc", heredoc], {
       workdir: undefined,
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
       stdin: undefined,
     });
@@ -130,7 +145,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     expect(execSandboxMock).toHaveBeenCalledWith(
       "alpha",
       ["bash", "-lc", "echo line1; echo line2"],
-      { workdir: undefined, tty: null, timeoutSeconds: undefined, stdin: undefined },
+      { workdir: undefined, tty: false, timeoutSeconds: undefined, stdin: undefined },
     );
   });
 
@@ -142,7 +157,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     expect(execSandboxMock).toHaveBeenCalledWith(
       "alpha",
       ["bash", "-lc", "echo line1; echo line2"],
-      { workdir: "/sandbox", tty: null, timeoutSeconds: undefined, stdin: undefined },
+      { workdir: "/sandbox", tty: false, timeoutSeconds: undefined, stdin: undefined },
     );
   });
 
@@ -165,11 +180,21 @@ describe("SandboxExecCommand oclif parse path", () => {
     });
   });
 
+  it("runs without a pseudo-terminal when no tty flag is present (#10753)", async () => {
+    await SandboxExecCommand.run(["alpha", "--", "dpkg", "-l", "perl-base"], rootDir);
+    expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["dpkg", "-l", "perl-base"], {
+      workdir: undefined,
+      tty: false,
+      timeoutSeconds: undefined,
+      stdin: undefined,
+    });
+  });
+
   it("parses --stdin as explicit stdin forwarding", async () => {
     await SandboxExecCommand.run(["alpha", "--stdin", "--", "cat"], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["cat"], {
       workdir: undefined,
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
       stdin: true,
     });
@@ -179,7 +204,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     await SandboxExecCommand.run(["alpha", "--no-stdin", "--", "pwd"], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["pwd"], {
       workdir: undefined,
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
       stdin: false,
     });
@@ -189,7 +214,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     await SandboxExecCommand.run(["alpha", "--", "bash"], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["bash"], {
       workdir: undefined,
-      tty: null,
+      tty: false,
       timeoutSeconds: undefined,
       stdin: undefined,
     });

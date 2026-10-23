@@ -17,14 +17,17 @@ import type { ConflictRegistry, ConflictRegistryEntry } from "../messaging/appli
 import {
   createMessagingPreEnableHookInputs,
   findChannelConflictsFromPlan,
+  getActiveChannelIdsFromPlan,
   MessagingSetupApplier,
 } from "../messaging/applier";
+import { createBuiltInChannelManifestRegistry } from "../messaging/channels/built-ins";
 import {
-  createBuiltInMessagingHookRegistry,
   isMessagingHookConflictError,
   runMessagingHook,
+  type MessagingHookRegistry,
 } from "../messaging/hooks";
-import type { SandboxMessagingPlan } from "../messaging/manifest";
+import type { MessagingChannelId, SandboxMessagingPlan } from "../messaging/manifest";
+import { createMessagingHostForwardPreEnableHookRegistry } from "./messaging-host-forward";
 
 export interface MessagingConflictGuardDeps {
   readonly sandboxName: string;
@@ -49,6 +52,7 @@ export interface MessagingConflictGuardDeps {
   readonly cliName: () => string;
   readonly log: (message: string) => void;
   readonly error: (message: string) => void;
+  readonly preEnableHookRegistry?: MessagingHookRegistry;
   /** Abort the onboard. Defaults to `process.exit`; injectable for tests. */
   readonly exit?: (code: number) => never;
 }
@@ -57,10 +61,39 @@ function abort(deps: MessagingConflictGuardDeps): never {
   return (deps.exit ?? ((code: number) => process.exit(code)))(1);
 }
 
+function abortIncompleteConflictCheck(
+  deps: MessagingConflictGuardDeps,
+  check: string,
+  error: unknown,
+): never {
+  const message = error instanceof Error ? error.message : String(error);
+  deps.error(`  Could not verify ${check}: ${message}`);
+  deps.error(
+    "  Aborting: restore messaging registry access and rerun. Onboarding and rebuild do not support a conflict override.",
+  );
+  return abort(deps);
+}
+
+function findChannelsWithIncompleteCredentialHashes(plan: SandboxMessagingPlan): string[] {
+  const activeChannelIds = new Set(getActiveChannelIdsFromPlan(plan));
+  const manifestRegistry = createBuiltInChannelManifestRegistry();
+
+  return [...activeChannelIds].filter((channelId) => {
+    const manifest = manifestRegistry.get(channelId as MessagingChannelId);
+    return manifest?.credentials.some((credential) => {
+      const binding = plan.credentialBindings.find(
+        (entry) =>
+          entry.channelId === channelId && entry.providerEnvKey === credential.providerEnvKey,
+      );
+      return !binding?.credentialHash;
+    });
+  });
+}
+
 /**
- * Run both conflict axes and warn/abort/prompt as appropriate. Returns when it
- * is safe (or the operator chose) to proceed; calls the injected `exit` (and
- * never returns) when the operator aborts or non-interactive mode blocks.
+ * Run both conflict axes and abort when a hard conflict is found. Calls the
+ * injected `exit` and never returns when a credential conflict or an
+ * abort-on-failure hook conflict is found.
  */
 export async function enforceMessagingChannelConflicts(
   deps: MessagingConflictGuardDeps,
@@ -83,32 +116,39 @@ export async function enforceMessagingChannelConflicts(
       }
     : null;
 
-  // Axis 1: credential-scoped conflict (#1953). Only runs when the plan carries
-  // an available credential hash to compare.
-  const hasPlanCredentials =
-    currentPlan?.credentialBindings.some((b) => b.credentialAvailable) ?? false;
-  if (currentPlan && hasPlanCredentials) {
-    const conflicts = findChannelConflictsFromPlan(sandboxName, currentPlan, registry);
+  // Axis 1: credential-scoped conflict (#1953). Every active credential-bearing
+  // channel must carry complete hashes so onboarding and rebuild fail closed.
+  if (currentPlan) {
+    const incompleteChannels = findChannelsWithIncompleteCredentialHashes(currentPlan);
+    if (incompleteChannels.length > 0) {
+      deps.error(
+        `  Could not verify messaging channel conflicts: credential hashes are unavailable for ${incompleteChannels.join(", ")}`,
+      );
+      deps.error(
+        "  Aborting: provide the intended channel credentials and rerun. Onboarding and rebuild do not support a conflict override.",
+      );
+      abort(deps);
+    }
+
+    let conflicts: ReturnType<typeof findChannelConflictsFromPlan>;
+    try {
+      conflicts = findChannelConflictsFromPlan(sandboxName, currentPlan, registry);
+    } catch (error) {
+      abortIncompleteConflictCheck(deps, "messaging channel conflicts", error);
+    }
     if (conflicts.length > 0) {
       for (const { channel, sandbox, reason } of conflicts) {
         const detail =
           reason === "matching-token"
             ? `uses the same ${channel} credential`
             : `already has ${channel} enabled, but its credential hash is unavailable`;
-        deps.log(
-          `  ⚠ Sandbox '${sandbox}' ${detail}. Shared channel credentials only allow one sandbox to poll/connect — continuing may break both bridges.`,
-        );
+        const message = `Sandbox '${sandbox}' ${detail}. Shared channel credentials only allow one sandbox to poll/connect.`;
+        deps.error(`  Conflict: ${message}`);
       }
-      if (deps.isNonInteractive()) {
-        deps.error(
-          `  Aborting: resolve the messaging channel conflict above or run \`${deps.cliName()} <sandbox> channels stop <channel>\` / \`${deps.cliName()} <sandbox> channels remove <channel>\` on the other sandbox.`,
-        );
-        abort(deps);
-      }
-      if (!(await deps.promptContinue())) {
-        deps.log("  Aborting sandbox creation.");
-        abort(deps);
-      }
+      deps.error(
+        `  Aborting: resolve the messaging channel conflict above or run \`${deps.cliName()} <sandbox> channels stop <channel>\` / \`${deps.cliName()} <sandbox> channels remove <channel>\` on the other sandbox.`,
+      );
+      abort(deps);
     }
   }
 
@@ -127,11 +167,18 @@ async function enforceMessagingPreEnableHooks(
   const requests = MessagingSetupApplier.listPreEnableChecks(currentPlan);
   if (requests.length === 0) return;
 
-  const hookRegistry = createBuiltInMessagingHookRegistry();
+  const hookRegistry =
+    deps.preEnableHookRegistry ?? createMessagingHostForwardPreEnableHookRegistry();
+  let registryEntries: ConflictRegistryEntry[];
+  try {
+    registryEntries = deps.registry.listSandboxes().sandboxes;
+  } catch (error) {
+    abortIncompleteConflictCheck(deps, "messaging pre-enable checks", error);
+  }
   const additionalInputs = createMessagingPreEnableHookInputs({
     currentSandbox: deps.sandboxName,
     currentGatewayName: deps.gatewayName,
-    registryEntries: deps.registry.listSandboxes().sandboxes,
+    registryEntries,
   });
 
   try {
@@ -158,8 +205,19 @@ async function enforceMessagingPreEnableHooks(
   } catch (error) {
     if (!isMessagingHookConflictError(error)) throw error;
     const message = error instanceof Error ? error.message : String(error);
+    const abortOnFailure = error.onFailure === "abort";
     for (const line of message.split("\n").filter((entry) => entry.trim().length > 0)) {
-      deps.log(`  ⚠ ${line}`);
+      if (abortOnFailure) {
+        deps.error(`  Conflict: ${line}`);
+      } else {
+        deps.log(`  ⚠ ${line}`);
+      }
+    }
+    if (abortOnFailure) {
+      deps.error(
+        `  Aborting: resolve the messaging pre-enable conflict above or run \`${deps.cliName()} <sandbox> channels stop <channel>\` / \`${deps.cliName()} <sandbox> channels remove <channel>\` on the other sandbox.`,
+      );
+      abort(deps);
     }
     if (deps.isNonInteractive()) {
       deps.error(

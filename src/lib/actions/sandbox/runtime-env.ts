@@ -25,15 +25,30 @@ const SANDBOX_RUNTIME_ENV_FILE = "/tmp/nemoclaw-proxy-env.sh";
 //     (buildGatewayAdminRpcShell) that sources the same file and legitimately
 //     needs the token; it does not use this wrapper, so no reinjection is
 //     required here.
-//   - Regression coverage: runtime-env.test.ts, passthrough-json.test.ts, and
-//     nemoclaw-start-perms.test.ts cover exec, JSON-agent, and PID-1 one-shot
-//     command boundaries respectively.
+//   - Regression coverage: runtime-env.test.ts and passthrough-json.test.ts
+//     cover exec and JSON-agent command boundaries respectively.
 //   - Removal condition: if nemoclaw-start.sh emits the gateway token into a
 //     separate owner-only env file that arbitrary commands never source, this
 //     unset becomes redundant and can be removed.
 const SANDBOX_RUNTIME_ENV_SENSITIVE_VARS = ["OPENCLAW_GATEWAY_TOKEN"];
 const SANDBOX_RUNTIME_ENV_UNSET_SENSITIVE = `builtin unset ${SANDBOX_RUNTIME_ENV_SENSITIVE_VARS.join(" ")}`;
 const SANDBOX_RUNTIME_ENV_EXEC_SCRIPT = `if [ -r "${SANDBOX_RUNTIME_ENV_FILE}" ]; then builtin source "${SANDBOX_RUNTIME_ENV_FILE}" || exit $?; fi; ${SANDBOX_RUNTIME_ENV_UNSET_SENSITIVE}; builtin exec -- "$@"`;
+const OPENCLAW_AGENT_NODE_OPTIONS =
+  'builtin export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--disable-warning=UNDICI-EHPA"';
+const SANDBOX_RUNTIME_ENV_OPENCLAW_AGENT_EXEC_SCRIPT = `if [ -r "${SANDBOX_RUNTIME_ENV_FILE}" ]; then builtin source "${SANDBOX_RUNTIME_ENV_FILE}" || exit $?; fi; ${SANDBOX_RUNTIME_ENV_UNSET_SENSITIVE}; ${OPENCLAW_AGENT_NODE_OPTIONS}; builtin exec -- "$@"`;
+
+function wrapExecCommand(command: readonly string[], script: string): string[] {
+  return [
+    "/bin/bash",
+    "--noprofile",
+    "--norc",
+    "-p",
+    "-c",
+    script,
+    "nemoclaw-runtime-env",
+    ...command,
+  ];
+}
 
 /**
  * Source NemoClaw's trusted runtime env without flattening the caller's argv.
@@ -42,14 +57,9 @@ const SANDBOX_RUNTIME_ENV_EXEC_SCRIPT = `if [ -r "${SANDBOX_RUNTIME_ENV_FILE}" ]
  * @internal Only NemoClaw-owned exec paths may source the root-generated file.
  */
 export function wrapExecCommandWithRuntimeEnv(command: readonly string[]): string[] {
-  return [
-    "/bin/bash",
-    "--noprofile",
-    "--norc",
-    "-p",
-    "-c",
-    SANDBOX_RUNTIME_ENV_EXEC_SCRIPT,
-    "nemoclaw-runtime-env",
-    ...command,
-  ];
+  return wrapExecCommand(command, SANDBOX_RUNTIME_ENV_EXEC_SCRIPT);
+}
+
+export function wrapOpenClawAgentCommandWithRuntimeEnv(command: readonly string[]): string[] {
+  return wrapExecCommand(command, SANDBOX_RUNTIME_ENV_OPENCLAW_AGENT_EXEC_SCRIPT);
 }

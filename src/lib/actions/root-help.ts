@@ -80,10 +80,15 @@ export function help(): void {
   lines.push("");
   lines.push(`  ${G}Uninstall flags:${R}`);
   lines.push(`    --yes${" ".repeat(29)}Skip the confirmation prompt`);
-  lines.push(`    --keep-openshell${" ".repeat(18)}Leave the openshell binary installed`);
-  lines.push(`    --delete-models${" ".repeat(19)}Remove ${CLI_DISPLAY_NAME}-pulled Ollama models`);
+  lines.push(`    --keep-openshell${" ".repeat(18)}Leave the OpenShell binary installed`);
   lines.push(
-    `    --destroy-user-data${" ".repeat(15)}Remove preserved ~/.nemoclaw/ user data (rebuild-backups/, backups/, sandboxes.json)`,
+    `    --delete-models${" ".repeat(19)}Remove all Ollama models and non-credential Hugging Face cache data (authentication files remain)`,
+  );
+  lines.push(
+    `    --destroy-user-data${" ".repeat(15)}Skip eligible fresh backups; remove preserved user data; remove managed CLI shims only when no sibling gateway is confirmed`,
+  );
+  lines.push(
+    `    --all-gateway-ports${" ".repeat(15)}Uninstall every gateway port on this host, not only NEMOCLAW_GATEWAY_PORT`,
   );
 
   lines.push("");
@@ -92,7 +97,7 @@ export function help(): void {
     `    ${D}• Check inference route:   ${CLI_NAME} inference get${R}`,
     `    ${D}• Change inference model:  ${CLI_NAME} inference set --model <model> --provider <provider>${R}`,
   );
-  lines.push(`    ${D}• Add network presets:     use the policy-add command on your sandbox${R}`);
+  lines.push(`    ${D}• Add network presets:     use the policy add command on your sandbox${R}`);
   lines.push(
     `    ${D}• Change credentials:      credentials reset <PROVIDER>, then re-run onboard${R}`,
   );
@@ -102,10 +107,6 @@ export function help(): void {
   lines.push(
     `    ${D}  Use host-side commands or re-run onboard for durable ${AGENT_PRODUCT_NAME} settings.${R}`,
   );
-  lines.push(
-    `    ${D}  Run \`${CLI_NAME} <name> shields up\` to lock config for sensitive workloads.${R}`,
-  );
-
   lines.push("");
   lines.push(`  ${D}Powered by NVIDIA OpenShell · Nemotron · Agent Toolkit`);
   lines.push(`  Credentials registered with the OpenShell gateway${R}`);

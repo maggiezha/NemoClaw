@@ -22,9 +22,12 @@ from urllib.parse import urljoin, urlparse, urlsplit
 _MANAGED_STATE_DIR = Path("/sandbox/.deepagents/.state")
 _AUTH_FILE = _MANAGED_STATE_DIR / "auth.json"
 _CODEX_AUTH_FILE = _MANAGED_STATE_DIR / "chatgpt-auth.json"
-_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.nemoclaw-mcp.json")
+_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.mcp.json")
 _INFERENCE_BASE_URL_FILE = Path(
     "/usr/local/share/nemoclaw/dcode-inference-base-url"
+)
+_UPSTREAM_PROVIDER_FILE = Path(
+    "/usr/local/share/nemoclaw/dcode-upstream-provider"
 )
 _MANAGED_PROXY_HOST_FILE = Path(
     "/usr/local/share/nemoclaw/dcode-proxy-host"
@@ -40,6 +43,15 @@ _AUTO_APPROVAL_THREAD_OPT_IN = "thread-opt-in"
 _AUTO_APPROVAL_CONTENTS = {
     b"disabled\n": _AUTO_APPROVAL_DISABLED,
     b"thread-opt-in\n": _AUTO_APPROVAL_THREAD_OPT_IN,
+}
+_REASONING_EFFORT_FILE = Path(
+    "/usr/local/share/nemoclaw/dcode-reasoning-effort"
+)
+_REASONING_EFFORT_CONTENTS: dict[bytes, str | None] = {
+    b"\n": None,
+    b"low\n": "low",
+    b"medium\n": "medium",
+    b"high\n": "high",
 }
 _MANAGED_FILE_OWNER_UID = 0
 _CREDENTIAL_NAME = re.compile(
@@ -105,7 +117,7 @@ _DISPLAY_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Match the launchers' root-owned, image-baked proxy validator. Its deliberate
 # RFC 1123 deviation permits underscores only for controlled internal/container
 # aliases such as `proxy_name`; the cross-boundary cases in
-# test/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
+# test/agents/deepagents/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
 _MANAGED_PROXY_HOST = re.compile(r"[A-Za-z0-9._-]+")
 _MCP_SERVER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 _MCP_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -123,6 +135,12 @@ _MCP_CHILD_BINDING_ENV = "NEMOCLAW_DCODE_MCP_BINDING"
 _MCP_SEALED_KIND = "sealed-memfd"
 _MCP_ANONYMOUS_KIND = "anonymous-otmpfile"
 _MCP_ANONYMOUS_DIRECTORY = Path("/tmp")
+_MCP_PRIVATE_ANONYMOUS_DIRECTORY = Path("/run/nemoclaw-dcode-mcp")
+_MCP_PRIVATE_ANONYMOUS_MAX_BYTES = 1_048_576
+_MCP_PRIVATE_ANONYMOUS_MODE = 0o1777
+_MCP_PRIVATE_ANONYMOUS_MOUNT_OPTIONS = frozenset(
+    {"rw", "noexec", "nosuid", "nodev"}
+)
 _MCP_FALLBACK_ERRNOS = {
     errno.EACCES,
     errno.EINVAL,
@@ -140,28 +158,13 @@ _MCP_BLOCKED_ALIASES = {
     "host.docker.internal",
     "host.containers.internal",
 }
-_MCP_RESERVED_NAMES = {"localhost", "local", "internal", "metadata"}
-_MCP_BLOCKED_IPV4_NETWORKS = tuple(
-    ipaddress.ip_network(network)
-    for network in (
-        "0.0.0.0/8",
+_MCP_ROUTED_PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
         "10.0.0.0/8",
         "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
         "172.16.0.0/12",
-        "192.0.0.0/24",
-        "192.0.2.0/24",
-        "192.31.196.0/24",
-        "192.52.193.0/24",
-        "192.88.99.0/24",
         "192.168.0.0/16",
-        "192.175.48.0/24",
-        "198.18.0.0/15",
-        "198.51.100.0/24",
-        "203.0.113.0/24",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
     )
 )
 _MANAGED_MCP_FD: int | None = None
@@ -171,10 +174,10 @@ _MANAGED_MCP_READY = False
 # SECURITY -- Source boundary: this isolated Python runtime cannot import the
 # canonical TypeScript groups in src/lib/security/secret-patterns.ts, so these
 # expressions deliberately mirror their secret-shape behavior.
-# Regression gate: test/langchain-deepagents-code-secret-pattern-parity.test.ts
+# Regression gate: test/agents/deepagents/langchain-deepagents-code-secret-pattern-parity.test.ts
 # fingerprints all canonical groups and runs one shared positive corpus through
 # both those groups and _contains_secret_shape; the Bash wrapper consumes the
-# same corpus in test/langchain-deepagents-code-image-credentials.test.ts.
+# same corpus in test/agents/deepagents/langchain-deepagents-code-image-credentials.test.ts.
 # Removal condition: delete this mirror only when the managed runtime can consume
 # the canonical patterns directly or upstream rejects these shapes before boot.
 _SECRET_PATTERNS = tuple(
@@ -228,19 +231,25 @@ def _contains_other_platform_secret(value: str, platform: str) -> bool:
 
 
 def _is_openshell_placeholder_for_name(name: str, value: str) -> bool:
+    if name == "NEMOCLAW_ATTACHED_PROVIDER_API_KEY":
+        if value != os.environ.get("NVIDIA_INFERENCE_API_KEY"):
+            return False
+        name = "NVIDIA_INFERENCE_API_KEY"
     if name == "OPENSHELL_TLS_KEY" or not _MCP_ENV_NAME.fullmatch(name):
         return False
     canonical = f"{_OPENSHELL_ENV_PLACEHOLDER_PREFIX}{name}"
-    versioned = re.fullmatch(
-        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}v[0-9]{{1,20}}_{re.escape(name)}",
+    generation_scoped = re.fullmatch(
+        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}(?:v[0-9]{{1,20}}|s[a-f0-9]{{64}})_{re.escape(name)}",
         value,
     )
-    return value == canonical or versioned is not None
+    return value == canonical or generation_scoped is not None
 
 
 def _is_managed_value(name: str, value: str) -> bool:
     if name == "DEEPAGENTS_CODE_OPENAI_API_KEY":
         return value == "nemoclaw-managed-inference"
+    if name == "NEMOCLAW_ATTACHED_PROVIDER_API_KEY":
+        return value == "nemoclaw-openshell-provider"
     if name == "SLACK_BOT_TOKEN":
         return bool(re.fullmatch(r"xoxb-[A-Za-z0-9_-]{10,}", value)) and not _contains_other_platform_secret(value, "slack")
     if name == "SLACK_APP_TOKEN":
@@ -351,13 +360,11 @@ def _validate_managed_mcp_hostname(hostname: str) -> None:
         hostname != hostname.lower()
         or hostname.endswith(".")
         or hostname in _MCP_BLOCKED_ALIASES
-        or hostname in _MCP_RESERVED_NAMES
-        or any(
-            hostname.endswith(f".{reserved}")
-            for reserved in _MCP_RESERVED_NAMES
-        )
     ):
         raise RuntimeError("managed MCP server URL hostname is invalid")
+    # Host preflight owns destination trust and binds every accepted endpoint to
+    # exact OpenShell address pins. This runtime revalidates canonical syntax and
+    # rejects IPv4 literals outside public or routed-private ranges.
     try:
         address = ipaddress.ip_address(hostname)
     except ValueError:
@@ -368,12 +375,13 @@ def _validate_managed_mcp_hostname(hostname: str) -> None:
         ):
             raise RuntimeError("managed MCP server URL hostname is invalid")
         return
-    if (
-        address.version != 4
-        or not address.is_global
-        or any(address in network for network in _MCP_BLOCKED_IPV4_NETWORKS)
+    if address.version != 4:
+        raise RuntimeError("managed MCP server URL does not support IPv6 literals")
+    if not (
+        (address.is_global and not address.is_multicast)
+        or any(address in network for network in _MCP_ROUTED_PRIVATE_IPV4_NETWORKS)
     ):
-        raise RuntimeError("managed MCP server URL address is not public IPv4")
+        raise RuntimeError("managed MCP server URL address is not an admitted destination")
 
 
 def _validate_managed_mcp_url(value: object) -> str:
@@ -458,7 +466,10 @@ def _validate_managed_mcp_entry(
     if not placeholder.startswith(_OPENSHELL_ENV_PLACEHOLDER_PREFIX):
         raise RuntimeError(f"managed MCP server {server} must use an OpenShell placeholder")
     suffix = placeholder.removeprefix(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)
-    match = re.fullmatch(r"(?:v[0-9]{1,20}_)?([A-Za-z_][A-Za-z0-9_]{0,127})", suffix)
+    match = re.fullmatch(
+        r"(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?([A-Za-z_][A-Za-z0-9_]{0,127})",
+        suffix,
+    )
     if match is None or not _is_openshell_placeholder_for_name(match.group(1), placeholder):
         raise RuntimeError(f"managed MCP server {server} has an invalid OpenShell placeholder")
     return {
@@ -829,13 +840,16 @@ def _sealed_managed_mcp_snapshot(payload: bytes) -> int:
         raise
 
 
-def _anonymous_managed_mcp_snapshot(payload: bytes) -> int:
+def _anonymous_managed_mcp_snapshot_at(
+    payload: bytes,
+    directory: Path,
+) -> int:
     writer: int | None = None
     reader: int | None = None
     complete = False
     try:
         flags = os.O_TMPFILE | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC
-        writer = os.open(_MCP_ANONYMOUS_DIRECTORY, flags, 0o600)
+        writer = os.open(directory, flags, 0o600)
         remaining = memoryview(payload)
         while remaining:
             written = os.write(writer, remaining)
@@ -883,6 +897,82 @@ def _anonymous_managed_mcp_snapshot(payload: bytes) -> int:
             except OSError:
                 # Best-effort teardown must not replace the primary result or error.
                 pass
+
+
+def _validate_private_managed_mcp_tmpfs() -> None:
+    directory = _MCP_PRIVATE_ANONYMOUS_DIRECTORY
+    try:
+        metadata = os.lstat(directory)
+        filesystem = os.statvfs(directory)
+        mount_lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            "managed MCP config requires a private bounded tmpfs"
+        ) from exc
+
+    matching_mount_options: list[set[str] | None] = []
+    for line in mount_lines:
+        fields = line.split()
+        if len(fields) <= 4 or fields[4] != str(directory):
+            continue
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            matching_mount_options.append(None)
+            continue
+        if len(fields) <= separator + 3 or fields[separator + 1] != "tmpfs":
+            matching_mount_options.append(None)
+            continue
+        matching_mount_options.append(set(fields[5].split(",")))
+
+    mount_options = (
+        matching_mount_options[0]
+        if len(matching_mount_options) == 1
+        else None
+    )
+
+    total_bytes = filesystem.f_blocks * filesystem.f_frsize
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != _MCP_PRIVATE_ANONYMOUS_MODE
+        or not os.path.ismount(directory)
+        or mount_options is None
+        or not _MCP_PRIVATE_ANONYMOUS_MOUNT_OPTIONS.issubset(mount_options)
+        or total_bytes <= 0
+        or total_bytes > _MCP_PRIVATE_ANONYMOUS_MAX_BYTES
+    ):
+        raise RuntimeError(
+            "managed MCP config requires a private bounded tmpfs"
+        )
+
+
+def _managed_mcp_tmpfile_fallback_allowed(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, AttributeError):
+            return True
+        if isinstance(current, OSError):
+            return current.errno == errno.EOPNOTSUPP
+        current = current.__cause__
+    return False
+
+
+def _anonymous_managed_mcp_snapshot(payload: bytes) -> int:
+    try:
+        return _anonymous_managed_mcp_snapshot_at(
+            payload,
+            _MCP_ANONYMOUS_DIRECTORY,
+        )
+    except RuntimeError as exc:
+        if not _managed_mcp_tmpfile_fallback_allowed(exc):
+            raise
+    _validate_private_managed_mcp_tmpfs()
+    return _anonymous_managed_mcp_snapshot_at(
+        payload,
+        _MCP_PRIVATE_ANONYMOUS_DIRECTORY,
+    )
 
 
 def _managed_mcp_fallback_allowed(exc: BaseException) -> bool:
@@ -988,6 +1078,55 @@ def managed_inference_base_url() -> str:
     return value
 
 
+def managed_inference_api_key(base_url: str) -> str:
+    """Select the non-secret credential for the validated image-owned route."""
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    local_host = host in {"host.openshell.internal", "host.docker.internal"}
+    try:
+        address = ipaddress.IPv4Address(host)
+        local_host = any(address in ipaddress.IPv4Network(network) for network in (
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"
+        ))
+    except ipaddress.AddressValueError:
+        # Keep the host-alias result above; every other non-IPv4 name remains untrusted.
+        pass
+    upstream_provider = _managed_upstream_provider()
+    if parsed.scheme == "http" and local_host and upstream_provider in {
+        "ollama-local", "vllm-local", "llama-cpp-local", "compatible-endpoint"
+    }:
+        value = os.environ.get("NEMOCLAW_LOCAL_INFERENCE_TOKEN", "")
+        if re.fullmatch(
+            r"openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_NEMOCLAW_LOCAL_INFERENCE_TOKEN",
+            value,
+        ) is None:
+            raise RuntimeError("native local inference requires an issued OpenShell credential reference")
+        return value
+    if base_url == "https://integrate.api.nvidia.com/v1" and upstream_provider != "compatible-endpoint":
+        name = "NVIDIA_INFERENCE_API_KEY"
+        provider = "NVIDIA"
+    elif base_url == "https://openrouter.ai/api/v1" and upstream_provider in (
+        _OPENROUTER_DISPLAY_PROVIDER_ALIASES | {"compatible-endpoint"}
+    ):
+        name = (
+            "COMPATIBLE_API_KEY"
+            if upstream_provider == "compatible-endpoint"
+            else "OPENROUTER_API_KEY"
+        )
+        provider = "OpenRouter"
+    elif upstream_provider == "compatible-endpoint" and host not in {
+        "inference.local", "localhost", "127.0.0.1", "::1"
+    }:
+        name = "COMPATIBLE_API_KEY"
+        provider = "compatible endpoint"
+    else:
+        return "nemoclaw-managed-inference"
+    value = os.environ.get(name, "")
+    if not _is_openshell_placeholder_for_name(name, value):
+        raise RuntimeError(f"native {provider} inference requires an OpenShell credential placeholder")
+    return value
+
+
 def managed_fetch_proxy_url() -> str | None:
     """Return the explicit OpenShell proxy delegated to managed ``fetch_url``.
 
@@ -1037,21 +1176,21 @@ def managed_fetch_proxy_url() -> str | None:
     return value
 
 
-def _read_managed_proxy_value(path: Path, label: str) -> str:
-    """Read one immutable proxy component from the managed image."""
+def _read_managed_file_value(path: Path, label: str) -> str:
+    """Read one root-owned, read-only value from the managed image."""
     if not path.is_file() or path.is_symlink():
-        raise RuntimeError(f"managed proxy {label} file is missing or unsafe")
+        raise RuntimeError(f"managed {label} file is missing or unsafe")
     try:
         metadata = path.stat()
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise RuntimeError(f"managed proxy {label} file is unreadable") from exc
+        raise RuntimeError(f"managed {label} file is unreadable") from exc
     if (
         metadata.st_uid != _MANAGED_FILE_OWNER_UID
         or stat.S_IMODE(metadata.st_mode) != 0o444
     ):
         raise RuntimeError(
-            f"managed proxy {label} file has unsafe ownership or mode"
+            f"managed {label} file has unsafe ownership or mode"
         )
     value = raw.rstrip("\n")
     if (
@@ -1061,14 +1200,14 @@ def _read_managed_proxy_value(path: Path, label: str) -> str:
         or value != value.strip()
         or any(ord(character) < 32 for character in value)
     ):
-        raise RuntimeError(f"managed proxy {label} file has invalid contents")
+        raise RuntimeError(f"managed {label} file has invalid contents")
     return value
 
 
 def _managed_fetch_proxy_url_from_files() -> str:
     """Derive the trusted proxy URL independently from root-owned files."""
-    host = _read_managed_proxy_value(_MANAGED_PROXY_HOST_FILE, "host")
-    port = _read_managed_proxy_value(_MANAGED_PROXY_PORT_FILE, "port")
+    host = _read_managed_file_value(_MANAGED_PROXY_HOST_FILE, "proxy host")
+    port = _read_managed_file_value(_MANAGED_PROXY_PORT_FILE, "proxy port")
     if _MANAGED_PROXY_HOST.fullmatch(host) is None:
         raise RuntimeError("managed proxy host file has invalid contents")
     if (
@@ -1077,6 +1216,16 @@ def _managed_fetch_proxy_url_from_files() -> str:
     ):
         raise RuntimeError("managed proxy port file has invalid contents")
     return f"http://{host}:{port}"
+
+
+def _managed_upstream_provider() -> str:
+    """Return the root-owned upstream provider."""
+    value = _read_managed_file_value(
+        _UPSTREAM_PROVIDER_FILE, "upstream provider"
+    )
+    if _DISPLAY_PROVIDER_NAME.fullmatch(value) is None:
+        raise RuntimeError("managed upstream provider file has invalid contents")
+    return value
 
 
 def _managed_fetch_ca_bundle() -> tuple[int, str]:
@@ -1309,6 +1458,64 @@ def managed_auto_approval_enabled() -> bool:
     return managed_auto_approval_mode() == _AUTO_APPROVAL_THREAD_OPT_IN
 
 
+def _unset_reasoning_effort(reason: str) -> None:
+    if os.environ.get("NEMOCLAW_DEBUG") == "1":
+        print(
+            f"NemoClaw managed reasoning effort unset: {reason}",
+            file=sys.stderr,
+        )
+    return None
+
+
+def managed_reasoning_effort() -> str | None:
+    """Return the reasoning effort baked into the image, or None for the endpoint default."""
+    path = _REASONING_EFFORT_FILE
+    try:
+        if path.is_symlink():
+            return _unset_reasoning_effort("capability path is a symlink")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+    except OSError:
+        return _unset_reasoning_effort("capability file is missing or unreadable")
+
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != _MANAGED_FILE_OWNER_UID
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_size not in {
+                len(content) for content in _REASONING_EFFORT_CONTENTS
+            }
+        ):
+            return _unset_reasoning_effort("capability metadata is unsafe")
+
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                return _unset_reasoning_effort("capability file was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            return _unset_reasoning_effort("capability file changed while reading")
+    except OSError:
+        return _unset_reasoning_effort("capability file read failed")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            # Cleanup cannot weaken the endpoint-default capability result.
+            pass
+
+    raw = b"".join(chunks)
+    if raw not in _REASONING_EFFORT_CONTENTS:
+        return _unset_reasoning_effort("capability contents are invalid")
+    return _REASONING_EFFORT_CONTENTS[raw]
+
+
 def managed_display_provider(adapter_provider: object) -> str:
     """Return the provider label to show for the managed inference adapter.
 
@@ -1336,6 +1543,14 @@ def assert_safe_runtime() -> None:
     """Reject unmanaged runtime credentials before dcode bootstraps settings."""
     _assert_safe_environment()
     _assert_safe_auth_state()
+    # Whole-home rebuild restores can retain the old native api_key_env field.
+    # Remove this alias when supported stored configs have retired that field.
+    native_placeholder = os.environ.get("NVIDIA_INFERENCE_API_KEY", "")
+    if _is_openshell_placeholder_for_name("NVIDIA_INFERENCE_API_KEY", native_placeholder):
+        os.environ["NEMOCLAW_ATTACHED_PROVIDER_API_KEY"] = native_placeholder
+    else:
+        os.environ.pop("NEMOCLAW_ATTACHED_PROVIDER_API_KEY", None)
+    os.environ[_UPSTREAM_PROVIDER_ENV] = _managed_upstream_provider()
     managed_fetch_proxy_url()
     base_url = managed_inference_base_url()
     os.environ["OPENAI_BASE_URL"] = base_url

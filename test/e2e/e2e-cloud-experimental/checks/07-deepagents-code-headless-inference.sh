@@ -5,11 +5,14 @@
 # Case: Deep Agents Code headless inference and RLIMIT enforcement (#5619, #6545).
 #
 # Headless `dcode -n "<prompt>"`, run inside a built Deep Agents Code sandbox,
-# must route through the managed https://inference.local/v1 endpoint using the
-# placeholder OpenAI-compatible key NemoClaw writes into config.toml. The login
-# shell path must reject an empty prompt with exit 2, then return PONG with exit
-# 0 for a real prompt; provider, connection, DNS, timeout, and ambiguous failures
-# are not acceptable. No real provider/proxy credentials may appear in
+# must route through its configured provider contract: managed routes use
+# https://inference.local/v1 and the managed placeholder, while native NVIDIA
+# uses https://integrate.api.nvidia.com/v1 and the attached-provider placeholder.
+# The login
+# shell path must reject an empty prompt with exit 2, then return a versioned
+# JSON success envelope containing PONG with exit 0 for a real prompt; provider,
+# connection, DNS, timeout, and ambiguous failures are not acceptable. No real
+# provider/proxy credentials may appear in
 # config.toml, .env, .mcp.json, /tmp/nemoclaw-proxy-env.sh, or output.
 # The sandbox entrypoint, direct managed launcher, and both login/interactive
 # shell paths must keep the documented nproc=512 and nofile=65536 contract.
@@ -21,12 +24,19 @@
 # sends untrusted evidence through the image-installed route-probe helper and
 # must stop before session attach. Per-phase diagnostics retain failure
 # attribution without splitting that shared evidence boundary.
+# This check is the typed target's risk-plan activation marker. The same target's
+# ordered thread-auto-approval check verifies that two named rebuilds converge and
+# that `nemoclaw status --json` exits 0 after the capability returns to `disabled`.
 
 set -euo pipefail
 
 SANDBOX_NAME="${SANDBOX_NAME:-${NEMOCLAW_SANDBOX_NAME:-e2e-cloud-onboard}}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 PREFIX="07-deepagents-code-headless-inference"
 HEADLESS_TIMEOUT="${DEEPAGENTS_HEADLESS_TIMEOUT:-120}"
+HOSTED_ENDPOINT="${NEMOCLAW_ENDPOINT_URL:-https://inference-api.nvidia.com/v1}"
+HOSTED_ENDPOINT="$(node --no-warnings "${REPO}/test/e2e/e2e-cloud-experimental/normalize-hosted-endpoint.ts" "$HOSTED_ENDPOINT")"
+SKILL_CLI_TIMEOUT_SECONDS=180
 
 ok() { printf '%s\n' "${PREFIX}: OK ($*)"; }
 info() { printf '%s\n' "${PREFIX}: $*"; }
@@ -71,10 +81,46 @@ sandbox_direct_dcode() {
   openshell sandbox exec --name "$SANDBOX_NAME" --timeout "$HEADLESS_TIMEOUT" -- dcode "$@" 2>&1
 }
 
+sandbox_skill_digest() {
+  # The variables in this command expand only inside the sandbox shell.
+  # shellcheck disable=SC2016
+  openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c '
+    set -euo pipefail
+    name="$1"
+    case "$name" in "" | *[!A-Za-z0-9._-]*) exit 64 ;; esac
+    root="/sandbox/.deepagents/agent/skills/$name"
+    [ -d "$root" ] && [ ! -L "$root" ]
+    [ -z "$(find "$root" -mindepth 1 ! -type d ! -type f -print -quit)" ]
+    verification="$(mktemp -d /sandbox/.nemoclaw-e2e-skill-digest.XXXXXX)"
+    trap '\''rm -rf -- "$verification"'\'' EXIT HUP INT TERM
+    find "$root" -type f -printf "%P\n" | LC_ALL=C sort >"$verification/files"
+    : >"$verification/manifest"
+    while IFS= read -r relative; do
+      candidate="$root/$relative"
+      [ -f "$candidate" ] && [ ! -L "$candidate" ]
+      if [ -n "$(find "$candidate" -maxdepth 0 -perm /111 -print -quit)" ]; then
+        mode=755
+      else
+        mode=644
+      fi
+      hash="$(sha256sum -- "$candidate")"
+      hash="${hash%% *}"
+      printf "%s %s  %s\n" "$mode" "$hash" "$relative" >>"$verification/manifest"
+    done <"$verification/files"
+    digest="$(sha256sum -- "$verification/manifest")"
+    printf "%s\n" "${digest%% *}"
+  ' -- "$1" 2>&1
+}
+
+bounded_skill_cli() {
+  timeout --signal=TERM --kill-after=5s "${SKILL_CLI_TIMEOUT_SECONDS}s" \
+    "$cli_bin" "$SANDBOX_NAME" skill "$@"
+}
+
 sandbox_dcode_wrapper_contract() {
   # Keep this assertion as one atomic shell expression for clear failure attribution.
   # shellcheck disable=SC2016
-  sandbox_exec 'dcode_path="$(command -v dcode 2>/dev/null || true)"; [ "$dcode_path" = /usr/local/bin/dcode ] && [ -x /usr/local/lib/nemoclaw/dcode-launcher.sh ] && [ -x /usr/local/lib/nemoclaw/dcode-managed-exec ] && [ -x /usr/local/lib/nemoclaw/dcode-wrapper.sh ] && cmp -s /usr/local/bin/dcode /usr/local/lib/nemoclaw/dcode-launcher.sh && cmp -s /usr/local/lib/nemoclaw/dcode-managed-exec /usr/local/lib/nemoclaw/dcode-launcher.sh && python3 -c '\''import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("deepagents_code") else 1)'\'' && printf "%s\\n" NEMOCLAW_DCODE_WRAPPER_CHAIN_OK'
+  sandbox_direct_rlimit_exec 'dcode_path="$(command -v dcode 2>/dev/null || true)"; [ "$dcode_path" = /usr/local/bin/dcode ] && [ -x /usr/local/lib/nemoclaw/dcode-launcher.sh ] && [ -x /usr/local/lib/nemoclaw/dcode-managed-exec ] && [ -x /usr/local/lib/nemoclaw/dcode-wrapper.sh ] && cmp -s /usr/local/bin/dcode /usr/local/lib/nemoclaw/dcode-launcher.sh && cmp -s /usr/local/lib/nemoclaw/dcode-managed-exec /usr/local/lib/nemoclaw/dcode-launcher.sh && python3 -c '\''import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("deepagents_code") else 1)'\'' && printf "%s\\n" NEMOCLAW_DCODE_WRAPPER_CHAIN_OK'
 }
 
 write_openshell_target_shim() {
@@ -331,6 +377,80 @@ references_managed_placeholder_key() {
   grep -Eq 'api_key_env[[:space:]]*=[[:space:]]*"DEEPAGENTS_CODE_OPENAI_API_KEY"'
 }
 
+references_native_nvidia_route() {
+  grep -Eq 'base_url[[:space:]]*=[[:space:]]*"https://integrate\.api\.nvidia\.com/v1"'
+}
+
+references_attached_provider_placeholder_key() {
+  grep -Eq 'api_key_env[[:space:]]*=[[:space:]]*"NVIDIA_INFERENCE_API_KEY"'
+}
+
+selected_openai_provider_scalar() {
+  local key="$1"
+  awk -v key="$key" '
+    /^\[\[?[^]]+\]\]?[[:space:]]*$/ {
+      selected = ($0 == "[models.providers.openai]")
+      next
+    }
+    selected && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      pattern = "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\"[^\"]*\"[[:space:]]*$"
+      if ($0 !~ pattern) {
+        invalid = 1
+        next
+      }
+      value = $0
+      sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\"", "", value)
+      sub(/"[[:space:]]*$/, "", value)
+      count++
+    }
+    END {
+      if (count == 1 && !invalid) print value
+    }
+  '
+}
+
+references_native_compatible_route() {
+  local configured_endpoint
+  configured_endpoint="$(selected_openai_provider_scalar base_url)"
+  [ "$configured_endpoint" = "$HOSTED_ENDPOINT" ]
+}
+
+references_compatible_provider_placeholder_key() {
+  [ "$(selected_openai_provider_scalar api_key_env)" = "COMPATIBLE_API_KEY" ]
+}
+
+configured_inference_route_contract() {
+  local config
+  config="$(cat)"
+  if printf '%s\n' "$config" | references_native_nvidia_route \
+    && printf '%s\n' "$config" | references_attached_provider_placeholder_key \
+    && ! printf '%s\n' "$config" | references_managed_inference_route \
+    && ! printf '%s\n' "$config" | references_managed_placeholder_key \
+    && ! printf '%s\n' "$config" | references_native_compatible_route \
+    && ! printf '%s\n' "$config" | references_compatible_provider_placeholder_key; then
+    printf '%s\n' native-nvidia
+    return 0
+  fi
+  if printf '%s\n' "$config" | references_native_compatible_route \
+    && printf '%s\n' "$config" | references_compatible_provider_placeholder_key \
+    && ! printf '%s\n' "$config" | references_managed_inference_route \
+    && ! printf '%s\n' "$config" | references_managed_placeholder_key \
+    && ! printf '%s\n' "$config" | references_attached_provider_placeholder_key; then
+    printf '%s\n' native-compatible
+    return 0
+  fi
+  if printf '%s\n' "$config" | references_managed_inference_route \
+    && printf '%s\n' "$config" | references_managed_placeholder_key \
+    && ! printf '%s\n' "$config" | references_native_nvidia_route \
+    && ! printf '%s\n' "$config" | references_attached_provider_placeholder_key \
+    && ! printf '%s\n' "$config" | references_native_compatible_route \
+    && ! printf '%s\n' "$config" | references_compatible_provider_placeholder_key; then
+    printf '%s\n' managed
+    return 0
+  fi
+  return 1
+}
+
 uses_native_openrouter_config() {
   local config
   config="$(cat)"
@@ -359,14 +479,18 @@ is_empty_prompt_rejection() {
 }
 
 # Route reachability is proved separately with /v1/models. This classifier has
-# the stronger #6191 acceptance contract: dcode itself must be usable and return
-# exit-zero PONG, so authentication, quota, provider, and model errors are
-# intentionally failures rather than route-only success signals.
+# the stronger #6191 and #7773 acceptance contract: dcode itself must be usable
+# and return an exit-zero, versioned JSON envelope containing PONG. Authentication,
+# quota, provider, model, and malformed-envelope errors are intentionally failures.
 classify_headless_output() {
   local dcode_exit="$1"
   local headless_output="$2"
+  local expected_response="${3:-PONG}"
   local payload
-  payload="$(printf '%s' "$headless_output" | sed 's/DCODE_EXIT:[0-9]*//g')"
+  payload="$(
+    printf '%s' "$headless_output" \
+      | sed '$ { /^DCODE_EXIT:[0-9][0-9]*$/d; }'
+  )"
 
   if [ "$dcode_exit" = "124" ]; then
     printf '%s\n' "timeout"
@@ -403,12 +527,56 @@ classify_headless_output() {
     return 1
   fi
 
-  if printf '%s\n' "$payload" | tr -d '\r' | grep -Eiq '^[[:space:]]*PONG[[:space:]]*$'; then
-    printf '%s\n' "pong"
+  if printf '%s' "$payload" | EXPECTED_RESPONSE="$expected_response" python3 -c '
+import json
+import os
+import sys
+
+try:
+    envelope = json.load(sys.stdin)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(envelope, dict):
+    raise SystemExit(1)
+if set(envelope) != {"schema_version", "command", "data"}:
+    raise SystemExit(1)
+if envelope["schema_version"] != 1 or envelope["command"] != "non-interactive":
+    raise SystemExit(1)
+data = envelope["data"]
+if not isinstance(data, dict) or set(data) != {
+    "status",
+    "exit_code",
+    "response",
+    "completion",
+}:
+    raise SystemExit(1)
+if data["status"] != "success" or data["exit_code"] != 0:
+    raise SystemExit(1)
+if not isinstance(data["response"], str) or data["response"].strip() != os.environ["EXPECTED_RESPONSE"]:
+    raise SystemExit(1)
+completion = data["completion"]
+if not isinstance(completion, dict) or set(completion) != {
+    "thread_id",
+    "duration_ms",
+    "response_bytes",
+}:
+    raise SystemExit(1)
+if not isinstance(completion["thread_id"], str) or not completion["thread_id"]:
+    raise SystemExit(1)
+if not isinstance(completion["duration_ms"], int) or completion["duration_ms"] < 0:
+    raise SystemExit(1)
+if completion["response_bytes"] != len(data["response"].encode("utf-8")):
+    raise SystemExit(1)
+'; then
+    if [ "$expected_response" = "PONG" ]; then
+      printf '%s\n' "json-pong"
+    else
+      printf '%s\n' "json-response"
+    fi
     return 0
   fi
 
-  printf '%s\n' "ambiguous-output"
+  printf '%s\n' "invalid-json-envelope"
   return 1
 }
 
@@ -487,20 +655,23 @@ main() {
     fail_test "direct-exec dcode did not reject an empty non-interactive prompt with exit 2 (exit ${empty_direct_exit})"
   fi
 
-  # 1. config.toml points at the managed inference route, not a real provider host.
+  # 1. config.toml matches exactly one supported inference route contract.
   config_output="$(sandbox_exec "cat /sandbox/.deepagents/config.toml 2>/dev/null" || true)"
-  if printf '%s' "$config_output" | references_managed_inference_route; then
+  route_contract="$(printf '%s' "$config_output" | configured_inference_route_contract || true)"
+  if [ "$route_contract" = "native-nvidia" ]; then
+    pass "config.toml routes through the native NVIDIA endpoint"
+    pass "config.toml uses the attached-provider placeholder API key"
+  elif [ "$route_contract" = "native-compatible" ]; then
+    pass "config.toml routes through the attached compatible endpoint"
+    pass "config.toml uses the compatible-provider placeholder API key"
+  elif [ "$route_contract" = "managed" ]; then
     pass "config.toml routes through the managed inference.local endpoint"
-  else
-    fail_test "config.toml does not reference the managed inference.local route (captured config redacted from log)"
-  fi
-  if printf '%s' "$config_output" | references_managed_placeholder_key; then
     pass "config.toml uses the managed Deep Agents Code placeholder API key"
   else
-    fail_test "config.toml does not use the managed placeholder API key env reference (captured config redacted from log)"
+    fail_test "config.toml does not match a supported inference route and placeholder contract (captured config redacted from log)"
   fi
-  if printf '%s\n' "$config_output" | uses_native_openrouter_config; then
-    native_openrouter=1
+  if [ "$route_contract" = "managed" ] \
+    && printf '%s\n' "$config_output" | uses_native_openrouter_config; then
     openrouter_identity_output="$(sandbox_direct_dcode identity || true)"
     if printf '%s\n' "$openrouter_identity_output" | grep -Fxq "Provider: openrouter" \
       && printf '%s\n' "$openrouter_identity_output" | grep -Eq '^Model:[[:space:]]+openrouter:' \
@@ -510,29 +681,34 @@ main() {
       fail_test "installed dcode identity does not report native OpenRouter consistently"
     fi
   else
-    native_openrouter=0
     openrouter_identity_output=""
   fi
 
-  # 2. Record whether direct DNS/hosts is absent. When it is, the following
+  dns_hosts_output=""
+  direct_dns_state=not-applicable
+  route_output=""
+
+  # 2. For the managed route, record whether direct DNS/hosts is absent. When it is, the following
   # login, direct-exec, and connect successes prove they do not depend on it;
   # a present route is informational and is not credited as that proof.
-  dns_hosts_output="$(sandbox_exec "if ! command -v getent >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_MISSING_GETENT; elif ! command -v timeout >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_MISSING_TIMEOUT; elif timeout 5 getent hosts inference.local >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PRESENT; else status=\$?; if [ \"\$status\" -eq 124 ]; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_TIMEOUT; else printf '%s\\n' NEMOCLAW_DCODE_DNS_ABSENT; fi; fi")"
-  if printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PROBE_MISSING_GETENT"; then
-    direct_dns_state=unknown
-    fail_test "required DNS diagnostic tool getent is unavailable in the sandbox"
-  elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PROBE_MISSING_TIMEOUT"; then
-    direct_dns_state=unknown
-    fail_test "required DNS diagnostic tool timeout is unavailable in the sandbox"
-  elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_ABSENT"; then
-    direct_dns_state=absent
-    pass "direct inference.local DNS/hosts is absent; exercising the proxy-only contract"
-  elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PRESENT"; then
-    direct_dns_state=present
-    info "direct inference.local DNS/hosts is present; proxy independence is not inferred from this observation"
-  else
-    direct_dns_state=unknown
-    fail_test "could not observe the direct inference.local DNS/hosts state"
+  if [ "$route_contract" = "managed" ]; then
+    dns_hosts_output="$(sandbox_exec "if ! command -v getent >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_MISSING_GETENT; elif ! command -v timeout >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_MISSING_TIMEOUT; elif timeout 5 getent hosts inference.local >/dev/null 2>&1; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PRESENT; else status=\$?; if [ \"\$status\" -eq 124 ]; then printf '%s\\n' NEMOCLAW_DCODE_DNS_PROBE_TIMEOUT; else printf '%s\\n' NEMOCLAW_DCODE_DNS_ABSENT; fi; fi")"
+    if printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PROBE_MISSING_GETENT"; then
+      direct_dns_state=unknown
+      fail_test "required DNS diagnostic tool getent is unavailable in the sandbox"
+    elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PROBE_MISSING_TIMEOUT"; then
+      direct_dns_state=unknown
+      fail_test "required DNS diagnostic tool timeout is unavailable in the sandbox"
+    elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_ABSENT"; then
+      direct_dns_state=absent
+      pass "direct inference.local DNS/hosts is absent; exercising the proxy-only contract"
+    elif printf '%s\n' "$dns_hosts_output" | grep -Fxq "NEMOCLAW_DCODE_DNS_PRESENT"; then
+      direct_dns_state=present
+      info "direct inference.local DNS/hosts is present; proxy independence is not inferred from this observation"
+    else
+      direct_dns_state=unknown
+      fail_test "could not observe the direct inference.local DNS/hosts state"
+    fi
   fi
 
   # 3. The login shell loaded the exact normalized proxy contract from .profile.
@@ -545,43 +721,119 @@ main() {
   fi
 
   # 4. The managed route is reachable through the normalized login-shell proxy.
-  route_output="$(sandbox_login_exec "curl -sS -o /dev/null -w 'HTTP_CODE:%{http_code}' --proxy \"\${HTTPS_PROXY}\" --noproxy \"\${NO_PROXY}\" --max-time 30 https://inference.local/v1/models" || true)"
-  route_code="$(printf '%s' "$route_output" | sed -n 's/.*HTTP_CODE:\([0-9][0-9][0-9]\).*/\1/p' | tail -n1)"
-  if [ "$route_code" = "200" ]; then
-    pass "login-shell proxy reached https://inference.local/v1/models"
-  else
-    fail_test "login-shell proxy did not receive HTTP 200 from https://inference.local/v1/models (HTTP ${route_code:-000})"
+  # Native NVIDIA is proved through the attached-provider dcode PONG below.
+  if [ "$route_contract" = "managed" ]; then
+    route_output="$(sandbox_login_exec "curl -sS -o /dev/null -w 'HTTP_CODE:%{http_code}' --proxy \"\${HTTPS_PROXY}\" --noproxy \"\${NO_PROXY}\" --max-time 30 https://inference.local/v1/models" || true)"
+    route_code="$(printf '%s' "$route_output" | sed -n 's/.*HTTP_CODE:\([0-9][0-9][0-9]\).*/\1/p' | tail -n1)"
+    if [ "$route_code" = "200" ]; then
+      pass "login-shell proxy reached https://inference.local/v1/models"
+    else
+      fail_test "login-shell proxy did not receive HTTP 200 from https://inference.local/v1/models (HTTP ${route_code:-000})"
+    fi
   fi
 
-  # 5. The same login-shell path runs dcode and returns PONG.
-  headless_output="$(sandbox_login_exec "cd /sandbox && timeout ${HEADLESS_TIMEOUT} dcode -n 'Reply with exactly one word: PONG'; echo \"DCODE_EXIT:\$?\"" || true)"
+  # Exercise the stateless public boundary, then let native DCode list/session
+  # behavior remain authoritative for discovery and activation.
+  skill_name="nemoclaw-native-lifecycle"
+  skill_marker_v1="DCODE_NATIVE_SKILL_V1"
+  skill_marker_v2="DCODE_NATIVE_SKILL_V2"
+  cli_bin="${NEMOCLAW_CLI_BIN:-${REPO:-.}/bin/nemoclaw.js}"
+  skill_body_v1="When asked for the native lifecycle canary, reply with exactly ${skill_marker_v1} and nothing else."
+  skill_helper="${REPO:-.}/test/e2e/e2e-cloud-experimental/features/skill/add-sandbox-skill.sh"
+  if skill_install_output="$(SKILL_ID="$skill_name" SKILL_BODY="$skill_body_v1" \
+    SKILL_DESCRIPTION="Use when asked for the native lifecycle canary." \
+    SANDBOX_NAME="$SANDBOX_NAME" NEMOCLAW_CLI_BIN="$cli_bin" bash "$skill_helper" 2>&1)"; then
+    pass "public install and native list reported the DCode canonical-root skill"
+  else
+    fail_test "public install and native list did not complete through DCode"
+  fi
+  skill_digest_line_count="$(
+    printf '%s\n' "$skill_install_output" \
+      | grep -Ec '^[[:space:]]*Content digest \(SHA-256\): [a-f0-9]{64}$' || true
+  )"
+  skill_reported_digest="$(
+    printf '%s\n' "$skill_install_output" \
+      | sed -n 's/^[[:space:]]*Content digest (SHA-256): \([a-f0-9]\{64\}\)$/\1/p'
+  )"
+  skill_placed_digest="$(sandbox_skill_digest "$skill_name" || true)"
+  if [ "$skill_digest_line_count" -eq 1 ] \
+    && [ -n "$skill_reported_digest" ] \
+    && [ "$skill_reported_digest" = "$skill_placed_digest" ]; then
+    pass "public DCode skill install digest matches the placed canonical-root skill"
+  else
+    fail_test "public DCode skill install digest does not match the placed canonical-root skill"
+  fi
+  skill_root="$(mktemp -d "${TMPDIR:-/tmp}/${PREFIX}-skill.XXXXXX")"
+  printf '%s\n' \
+    '---' \
+    "name: ${skill_name}" \
+    'description: Use when asked for the native lifecycle canary.' \
+    '---' \
+    '# Native lifecycle canary' \
+    "When asked for the native lifecycle canary, reply with exactly ${skill_marker_v2} and nothing else." \
+    >"${skill_root}/SKILL.md"
+  skill_update_output="$(bounded_skill_cli install "$skill_root" 2>&1)" \
+    && skill_update_status=0 || skill_update_status=$?
+  skill_file_output="$(sandbox_exec "cat /sandbox/.deepagents/agent/skills/${skill_name}/SKILL.md" || true)"
+  rm -rf -- "$skill_root"
+  if [ "$skill_update_status" -ne 0 ] \
+    && grep -Fxq "When asked for the native lifecycle canary, reply with exactly ${skill_marker_v1} and nothing else." <<<"$skill_file_output" \
+    && ! grep -Fq "$skill_marker_v2" <<<"$skill_file_output"; then
+    pass "public NemoClaw skill install refused to replace the existing DCode canonical-root target"
+  else
+    fail_test "public NemoClaw skill install replaced or changed the existing DCode canonical-root target"
+  fi
+
+  # 5. The same login-shell path runs dcode and returns a JSON PONG envelope.
+  headless_output="$(sandbox_login_exec "cd /sandbox && timeout ${HEADLESS_TIMEOUT} dcode -n 'Reply with exactly one word: PONG' --json; echo \"DCODE_EXIT:\$?\"" || true)"
+  printf '%s\n' "${PREFIX}: login-shell stdout/stderr:" "$headless_output" \
+    | node --no-warnings "${REPO:-.}/test/e2e/fixtures/redaction.ts"
   dcode_exit="$(printf '%s' "$headless_output" | sed -n 's/.*DCODE_EXIT:\([0-9]\+\).*/\1/p' | tail -n1)"
   if classification="$(classify_headless_output "${dcode_exit:-unknown}" "$headless_output")"; then
-    pass "login-shell dcode -n reached managed inference with ${classification} (exit ${dcode_exit:-unknown}; direct DNS/hosts ${direct_dns_state})"
-    if [ "$native_openrouter" -eq 1 ]; then
-      if printf '%s\n' "$headless_output" | grep -Fq "Usage Stats" \
-        && printf '%s\n' "$headless_output" | grep -Eiq '(^|[[:space:]])openrouter([[:space:]]|$)'; then
-        pass "headless usage output reports the native OpenRouter provider"
-      else
-        fail_test "headless usage output does not report the native OpenRouter provider"
-      fi
-    fi
+    pass "login-shell dcode -n reached ${route_contract:-unknown} inference with ${classification} (exit ${dcode_exit:-unknown}; direct DNS/hosts ${direct_dns_state})"
   else
-    fail_test "login-shell dcode -n did not exit 0 with PONG (${classification}, exit ${dcode_exit:-unknown})"
+    fail_test "login-shell dcode -n --json did not return a success envelope with PONG (${classification}, exit ${dcode_exit:-unknown})"
   fi
 
   # 6. The public direct-exec path reaches inference without shell startup files.
-  if direct_output="$(sandbox_direct_dcode -n "Reply with exactly one word: PONG")"; then
+  if direct_output="$(sandbox_direct_dcode -n "Use the ${skill_name} skill for the native lifecycle canary." --json)"; then
     direct_exit=0
   else
     direct_exit=$?
   fi
   direct_headless_output="${direct_output}
 DCODE_EXIT:${direct_exit}"
-  if direct_classification="$(classify_headless_output "$direct_exit" "$direct_headless_output")"; then
-    pass "direct-exec dcode -n reached managed inference with ${direct_classification} (exit ${direct_exit}; direct DNS/hosts ${direct_dns_state})"
+  printf '%s\n' "${PREFIX}: direct-exec stdout/stderr:" "$direct_headless_output" \
+    | node --no-warnings "${REPO:-.}/test/e2e/fixtures/redaction.ts"
+  if direct_classification="$(classify_headless_output "$direct_exit" "$direct_headless_output" "$skill_marker_v1")"; then
+    pass "direct-exec dcode -n reached ${route_contract:-unknown} inference; fresh direct-exec dcode session retained only the original skill (${direct_classification}; exit ${direct_exit})"
   else
-    fail_test "direct-exec dcode -n did not exit 0 with PONG (${direct_classification}, exit ${direct_exit})"
+    fail_test "fresh direct-exec dcode session did not retain only the original skill (${direct_classification}, exit ${direct_exit})"
+  fi
+  skill_remove_output="$(bounded_skill_cli remove "$skill_name" 2>&1)" \
+    && skill_remove_status=0 || skill_remove_status=$?
+  skill_post_remove_list=""
+  info "checking DCode's native list through the public boundary after removal"
+  skill_post_remove_list="$(bounded_skill_cli list --json 2>&1)" \
+    && skill_post_remove_list_status=0 || skill_post_remove_list_status=$?
+  if [ "$skill_remove_status" -eq 0 ] \
+    && [ "$skill_post_remove_list_status" -eq 0 ] \
+    && ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"${skill_name}\"" <<<"$skill_post_remove_list"; then
+    pass "DCode's native remove and list no longer report the canonical-root skill"
+  else
+    fail_test "DCode's native remove/list lifecycle still reported the canonical-root skill"
+  fi
+  if removed_skill_output="$(sandbox_direct_dcode -n "The native lifecycle canary skill was removed. Reply exactly PONG without inventing its value." --json)"; then
+    removed_skill_exit=0
+  else
+    removed_skill_exit=$?
+  fi
+  if [ "$removed_skill_exit" -eq 0 ] \
+    && ! grep -Fq "$skill_marker_v1" <<<"$removed_skill_output" \
+    && ! grep -Fq "$skill_marker_v2" <<<"$removed_skill_output"; then
+    pass "fresh direct-exec dcode session did not consume the removed native skill"
+  else
+    fail_test "fresh direct-exec dcode session retained removed native skill content (exit ${removed_skill_exit})"
   fi
 
   # 7. The user-facing bare-connect readiness path must route every observed
@@ -590,14 +842,16 @@ DCODE_EXIT:${direct_exit}"
   if connect_output="$(nemoclaw_connect_probe)"; then
     connect_exit=0
     pass "bare connect targeted the Deep Agents Code sandbox"
-    pass "nemoclaw connect --probe-only accepted the managed inference route (direct DNS/hosts ${direct_dns_state})"
+    pass "nemoclaw connect --probe-only accepted the ${route_contract:-unknown} inference route (direct DNS/hosts ${direct_dns_state})"
   else
     connect_exit=$?
+    printf '%s\n' "$connect_output" \
+      | node --no-warnings "${REPO:-.}/test/e2e/fixtures/redaction.ts"
     connect_target_reason="$(printf '%s\n' "$connect_output" | sed -n 's/^NEMOCLAW_DCODE_CONNECT_TARGET_FAIL:\([a-z-]*\)$/\1/p' | tail -n1)"
     if [ -n "$connect_target_reason" ]; then
       fail_test "bare connect did not target the expected sandbox (${connect_target_reason})"
     else
-      fail_test "nemoclaw connect --probe-only rejected the managed inference route (exit ${connect_exit})"
+      fail_test "nemoclaw connect --probe-only rejected the ${route_contract:-unknown} inference route (exit ${connect_exit})"
     fi
   fi
 
@@ -609,8 +863,11 @@ DCODE_EXIT:${direct_exit}"
     && [ "$fail_closed_connect_exit" -ne 0 ] \
     && grep -Fq NEMOCLAW_DCODE_IMAGE_PROBE_USED <<<"$fail_closed_connect_output" \
     && grep -Fq NEMOCLAW_DCODE_SESSION_ATTACH_NOT_INVOKED <<<"$fail_closed_connect_output" \
-    && grep -Fq "UNTRUSTED PREAMBLE" <<<"$fail_closed_connect_output" \
-    && grep -Fq "did not return a trusted result" <<<"$fail_closed_connect_output"; then
+    && { { [ "$route_contract" = managed ] \
+      && grep -Fq "UNTRUSTED PREAMBLE" <<<"$fail_closed_connect_output" \
+      && grep -Fq "did not return a trusted result" <<<"$fail_closed_connect_output"; } \
+      || { [[ "$route_contract" = native-nvidia || "$route_contract" = native-compatible ]] \
+        && grep -Fq "sandbox inference route is not known healthy" <<<"$fail_closed_connect_output"; }; }; then
     pass "connect rejects untrusted image-backed route evidence before session attach"
   else
     fail_test "connect did not fail closed before session attach for untrusted image-backed route evidence"
@@ -630,8 +887,13 @@ ${empty_direct_output}
 ${dns_hosts_output}
 ${proxy_contract_output}
 ${route_output}
+${skill_install_output}
+${skill_update_output}
+${skill_file_output}
 ${headless_output}
 ${direct_headless_output}
+${skill_remove_output}
+${skill_post_remove_list}
 ${connect_output}
 ${fail_closed_connect_output}"
   if printf '%s' "$combined" | contains_secret; then

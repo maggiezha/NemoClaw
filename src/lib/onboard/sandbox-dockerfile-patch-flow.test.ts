@@ -97,6 +97,7 @@ describe("prepareSandboxDockerfilePatch", () => {
       resolutionHint: resolutionMetadata,
     });
     expect(patchStagedDockerfile.mock.calls[0]?.[11]).toEqual({
+      agentName: "openclaw",
       buildIdPolicy: "preserve",
       toolDisclosure: "progressive",
       trustedManagedDockerfile: true,
@@ -119,6 +120,7 @@ describe("prepareSandboxDockerfilePatch", () => {
       model: "model-a",
       chatUiUrl: "http://127.0.0.1:7000",
       provider: "nvidia-prod",
+      compatibleEndpointReasoning: "true",
       preferredInferenceApi: "chat",
       webSearchConfig: { fetchEnabled: true },
       hermesToolGateways: ["github"],
@@ -149,12 +151,13 @@ describe("prepareSandboxDockerfilePatch", () => {
     expect(enforceDockerGpuPatchPreserveNetwork).toHaveBeenCalledWith(
       "nvidia-prod",
       sandboxGpuConfig,
-      {
+      expect.objectContaining({
         dockerDriverGateway: true,
         gatewayPort: undefined,
         log,
+        reverifyBridgeReachability: expect.any(Function),
         selectedRoute: "none",
-      },
+      }),
     );
     expect(patchStagedDockerfile).toHaveBeenCalledWith(
       "/tmp/Dockerfile",
@@ -169,7 +172,9 @@ describe("prepareSandboxDockerfilePatch", () => {
       null,
       ["github"],
       {
+        agentName: "openclaw",
         buildIdPolicy: "preserve",
+        compatibleEndpointReasoning: "true",
         toolDisclosure: "progressive",
         trustedManagedDockerfile: true,
         wslDashboardExposure: false,
@@ -241,6 +246,7 @@ describe("prepareSandboxDockerfilePatch", () => {
     expect(pullAndResolveBaseImageDigest).not.toHaveBeenCalled();
     expect(dockerImageInspect).not.toHaveBeenCalled();
     expect(patchStagedDockerfile.mock.calls[0]?.[11]).toEqual({
+      agentName: "hermes",
       buildIdPolicy: "preserve",
       toolDisclosure: "progressive",
       trustedManagedDockerfile: true,
@@ -276,6 +282,7 @@ describe("prepareSandboxDockerfilePatch", () => {
     });
 
     expect(patchStagedDockerfile.mock.calls[0]?.[11]).toEqual({
+      agentName: "hermes",
       buildIdPolicy: "preserve",
       toolDisclosure: "progressive",
       trustedManagedDockerfile: true,
@@ -356,6 +363,7 @@ describe("prepareSandboxDockerfilePatch", () => {
       "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:customagent",
     );
     expect(patchStagedDockerfile.mock.calls[0]?.[11]).toEqual({
+      agentName: "hermes",
       buildIdPolicy: "rewrite",
       toolDisclosure: "progressive",
       requireToolDisclosureContract: true,
@@ -387,6 +395,7 @@ describe("prepareSandboxDockerfilePatch", () => {
     });
 
     expect(patchStagedDockerfile.mock.calls[0]?.[11]).toEqual({
+      agentName: "langchain-deepagents-code",
       buildIdPolicy: "rewrite",
       toolDisclosure: "progressive",
       trustedManagedDockerfile: true,

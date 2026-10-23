@@ -15,11 +15,29 @@
 // so they accept whatever the orchestrator hands in without needing to
 // duplicate every helper's exact signature.
 
+import type { HermesInferenceCredentialRegistrar } from "../../hermes-provider-auth";
+import type { NativeProviderAttachment } from "../../inference/native-provider/contract";
 import type { TrustedPrivateEndpointCapability } from "../../inference/endpoint-ssrf-preflight";
+import type { OpenShellInferenceRouteMutator } from "../../adapters/openshell/inference-route";
+import type { OpenShellProviderAdapter } from "../../adapters/openshell/provider-adapter";
 import type { HermesAuthMethod } from "../hermes-auth";
 import type { OnboardInferenceCapabilityCache } from "../inference-capability-cache";
 
-export type SetupInferenceResult = { ok: true; retry?: undefined } | { retry: "selection" };
+/** Process-local replacement prepared while the published legacy source stays intact. */
+export interface StagedNativeLocalRecreation {
+  source: import("../../state/registry").SandboxEntry;
+  attachment: import("../../inference/native-local/contract").NativeLocalProviderAttachment;
+}
+
+export type SetupInferenceResult =
+  | {
+      ok: true;
+      retry?: undefined;
+      nativeInference?: { endpointUrl: string; credentialEnv: string };
+      stagedNativeLocalRecreation?: StagedNativeLocalRecreation;
+      deferredInferenceRoute?: (reserve: () => void) => Promise<void>;
+    }
+  | { retry: "selection" };
 
 export type RunOpenshell = (
   args: string[],
@@ -45,7 +63,7 @@ export type UpsertProvider = (
   credentialEnv: any,
   baseUrl: any,
   env?: NodeJS.ProcessEnv,
-) => UpsertProviderResult;
+) => Promise<UpsertProviderResult>;
 
 export type RemoteProviderConfigEntry = {
   label: string;
@@ -77,6 +95,7 @@ export type PromptValidationRecovery = (
   classification: any,
   credentialEnv: any,
   helpUrl: any,
+  revalidateSandboxIdentity?: (operation: string) => void,
 ) => Promise<"credential" | "selection" | "retry" | "model">;
 
 export type ClassifyApplyFailure = (message: string) => any;
@@ -86,6 +105,7 @@ export type Registry = {
 };
 
 export type CommonDeps = {
+  nativeLocalInference?: boolean;
   runOpenshell: RunOpenshell;
   upsertProvider: UpsertProvider;
   verifyInferenceRoute: VerifyInferenceRoute;
@@ -97,70 +117,75 @@ export type CommonDeps = {
   log: (message: string) => void;
 };
 
-export type RemoteProviderDeps = CommonDeps & {
-  REMOTE_PROVIDER_CONFIG: Record<string, RemoteProviderConfigEntry>;
-  hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
-  promptValidationRecovery: PromptValidationRecovery;
-  classifyApplyFailure: ClassifyApplyFailure;
-  LOCAL_INFERENCE_TIMEOUT_SECS: number;
-  redact: (input: string) => string;
-  compactText: (input: string) => string;
-  // #6294 OpenAI-surface registration for openai_compatible agents onboarded
-  // on compatible-anthropic-endpoint. Optional: production falls back to the
-  // real implementations inside remote.ts; tests inject fakes.
-  probeOpenAiLikeEndpoint?: (
-    endpointUrl: string,
-    model: string,
-    apiKey: string,
-    options?: Record<string, unknown>,
-  ) => { ok: boolean; message?: string } | Promise<{ ok: boolean; message?: string }>;
-  readGatewayProviderMetadata?: (
-    name: string,
-    runOpenshell: RunOpenshell,
-  ) => { name: string; type: string; credentialKeys: string[]; configKeys: string[] } | null;
-  deleteGatewayProvider?: (
-    name: string,
-    deps: { runOpenshell: RunOpenshell; allowedSandboxes?: readonly string[] },
-  ) => { ok: boolean; status?: number | null; stderr?: string; stdout?: string };
-  bedrockRuntimeOnboard: {
-    setupBedrockRuntimeInference(input: {
-      sandboxName: string | null;
-      provider: string;
-      model: string;
-      endpointUrl: string | null;
-      credentialEnv: string | null;
-      isNonInteractive: () => boolean;
-      runOpenshell: RunOpenshell;
-      upsertProvider: UpsertProvider;
-      verifyInferenceRoute: VerifyInferenceRoute;
-      verifyOnboardInferenceSmoke: any;
-      updateSandbox: Registry["updateSandbox"];
-      exitProcess: CommonDeps["exitProcess"];
-      error: (message: string) => void;
-      log: (message: string) => void;
-    }): Promise<{ handled: true; result: SetupInferenceResult } | { handled: false }>;
-  };
-  openrouterRuntimeOnboard: {
-    setupOpenRouterRuntimeInference(input: {
-      sandboxName: string | null;
-      provider: string;
-      model: string;
-      credentialEnv: string | null;
-      credentialValue: string | null;
-      reuseGatewayCredentialWithoutLocalKey?: boolean;
-      skipHostInferenceSmoke?: boolean;
-      isNonInteractive: () => boolean;
-      runOpenshell: RunOpenshell;
-      upsertProvider: UpsertProvider;
-      verifyInferenceRoute: VerifyInferenceRoute;
-      verifyOnboardInferenceSmoke: any;
-      updateSandbox: Registry["updateSandbox"];
-      exitProcess: CommonDeps["exitProcess"];
-      error: (message: string) => void;
-      log: (message: string) => void;
-    }): Promise<{ handled: true; result: SetupInferenceResult } | { handled: false }>;
-  };
+type InferenceRouteMutationDeps = {
+  inferenceRouteMutator: OpenShellInferenceRouteMutator;
+  gatewayName: string;
 };
+
+export type RemoteProviderDeps = CommonDeps &
+  InferenceRouteMutationDeps & {
+    reserveSandboxInferenceRoute: (
+      name: string,
+      route: { provider: string; model: string },
+    ) => boolean;
+    REMOTE_PROVIDER_CONFIG: Record<string, RemoteProviderConfigEntry>;
+    hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
+    promptValidationRecovery: PromptValidationRecovery;
+    classifyApplyFailure: ClassifyApplyFailure;
+    LOCAL_INFERENCE_TIMEOUT_SECS: number;
+    redact: (input: string) => string;
+    compactText: (input: string) => string;
+    // #6294 OpenAI-surface registration for openai_compatible agents onboarded
+    // on compatible-anthropic-endpoint. Optional: production falls back to the
+    // real implementations inside remote.ts; tests inject fakes.
+    probeOpenAiLikeEndpoint?: (
+      endpointUrl: string,
+      model: string,
+      apiKey: string,
+      options?: Record<string, unknown>,
+    ) => { ok: boolean; message?: string } | Promise<{ ok: boolean; message?: string }>;
+    providerAdapter?: OpenShellProviderAdapter;
+    bedrockRuntimeOnboard: {
+      setupBedrockRuntimeInference(input: {
+        sandboxName: string | null;
+        provider: string;
+        model: string;
+        endpointUrl: string | null;
+        credentialEnv: string | null;
+        isNonInteractive: () => boolean;
+        gatewayName: string;
+        inferenceRouteMutator: OpenShellInferenceRouteMutator;
+        upsertProvider: UpsertProvider;
+        verifyInferenceRoute: VerifyInferenceRoute;
+        verifyOnboardInferenceSmoke: any;
+        updateSandbox: Registry["updateSandbox"];
+        exitProcess: CommonDeps["exitProcess"];
+        error: (message: string) => void;
+        log: (message: string) => void;
+      }): Promise<{ handled: true; result: SetupInferenceResult } | { handled: false }>;
+    };
+    openrouterRuntimeOnboard: {
+      setupOpenRouterRuntimeInference(input: {
+        sandboxName: string | null;
+        provider: string;
+        model: string;
+        credentialEnv: string | null;
+        credentialValue: string | null;
+        reuseGatewayCredentialWithoutLocalKey?: boolean;
+        skipHostInferenceSmoke?: boolean;
+        isNonInteractive: () => boolean;
+        gatewayName: string;
+        inferenceRouteMutator: OpenShellInferenceRouteMutator;
+        upsertProvider: UpsertProvider;
+        verifyInferenceRoute: VerifyInferenceRoute;
+        verifyOnboardInferenceSmoke: any;
+        updateSandbox: Registry["updateSandbox"];
+        exitProcess: CommonDeps["exitProcess"];
+        error: (message: string) => void;
+        log: (message: string) => void;
+      }): Promise<{ handled: true; result: SetupInferenceResult } | { handled: false }>;
+    };
+  };
 
 // DNS lookup signature compatible with `dnsPromises.lookup(host, { all: true })`
 // and with the injectable `lookup` accepted by
@@ -171,48 +196,65 @@ export type LookupFn = (
   options: { all: true },
 ) => Promise<Array<{ address: string; family?: number }>>;
 
-export type HermesDeps = CommonDeps & {
-  lookup?: LookupFn;
-  hermesProviderAuth: {
-    HERMES_PROVIDER_NAME: string;
-    isHermesProviderRegistered(runOpenshell: any): boolean;
-    ensureHermesProviderApiKeyCredentials(
-      sandboxName: string,
-      opts: { apiKey: unknown; runOpenshell: any; baseUrl?: string | undefined },
-    ): Promise<unknown>;
-    ensureHermesProviderOAuthCredentials(
-      sandboxName: string,
-      opts: {
-        allowInteractiveLogin: boolean;
-        runOpenshell: any;
-        baseUrl?: string | undefined;
-        toolGatewayPresets: string[];
-      },
-    ): Promise<unknown>;
+export type HermesDeps = CommonDeps &
+  InferenceRouteMutationDeps & {
+    lookup?: LookupFn;
+    getNativeProviderAuthority?(): NativeProviderAttachment | undefined;
+    prepareNativeProvider?(
+      apiKey: string | null,
+      endpointUrl: string,
+    ): Promise<NativeProviderAttachment>;
+    hermesProviderAuth: {
+      HERMES_PROVIDER_NAME: string;
+      isHermesProviderRegistered(runOpenshell: any): Promise<boolean>;
+      ensureHermesProviderApiKeyCredentials(
+        sandboxName: string,
+        opts: {
+          apiKey: unknown;
+          runOpenshell: any;
+          baseUrl?: string | undefined;
+          registerInferenceCredential?: HermesInferenceCredentialRegistrar;
+        },
+      ): Promise<unknown>;
+      ensureHermesProviderOAuthCredentials(
+        sandboxName: string,
+        opts: {
+          allowInteractiveLogin: boolean;
+          runOpenshell: any;
+          baseUrl?: string | undefined;
+          toolGatewayPresets: string[];
+          registerInferenceCredential?: HermesInferenceCredentialRegistrar;
+        },
+      ): Promise<unknown>;
+    };
+    getHermesToolGatewayBroker: () => {
+      getHermesToolGatewayProviderName(sandboxName: string): string;
+      isHermesToolGatewayRefreshProviderRegistered(
+        sandboxName: string,
+        runOpenshell: any,
+      ): Promise<boolean>;
+    };
+    normalizeHermesAuthMethod: (m: HermesAuthMethod | string | null) => HermesAuthMethod | null;
+    resolveHermesNousApiKey: () => any;
+    checkHermesProviderStoreReachable: (
+      runOpenshell: any,
+    ) => { ok: boolean; message?: string } | Promise<{ ok: boolean; message?: string }>;
+    hermesAuthMethodLabel: (m: HermesAuthMethod) => string;
+    hermesConstants: {
+      HERMES_NOUS_API_KEY_CREDENTIAL_ENV: string;
+      HERMES_AUTH_METHOD_API_KEY: HermesAuthMethod;
+      HERMES_AUTH_METHOD_OAUTH: HermesAuthMethod;
+    };
+    requireValue: <T>(value: T | null | undefined, message: string) => T;
+    redact: (input: string) => string;
+    compactText: (input: string) => string;
   };
-  getHermesToolGatewayBroker: () => {
-    getHermesToolGatewayProviderName(sandboxName: string): string;
-  };
-  providerExistsInGateway: (name: string) => boolean;
-  normalizeHermesAuthMethod: (m: HermesAuthMethod | string | null) => HermesAuthMethod | null;
-  resolveHermesNousApiKey: () => any;
-  checkHermesProviderStoreReachable: (runOpenshell: any) => { ok: boolean; message?: string };
-  hermesAuthMethodLabel: (m: HermesAuthMethod) => string;
-  hermesConstants: {
-    HERMES_NOUS_API_KEY_CREDENTIAL_ENV: string;
-    HERMES_AUTH_METHOD_API_KEY: HermesAuthMethod;
-    HERMES_AUTH_METHOD_OAUTH: HermesAuthMethod;
-  };
-  requireValue: <T>(value: T | null | undefined, message: string) => T;
-  redact: (input: string) => string;
-  compactText: (input: string) => string;
-};
 
 // `run` accepts an array form (execa-style) in the real onboard.ts; we type it
 // loosely so callers can pass either shape without casting.
 export type RunFn = (
   cmd: any,
-  opts?: { ignoreError?: boolean; suppressOutput?: boolean },
+  opts?: { ignoreError?: boolean; suppressOutput?: boolean; env?: NodeJS.ProcessEnv },
 ) => RunResult;
 
 export type VllmDeps = CommonDeps & {
@@ -226,6 +268,11 @@ export type VllmDeps = CommonDeps & {
   applyLocalInferenceRoute: (provider: string, model: string) => Promise<boolean>;
   run: RunFn;
   VLLM_LOCAL_CREDENTIAL_ENV: string;
+  getManagedVllmProviderBinding: () => {
+    baseUrl: string;
+    validationBaseUrl?: string;
+    apiKey: string;
+  } | null;
 };
 
 export type OllamaDeps = CommonDeps & {
@@ -236,7 +283,6 @@ export type OllamaDeps = CommonDeps & {
   };
   getLocalProviderBaseUrl: (provider: string) => any;
   applyLocalInferenceRoute: (provider: string, model: string) => Promise<boolean>;
-  getOllamaWarmupCommand: (model: string) => any;
   run: RunFn;
   shouldFrontOllamaWithProxy: () => boolean;
   ensureOllamaAuthProxy: () => void;
@@ -248,27 +294,46 @@ export type OllamaDeps = CommonDeps & {
       model: string,
       allowToolsIncompatible: boolean,
     ): { ok: boolean; message?: string };
+    validateSandboxFacingOllamaModel(model: string): { ok: boolean; message?: string };
+    runOllamaWarmup(model: string, runImpl: RunFn): void;
+    loadPendingOllamaModelCleanup?(sandboxName: string): readonly string[];
+    persistPendingOllamaModelCleanup?(sandboxName: string, models: readonly string[]): void;
+    clearPendingOllamaModelCleanup?(sandboxName: string, releasedModels?: readonly string[]): void;
+    persistResolvedOllamaHost(): () => void;
+    loadPersistedOllamaHost?(): "127.0.0.1" | "host.docker.internal" | null;
+    clearPersistedOllamaHostIfUnused?(
+      routes: readonly { provider?: string | null; endpointUrl?: string | null }[],
+    ): boolean;
+  };
+  /** Exact provider-owned proof used instead of legacy host warmup/probes. */
+  providerOwnedInferenceProof?: {
+    readonly protocol: "openai-chat-completions";
+    readonly model: string;
+    readonly toolCallingRequired: boolean;
   };
   OLLAMA_PROXY_CREDENTIAL_ENV: string;
 };
 
-export type RoutedDeps = CommonDeps & {
-  reconcileModelRouter: () => Promise<void>;
-  routedInference: {
-    upsertRoutedProvider(
-      provider: string,
-      endpointUrl: string | null,
-      credentialEnv: string | null,
-      helpers: {
-        upsertProvider: UpsertProvider;
-        hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
-      },
-    ): { ok: boolean; result: { message?: string; status?: number } };
+export type RoutedDeps = CommonDeps &
+  InferenceRouteMutationDeps & {
+    reconcileModelRouter: () => Promise<void>;
+    routedInference: {
+      upsertRoutedProvider(
+        provider: string,
+        endpointUrl: string | null,
+        credentialEnv: string | null,
+        helpers: {
+          upsertProvider: UpsertProvider;
+          hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
+        },
+      ):
+        | { ok: boolean; result: { message?: string; status?: number } }
+        | Promise<{ ok: boolean; result: { message?: string; status?: number } }>;
+    };
+    hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
+    redact: (input: string) => string;
+    compactText: (input: string) => string;
   };
-  hydrateCredentialEnv: (envName: any, resolveCredential?: any) => any;
-  redact: (input: string) => string;
-  compactText: (input: string) => string;
-};
 
 export const REMOTE_PROVIDER_NAMES = [
   "nvidia-prod",
@@ -279,6 +344,7 @@ export const REMOTE_PROVIDER_NAMES = [
   "compatible-anthropic-endpoint",
   "gemini-api",
   "compatible-endpoint",
+  "llama-cpp-local",
 ] as const;
 
 export type RemoteProviderName = (typeof REMOTE_PROVIDER_NAMES)[number];

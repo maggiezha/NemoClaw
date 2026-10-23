@@ -101,6 +101,15 @@ navigation:
                   - page: "Set Up vLLM"
                     path: _build/agent-variants/inference/set-up-vllm.openclaw.generated.mdx
                     slug: set-up-vllm
+                  - page: "Set Up vLLM on Two DGX Sparks"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-sparks.openclaw.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-sparks
+                  - page: "Set Up vLLM on Two DGX Stations"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-stations.openclaw.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-stations
+                  - page: "Set Up llama.cpp"
+                    path: _build/agent-variants/inference/set-up-llama-cpp.openclaw.generated.mdx
+                    slug: set-up-llama-cpp
                   - page: "Set Up NVIDIA NIM"
                     path: _build/agent-variants/inference/set-up-nvidia-nim.openclaw.generated.mdx
                     slug: set-up-nvidia-nim
@@ -125,7 +134,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.openclaw.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.openclaw.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -168,6 +177,9 @@ navigation:
               - page: "Configure Agent Heartbeats"
                 path: configure-agents/configure-agent-heartbeats.mdx
                 slug: configure-agent-heartbeats
+              - page: "Configure Memory Search"
+                path: configure-agents/configure-memory-search.mdx
+                slug: configure-memory-search
               - page: "Set Up Task-Specific Sub-Agents"
                 path: inference/set-up-sub-agent.mdx
                 slug: set-up-sub-agent
@@ -223,6 +235,9 @@ navigation:
                   - page: "Set Up Slack"
                     path: _build/agent-variants/manage-sandboxes/set-up-slack.openclaw.generated.mdx
                     slug: set-up-slack
+                  - page: "Set Up Google Chat"
+                    path: _build/agent-variants/manage-sandboxes/set-up-google-chat.openclaw.generated.mdx
+                    slug: set-up-google-chat
                   - page: "Set Up WeChat"
                     path: _build/agent-variants/manage-sandboxes/set-up-wechat.openclaw.generated.mdx
                     slug: set-up-wechat
@@ -262,7 +277,7 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.openclaw.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.openclaw.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
@@ -278,9 +293,33 @@ navigation:
               - page: "Customize the Network Policy"
                 path: _build/agent-variants/network-policy/customize-network-policy.openclaw.generated.mdx
                 slug: customize-network-policy
+              - section: "Configure Policies"
+                slug: configure-policies
+                contents:
+                  - page: "Change the Baseline Policy"
+                    path: _build/agent-variants/network-policy/change-baseline-network-policy.openclaw.generated.mdx
+                    slug: change-baseline-network-policy
+                  - page: "Apply Policy Presets"
+                    path: _build/agent-variants/network-policy/apply-policy-presets.openclaw.generated.mdx
+                    slug: apply-policy-presets
+                  - page: "Create Custom Presets"
+                    path: _build/agent-variants/network-policy/create-custom-policy-presets.openclaw.generated.mdx
+                    slug: create-custom-policy-presets
+                  - page: "Configure Raw TLS"
+                    path: _build/agent-variants/network-policy/configure-raw-tls-passthrough.openclaw.generated.mdx
+                    slug: configure-raw-tls-passthrough
+                  - page: "Replace the Live Policy"
+                    path: _build/agent-variants/network-policy/replace-live-network-policy.openclaw.generated.mdx
+                    slug: replace-live-network-policy
+              - page: "Explain Policy to Agents"
+                path: _build/agent-variants/network-policy/explain-network-policy-to-agents.openclaw.generated.mdx
+                slug: explain-network-policy-to-agents
               - page: "Integration Policy Examples"
                 path: _build/agent-variants/network-policy/integration-policy-examples.openclaw.generated.mdx
                 slug: integration-policy-examples
+              - page: "Set Up Gmail With an App Password"
+                path: _build/agent-variants/network-policy/set-up-gmail-with-an-app-password.openclaw.generated.mdx
+                slug: set-up-gmail-with-an-app-password
           - section: "Deployment"
             slug: deployment
             collapsed: open-by-default
@@ -288,6 +327,12 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.openclaw.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.openclaw.generated.mdx
+                slug: register-external-component
+              - page: "Gateway Lifecycle Authority"
+                path: _build/agent-variants/deployment/gateway-lifecycle-authority.openclaw.generated.mdx
+                slug: gateway-lifecycle-authority
           - section: "Monitoring"
             slug: monitoring
             collapsed: open-by-default
@@ -302,6 +347,18 @@ navigation:
               - page: "Security Best Practices"
                 path: _build/agent-variants/security/best-practices.openclaw.generated.mdx
                 slug: best-practices
+              - section: "Security Controls"
+                slug: security-controls
+                contents:
+                  - page: "Filesystem Controls"
+                    path: _build/agent-variants/security/filesystem-controls.openclaw.generated.mdx
+                    slug: filesystem-controls
+                  - page: "Process Controls"
+                    path: _build/agent-variants/security/process-controls.openclaw.generated.mdx
+                    slug: process-controls
+                  - page: "Gateway and Secret Controls"
+                    path: _build/agent-variants/security/gateway-authentication-controls.openclaw.generated.mdx
+                    slug: gateway-authentication-controls
               - page: "Configure Corporate CA Trust"
                 path: _build/agent-variants/security/configure-corporate-ca-trust.openclaw.generated.mdx
                 slug: configure-corporate-ca-trust
@@ -314,12 +371,6 @@ navigation:
               - page: "Trusted Computing Base"
                 path: _build/agent-variants/security/tcb-boundary.openclaw.generated.mdx
                 slug: trusted-computing-base
-              - page: "OpenShell 0.0.72 Compatibility Review"
-                path: _build/agent-variants/security/openshell-0.0.72-compatibility-review.openclaw.generated.mdx
-                slug: openshell-0.0.72-compatibility-review
-              - page: "OpenShell 0.0.71 Review"
-                path: _build/agent-variants/security/openshell-0.0.71-gateway-auth-review.openclaw.generated.mdx
-                slug: openshell-0.0.71-gateway-auth-review
               - page: "OpenClaw Controls"
                 path: security/openclaw-controls.mdx
                 slug: openclaw-controls
@@ -328,7 +379,7 @@ navigation:
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.openclaw.generated.mdx
                 slug: platform-support
               - page: "Enterprise Readiness"
                 path: _build/agent-variants/reference/enterprise-readiness.openclaw.generated.mdx
@@ -336,6 +387,9 @@ navigation:
               - page: "Architecture Details"
                 path: _build/agent-variants/reference/architecture.openclaw.generated.mdx
                 slug: architecture
+              - page: "Configure Runtime Identity"
+                path: reference/configure-runtime-identity.mdx
+                slug: configure-runtime-identity
               - page: "Extension Taxonomy and SDK Readiness"
                 path: _build/agent-variants/reference/extension-taxonomy-sdk-readiness.openclaw.generated.mdx
                 slug: extension-taxonomy-sdk-readiness
@@ -354,6 +408,9 @@ navigation:
               - page: "Troubleshoot MCP Servers"
                 path: _build/agent-variants/reference/troubleshoot-mcp-servers.openclaw.generated.mdx
                 slug: troubleshoot-mcp-servers
+              - page: "System Readiness"
+                path: _build/agent-variants/reference/system-readiness.openclaw.generated.mdx
+                slug: system-readiness
               - page: "Troubleshooting"
                 path: _build/agent-variants/reference/troubleshooting.openclaw.generated.mdx
                 slug: troubleshooting
@@ -367,6 +424,9 @@ navigation:
               - page: "Community Solutions"
                 path: _build/agent-variants/resources/community-contributions.openclaw.generated.mdx
                 slug: community-contributions
+              - page: "Engineer Documentation for AI Agents"
+                path: _build/agent-variants/resources/engineer-agentic-documentation.openclaw.generated.mdx
+                slug: engineer-agentic-documentation
               - link: "Discord"
                 href: https://discord.gg/XFpfPv9Uvx
               - link: "Report Vulnerabilities"
@@ -374,6 +434,54 @@ navigation:
               - page: "License"
                 path: _build/agent-variants/resources/license.openclaw.generated.mdx
                 slug: license
+      - title: NemoClaw for Pi
+        subtitle: Guide for Pi agents
+        slug: pi
+        layout:
+          - page: "Home"
+            path: index.mdx
+            slug: home
+          - changelog: ./changelog
+            title: Release Notes
+            slug: release-notes
+          - section: "Get Started"
+            slug: get-started
+            collapsed: open-by-default
+            contents:
+              - page: "Quickstart with Pi"
+                path: get-started/quickstart-pi.mdx
+                slug: quickstart
+          - section: "Inference"
+            slug: inference
+            collapsed: open-by-default
+            contents:
+              - page: "Configure Model Limits"
+                path: _build/agent-variants/inference/configure-model-limits.pi.generated.mdx
+                slug: configure-model-limits
+          - section: "Operate Pi"
+            slug: manage-sandboxes
+            collapsed: open-by-default
+            contents:
+              - page: "Run and Manage Pi"
+                path: manage-sandboxes/run-pi.mdx
+                slug: run-pi
+          - section: "Reference"
+            slug: reference
+            collapsed: open-by-default
+            contents:
+              - page: "CLI Commands Reference"
+                path: reference/pi-commands.mdx
+                slug: commands
+              - page: "Pi Support and Security"
+                path: reference/pi-support.mdx
+                slug: pi-support
+          - section: "Resources"
+            slug: resources
+            contents:
+              - link: "Report Vulnerabilities"
+                href: https://github.com/NVIDIA/NemoClaw/blob/main/SECURITY.md
+              - link: "Discord"
+                href: https://discord.gg/XFpfPv9Uvx
       - title: NemoClaw for Deep Agents
         subtitle: Guide for LangChain Deep Agents Code
         slug: deepagents
@@ -462,6 +570,15 @@ navigation:
                   - page: "Set Up vLLM"
                     path: _build/agent-variants/inference/set-up-vllm.deepagents.generated.mdx
                     slug: set-up-vllm
+                  - page: "Set Up vLLM on Two DGX Sparks"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-sparks.deepagents.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-sparks
+                  - page: "Set Up vLLM on Two DGX Stations"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-stations.deepagents.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-stations
+                  - page: "Set Up llama.cpp"
+                    path: _build/agent-variants/inference/set-up-llama-cpp.deepagents.generated.mdx
+                    slug: set-up-llama-cpp
                   - page: "Set Up NVIDIA NIM"
                     path: _build/agent-variants/inference/set-up-nvidia-nim.deepagents.generated.mdx
                     slug: set-up-nvidia-nim
@@ -486,7 +603,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.deepagents.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.deepagents.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -533,6 +650,9 @@ navigation:
                   - page: "Run Sandboxes"
                     path: _build/agent-variants/manage-sandboxes/run-sandboxes.deepagents.generated.mdx
                     slug: run-sandboxes
+                  - page: "Run Deep Agents Code"
+                    path: manage-sandboxes/run-deep-agents-code.mdx
+                    slug: run-deep-agents-code
                   - page: "Recover and Rebuild Sandboxes"
                     path: _build/agent-variants/manage-sandboxes/recover-rebuild-sandboxes.deepagents.generated.mdx
                     slug: recover-and-rebuild-sandboxes
@@ -560,12 +680,37 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.deepagents.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.deepagents.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
                     path: _build/agent-variants/manage-sandboxes/transfer-state-manually.deepagents.generated.mdx
                     slug: transfer-state-manually
+          - section: "Network Policy"
+            slug: network-policy
+            collapsed: open-by-default
+            contents:
+              - page: "Approve or Deny Network Requests"
+                path: _build/agent-variants/network-policy/approve-network-requests.deepagents.generated.mdx
+                slug: approve-network-requests
+              - page: "Customize the Network Policy"
+                path: _build/agent-variants/network-policy/customize-network-policy.deepagents.generated.mdx
+                slug: customize-network-policy
+              - section: "Configure Policies"
+                slug: configure-policies
+                contents:
+                  - page: "Change the Baseline Policy"
+                    path: _build/agent-variants/network-policy/change-baseline-network-policy.deepagents.generated.mdx
+                    slug: change-baseline-network-policy
+                  - page: "Apply Policy Presets"
+                    path: _build/agent-variants/network-policy/apply-policy-presets.deepagents.generated.mdx
+                    slug: apply-policy-presets
+                  - page: "Create Custom Presets"
+                    path: _build/agent-variants/network-policy/create-custom-policy-presets.deepagents.generated.mdx
+                    slug: create-custom-policy-presets
+                  - page: "Replace the Live Policy"
+                    path: _build/agent-variants/network-policy/replace-live-network-policy.deepagents.generated.mdx
+                    slug: replace-live-network-policy
           - section: "Deployment"
             slug: deployment
             collapsed: open-by-default
@@ -573,6 +718,28 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.deepagents.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.deepagents.generated.mdx
+                slug: register-external-component
+              - page: "Gateway Lifecycle Authority"
+                path: _build/agent-variants/deployment/gateway-lifecycle-authority.deepagents.generated.mdx
+                slug: gateway-lifecycle-authority
+          - section: "Monitoring"
+            slug: monitoring
+            collapsed: open-by-default
+            contents:
+              - page: "Understand Trace Export"
+                path: monitoring/understand-deepagents-trace-export.mdx
+                slug: understand-deepagents-trace-export
+              - page: "Set Up Trace Export"
+                path: monitoring/set-up-deepagents-trace-export.mdx
+                slug: set-up-deepagents-trace-export
+              - page: "Verify Trace Export"
+                path: monitoring/verify-deepagents-trace-export.mdx
+                slug: verify-deepagents-trace-export
+              - page: "Manage Trace Export"
+                path: monitoring/manage-deepagents-trace-export.mdx
+                slug: manage-deepagents-trace-export
           - section: "Security"
             slug: security
             collapsed: open-by-default
@@ -580,19 +747,37 @@ navigation:
               - page: "Security Best Practices"
                 path: _build/agent-variants/security/best-practices.deepagents.generated.mdx
                 slug: best-practices
+              - section: "Security Controls"
+                slug: security-controls
+                contents:
+                  - page: "Filesystem Controls"
+                    path: _build/agent-variants/security/filesystem-controls.deepagents.generated.mdx
+                    slug: filesystem-controls
+                  - page: "Process Controls"
+                    path: _build/agent-variants/security/process-controls.deepagents.generated.mdx
+                    slug: process-controls
+                  - page: "Gateway and Secret Controls"
+                    path: _build/agent-variants/security/gateway-authentication-controls.deepagents.generated.mdx
+                    slug: gateway-authentication-controls
+              - page: "Configure Corporate CA Trust"
+                path: _build/agent-variants/security/configure-corporate-ca-trust.deepagents.generated.mdx
+                slug: configure-corporate-ca-trust
               - page: "Credential Storage"
                 path: _build/agent-variants/security/credential-storage.deepagents.generated.mdx
                 slug: credential-storage
-              - page: "OpenShell 0.0.72 Compatibility Review"
-                path: _build/agent-variants/security/openshell-0.0.72-compatibility-review.deepagents.generated.mdx
-                slug: openshell-0.0.72-compatibility-review
+              - page: "Trusted Computing Base"
+                path: _build/agent-variants/security/tcb-boundary.deepagents.generated.mdx
+                slug: trusted-computing-base
           - section: "Reference"
             slug: reference
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.deepagents.generated.mdx
                 slug: platform-support
+              - page: "Enterprise Readiness"
+                path: _build/agent-variants/reference/enterprise-readiness.deepagents.generated.mdx
+                slug: enterprise-readiness
               - page: "Architecture Details"
                 path: _build/agent-variants/reference/architecture.deepagents.generated.mdx
                 slug: architecture
@@ -614,6 +799,9 @@ navigation:
               - page: "Troubleshoot MCP Servers"
                 path: _build/agent-variants/reference/troubleshoot-mcp-servers.deepagents.generated.mdx
                 slug: troubleshoot-mcp-servers
+              - page: "System Readiness"
+                path: _build/agent-variants/reference/system-readiness.deepagents.generated.mdx
+                slug: system-readiness
               - page: "Troubleshooting"
                 path: _build/agent-variants/reference/troubleshooting.deepagents.generated.mdx
                 slug: troubleshooting
@@ -627,6 +815,9 @@ navigation:
               - page: "Community Solutions"
                 path: _build/agent-variants/resources/community-contributions.deepagents.generated.mdx
                 slug: community-contributions
+              - page: "Engineer Documentation for AI Agents"
+                path: _build/agent-variants/resources/engineer-agentic-documentation.deepagents.generated.mdx
+                slug: engineer-agentic-documentation
               - link: "Report Vulnerabilities"
                 href: https://github.com/NVIDIA/NemoClaw/blob/main/SECURITY.md
               - page: "License"
@@ -728,6 +919,15 @@ navigation:
                   - page: "Set Up vLLM"
                     path: _build/agent-variants/inference/set-up-vllm.hermes.generated.mdx
                     slug: set-up-vllm
+                  - page: "Set Up vLLM on Two DGX Sparks"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-sparks.hermes.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-sparks
+                  - page: "Set Up vLLM on Two DGX Stations"
+                    path: _build/agent-variants/inference/set-up-vllm-on-two-dgx-stations.hermes.generated.mdx
+                    slug: set-up-vllm-on-two-dgx-stations
+                  - page: "Set Up llama.cpp"
+                    path: _build/agent-variants/inference/set-up-llama-cpp.hermes.generated.mdx
+                    slug: set-up-llama-cpp
                   - page: "Set Up NVIDIA NIM"
                     path: _build/agent-variants/inference/set-up-nvidia-nim.hermes.generated.mdx
                     slug: set-up-nvidia-nim
@@ -752,7 +952,7 @@ navigation:
                   - page: "Use Shared Gateway Routes"
                     path: _build/agent-variants/inference/use-shared-gateway-routes.hermes.generated.mdx
                     slug: use-shared-gateway-routes
-                  - page: "View the Active Inference Route"
+                  - page: "View the Selected Inference Path"
                     path: _build/agent-variants/inference/view-active-inference-route.hermes.generated.mdx
                     slug: view-active-inference-route
                   - page: "Switch Models"
@@ -832,6 +1032,9 @@ navigation:
                   - page: "Set Up Slack"
                     path: _build/agent-variants/manage-sandboxes/set-up-slack.hermes.generated.mdx
                     slug: set-up-slack
+                  - page: "Set Up Google Chat"
+                    path: _build/agent-variants/manage-sandboxes/set-up-google-chat.hermes.generated.mdx
+                    slug: set-up-google-chat
                   - page: "Set Up WeChat"
                     path: _build/agent-variants/manage-sandboxes/set-up-wechat.hermes.generated.mdx
                     slug: set-up-wechat
@@ -871,7 +1074,7 @@ navigation:
                   - page: "Understand Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/workspace-files.hermes.generated.mdx
                     slug: understand-sandbox-state
-                  - page: "Create and Restore Snapshots"
+                  - page: "Persist Sandbox State"
                     path: _build/agent-variants/manage-sandboxes/backup-restore.hermes.generated.mdx
                     slug: create-and-restore-snapshots
                   - page: "Transfer State Manually"
@@ -887,9 +1090,33 @@ navigation:
               - page: "Customize the Network Policy"
                 path: _build/agent-variants/network-policy/customize-network-policy.hermes.generated.mdx
                 slug: customize-network-policy
+              - section: "Configure Policies"
+                slug: configure-policies
+                contents:
+                  - page: "Change the Baseline Policy"
+                    path: _build/agent-variants/network-policy/change-baseline-network-policy.hermes.generated.mdx
+                    slug: change-baseline-network-policy
+                  - page: "Apply Policy Presets"
+                    path: _build/agent-variants/network-policy/apply-policy-presets.hermes.generated.mdx
+                    slug: apply-policy-presets
+                  - page: "Create Custom Presets"
+                    path: _build/agent-variants/network-policy/create-custom-policy-presets.hermes.generated.mdx
+                    slug: create-custom-policy-presets
+                  - page: "Configure Raw TLS"
+                    path: _build/agent-variants/network-policy/configure-raw-tls-passthrough.hermes.generated.mdx
+                    slug: configure-raw-tls-passthrough
+                  - page: "Replace the Live Policy"
+                    path: _build/agent-variants/network-policy/replace-live-network-policy.hermes.generated.mdx
+                    slug: replace-live-network-policy
+              - page: "Explain Policy to Agents"
+                path: _build/agent-variants/network-policy/explain-network-policy-to-agents.hermes.generated.mdx
+                slug: explain-network-policy-to-agents
               - page: "Integration Policy Examples"
                 path: _build/agent-variants/network-policy/integration-policy-examples.hermes.generated.mdx
                 slug: integration-policy-examples
+              - page: "Set Up Gmail With an App Password"
+                path: _build/agent-variants/network-policy/set-up-gmail-with-an-app-password.hermes.generated.mdx
+                slug: set-up-gmail-with-an-app-password
           - section: "Deployment"
             slug: deployment
             collapsed: open-by-default
@@ -897,6 +1124,12 @@ navigation:
               - page: "Deploy to a Headless Server"
                 path: _build/agent-variants/deployment/deploy-to-headless-server.hermes.generated.mdx
                 slug: deploy-to-headless-server
+              - page: "Register an External Component"
+                path: _build/agent-variants/deployment/register-external-component.hermes.generated.mdx
+                slug: register-external-component
+              - page: "Gateway Lifecycle Authority"
+                path: _build/agent-variants/deployment/gateway-lifecycle-authority.hermes.generated.mdx
+                slug: gateway-lifecycle-authority
           - section: "Monitoring"
             slug: monitoring
             collapsed: open-by-default
@@ -911,6 +1144,18 @@ navigation:
               - page: "Security Best Practices"
                 path: _build/agent-variants/security/best-practices.hermes.generated.mdx
                 slug: best-practices
+              - section: "Security Controls"
+                slug: security-controls
+                contents:
+                  - page: "Filesystem Controls"
+                    path: _build/agent-variants/security/filesystem-controls.hermes.generated.mdx
+                    slug: filesystem-controls
+                  - page: "Process Controls"
+                    path: _build/agent-variants/security/process-controls.hermes.generated.mdx
+                    slug: process-controls
+                  - page: "Gateway and Secret Controls"
+                    path: _build/agent-variants/security/gateway-authentication-controls.hermes.generated.mdx
+                    slug: gateway-authentication-controls
               - page: "Configure Corporate CA Trust"
                 path: _build/agent-variants/security/configure-corporate-ca-trust.hermes.generated.mdx
                 slug: configure-corporate-ca-trust
@@ -923,18 +1168,12 @@ navigation:
               - page: "Trusted Computing Base"
                 path: _build/agent-variants/security/tcb-boundary.hermes.generated.mdx
                 slug: trusted-computing-base
-              - page: "OpenShell 0.0.72 Compatibility Review"
-                path: _build/agent-variants/security/openshell-0.0.72-compatibility-review.hermes.generated.mdx
-                slug: openshell-0.0.72-compatibility-review
-              - page: "OpenShell 0.0.71 Review"
-                path: _build/agent-variants/security/openshell-0.0.71-gateway-auth-review.hermes.generated.mdx
-                slug: openshell-0.0.71-gateway-auth-review
           - section: "Reference"
             slug: reference
             collapsed: open-by-default
             contents:
               - page: "Platform Support"
-                path: reference/platform-support.mdx
+                path: _build/agent-variants/reference/platform-support.hermes.generated.mdx
                 slug: platform-support
               - page: "Enterprise Readiness"
                 path: _build/agent-variants/reference/enterprise-readiness.hermes.generated.mdx
@@ -945,6 +1184,9 @@ navigation:
               - page: "Extension Taxonomy and SDK Readiness"
                 path: _build/agent-variants/reference/extension-taxonomy-sdk-readiness.hermes.generated.mdx
                 slug: extension-taxonomy-sdk-readiness
+              - page: "Headless Lifecycle Package"
+                path: reference/headless-lifecycle-package.mdx
+                slug: headless-lifecycle-package
               - page: "CLI Commands Reference"
                 path: _build/agent-variants/reference/commands.hermes.generated.mdx
                 slug: commands
@@ -960,6 +1202,9 @@ navigation:
               - page: "Troubleshoot MCP Servers"
                 path: _build/agent-variants/reference/troubleshoot-mcp-servers.hermes.generated.mdx
                 slug: troubleshoot-mcp-servers
+              - page: "System Readiness"
+                path: _build/agent-variants/reference/system-readiness.hermes.generated.mdx
+                slug: system-readiness
               - page: "Troubleshooting"
                 path: _build/agent-variants/reference/troubleshooting.hermes.generated.mdx
                 slug: troubleshooting
@@ -973,6 +1218,9 @@ navigation:
               - page: "Community Solutions"
                 path: _build/agent-variants/resources/community-contributions.hermes.generated.mdx
                 slug: community-contributions
+              - page: "Engineer Documentation for AI Agents"
+                path: _build/agent-variants/resources/engineer-agentic-documentation.hermes.generated.mdx
+                slug: engineer-agentic-documentation
               - link: "Report Vulnerabilities"
                 href: https://github.com/NVIDIA/NemoClaw/blob/main/SECURITY.md
               - page: "License"

@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildDoctorReport, type DoctorCheck, renderDoctorReport } from "./doctor-report";
+import {
+  buildDoctorReport,
+  buildGlobalDoctorReport,
+  type DoctorCheck,
+  renderDoctorReport,
+} from "./doctor-report";
 
 function check(status: DoctorCheck["status"], group = "Host"): DoctorCheck {
   return { group, label: `${status} check`, status, detail: `${status} detail` };
@@ -34,6 +39,46 @@ describe("doctor reports", () => {
     expect(JSON.parse(String(logSpy.mock.calls[0]?.[0]))).toEqual(report);
   });
 
+  it("redacts token-shaped values from the machine-readable report", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const report = buildDoctorReport("alpha", [
+      {
+        group: "Gateway",
+        label: "Gateway status",
+        status: "fail",
+        detail: "connect failed: Authorization: Bearer sk-abc123DEF456ghi789 (HTTP 401)",
+        hint: "restart the gateway",
+      },
+    ]);
+
+    expect(renderDoctorReport(report, true)).toBe(1);
+    const printed = JSON.parse(String(logSpy.mock.calls[0]?.[0]));
+    expect(printed.checks[0].detail).toBe(
+      "connect failed: Authorization: Bearer <REDACTED> (HTTP 401)",
+    );
+    expect(printed.checks[0].hint).toBe("restart the gateway");
+    expect(JSON.stringify(printed)).not.toContain("sk-abc123DEF456ghi789");
+  });
+
+  it("redacts token-shaped values from the text report", () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line = "") => lines.push(String(line)));
+    const report = buildGlobalDoctorReport([
+      {
+        group: "Gateway",
+        label: "OpenShell status",
+        status: "fail",
+        detail: "connect failed: Authorization: Bearer sk-abc123DEF456ghi789 (HTTP 401)",
+      },
+    ]);
+
+    expect(renderDoctorReport(report, false)).toBe(1);
+    const output = lines.join("\n");
+    expect(output).toContain("Authorization: Bearer <REDACTED>");
+    expect(output).toContain("[fail]");
+    expect(output).not.toContain("sk-abc123DEF456ghi789");
+  });
+
   it("renders preferred groups first, preserves extra-group order, and includes hints", () => {
     const lines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((line = "") => lines.push(String(line)));
@@ -46,5 +91,25 @@ describe("doctor reports", () => {
     expect(output.indexOf("Messaging:")).toBeLessThan(output.indexOf("Custom:"));
     expect(output).toContain("hint: inspect the custom probe");
     expect(output).toContain("healthy with 1 warning(s)");
+  });
+
+  it("renders a global report without a sandbox field or heading suffix (#10212)", () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line = "") => lines.push(String(line)));
+    const report = buildGlobalDoctorReport([check("ok")]);
+
+    expect(report).toEqual({
+      schemaVersion: 1,
+      scope: "global",
+      status: "ok",
+      failed: 0,
+      warnings: 0,
+      checks: [check("ok")],
+    });
+    expect(report).not.toHaveProperty("sandbox");
+    expect(renderDoctorReport(report, false)).toBe(0);
+    const output = lines.join("\n");
+    expect(output).toContain("NemoClaw doctor");
+    expect(output).not.toContain("NemoClaw doctor:");
   });
 });

@@ -4,6 +4,86 @@
 
 set -euo pipefail
 
+# Exit codes consumed by the TypeScript lifecycle adapter. Keep these stable:
+# they are the machine-readable contract between formula presence, repair, and
+# the temporary Homebrew trust boundary. Raw Homebrew diagnostics never
+# authorize standalone startup while a formula or installed keg can retain
+# gateway lifecycle authority.
+readonly OPENSHELL_HOMEBREW_FORMULA_ABSENT=65
+readonly OPENSHELL_HOMEBREW_FORMULA_REPAIR=66
+readonly OPENSHELL_HOMEBREW_TRUST_FAILED=67
+readonly OPENSHELL_HOMEBREW_UNTRUST_FAILED=68
+readonly OPENSHELL_HOMEBREW_OPERATION_FAILED=69
+
+run_trusted_openshell_homebrew_operation() {
+  local expected_sha256="$1"
+  shift
+  [ "${1:-}" = "--" ] || return 64
+  shift
+  [ "${1:-}" = "brew" ] || return 64
+  [ "$#" -gt 1 ] || return 64
+
+  (
+    local actual_sha256 cellar formula_file formula_ref status tap_repo trust_active
+    formula_ref="nvidia/openshell/openshell"
+    trust_active=0
+
+    tap_repo="$(brew --repository nvidia/openshell 2>/dev/null || true)"
+    formula_file="${tap_repo}/Formula/openshell.rb"
+    if [ -z "$tap_repo" ] || [ ! -f "$formula_file" ]; then
+      cellar="$(brew --cellar 2>/dev/null || true)"
+      if [ -n "$cellar" ] && [ -d "${cellar}/openshell" ]; then
+        exit "$OPENSHELL_HOMEBREW_FORMULA_REPAIR"
+      fi
+      exit "$OPENSHELL_HOMEBREW_FORMULA_ABSENT"
+    fi
+    [ ! -L "$formula_file" ] || exit "$OPENSHELL_HOMEBREW_FORMULA_REPAIR"
+
+    [[ "$expected_sha256" =~ ^[a-f0-9]{64}$ ]] \
+      || exit "$OPENSHELL_HOMEBREW_FORMULA_REPAIR"
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual_sha256="$(sha256sum "$formula_file" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual_sha256="$(shasum -a 256 "$formula_file" | awk '{print $1}')"
+    else
+      exit "$OPENSHELL_HOMEBREW_FORMULA_REPAIR"
+    fi
+    [ "$actual_sha256" = "$expected_sha256" ] \
+      || exit "$OPENSHELL_HOMEBREW_FORMULA_REPAIR"
+
+    # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap below.
+    cleanup_openshell_homebrew_formula_trust() {
+      status=$?
+      trap - EXIT
+      if [ "$trust_active" = "1" ] && ! brew untrust --formula "$formula_ref" >/dev/null 2>&1; then
+        exit "$OPENSHELL_HOMEBREW_UNTRUST_FAILED"
+      fi
+      exit "$status"
+    }
+    trap cleanup_openshell_homebrew_formula_trust EXIT
+    trap 'exit 70' HUP INT TERM
+
+    brew help trust >/dev/null 2>&1 \
+      || exit "$OPENSHELL_HOMEBREW_TRUST_FAILED"
+    brew help untrust >/dev/null 2>&1 \
+      || exit "$OPENSHELL_HOMEBREW_TRUST_FAILED"
+    brew untrust --formula "$formula_ref" >/dev/null 2>&1 \
+      || exit "$OPENSHELL_HOMEBREW_TRUST_FAILED"
+    trust_active=1
+    brew trust --formula "$formula_ref" >/dev/null 2>&1 \
+      || exit "$OPENSHELL_HOMEBREW_TRUST_FAILED"
+
+    "$@" || exit "$OPENSHELL_HOMEBREW_OPERATION_FAILED"
+  )
+}
+
+if [ "${1:-}" = "--homebrew-formula-operation" ]; then
+  shift
+  [ "$#" -ge 4 ] || exit 64
+  run_trusted_openshell_homebrew_operation "$@"
+  exit $?
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -37,21 +117,24 @@ info "Detected $OS_LABEL ($ARCH_LABEL)"
 # round-trippable base policies: WebSocket text frames, provider-shaped
 # aliases, REST request bodies, MCP/JSON-RPC L7 enforcement, and
 # `policy get --base` for MCP/JSON-RPC-safe read-modify-write operations.
-MIN_VERSION="0.0.85"
+MIN_VERSION="0.0.116"
 # Maximum version validated for this NemoClaw release. Newer OpenShell builds
 # may change sandbox semantics; upgrade NemoClaw before upgrading past this.
-MAX_VERSION="0.0.85"
+MAX_VERSION="0.0.116"
 # Pin fresh installs to this version. The TS installer normally overrides this
 # via NEMOCLAW_OPENSHELL_PIN_VERSION after resolving the highest published
 # OpenShell release that satisfies the blueprint's max_openshell_version
 # (see #3404). The hardcoded value is the fallback for offline runs.
 PIN_VERSION="$MAX_VERSION"
-DEV_MIN_VERSION="0.0.85"
+# Keep the base-trusted template selector aligned with the immutable release;
+# the dev channel is rejected below and cannot consume it.
+DEV_MIN_VERSION="0.0.116"
 
 CHANNEL="${NEMOCLAW_OPENSHELL_CHANNEL:-auto}"
 case "$CHANNEL" in
-  stable | dev | auto) ;;
-  *) fail "NEMOCLAW_OPENSHELL_CHANNEL must be one of: stable, dev, auto" ;;
+  stable | auto) ;;
+  dev) fail "NemoClaw requires exact stable OpenShell $DEV_MIN_VERSION; the dev channel is not supported." ;;
+  *) fail "NEMOCLAW_OPENSHELL_CHANNEL must be one of: stable, auto" ;;
 esac
 
 FORCE_INSTALL="${NEMOCLAW_OPENSHELL_FORCE_INSTALL:-0}"
@@ -60,71 +143,65 @@ case "$FORCE_INSTALL" in
   *) fail "NEMOCLAW_OPENSHELL_FORCE_INSTALL must be 0 or 1." ;;
 esac
 
-if [ "$CHANNEL" = "auto" ]; then
-  RESOLVED_CHANNEL="stable"
-else
-  RESOLVED_CHANNEL="$CHANNEL"
-fi
+HOMEBREW_TAP="nvidia/openshell"
+HOMEBREW_FORMULA_NAME="openshell"
+MACOS_INSTALL_METHOD="${_NEMOCLAW_OPENSHELL_INSTALL_METHOD:-auto}"
+case "$MACOS_INSTALL_METHOD" in
+  auto) ;;
+  homebrew)
+    [ "$OS" = "Darwin" ] || fail "The Homebrew OpenShell installation method is valid only on macOS."
+    command -v brew >/dev/null 2>&1 \
+      || fail "The selected Homebrew OpenShell installation method became unavailable before installation."
+    ;;
+  standalone)
+    [ "$OS" = "Darwin" ] || fail "The standalone macOS OpenShell installation method is valid only on macOS."
+    ! command -v brew >/dev/null 2>&1 \
+      || fail "Homebrew appeared after standalone OpenShell installation was selected; refusing an ambiguous installation method."
+    ;;
+  *) fail "The internal macOS OpenShell installation method is invalid." ;;
+esac
 
-if [ "$RESOLVED_CHANNEL" = "dev" ]; then
-  # invalidState: a mutable dev artifact is consumed as if it were a verified
-  # stable release. sourceBoundary: OpenShell owns the moving dev tag; NemoClaw
-  # owns this explicit compatibility-only opt-in. whyNotSourceFix: NemoClaw
-  # cannot make that upstream tag immutable. regressionTest:
-  # test/install-openshell-version-check.test.ts covers rejection without the
-  # opt-in and acceptance with it. removalCondition: remove this path when dev
-  # compatibility testing ends or OpenShell publishes an independently
-  # verifiable immutable development channel. See the v0.0.72 compatibility
-  # review's "Dev Channel Opt-In" section.
-  if [ "${NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL:-}" != "1" ]; then
-    fail "Dev channel install skips SHA-256 verification. Set NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL=1 to explicitly accept an unverified OpenShell dev-channel install."
-  fi
-  warn "Dev channel install skips SHA-256 verification. Use only in trusted environments."
-fi
-
-# Honour the TS installer's blueprint-derived env overrides only on the stable
-# channel — the dev channel installs from the `dev` tag and uses DEV_MIN_VERSION
-# instead, so a malformed override should not abort a dev install (#3446 review).
-# The TS layer passes MIN/MAX/PIN from the blueprint so a single source of truth
+# Honour the TS installer's blueprint-derived env overrides. The TS layer
+# passes MIN/MAX/PIN from the blueprint so a single source of truth
 # (nemoclaw-blueprint/blueprint.yaml) drives the install (#3404).
 #
 # Validation is inlined (rather than wrapped in a helper that returns via
 # $(...)) so a `fail` triggered here is not captured into the variable
 # assignment. `fail` now writes to stderr (#3446 CodeRabbit), but keeping
 # the validation outside of $(...) avoids relying on that.
-if [ "$RESOLVED_CHANNEL" != "dev" ]; then
-  if [ -n "${NEMOCLAW_OPENSHELL_MIN_VERSION:-}" ]; then
-    if [[ "$NEMOCLAW_OPENSHELL_MIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      MIN_VERSION="$NEMOCLAW_OPENSHELL_MIN_VERSION"
-    else
-      fail "NEMOCLAW_OPENSHELL_MIN_VERSION='$NEMOCLAW_OPENSHELL_MIN_VERSION' is not a valid X.Y.Z version."
-    fi
+if [ -n "${NEMOCLAW_OPENSHELL_MIN_VERSION:-}" ]; then
+  if [[ "$NEMOCLAW_OPENSHELL_MIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$NEMOCLAW_OPENSHELL_MIN_VERSION" = "$MIN_VERSION" ] \
+      || fail "NEMOCLAW_OPENSHELL_MIN_VERSION must equal immutable OpenShell $MIN_VERSION."
+    MIN_VERSION="$NEMOCLAW_OPENSHELL_MIN_VERSION"
+  else
+    fail "NEMOCLAW_OPENSHELL_MIN_VERSION='$NEMOCLAW_OPENSHELL_MIN_VERSION' is not a valid X.Y.Z version."
   fi
-  if [ -n "${NEMOCLAW_OPENSHELL_MAX_VERSION:-}" ]; then
-    if [[ "$NEMOCLAW_OPENSHELL_MAX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      MAX_VERSION="$NEMOCLAW_OPENSHELL_MAX_VERSION"
-      # Intentionally do NOT default PIN_VERSION to the overridden MAX here.
-      # If the TS resolver couldn't reach GitHub (rate-limited / offline) it
-      # only sets MIN/MAX, never PIN — falling through to the script's
-      # hardcoded PIN_VERSION is the known-good safe path (#3446 CodeRabbit).
-    else
-      fail "NEMOCLAW_OPENSHELL_MAX_VERSION='$NEMOCLAW_OPENSHELL_MAX_VERSION' is not a valid X.Y.Z version."
-    fi
+fi
+if [ -n "${NEMOCLAW_OPENSHELL_MAX_VERSION:-}" ]; then
+  if [[ "$NEMOCLAW_OPENSHELL_MAX_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$NEMOCLAW_OPENSHELL_MAX_VERSION" = "$MAX_VERSION" ] \
+      || fail "NEMOCLAW_OPENSHELL_MAX_VERSION must equal immutable OpenShell $MAX_VERSION."
+    MAX_VERSION="$NEMOCLAW_OPENSHELL_MAX_VERSION"
+    # Intentionally do NOT default PIN_VERSION to the overridden MAX here.
+    # If the TS resolver couldn't reach GitHub (rate-limited / offline) it
+    # only sets MIN/MAX, never PIN — falling through to the script's
+    # hardcoded PIN_VERSION is the known-good safe path (#3446 CodeRabbit).
+  else
+    fail "NEMOCLAW_OPENSHELL_MAX_VERSION='$NEMOCLAW_OPENSHELL_MAX_VERSION' is not a valid X.Y.Z version."
   fi
-  if [ -n "${NEMOCLAW_OPENSHELL_PIN_VERSION:-}" ]; then
-    if [[ "$NEMOCLAW_OPENSHELL_PIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      PIN_VERSION="$NEMOCLAW_OPENSHELL_PIN_VERSION"
-    else
-      fail "NEMOCLAW_OPENSHELL_PIN_VERSION='$NEMOCLAW_OPENSHELL_PIN_VERSION' is not a valid X.Y.Z version."
-    fi
+fi
+if [ -n "${NEMOCLAW_OPENSHELL_PIN_VERSION:-}" ]; then
+  if [[ "$NEMOCLAW_OPENSHELL_PIN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    [ "$NEMOCLAW_OPENSHELL_PIN_VERSION" = "$PIN_VERSION" ] \
+      || fail "NEMOCLAW_OPENSHELL_PIN_VERSION must equal immutable OpenShell $PIN_VERSION."
+    PIN_VERSION="$NEMOCLAW_OPENSHELL_PIN_VERSION"
+  else
+    fail "NEMOCLAW_OPENSHELL_PIN_VERSION='$NEMOCLAW_OPENSHELL_PIN_VERSION' is not a valid X.Y.Z version."
   fi
 fi
 
-if [ "$RESOLVED_CHANNEL" = "dev" ]; then
-  RELEASE_TAG="dev"
-else
-  RELEASE_TAG="v${PIN_VERSION}"
-fi
+RELEASE_TAG="v${PIN_VERSION}"
 
 # invalidState: a consumed OpenShell release asset differs from the digest
 # published for the selected immutable release, or a mutable registry tag moves.
@@ -132,37 +209,49 @@ fi
 # assets, and GHCR manifests; NemoClaw owns which exact artifacts it trusts.
 # whyNotSourceFix: NemoClaw cannot retroactively make an upstream publication
 # immutable, so it independently pins every consumed archive and supervisor.
-# regressionTest: test/install-openshell-version-check.test.ts exercises all
-# eight mappings, and scripts/check-installer-hash.sh compares them with the
+# regressionTest: test/installer-integration/install-openshell-version-check.test.ts exercises all
+# nine mappings, and scripts/check-installer-hash.sh compares them with the
 # GitHub release API on every PR, main push, weekly run, and manual dispatch.
 # removalCondition: remove these entries only when NemoClaw drops that
 # supported release or replaces them with independently verified newer pins.
 openshell_pinned_sha256() {
   local release_tag="$1" asset="$2"
   case "${release_tag}:${asset}" in
-    v0.0.85:openshell-x86_64-unknown-linux-musl.tar.gz)
-      printf '%s\n' "078fa086f506832c3d47d992e6109f26074bdd55916ce268e47c3971423459eb"
+    v0.0.116:openshell-x86_64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "4fb4476d80a1875a0b83547ec3aba999cf0a2e2d75f95f2f709b622e2103520e"
       ;;
-    v0.0.85:openshell-aarch64-unknown-linux-musl.tar.gz)
-      printf '%s\n' "3cf353e7994d5835a233fe0641f9a860779190b054d0f90a04c897be782734b8"
+    v0.0.116:openshell-aarch64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb3f43"
       ;;
-    v0.0.85:openshell-aarch64-apple-darwin.tar.gz)
-      printf '%s\n' "522c963f9515c7325b978e89022de76227ac245eefe1371292af1424434e2067"
+    v0.0.116:openshell-aarch64-apple-darwin.tar.gz)
+      printf '%s\n' "e582f2374053bebac8e6aaeb4a369931b7d4bb97bd55055e2c02e85502627e22"
       ;;
-    v0.0.85:openshell-gateway-x86_64-unknown-linux-gnu.tar.gz)
-      printf '%s\n' "718cc9f942f88565cacb13c39717b128d6acc8d336212d42d26243f36ab19ece"
+    v0.0.116:openshell-gateway-x86_64-unknown-linux-gnu.tar.gz)
+      printf '%s\n' "59c6da724eae7a00c28826f9191efbdf4fbaa5c768afdc8dea6a80a949ebcc89"
       ;;
-    v0.0.85:openshell-gateway-aarch64-unknown-linux-gnu.tar.gz)
-      printf '%s\n' "09f2823f6e9c5f70f4482b200206eac455d789618da4ebe4acff042d794e7162"
+    v0.0.116:openshell-gateway-aarch64-unknown-linux-gnu.tar.gz)
+      printf '%s\n' "292c379193a339220234ffea585350901468bb8f4076e2076bc074e8ed18974b"
       ;;
-    v0.0.85:openshell-gateway-aarch64-apple-darwin.tar.gz)
-      printf '%s\n' "5de3e08ad1bdb0cdd01373999f537edca3d8aca22ae1c29bc9926969fe401e45"
+    v0.0.116:openshell-gateway-aarch64-apple-darwin.tar.gz)
+      printf '%s\n' "f192d3d737c125264e13ef73458541df2ca6a9eb2fa599736a7f2587d5d2ce8d"
       ;;
-    v0.0.85:openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz)
-      printf '%s\n' "94306f057d862cd5c34a0daa7692491733bc5ca528a7b92f9f62f717fb70a9be"
+    v0.0.116:openshell-sandbox-x86_64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "0bb160f73e5007338b94e3c868f66f50c71cd65c27c932ed9a4fa67c49e6d423"
       ;;
-    v0.0.85:openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz)
-      printf '%s\n' "2c52b2971aecf125e41ed160d8d2f2addf04031906ca88f120ae3d436dd6b8f7"
+    v0.0.116:openshell-sandbox-aarch64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "959d9a88270e0336f04342560df750591da603424d0a9bfb481ee29670342557"
+      ;;
+    v0.0.116:openshell-checksums-sha256.txt)
+      printf '%s\n' "f8b6ec65366f9d256737b884ba4d9f184b4dbbbb9540711ed9e4934d772eba7e"
+      ;;
+    v0.0.116:openshell-gateway-checksums-sha256.txt)
+      printf '%s\n' "572d80ded99fab0c2cf75f8108c62ab3e8455356b3c3b38de1be98806a2440e9"
+      ;;
+    v0.0.116:openshell-sandbox-checksums-sha256.txt)
+      printf '%s\n' "0cb63b3b4436214224872c1ba245bda0d92d904822aa4f28015081269f398f93"
+      ;;
+    v0.0.116:openshell.rb)
+      printf '%s\n' "cf00a9441589702ffe006720fd6a9dffc0f0745b337036aad26dc53eb94c1558"
       ;;
     *)
       return 1
@@ -285,10 +374,25 @@ pinned_sandbox_build_version() {
       76bc19b70d9f1e1e9871307045796cd39cc7b8fc4c08ffc90593cc934f36d500)
       printf '%s\n' "0.0.82"
       ;;
-    # OpenShell v0.0.85 standalone sandbox binaries.
-    863ef21ab7ef623f5e7a8728c4e5532b46bfbae3ace3b800665a1c6353a1f7d2 | \
-      680115dbc2affde0e88261ab09f4044726d1cc9e01de55dc5077d1118f52968d)
-      printf '%s\n' "0.0.85"
+    # OpenShell v0.0.99 standalone sandbox binaries.
+    a4b0c38ed90a6dd4b4f312ad3727824a25ec478d88d4e65d22a82377b18e6214 | \
+      f60ce5b76e4dbd645f690c8519852d261c8cf6a70b5fc56db329a23d68bc7b2e)
+      printf '%s\n' "0.0.99"
+      ;;
+    # OpenShell v0.0.101 standalone sandbox binaries.
+    a2704babbb468fd0a359bfdd9844de71095b730758541b4ca8cbab77d4018920 | \
+      88300e35f153123e4dc3021c537834dd6c0a09665a4a6d3974cd285d512345c4)
+      printf '%s\n' "0.0.101"
+      ;;
+    # OpenShell v0.0.106 standalone sandbox binaries.
+    019301ec8618abbed8135e8d39dde7bea47e5e92813bbc17768550de34db59f8 | \
+      0031c6b257a23ecc1a2333153918324f3af0005e68abde388858d682ec646c55)
+      printf '%s\n' "0.0.106"
+      ;;
+    # OpenShell v0.0.116 standalone sandbox binaries.
+    326ee26df8f8575ba761470757a12fe5c1cdc904ba064b81946692dd0328dd40 | \
+      7052a87d2b46ef52ecc0f7c64b9bac008dd3010c467881b0648045334eb0ed1d)
+      printf '%s\n' "0.0.116"
       ;;
     *)
       return 1
@@ -613,6 +717,129 @@ repair_existing_macos_vm_driver() {
   return 1
 }
 
+macos_homebrew_formula_installed() {
+  local formula_info formula_operation_pin
+  [ "$OS" = "Darwin" ] || return 1
+  command -v brew >/dev/null 2>&1 || return 1
+  formula_operation_pin="$(openshell_pinned_sha256 "$RELEASE_TAG" "openshell.rb")" \
+    || return 1
+  run_trusted_openshell_homebrew_operation "$formula_operation_pin" -- \
+    brew list --formula "$HOMEBREW_FORMULA_NAME" >/dev/null 2>&1 \
+    || return 1
+  formula_info="$(run_trusted_openshell_homebrew_operation "$formula_operation_pin" -- \
+    brew info --json=v2 "$HOMEBREW_FORMULA_NAME" 2>/dev/null)" \
+    || return 1
+  printf '%s\n' "$formula_info" \
+    | grep -Eq '"tap"[[:space:]]*:[[:space:]]*"nvidia/openshell"'
+}
+
+download_openshell_formula() {
+  local release_tag="$1" output="$2" output_dir
+  output_dir="$(dirname "$output")"
+  if command -v gh >/dev/null 2>&1; then
+    if GH_PROMPT_DISABLED=1 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" gh release download "$release_tag" --repo NVIDIA/OpenShell \
+      --pattern "openshell.rb" --dir "$output_dir" --clobber 2>/dev/null; then
+      [ -f "$output" ] && return 0
+    fi
+    warn "gh CLI formula download failed (auth may not be configured) — falling back to curl"
+    rm -f "$output"
+  fi
+  curl --proto '=https' --tlsv1.2 -fL -sS \
+    --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 1 --retry-all-errors \
+    "https://github.com/NVIDIA/OpenShell/releases/download/${release_tag}/openshell.rb" \
+    -o "$output"
+}
+
+homebrew_formula_path() {
+  local tap="$1" formula="$2" tap_dir formula_dir
+  if ! brew tap-info "$tap" >/dev/null 2>&1; then
+    info "creating local Homebrew tap ${tap}..." >&2
+    brew tap-new --no-git "$tap" >/dev/null
+  fi
+
+  tap_dir="$(brew --repository "$tap" 2>/dev/null || true)"
+  [ -n "$tap_dir" ] || fail "could not locate Homebrew tap ${tap}"
+
+  formula_dir="${tap_dir}/Formula"
+  mkdir -p "$formula_dir"
+  printf '%s/%s.rb\n' "$formula_dir" "$formula"
+}
+
+cleanup_macos_homebrew_formula() {
+  local status=$?
+  trap - EXIT
+  if ! rm -rf "${OPENSHELL_HOMEBREW_FORMULA_TMPDIR:-}"; then
+    warn "Could not remove temporary OpenShell Homebrew formula files"
+    status=1
+  fi
+  exit "$status"
+}
+
+install_macos_homebrew_formula() {
+  local tmpdir formula_file tap_formula_file formula_ref expected_sha actual_sha brew_prefix openshell_bin
+  local formula_operation_pin homebrew_operation_status install_action
+  [ "$OS" = "Darwin" ] || return 1
+  [ "$ARCH_LABEL" = "aarch64" ] || fail "OpenShell ${PIN_VERSION} supports the Homebrew gateway service only on Apple Silicon macOS."
+  command -v brew >/dev/null 2>&1 || fail "Homebrew is required to install the OpenShell macOS gateway service. Install Homebrew and retry."
+
+  tmpdir="$(mktemp -d)"
+  OPENSHELL_HOMEBREW_FORMULA_TMPDIR="$tmpdir"
+  trap cleanup_macos_homebrew_formula EXIT
+  formula_file="${tmpdir}/openshell.rb"
+
+  info "Downloading OpenShell Homebrew formula..."
+  download_openshell_formula "$RELEASE_TAG" "$formula_file" \
+    || fail "failed to download OpenShell Homebrew formula for ${RELEASE_TAG}"
+  chmod 0644 "$formula_file"
+
+  expected_sha="$(openshell_pinned_sha256 "$RELEASE_TAG" "openshell.rb")" \
+    || fail "No NemoClaw-pinned SHA-256 for OpenShell $RELEASE_TAG Homebrew formula"
+  actual_sha="$(file_sha256 "$formula_file")" \
+    || fail "No SHA-256 tool available (sha256sum/shasum)"
+  [ "$actual_sha" = "$expected_sha" ] \
+    || fail "OpenShell Homebrew formula checksum does not match NemoClaw-pinned $RELEASE_TAG digest"
+  formula_operation_pin="$expected_sha"
+
+  formula_ref="${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}"
+  tap_formula_file="$(homebrew_formula_path "$HOMEBREW_TAP" "$HOMEBREW_FORMULA_NAME")"
+  info "staging Homebrew formula in tap ${HOMEBREW_TAP}..."
+  cp "$formula_file" "$tap_formula_file"
+  chmod 0644 "$tap_formula_file"
+
+  homebrew_operation_status=0
+  run_trusted_openshell_homebrew_operation "$formula_operation_pin" -- \
+    brew list --formula "$HOMEBREW_FORMULA_NAME" >/dev/null 2>&1 \
+    || homebrew_operation_status=$?
+  if [ "$homebrew_operation_status" = "0" ]; then
+    install_action="reinstall"
+    info "reinstalling OpenShell with Homebrew..."
+  elif [ "$homebrew_operation_status" = "$OPENSHELL_HOMEBREW_OPERATION_FAILED" ]; then
+    install_action="install"
+    info "installing OpenShell with Homebrew..."
+  else
+    fail "OpenShell Homebrew formula verification or temporary trust setup failed (status ${homebrew_operation_status}); rerun the pinned NemoClaw installer."
+  fi
+  homebrew_operation_status=0
+  run_trusted_openshell_homebrew_operation "$formula_operation_pin" -- \
+    brew "$install_action" --formula "$formula_ref" \
+    || homebrew_operation_status=$?
+  [ "$homebrew_operation_status" = "0" ] \
+    || fail "OpenShell Homebrew ${install_action} failed inside the temporary formula trust boundary (status ${homebrew_operation_status})."
+
+  brew_prefix="$(brew --prefix 2>/dev/null || true)"
+  openshell_bin="${brew_prefix}/bin/openshell"
+  if [ -z "$brew_prefix" ] || [ ! -x "$openshell_bin" ]; then
+    openshell_bin="$(command -v openshell 2>/dev/null || true)"
+  fi
+  if [ -z "$openshell_bin" ] || [ ! -x "$openshell_bin" ]; then
+    fail "Homebrew completed but the openshell binary was not found on PATH."
+  fi
+  require_openshell_messaging_features "$openshell_bin"
+  info "$("$openshell_bin" --version 2>&1 || echo openshell) installed"
+  info "OpenShell Homebrew service staged; onboarding will start it after gateway validation."
+  exit 0
+}
+
 validate_explicit_component_override gateway "${NEMOCLAW_OPENSHELL_GATEWAY_BIN:-}"
 validate_explicit_component_override sandbox "${NEMOCLAW_OPENSHELL_SANDBOX_BIN:-}"
 
@@ -622,44 +849,38 @@ if command -v openshell >/dev/null 2>&1; then
   INSTALLED_VERSION_OUTPUT="$(openshell --version 2>&1 || true)"
   INSTALLED_VERSION="$(printf '%s\n' "$INSTALLED_VERSION_OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
   [ -n "$INSTALLED_VERSION" ] || INSTALLED_VERSION="0.0.0"
-  if [ "$RESOLVED_CHANNEL" = "dev" ]; then
-    if version_gte "$INSTALLED_VERSION" "$DEV_MIN_VERSION" \
-      && printf '%s\n' "$INSTALLED_VERSION_OUTPUT" | grep -qi 'dev'; then
-      if required_driver_bins_present "$ACTIVE_OPENSHELL_BIN" && openshell_has_required_messaging_features "$ACTIVE_OPENSHELL_BIN"; then
-        if [ "$FORCE_INSTALL" != "1" ]; then
-          info "openshell already installed: $INSTALLED_VERSION_OUTPUT (dev channel)"
-          exit 0
-        fi
-        warn "Current OpenShell dev build requested — refreshing the moving dev release instead of reusing the installed binary."
-      else
-        feature_status=$?
-        if [ "$feature_status" = "2" ]; then
-          fail "$OPENSHELL_FEATURE_CHECK_ERROR"
-        fi
+  if printf '%s\n' "$INSTALLED_VERSION_OUTPUT" | grep -qi 'dev'; then
+    warn "OpenShell development builds are unsupported — reinstalling exact stable OpenShell ${PIN_VERSION}..."
+  elif version_gte "$INSTALLED_VERSION" "$MIN_VERSION"; then
+    if ! version_gte "$MAX_VERSION" "$INSTALLED_VERSION"; then
+      warn "openshell $INSTALLED_VERSION is above the maximum ($MAX_VERSION) supported by this NemoClaw release — reinstalling pinned OpenShell ${PIN_VERSION}..."
+    elif ! required_driver_bins_present "$ACTIVE_OPENSHELL_BIN"; then
+      warn "openshell $INSTALLED_VERSION is missing Docker-driver binaries — reinstalling pinned OpenShell ${PIN_VERSION}..."
+    elif ! openshell_has_required_messaging_features "$ACTIVE_OPENSHELL_BIN"; then
+      fail "${OPENSHELL_FEATURE_CHECK_ERROR:-openshell $INSTALLED_VERSION is missing required messaging credential rewrite and MCP L7 policy support. Install an OpenShell build that includes provider aliases, WebSocket text rewrite, request-body credential rewrite, and MCP/JSON-RPC L7 policy enforcement.}"
+    elif [ "$OS" = "Darwin" ] && command -v brew >/dev/null 2>&1 && ! macos_homebrew_formula_installed; then
+      warn "NemoClaw cannot confirm the pinned Homebrew gateway formula for openshell $INSTALLED_VERSION — reinstalling pinned OpenShell ${PIN_VERSION} with Homebrew..."
+    else
+      if [ "$OS" = "Darwin" ] && ! command -v brew >/dev/null 2>&1; then
+        warn "Homebrew is not installed; reusing the standalone OpenShell gateway without reboot persistence."
       fi
-    fi
-    if [ "$FORCE_INSTALL" != "1" ]; then
-      warn "openshell $INSTALLED_VERSION is not the required dev-channel messaging-rewrite/MCP-L7 build — upgrading..."
+      info "openshell already installed: $INSTALLED_VERSION (>= $MIN_VERSION, <= $MAX_VERSION, messaging rewrite, MCP L7, and policy --base capable)"
+      exit 0
     fi
   else
-    if version_gte "$INSTALLED_VERSION" "$MIN_VERSION"; then
-      if ! version_gte "$MAX_VERSION" "$INSTALLED_VERSION"; then
-        warn "openshell $INSTALLED_VERSION is above the maximum ($MAX_VERSION) supported by this NemoClaw release — reinstalling pinned OpenShell ${PIN_VERSION}..."
-      elif ! required_driver_bins_present "$ACTIVE_OPENSHELL_BIN"; then
-        warn "openshell $INSTALLED_VERSION is missing Docker-driver binaries — reinstalling pinned OpenShell ${PIN_VERSION}..."
-      elif ! openshell_has_required_messaging_features "$ACTIVE_OPENSHELL_BIN"; then
-        fail "${OPENSHELL_FEATURE_CHECK_ERROR:-openshell $INSTALLED_VERSION is missing required messaging credential rewrite and MCP L7 policy support. Install an OpenShell build that includes provider aliases, WebSocket text rewrite, request-body credential rewrite, and MCP/JSON-RPC L7 policy enforcement.}"
-      else
-        info "openshell already installed: $INSTALLED_VERSION (>= $MIN_VERSION, <= $MAX_VERSION, messaging rewrite, MCP L7, and policy --base capable)"
-        exit 0
-      fi
-    else
-      warn "openshell $INSTALLED_VERSION is below minimum $MIN_VERSION — upgrading..."
-    fi
+    warn "openshell $INSTALLED_VERSION is below minimum $MIN_VERSION — upgrading..."
   fi
 fi
 
 info "Installing OpenShell from release '$RELEASE_TAG'..."
+
+if [ "$OS" = "Darwin" ]; then
+  if command -v brew >/dev/null 2>&1; then
+    install_macos_homebrew_formula
+  else
+    warn "Homebrew is not installed; installing the standalone OpenShell gateway without reboot persistence."
+  fi
+fi
 
 case "$OS" in
   Darwin)
@@ -686,19 +907,20 @@ case "$OS" in
         CHECKSUM_FILES+=("openshell-gateway-checksums-sha256.txt")
         ;;
       x86_64)
-        fail "OpenShell ${PIN_VERSION} does not publish macOS x86_64 standalone gateway assets."
+        fail "OpenShell ${PIN_VERSION} supports the macOS Homebrew gateway service only on Apple Silicon."
         ;;
     esac
     ;;
   Linux)
+    SANDBOX_LIBC="musl"
     case "$ARCH_LABEL" in
       x86_64)
         ASSETS+=("openshell-gateway-x86_64-unknown-linux-gnu.tar.gz")
-        ASSETS+=("openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz")
+        ASSETS+=("openshell-sandbox-x86_64-unknown-linux-${SANDBOX_LIBC}.tar.gz")
         ;;
       aarch64)
         ASSETS+=("openshell-gateway-aarch64-unknown-linux-gnu.tar.gz")
-        ASSETS+=("openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz")
+        ASSETS+=("openshell-sandbox-aarch64-unknown-linux-${SANDBOX_LIBC}.tar.gz")
         ;;
     esac
     CHECKSUM_FILES+=("openshell-gateway-checksums-sha256.txt")
@@ -730,7 +952,9 @@ download_with_curl() {
     curl_progress=(-sS)
   fi
   for name in "${ASSETS[@]}" "${CHECKSUM_FILES[@]}"; do
-    curl -fL "${curl_progress[@]}" "https://github.com/NVIDIA/OpenShell/releases/download/${RELEASE_TAG}/$name" \
+    curl -fL "${curl_progress[@]}" --connect-timeout 10 --retry 3 --retry-delay 2 \
+      --speed-limit 1024 --speed-time 60 \
+      "https://github.com/NVIDIA/OpenShell/releases/download/${RELEASE_TAG}/$name" \
       -o "$tmpdir/$name"
   done
 }
@@ -763,13 +987,11 @@ for i in "${!ASSETS[@]}"; do
   checksum_file="${CHECKSUM_FILES[$i]}"
   checksum_line="$(openshell_checksum_line "$tmpdir/$checksum_file" "$asset_name")" \
     || fail "OpenShell checksum file $checksum_file does not list $asset_name"
-  if [ "$RELEASE_TAG" != "dev" ]; then
-    expected_sha="$(openshell_pinned_sha256 "$RELEASE_TAG" "$asset_name")" \
-      || fail "No NemoClaw-pinned SHA-256 for OpenShell $RELEASE_TAG asset $asset_name"
-    release_sha="$(printf '%s\n' "$checksum_line" | awk '{print $1}')"
-    [ "$release_sha" = "$expected_sha" ] \
-      || fail "OpenShell release checksum for $asset_name does not match NemoClaw-pinned $RELEASE_TAG digest"
-  fi
+  expected_sha="$(openshell_pinned_sha256 "$RELEASE_TAG" "$asset_name")" \
+    || fail "No NemoClaw-pinned SHA-256 for OpenShell $RELEASE_TAG asset $asset_name"
+  release_sha="$(printf '%s\n' "$checksum_line" | awk '{print $1}')"
+  [ "$release_sha" = "$expected_sha" ] \
+    || fail "OpenShell release checksum for $asset_name does not match NemoClaw-pinned $RELEASE_TAG digest"
   (cd "$tmpdir" && printf '%s\n' "$checksum_line" | $SHA_CMD -c -) \
     || fail "SHA-256 checksum verification failed for $asset_name"
 done

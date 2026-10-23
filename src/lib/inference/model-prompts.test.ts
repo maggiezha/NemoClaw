@@ -33,14 +33,14 @@ describe("model prompt helpers", () => {
     expect(result).toBe("llama");
   });
 
-  it("returns Minimax M3 from the default cloud model menu", async () => {
-    const promptFn = promptSequence(["3"]);
+  it("returns Nemotron 3 Super from the default cloud model menu", async () => {
+    const promptFn = promptSequence(["2"]);
     const result = await promptCloudModel({
       promptFn,
       writeLine: vi.fn(),
     });
 
-    expect(result).toBe("minimaxai/minimax-m3");
+    expect(result).toBe("nvidia/nemotron-3-super-120b-a12b");
   });
 
   it("uses the effective live catalog default when the user presses enter", async () => {
@@ -55,6 +55,15 @@ describe("model prompt helpers", () => {
     });
 
     expect(result).toBe("live/default");
+  });
+
+  it("selects hosted Super VL after the existing cloud model choices", async () => {
+    const result = await promptCloudModel({
+      promptFn: promptSequence(["3"]),
+      writeLine: vi.fn(),
+    });
+
+    expect(result).toBe("nvidia/nemotron-3.5-super-vl-120b-a12b");
   });
 
   it("keeps a separate safe custom model as the Other prefill (#5827)", async () => {
@@ -202,6 +211,37 @@ describe("model prompt helpers", () => {
     });
 
     expect(result).toBe("gpt-5.4-mini");
+  });
+
+  it("offers Gemini 3.6 Flash and excludes Gemini 2.5 Flash (#9298)", async () => {
+    await expect(
+      promptRemoteModel("Google Gemini", "gemini", "gemini-3.6-flash", null, {
+        promptFn: promptSequence([""]),
+        writeLine: vi.fn(),
+      }),
+    ).resolves.toBe("gemini-3.6-flash");
+
+    const promptFn = promptSequence(["7", "gemini-custom"]);
+    const writeLine = vi.fn();
+    const result = await promptRemoteModel("Google Gemini", "gemini", "gemini-3.6-flash", null, {
+      promptFn,
+      writeLine,
+    });
+
+    expect(result).toBe("gemini-custom");
+    expect(promptFn).toHaveBeenNthCalledWith(1, "  Choose model [1]: ");
+    expect(writeLine.mock.calls.map(([line]) => line)).toEqual([
+      "",
+      "  Google Gemini models:",
+      "    1) gemini-3.6-flash",
+      "    2) gemini-3.1-pro-preview",
+      "    3) gemini-3.1-flash-lite-preview",
+      "    4) gemini-3-flash-preview",
+      "    5) gemini-2.5-pro",
+      "    6) gemini-2.5-flash-lite",
+      "    7) Other...",
+      "",
+    ]);
   });
 
   it("treats non-numeric curated selections as manual-entry fallback", async () => {

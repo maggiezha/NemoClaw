@@ -23,6 +23,7 @@ import {
 } from "../live/hermes-gpu-startup-fallback.ts";
 
 const roots: string[] = [];
+const INSTALLER_PAYLOAD = path.join(import.meta.dirname, "..", "..", "..", "scripts", "install.sh");
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -100,6 +101,16 @@ describe("Hermes GPU startup failure diagnostics", () => {
       "Native GPU diagnostics saved: /tmp/native\nPre-rollback diagnostics saved: /tmp/compatibility",
       "/tmp/compatibility",
     ],
+    [
+      "uses Docker GPU diagnostics after the fallback attempt",
+      "Native GPU diagnostics saved: /tmp/native\nDocker GPU diagnostics saved: /tmp/docker",
+      "/tmp/docker",
+    ],
+    [
+      "uses Docker GPU diagnostics for compatibility-only startup",
+      "Docker GPU diagnostics saved: /tmp/docker",
+      "/tmp/docker",
+    ],
     ["returns empty without a bundle", "GPU setup failed before diagnostics\n", ""],
   ])("extracts %s", (_name, output, expected) => {
     expect(extractHermesGpuDiagnosticsDirectory(output)).toBe(expected);
@@ -123,8 +134,8 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
     ]);
   });
 
-  it("creates native state without GPU, rejects one exact proof, and delegates compatibility", () => {
-    const { root, wrapper } = createWrapperFixture("hermes-gpu-fallback-test-", {
+  it("rejects native create before progress and delegates one compatibility attempt (#10155)", () => {
+    const { realOpenshell, root, wrapper } = createWrapperFixture("hermes-gpu-fallback-test-", {
       openshell: [
         "#!/usr/bin/env bash",
         "marker=delegated",
@@ -165,7 +176,8 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
       ],
       env,
     );
-    expect(nativeCreate.status, nativeCreate.stderr).toBe(0);
+    expect(nativeCreate.status).toBe(2);
+    expect(nativeCreate.stderr).toContain("error: unexpected argument '--gpu' found");
 
     const nearMissProof = runWrapper(
       wrapper.wrapperPath,
@@ -173,16 +185,6 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
       env,
     );
     expect(nearMissProof.status, nearMissProof.stderr).toBe(0);
-
-    const rejectedProof = runWrapper(
-      wrapper.wrapperPath,
-      ["sandbox", "exec", "-n", "alpha", "--", "sh", "-lc", HERMES_GPU_NATIVE_NVIDIA_SMI_PROOF],
-      env,
-    );
-    expect(rejectedProof.status).toBe(1);
-    expect(rejectedProof.stderr).toContain(
-      "Failed to initialize NVML: Driver/library version mismatch",
-    );
 
     const compatibility = runWrapper(
       wrapper.wrapperPath,
@@ -197,14 +199,15 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
       env,
     );
     expect(compatibilityProof.status, compatibilityProof.stderr).toBe(0);
+    expect(fs.lstatSync(wrapper.wrapperPath).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(wrapper.wrapperPath)).toBe(fs.realpathSync(realOpenshell));
 
     const version = runWrapper(wrapper.wrapperPath, ["--version"], env);
     expect(version.status, version.stderr).toBe(0);
     expect(readHermesGpuFallbackEvents(wrapper.eventsPath)).toEqual([
-      HERMES_GPU_FALLBACK_EVENTS.delegateNativeCreateWithoutGpu,
-      HERMES_GPU_FALLBACK_EVENTS.rejectNativeNvidiaSmiProof,
+      HERMES_GPU_FALLBACK_EVENTS.rejectNativeCreateBeforeProgress,
       HERMES_GPU_FALLBACK_EVENTS.delegateCompatibilityCreate,
-      HERMES_GPU_FALLBACK_EVENTS.delegateNvidiaSmiProofAfterRejection,
+      HERMES_GPU_FALLBACK_EVENTS.delegateNvidiaSmiProofAfterFallback,
     ]);
     const wrapperArtifacts = fs
       .readdirSync(path.dirname(wrapper.eventsPath), { withFileTypes: true })
@@ -213,13 +216,12 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
         fs.readFileSync(path.join(path.dirname(wrapper.eventsPath), entry.name), "utf8"),
       )
       .join("\n");
-    for (const secretMarker of secretMarkers) {
-      expect(wrapperArtifacts).not.toContain(secretMarker);
-    }
+    expect(secretMarkers.every((secretMarker) => !wrapperArtifacts.includes(secretMarker))).toBe(
+      true,
+    );
     expect(wrapperArtifacts).not.toMatch(/(?:TOKEN|API_KEY|PASSWORD)=/u);
     // The fake delegate records a constant marker only; it never serializes argv.
     expect(fs.readFileSync(delegateMarkerLog, "utf8").split(/\r?\n/u).filter(Boolean)).toEqual([
-      "create-without-gpu",
       "delegated",
       "create-without-gpu",
       "delegated",
@@ -227,39 +229,136 @@ describe("Hermes GPU startup fallback OpenShell wrapper", () => {
     ]);
   });
 
-  it("rejects exactly one native nvidia-smi proof when wrapper calls race", async () => {
+  it("preserves the fallback wrapper while staging the existing OpenShell service (#7140)", () => {
+    const { realDir, root, wrapper } = createWrapperFixture(
+      "hermes-gpu-fallback-installer-selection-",
+    );
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          'source "$INSTALLER_PAYLOAD" 2>/dev/null',
+          "install_nemoclaw_openshell_gateway_user_service() {",
+          '  printf "service-selection=%s\\n" "$NEMOCLAW_OPENSHELL_BIN"',
+          '  printf "service-gateway=%s\\n" "$NEMOCLAW_OPENSHELL_GATEWAY_BIN"',
+          '  printf "service-path=%s\\n" "$PATH"',
+          "}",
+          "maybe_install_openshell_during_install if-missing",
+          'printf "final-selection=%s\\n" "$NEMOCLAW_OPENSHELL_BIN"',
+        ].join("\n"),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...wrapper.componentEnv,
+          HOME: root,
+          INSTALLER_PAYLOAD,
+          PATH: `${realDir}:/usr/bin:/bin`,
+          XDG_BIN_HOME: realDir,
+        },
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain(`service-selection=${wrapper.wrapperPath}\n`);
+    expect(result.stdout).toContain(`service-gateway=${path.join(realDir, "openshell-gateway")}\n`);
+    expect(result.stdout.match(/^service-path=(.*)$/mu)?.[1]?.split(":")[0]).toBe(realDir);
+    expect(result.stdout).toContain(`final-selection=${wrapper.wrapperPath}\n`);
+  });
+
+  it("rejects a relative fallback wrapper selection during service staging (#7140)", () => {
+    const { realDir, root, wrapper } = createWrapperFixture(
+      "hermes-gpu-fallback-relative-selection-",
+    );
+    const relativeBin = path.join(root, "relative-openshell");
+    writeExecutable(relativeBin, "#!/usr/bin/env bash\nexit 0\n");
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          'source "$INSTALLER_PAYLOAD" 2>/dev/null',
+          "install_nemoclaw_openshell_gateway_user_service() { :; }",
+          "maybe_install_openshell_during_install if-missing",
+          'printf "final-selection=%s\\n" "$NEMOCLAW_OPENSHELL_BIN"',
+        ].join("\n"),
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...wrapper.componentEnv,
+          HOME: root,
+          INSTALLER_PAYLOAD,
+          NEMOCLAW_OPENSHELL_BIN: "./relative-openshell",
+          PATH: `${realDir}:/usr/bin:/bin`,
+          XDG_BIN_HOME: realDir,
+        },
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain(`final-selection=${path.join(realDir, "openshell")}\n`);
+  });
+
+  it("rejects an absolute directory fallback selection during service staging (#7140)", () => {
+    const { realDir, root, wrapper } = createWrapperFixture(
+      "hermes-gpu-fallback-directory-selection-",
+    );
+    const directoryBin = path.join(root, "openshell-directory");
+    fs.mkdirSync(directoryBin, { mode: 0o700 });
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        [
+          'source "$INSTALLER_PAYLOAD" 2>/dev/null',
+          "install_nemoclaw_openshell_gateway_user_service() { :; }",
+          "maybe_install_openshell_during_install if-missing",
+          'printf "final-selection=%s\\n" "$NEMOCLAW_OPENSHELL_BIN"',
+        ].join("\n"),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...wrapper.componentEnv,
+          HOME: root,
+          INSTALLER_PAYLOAD,
+          NEMOCLAW_OPENSHELL_BIN: directoryBin,
+          PATH: `${realDir}:/usr/bin:/bin`,
+          XDG_BIN_HOME: realDir,
+        },
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain(`final-selection=${path.join(realDir, "openshell")}\n`);
+  });
+
+  it("records one pre-progress rejection event when native create calls race (#10155)", async () => {
     const { wrapper } = createWrapperFixture("hermes-gpu-fallback-race-test-");
     const env = { ...process.env, ...wrapper.componentEnv };
-    const nativeCreate = runWrapper(
-      wrapper.wrapperPath,
-      ["sandbox", "create", "--from", "image", "--gpu"],
-      env,
-    );
-    expect(nativeCreate.status, nativeCreate.stderr).toBe(0);
     const statuses = await Promise.all(
       Array.from({ length: 8 }, () =>
         runWrapperConcurrently(
           wrapper.wrapperPath,
-          ["sandbox", "exec", "-n", "alpha", "--", "sh", "-lc", HERMES_GPU_NATIVE_NVIDIA_SMI_PROOF],
+          ["sandbox", "create", "--from", "image", "--gpu"],
           env,
         ),
       ),
     );
 
-    expect(statuses.filter((status) => status === 1)).toHaveLength(1);
-    expect(statuses.filter((status) => status === 0)).toHaveLength(7);
+    expect(statuses).toEqual(Array.from({ length: 8 }, () => 2));
     const events = readHermesGpuFallbackEvents(wrapper.eventsPath);
     expect(
-      events.filter((event) => event === HERMES_GPU_FALLBACK_EVENTS.delegateNativeCreateWithoutGpu),
-    ).toHaveLength(1);
-    expect(
-      events.filter((event) => event === HERMES_GPU_FALLBACK_EVENTS.rejectNativeNvidiaSmiProof),
-    ).toHaveLength(1);
-    expect(
       events.filter(
-        (event) => event === HERMES_GPU_FALLBACK_EVENTS.delegateNvidiaSmiProofAfterRejection,
+        (event) => event === HERMES_GPU_FALLBACK_EVENTS.rejectNativeCreateBeforeProgress,
       ),
-    ).toHaveLength(7);
+    ).toHaveLength(1);
   });
 
   it("preserves OpenShell version and capability detection without private wrapper env", () => {

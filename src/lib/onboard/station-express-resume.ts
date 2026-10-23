@@ -5,7 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { isErrnoException } from "../core/errno";
-import { selectVllmModelFromEnv, type VllmModelDef } from "../inference/vllm-models";
+import { detectNvidiaPlatform, type NvidiaPlatform } from "../inference/nim";
+import {
+  defaultVllmModelForPlatform,
+  selectVllmModelFromEnv,
+  STATION_PAIR_OPTIONAL_ORCHESTRATION,
+  type VllmModelDef,
+  vllmStationPairForOrchestration,
+} from "../inference/vllm-models";
 import { NAME_MAX_LENGTH, NAME_VALID_PATTERN } from "../name-validation";
 import { getNemoclawStateRoot, resolveHome, STATE_DIR_NAME } from "../state/state-root";
 import { isSafeModelId } from "../validation";
@@ -16,14 +23,25 @@ export const INSTALLER_AUTO_FRESH_RECEIPT_GENERATION_ENV =
   "NEMOCLAW_INSTALLER_AUTO_FRESH_RECEIPT_GENERATION";
 export const STATION_EXPRESS_INTENT_VERSION = 1;
 
-export interface StationExpressResumeIntent {
+interface StationResumeIntent {
   version: typeof STATION_EXPRESS_INTENT_VERSION;
+  kind?: undefined;
   model: string;
   sandboxName: string;
   receiptGeneration?: string;
   servedModel?: string;
   checkpointModel?: string;
 }
+
+interface SparkResumeIntent {
+  version: typeof STATION_EXPRESS_INTENT_VERSION;
+  kind: "spark";
+  // The default model is resolved after host detection, after intent capture.
+  model?: string;
+  sandboxName: string;
+}
+
+export type StationExpressResumeIntent = StationResumeIntent | SparkResumeIntent;
 
 export interface StationExpressSessionLike {
   resumable?: boolean;
@@ -51,7 +69,12 @@ interface StationExpressResumeDeps {
   exitProcess(code: number): never;
 }
 
-type StationExpressFailureDeps = Pick<StationExpressResumeDeps, "error" | "exitProcess">;
+interface StationExpressCaptureDeps {
+  detectNvidiaPlatform(): NvidiaPlatform;
+}
+
+type StationExpressFailureDeps = Pick<StationExpressResumeDeps, "error" | "exitProcess"> &
+  Partial<StationExpressCaptureDeps>;
 
 type IntentResult =
   | { ok: true; intent: StationExpressResumeIntent | null }
@@ -68,12 +91,20 @@ const RESUME_ENV = [
   "NEMOCLAW_MODEL",
   STATION_EXPRESS_RECEIPT_GENERATION_ENV,
 ] as const;
+type ExpectedResumeEnvironment = Partial<Record<(typeof RESUME_ENV)[number], string | null>>;
 const MAX_SERVED_MODEL_LENGTH = 512;
 const UNBOUND_INTENT_KEYS = "model,sandboxName,version";
 const UNBOUND_RECEIPT_INTENT_KEYS = "model,receiptGeneration,sandboxName,version";
 const BOUND_INTENT_KEYS = "checkpointModel,model,sandboxName,servedModel,version";
 const BOUND_RECEIPT_INTENT_KEYS =
   "checkpointModel,model,receiptGeneration,sandboxName,servedModel,version";
+// DGX Spark managed-vLLM Express intents (#7231). They only ever exist while
+// provider selection is incomplete (they are cleared, never bound, on
+// completion), so they never carry the Station-only served/checkpoint/receipt
+// fields. The model key is present only when the user pinned NEMOCLAW_VLLM_MODEL.
+const SPARK_INTENT_KEYS = "kind,sandboxName,version";
+const SPARK_INTENT_KEYS_WITH_MODEL = "kind,model,sandboxName,version";
+const SPARK_EXPRESS_PROVIDER = "install-vllm";
 const STATION_EXPRESS_INSTALLER_RESUME_FILE = "station-express-resume";
 const STATION_EXPRESS_RETIREMENT_CLAIM_PREFIX = `${STATION_EXPRESS_INSTALLER_RESUME_FILE}.retiring-`;
 const STATION_EXPRESS_RETIREMENT_CLAIM_RECEIPT = "receipt";
@@ -84,7 +115,14 @@ const STATION_EXPRESS_RECEIPT_REVISION_PATTERN = /^[0-9a-f]{40}$/;
 const STATION_EXPRESS_RETIREMENT_CLAIM_SUFFIX_PATTERN = /^[A-Za-z0-9]+$/;
 const STATION_EXPRESS_RECEIPT_PORT_PATTERN = /^\d+$/;
 const STATION_EXPRESS_RECEIPT_AGENTS = new Set(["openclaw", "hermes", "langchain-deepagents-code"]);
-const STATION_EXPRESS_RECEIPT_POLICY_TIERS = new Set(["restricted", "balanced", "open"]);
+const STATION_EXPRESS_RECEIPT_POLICY_TIERS = new Set([
+  "restricted",
+  "balanced",
+  "open",
+  "personal",
+]);
+// Mirrors validate_station_install_mode() in scripts/install.sh.
+const STATION_EXPRESS_RECEIPT_MODES = new Set(["express", "provider"]);
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -100,13 +138,54 @@ function stationModel(value: unknown): VllmModelDef | null {
   }
 }
 
+function sparkModel(value: unknown): VllmModelDef | null {
+  if (typeof value !== "string") return null;
+  try {
+    const model = selectVllmModelFromEnv({ NEMOCLAW_VLLM_MODEL: value });
+    return model?.platforms.includes("spark") ? model : null;
+  } catch {
+    return null;
+  }
+}
+
 function canonicalStationModelValue(value: string): string | null {
   if (value.trim() !== value) return null;
-  return stationModel(value)?.envValue ?? null;
+  const model = stationModel(value);
+  if (!model) return null;
+  const normalized = value.toLowerCase();
+  return normalized === model.envValue.toLowerCase() || normalized === model.id.toLowerCase()
+    ? model.envValue
+    : null;
 }
 
 function servedModel(model: VllmModelDef): string {
   return model.servedModelId ?? model.id;
+}
+
+function qualifiedDualStationServedModel(
+  env: NodeJS.ProcessEnv,
+  model: VllmModelDef,
+): string | null {
+  let stationPair;
+  try {
+    stationPair = vllmStationPairForOrchestration(
+      model,
+      STATION_PAIR_OPTIONAL_ORCHESTRATION,
+      "station",
+      "arm64",
+    );
+  } catch {
+    return null;
+  }
+  if (
+    !stationPair ||
+    String(env.NEMOCLAW_DGX_STATION_PEER ?? "").trim().length === 0 ||
+    String(env.NEMOCLAW_DGX_STATION_SSH_BINDING ?? "").trim().length === 0
+  ) {
+    return null;
+  }
+  const selected = String(env.NEMOCLAW_MODEL ?? "").trim();
+  return selected === stationPair.servedName ? selected : null;
 }
 
 function identifiesCheckpoint(model: VllmModelDef, value: string): boolean {
@@ -181,8 +260,22 @@ function lstatOrNull(candidate: string): fs.Stats | null {
 
 function assertOwnerOnlyDirectory(candidate: string, stat: fs.Stats): void {
   const uid = process.getuid?.();
-  if (!stat.isDirectory() || uid === undefined || stat.uid !== uid || (stat.mode & 0o077) !== 0) {
-    throw new Error(`Refusing non-owner-only DGX Station Express resume directory: ${candidate}`);
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `Refusing NemoClaw installer resume path that is not a directory: ${candidate}`,
+    );
+  }
+  if (uid === undefined || stat.uid !== uid) {
+    throw new Error(
+      `Refusing NemoClaw installer resume directory that is not owned by the current user: ${candidate}`,
+    );
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    const mode = (stat.mode & 0o7777).toString(8).padStart(4, "0");
+    throw new Error(
+      `NemoClaw installer resume directory has mode ${mode}; expected 0700: ${candidate}. ` +
+        'After you verify ownership, run `chmod 700 -- "$HOME/.nemoclaw"` for the default state directory.',
+    );
   }
 }
 
@@ -208,14 +301,17 @@ function assertStationExpressClearStatePathSafe(paths: StationExpressReceiptPath
     if (stat.isSymbolicLink()) {
       throw new Error(`Refusing symbolic link in DGX Station Express resume path: ${candidate}`);
     }
-    const isLegacyStateBase = candidate === paths.stateBase && (stat.mode & 0o7777) === 0o755;
+    const isLegacyStateBase =
+      candidate === paths.stateBase && stat.isDirectory() && (stat.mode & 0o7777) === 0o755;
     if (!isLegacyStateBase) {
       assertOwnerOnlyDirectory(candidate, stat);
       continue;
     }
     const uid = process.getuid?.();
-    if (!stat.isDirectory() || uid === undefined || stat.uid !== uid) {
-      throw new Error(`Refusing non-owner-only DGX Station Express resume directory: ${candidate}`);
+    if (uid === undefined || stat.uid !== uid) {
+      throw new Error(
+        `Refusing NemoClaw installer resume directory that is not owned by the current user: ${candidate}`,
+      );
     }
   }
 }
@@ -289,7 +385,30 @@ function readStationExpressInstallerResumeGeneration(stateFile: string): string 
       lines[7].slice("dashboard_port=".length),
       lines[8].slice("vllm_port=".length),
     );
-  if (!legacyFormat && !currentFormat && !portFormat) {
+  // The current installer appends a tenth `mode=` field after the nine
+  // port-bound fields (scripts/install.sh save_station_express_resume). Accept
+  // that exact shape so completeSession() can validate and retire the receipt
+  // the same installer wrote, while still rejecting an unknown/expanded mode.
+  const modeFormat =
+    lines.length === 11 &&
+    lines[10] === "" &&
+    lines[3]?.startsWith("agent=") &&
+    STATION_EXPRESS_RECEIPT_AGENTS.has(lines[3].slice("agent=".length)) &&
+    lines[4]?.startsWith("sandbox=") &&
+    validSandboxName(lines[4].slice("sandbox=".length)) &&
+    lines[5]?.startsWith("policy_tier=") &&
+    STATION_EXPRESS_RECEIPT_POLICY_TIERS.has(lines[5].slice("policy_tier=".length)) &&
+    lines[6]?.startsWith("gateway_port=") &&
+    lines[7]?.startsWith("dashboard_port=") &&
+    lines[8]?.startsWith("vllm_port=") &&
+    validReceiptPorts(
+      lines[6].slice("gateway_port=".length),
+      lines[7].slice("dashboard_port=".length),
+      lines[8].slice("vllm_port=".length),
+    ) &&
+    lines[9]?.startsWith("mode=") &&
+    STATION_EXPRESS_RECEIPT_MODES.has(lines[9].slice("mode=".length));
+  if (!legacyFormat && !currentFormat && !portFormat && !modeFormat) {
     throw new Error("DGX Station Express installer resume state is malformed.");
   }
   const revision = lines[0]?.startsWith("revision=") ? lines[0].slice("revision=".length) : "";
@@ -297,10 +416,10 @@ function readStationExpressInstallerResumeGeneration(stateFile: string): string 
   const generation = lines[2]?.startsWith("generation=")
     ? lines[2].slice("generation=".length)
     : "";
-  const canonicalModel = canonicalStationModelValue(modelValue);
+  const validModel = modelValue === "auto" || canonicalStationModelValue(modelValue) !== null;
   if (
     !STATION_EXPRESS_RECEIPT_REVISION_PATTERN.test(revision) ||
-    !canonicalModel ||
+    !validModel ||
     !isValidStationExpressReceiptGeneration(generation)
   ) {
     throw new Error("DGX Station Express installer resume state is malformed.");
@@ -634,9 +753,33 @@ export function cleanupStationExpressReceiptRetirementClaims(
   }
 }
 
+function parseSparkResumeIntent(
+  value: Record<string, unknown>,
+  hasModel: boolean,
+): StationExpressResumeIntent | null {
+  if (value.version !== STATION_EXPRESS_INTENT_VERSION || value.kind !== "spark") return null;
+  const sandboxName = value.sandboxName;
+  if (!validSandboxName(sandboxName)) return null;
+  let model: string | undefined;
+  if (hasModel) {
+    const resolved = sparkModel(value.model);
+    if (!resolved || value.model !== resolved.envValue) return null;
+    model = resolved.envValue;
+  }
+  return {
+    version: STATION_EXPRESS_INTENT_VERSION,
+    kind: "spark",
+    sandboxName,
+    ...(model !== undefined ? { model } : {}),
+  };
+}
+
 export function parseStationExpressResumeIntent(value: unknown): StationExpressResumeIntent | null {
   if (!isObject(value)) return null;
   const keys = Object.keys(value).sort().join(",");
+  if (keys === SPARK_INTENT_KEYS || keys === SPARK_INTENT_KEYS_WITH_MODEL) {
+    return parseSparkResumeIntent(value, keys === SPARK_INTENT_KEYS_WITH_MODEL);
+  }
   if (
     keys !== UNBOUND_INTENT_KEYS &&
     keys !== UNBOUND_RECEIPT_INTENT_KEYS &&
@@ -679,6 +822,29 @@ export function parseStationExpressResumeIntent(value: unknown): StationExpressR
   };
 }
 
+export function isValidStationExpressProviderState(
+  intent: StationExpressResumeIntent,
+  providerStepStatus: string | null | undefined,
+  provider: unknown,
+  model: unknown,
+): boolean {
+  const providerComplete = providerStepStatus === "complete";
+  const providerBound = Boolean(
+    intent.kind !== "spark" && intent.servedModel && intent.checkpointModel,
+  );
+  if (providerComplete !== providerBound) return false;
+  if (providerComplete) {
+    return intent.kind !== "spark" && provider === "vllm-local" && model === intent.servedModel;
+  }
+  if (provider == null && model == null) return true;
+  if (provider !== "vllm-local" || typeof model !== "string" || model.trim().length === 0) {
+    return false;
+  }
+  return (
+    intent.kind === "spark" || (model.length <= MAX_SERVED_MODEL_LENGTH && isSafeModelId(model))
+  );
+}
+
 export function bindStationExpressProviderSelection(
   intentValue: unknown,
   provider: unknown,
@@ -686,10 +852,12 @@ export function bindStationExpressProviderSelection(
   checkpointModel: unknown,
 ): StationExpressResumeIntent {
   const intent = parseStationExpressResumeIntent(intentValue);
-  const selectedModel = intent ? stationModel(intent.model) : null;
-  if (!intent || !selectedModel) {
+  if (!intent || intent.kind === "spark") {
     throw new Error("Cannot record an invalid DGX Station Express provider selection.");
   }
+  const selectedModel = stationModel(intent.model);
+  if (!selectedModel)
+    throw new Error("Cannot record an invalid DGX Station Express provider selection.");
   if (intent.servedModel !== undefined) {
     if (provider === "vllm-local" && model === intent.servedModel) return intent;
     throw new Error("Cannot record an invalid DGX Station Express provider selection.");
@@ -712,10 +880,33 @@ export function bindStationExpressProviderSelection(
 function expectedEnvironment(
   intent: StationExpressResumeIntent,
   includeProviderSelection = true,
-): Partial<Record<(typeof RESUME_ENV)[number], string>> | null {
+): ExpectedResumeEnvironment | null {
+  if (intent.kind === "spark") {
+    const expected: ExpectedResumeEnvironment = {
+      [STATION_EXPRESS_ENV]: null,
+      NEMOCLAW_NON_INTERACTIVE: "1",
+      NEMOCLAW_YES: "1",
+      NEMOCLAW_POLICY_MODE: null,
+      NEMOCLAW_SANDBOX_NAME: intent.sandboxName,
+    };
+    if (includeProviderSelection) {
+      expected.NEMOCLAW_PROVIDER = SPARK_EXPRESS_PROVIDER;
+      // Restore a pinned model only; when none was pinned the install re-runs
+      // and re-resolves the same default model deterministically for this host.
+      const pinned = intent.model ? sparkModel(intent.model) : null;
+      if (pinned) {
+        expected.NEMOCLAW_VLLM_MODEL = pinned.envValue;
+        expected.NEMOCLAW_MODEL = servedModel(pinned);
+      } else {
+        expected.NEMOCLAW_VLLM_MODEL = null;
+        expected.NEMOCLAW_MODEL = null;
+      }
+    }
+    return expected;
+  }
   const model = stationModel(intent.model);
   if (!model) return null;
-  const expected: Partial<Record<(typeof RESUME_ENV)[number], string>> = {
+  const expected: ExpectedResumeEnvironment = {
     [STATION_EXPRESS_ENV]: "1",
     NEMOCLAW_NON_INTERACTIVE: "1",
     NEMOCLAW_YES: "1",
@@ -728,7 +919,7 @@ function expectedEnvironment(
   if (includeProviderSelection) {
     expected.NEMOCLAW_PROVIDER = "install-vllm";
     expected.NEMOCLAW_VLLM_MODEL = model.envValue;
-    expected.NEMOCLAW_MODEL = servedModel(model);
+    expected.NEMOCLAW_MODEL = intent.servedModel ?? servedModel(model);
   }
   return expected;
 }
@@ -739,7 +930,7 @@ function equivalentEnvironmentValue(
   expected: string,
 ): boolean {
   if (name === "NEMOCLAW_VLLM_MODEL") {
-    return stationModel(actual)?.envValue === expected;
+    return (stationModel(actual)?.envValue ?? sparkModel(actual)?.envValue) === expected;
   }
   if (name === "NEMOCLAW_SANDBOX_NAME") {
     return actual.trim().toLowerCase() === expected;
@@ -749,11 +940,11 @@ function equivalentEnvironmentValue(
 
 function validateExpectedEnvironment(
   env: NodeJS.ProcessEnv,
-  expected: Partial<Record<(typeof RESUME_ENV)[number], string>>,
+  expected: ExpectedResumeEnvironment,
 ): string | null {
   for (const name of RESUME_ENV) {
     const expectedValue = expected[name];
-    if (expectedValue === undefined) continue;
+    if (expectedValue === undefined || expectedValue === null) continue;
     const actual = env[name];
     if (typeof actual !== "string" || actual.trim().length === 0) continue;
     if (!equivalentEnvironmentValue(name, actual, expectedValue)) return name;
@@ -761,27 +952,73 @@ function validateExpectedEnvironment(
   return null;
 }
 
+/**
+ * Capture a DGX Spark managed-vLLM Express resume intent (#7231) when the
+ * non-interactive installer selected `install-vllm` without the Station marker.
+ * Unlike Station this needs no receipt/served/checkpoint state: restoring
+ * `NEMOCLAW_PROVIDER=install-vllm` (plus the sandbox name and, when pinned, the
+ * model) is enough for resume to re-run the identical managed install instead
+ * of dropping into the interactive provider menu defaulting to NVIDIA Endpoints.
+ */
+function getSparkExpressResumeIntent(
+  env: NodeJS.ProcessEnv,
+  sandboxName: string | null,
+  deps: StationExpressCaptureDeps,
+): IntentResult {
+  const provider = String(env.NEMOCLAW_PROVIDER ?? "")
+    .trim()
+    .toLowerCase();
+  const nonInteractive = String(env.NEMOCLAW_NON_INTERACTIVE ?? "").trim() === "1";
+  if (provider !== SPARK_EXPRESS_PROVIDER || !nonInteractive) return { ok: true, intent: null };
+  if (!sandboxName || !validSandboxName(sandboxName)) return { ok: true, intent: null };
+  if (deps.detectNvidiaPlatform() !== "spark") return { ok: true, intent: null };
+  const pinned = sparkModel(env.NEMOCLAW_VLLM_MODEL);
+  return {
+    ok: true,
+    intent: {
+      version: STATION_EXPRESS_INTENT_VERSION,
+      kind: "spark",
+      sandboxName,
+      ...(pinned ? { model: pinned.envValue } : {}),
+    },
+  };
+}
+
 export function getStationExpressResumeIntent(
   env: NodeJS.ProcessEnv,
   sandboxName: string | null,
+  deps: StationExpressCaptureDeps = { detectNvidiaPlatform },
 ): IntentResult {
   const marker = String(env[STATION_EXPRESS_ENV] ?? "").trim();
-  if (!marker) return { ok: true, intent: null };
+  if (!marker) return getSparkExpressResumeIntent(env, sandboxName, deps);
   if (marker !== "1") {
     return { ok: false, message: `${STATION_EXPRESS_ENV} must be 1 when set.` };
   }
 
-  const model = stationModel(env.NEMOCLAW_VLLM_MODEL);
-  if (!model || !sandboxName || !validSandboxName(sandboxName)) {
+  let model: VllmModelDef | null = null;
+  try {
+    // Capture the same catalog default as the Station runtime before persisting resume intent.
+    model = selectVllmModelFromEnv(env) ?? defaultVllmModelForPlatform("station", "arm64");
+  } catch {
+    // Invalid explicit selectors and catalog failures must still reject the intent.
+  }
+  if (
+    !model ||
+    !model.platforms.includes("station") ||
+    !sandboxName ||
+    !validSandboxName(sandboxName)
+  ) {
     return {
       ok: false,
       message: "DGX Station Express requires a registered Station vLLM model and sandbox name.",
     };
   }
-  const intent: StationExpressResumeIntent = {
+  const dualServedModel = qualifiedDualStationServedModel(env, model);
+  const intent: StationResumeIntent = {
     version: STATION_EXPRESS_INTENT_VERSION,
     model: model.envValue,
     sandboxName,
+    ...(dualServedModel ? { servedModel: dualServedModel, checkpointModel: model.id } : {}),
     ...(isValidStationExpressReceiptGeneration(env[STATION_EXPRESS_RECEIPT_GENERATION_ENV])
       ? { receiptGeneration: env[STATION_EXPRESS_RECEIPT_GENERATION_ENV] }
       : {}),
@@ -827,10 +1064,13 @@ export function requireStationExpressResumeIntent(
   deps: StationExpressFailureDeps = {
     error: (message) => console.error(message),
     exitProcess: (code) => process.exit(code),
+    detectNvidiaPlatform,
   },
 ): StationExpressResumeIntent | null {
   if (resume) return null;
-  const result = getStationExpressResumeIntent(env, sandboxName);
+  const result = getStationExpressResumeIntent(env, sandboxName, {
+    detectNvidiaPlatform: deps.detectNvidiaPlatform ?? detectNvidiaPlatform,
+  });
   if (!result.ok) {
     deps.error(`  ${result.message}`);
     deps.exitProcess(1);
@@ -865,14 +1105,11 @@ function matchesRecordedStationExpressSelection(
   intent: StationExpressResumeIntent,
 ): boolean {
   if (session.sandboxName != null && session.sandboxName !== intent.sandboxName) return false;
-
-  const providerComplete = session.steps?.provider_selection?.status === "complete";
-  const providerBound = Boolean(intent.servedModel && intent.checkpointModel);
-  if (providerComplete !== providerBound) return false;
-  if (!providerComplete) return session.provider == null && session.model == null;
-
-  return Boolean(
-    intent.servedModel && session.provider === "vllm-local" && session.model === intent.servedModel,
+  return isValidStationExpressProviderState(
+    intent,
+    session.steps?.provider_selection?.status,
+    session.provider,
+    session.model,
   );
 }
 
@@ -907,7 +1144,7 @@ export function withStationExpressResumeEnvironment<Options extends ResumeOption
           deps.clearInstallerResume();
         } catch (error) {
           deps.error(
-            `  Could not discard DGX Station Express installer resume state: ${error instanceof Error ? error.message : String(error)}`,
+            `  Could not discard NemoClaw installer resume state: ${error instanceof Error ? error.message : String(error)}`,
           );
           deps.exitProcess(1);
         }
@@ -1001,7 +1238,8 @@ export function withStationExpressResumeEnvironment<Options extends ResumeOption
       const expectedValue = expected[name];
       if (expectedValue === undefined) continue;
       previous.set(name, env[name]);
-      env[name] = expectedValue;
+      if (expectedValue === null) delete env[name];
+      else env[name] = expectedValue;
     }
     try {
       await run(options);

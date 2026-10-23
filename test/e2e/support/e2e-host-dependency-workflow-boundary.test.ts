@@ -26,10 +26,12 @@ const ACTION_PATH = path.join(
 );
 const SCRIPT_PATH = path.join(REPO_ROOT, ".github", "scripts", "host-dependency-setup.sh");
 const ACTION_USES =
-  "NVIDIA/NemoClaw/.github/actions/host-dependency-setup@4def1501b34ce586f83b91af50a66b5d22b31d75";
+  "NVIDIA/NemoClaw/.github/actions/host-dependency-setup@e85857e2a7bfb2af01241ecbce5947ee774c1280";
 
 interface WorkflowStep {
+  if?: string;
   name?: string;
+  run?: string;
   uses?: string;
   with?: Record<string, unknown>;
   "continue-on-error"?: boolean;
@@ -76,28 +78,22 @@ function writeExecutable(filePath: string, source: string): void {
 }
 
 describe("E2E host dependency action boundary (#6961)", () => {
-  // source-shape-contract: security -- Privileged apt host setup must stay bound to the reviewed immutable action provenance.
-  it("binds the host-dependency action and helper to their immutable reviewed revision (#6961)", () => {
-    expect(validateHostDependencyAction()).toEqual([]);
-
-    const mappingErrors = validateActionMutation({
-      mutateAction: (source) => {
-        const action = YAML.parse(source) as Record<string, unknown>;
-        const runs = action.runs as { steps: Array<Record<string, unknown>> };
-        runs.steps[0].env = { HOST_DEPENDENCY_PACKAGES: "${{ inputs.packages }} curl" };
-        return YAML.stringify(action);
-      },
+  // source-shape-contract: security -- Mutating isolated copies proves reviewed host dependency action and script bytes fail closed on source drift
+  it("rejects drift in the reviewed action and script contents", () => {
+    const actionErrors = validateActionMutation({
+      mutateAction: (source) => YAML.stringify({ ...YAML.parse(source), name: "drifted" }),
     });
-    expect(mappingErrors).toContain(
-      "host-dependency-setup action content must match the action reviewed at its immutable commit pin",
-    );
-    expect(mappingErrors).toContain(
-      "host-dependency-setup action must preserve its exact single-input package mapping and pinned helper invocation",
+    expect(actionErrors).toEqual(
+      expect.arrayContaining([
+        "host-dependency-setup action content must match the action reviewed at its immutable commit pin",
+        "host-dependency-setup action must preserve its exact single-input package mapping and pinned helper invocation",
+      ]),
     );
 
-    expect(
-      validateActionMutation({ mutateScript: (source) => `${source}# unreviewed drift\n` }),
-    ).toContain(
+    const scriptErrors = validateActionMutation({
+      mutateScript: (source) => `${source}\n# drift\n`,
+    });
+    expect(scriptErrors).toContain(
       "host-dependency-setup script content must match the helper reviewed at its immutable commit pin",
     );
   });
@@ -109,23 +105,8 @@ describe("E2E host dependency action boundary (#6961)", () => {
       packages: "expect",
     },
     {
-      jobName: "network-policy",
-      stepName: "Install network-policy host dependencies",
-      packages: "expect",
-    },
-    {
       jobName: "cloud-onboard",
       stepName: "Install cloud-onboard DCode TUI host dependencies",
-      packages: "expect",
-    },
-    {
-      jobName: "issue-4434-tui-unreachable-inference",
-      stepName: "Install issue #4434 host dependencies",
-      packages: "expect iptables",
-    },
-    {
-      jobName: "openclaw-tui-chat-correlation",
-      stepName: "Install OpenClaw TUI host dependencies",
       packages: "expect",
     },
   ])("rejects package allowlist drift in $jobName", ({ jobName, stepName, packages }) => {
@@ -159,16 +140,32 @@ describe("E2E host dependency action boundary (#6961)", () => {
     expect(validateE2eWorkflow(workflow)).toContain("live host dependency setup must fail closed");
   });
 
-  it("executes the host helper with validated packages and bounded retries (#6961)", () => {
-    expect(fs.statSync(SCRIPT_PATH).mode & 0o111).not.toBe(0);
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-dependency-script-"));
-    const fakeBin = path.join(directory, "bin");
-    const callsPath = path.join(directory, "sudo-calls");
-    fs.mkdirSync(fakeBin);
-    writeExecutable(path.join(fakeBin, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
-    writeExecutable(
-      path.join(fakeBin, "sudo"),
-      `#!/usr/bin/env bash
+  it("keeps DCode TUI dependencies available on every selected runtime", () => {
+    const workflow = readWorkflow();
+    const install = workflow.jobs.live?.steps.find(
+      (step) => step.name === "Install Deep Agents Code TUI host dependencies",
+    )!;
+    const expectedError =
+      "live DCode TUI host dependencies must be scoped to the typed DCode target";
+    expect(validateE2eWorkflow(workflow)).not.toContain(expectedError);
+    install.if =
+      "${{ matrix.id == 'ubuntu-repo-cloud-langchain-deepagents-code' && matrix.runtime_provider == 'docker' }}";
+
+    expect(validateE2eWorkflow(workflow)).toContain(expectedError);
+  });
+
+  it.each(["", "   ", "expect\ncurl", "curl", "runc"])(
+    "executes the host helper with validated packages and bounded retries [%s] (#6961)",
+    (invalidPackages) => {
+      expect(fs.statSync(SCRIPT_PATH).mode & 0o111).not.toBe(0);
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-dependency-script-"));
+      const fakeBin = path.join(directory, "bin");
+      const callsPath = path.join(directory, "sudo-calls");
+      fs.mkdirSync(fakeBin);
+      writeExecutable(path.join(fakeBin, "sleep"), "#!/usr/bin/env bash\nexit 0\n");
+      writeExecutable(
+        path.join(fakeBin, "sudo"),
+        `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "\${SUDO_CALLS}"
 if [[ "$1 $2" == "apt-get update" ]]; then
@@ -183,68 +180,59 @@ if [[ "$1 $2" == "apt-get install" ]]; then
 fi
 exit 64
 `,
-    );
+      );
 
-    const runSetup = (packages: string, successAttempt = 1, args: string[] = []) => {
-      fs.rmSync(callsPath, { force: true });
-      return spawnSync(SCRIPT_PATH, args, {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          APT_UPDATE_SUCCESS_ATTEMPT: String(successAttempt),
-          HOST_DEPENDENCY_PACKAGES: packages,
-          PATH: `${fakeBin}:${process.env.PATH}`,
-          SUDO_CALLS: callsPath,
-        },
-      });
-    };
+      const runSetup = (packages: string, successAttempt = 1, args: string[] = []) => {
+        fs.rmSync(callsPath, { force: true });
+        return spawnSync(SCRIPT_PATH, args, {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            APT_UPDATE_SUCCESS_ATTEMPT: String(successAttempt),
+            HOST_DEPENDENCY_PACKAGES: packages,
+            PATH: `${fakeBin}:${process.env.PATH}`,
+            SUDO_CALLS: callsPath,
+          },
+        });
+      };
 
-    try {
-      const unexpectedArgument = runSetup("expect", 1, ["unexpected"]);
-      expect(unexpectedArgument.status).toBe(1);
-      expect(unexpectedArgument.stderr).toContain("does not accept arguments");
-      expect(fs.existsSync(callsPath)).toBe(false);
+      try {
+        const unexpectedArgument = runSetup("expect", 1, ["unexpected"]);
+        expect(unexpectedArgument.status).toBe(1);
+        expect(unexpectedArgument.stderr).toContain("does not accept arguments");
+        expect(fs.existsSync(callsPath)).toBe(false);
 
-      for (const invalidPackages of ["", "   ", "expect\ncurl", "curl"]) {
         const rejected = runSetup(invalidPackages);
         expect(rejected.status).toBe(1);
         expect(fs.existsSync(callsPath)).toBe(false);
+
+        const retried = runSetup(
+          "expect iptables conmon crun fuse-overlayfs golang-github-containers-common nftables slirp4netns uidmap",
+          3,
+        );
+        expect(retried.status, retried.stderr).toBe(0);
+        expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toEqual([
+          "apt-get update",
+          "apt-get update",
+          "apt-get update",
+          "apt-get install -y --no-remove --no-install-recommends expect iptables conmon crun fuse-overlayfs golang-github-containers-common nftables slirp4netns uidmap",
+        ]);
+
+        const exhausted = runSetup("expect", 4);
+        expect(exhausted.status).toBe(1);
+        expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toEqual([
+          "apt-get update",
+          "apt-get update",
+          "apt-get update",
+        ]);
+        expect(`${exhausted.stdout}${exhausted.stderr}`).toContain(
+          "apt-get update failed after 3 attempts",
+        );
+      } finally {
+        fs.rmSync(directory, { force: true, recursive: true });
       }
-
-      const retried = runSetup("expect iptables", 3);
-      expect(retried.status, retried.stderr).toBe(0);
-      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toEqual([
-        "apt-get update",
-        "apt-get update",
-        "apt-get update",
-        "apt-get install -y --no-install-recommends expect iptables",
-      ]);
-
-      const exhausted = runSetup("expect", 4);
-      expect(exhausted.status).toBe(1);
-      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toEqual([
-        "apt-get update",
-        "apt-get update",
-        "apt-get update",
-      ]);
-      expect(`${exhausted.stdout}${exhausted.stderr}`).toContain(
-        "apt-get update failed after 3 attempts",
-      );
-    } finally {
-      fs.rmSync(directory, { force: true, recursive: true });
-    }
-  });
-
-  it("rejects installing the OpenClaw TUI host dependency after workspace preparation", () => {
-    const workflow = readWorkflow();
-    const steps = workflow.jobs["openclaw-tui-chat-correlation"].steps;
-    const installIndex = requireStepIndex(steps, "Install OpenClaw TUI host dependencies");
-    const prepareIndex = requireStepIndex(steps, "Prepare E2E workspace");
-    [steps[installIndex], steps[prepareIndex]] = [steps[prepareIndex]!, steps[installIndex]!];
-    expect(validateE2eWorkflow(workflow)).toContain(
-      "openclaw-tui-chat-correlation host dependencies must be installed before workspace prep",
-    );
-  });
+    },
+  );
 
   it("keeps cloud-onboard host dependencies before workspace preparation", () => {
     const workflow = readWorkflow();
@@ -258,6 +246,58 @@ exit 64
     steps.splice(prepareIndex + 1, 0, install);
     expect(validateE2eWorkflow(workflow)).toContain(
       "cloud-onboard DCode TUI host dependencies must precede workspace prep",
+    );
+  });
+
+  it("keeps Docker absent for the native Podman cloud-onboard test", () => {
+    const workflow = readWorkflow();
+    const steps = workflow.jobs["cloud-onboard"].steps;
+    const hide =
+      steps[requireStepIndex(steps, "Hide Docker CLI from native Podman public install")]!;
+    const restore =
+      steps[requireStepIndex(steps, "Restore Docker CLI after native Podman public install")]!;
+    hide.run = hide.run?.replace(
+      "if command -v docker >/dev/null 2>&1",
+      "if command -v docker-does-not-exist >/dev/null 2>&1",
+    );
+    restore.uses = "NVIDIA/NemoClaw/.github/actions/restore-native-podman-e2e@" + "0".repeat(40);
+
+    expect(validateE2eWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "step 'Hide Docker CLI from native Podman public install' run script must include if command -v docker >/dev/null 2>&1",
+        "cloud-onboard must restore Docker through the reviewed Podman cleanup action",
+        "cloud-onboard must restore the Docker CLI exactly once after native Podman execution",
+      ]),
+    );
+  });
+
+  it("keeps Docker restoration after the native Podman public install", () => {
+    const workflow = readWorkflow();
+    const steps = workflow.jobs["cloud-onboard"].steps;
+    const restoreIndex = requireStepIndex(
+      steps,
+      "Restore Docker CLI after native Podman public install",
+    );
+    const [restore] = steps.splice(restoreIndex, 1);
+    steps.splice(requireStepIndex(steps, "Run cloud-onboard live Vitest test"), 0, restore!);
+
+    expect(validateE2eWorkflow(workflow)).toContain(
+      "cloud-onboard must hide Docker through the live test and artifact upload before restoring it",
+    );
+  });
+
+  it.each([
+    ["live", "Run live E2E tests"],
+    ["shared-e2e", "Run tagged credential-free test"],
+  ] as const)("rejects Docker restoration before %s workload execution", (jobName, runStep) => {
+    const workflow = readWorkflow();
+    const steps = workflow.jobs[jobName].steps;
+    const restoreIndex = requireStepIndex(steps, "Restore Docker CLI after native Podman E2E");
+    const [restore] = steps.splice(restoreIndex, 1);
+    steps.splice(requireStepIndex(steps, runStep), 0, restore!);
+
+    expect(validateE2eWorkflow(workflow)).toContain(
+      `${jobName} must keep Docker unavailable through result artifact upload`,
     );
   });
 });

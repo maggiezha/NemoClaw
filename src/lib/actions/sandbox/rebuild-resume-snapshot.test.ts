@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
 import * as gatewayDrift from "../../adapters/openshell/gateway-drift";
@@ -10,6 +14,7 @@ import * as agentDefs from "../../agent/defs";
 import * as agentRuntime from "../../agent/runtime";
 import * as gatewayRuntime from "../../gateway-runtime-action";
 import * as nim from "../../inference/nim";
+import * as gatewayTeardownAuthority from "../../onboard/gateway-teardown-authority";
 import * as sessionRecovery from "../../onboard/session-recovery";
 import * as sandboxList from "../../openshell-sandbox-list";
 import * as sandboxVersion from "../../sandbox/version";
@@ -19,11 +24,47 @@ import * as registry from "../../state/registry";
 import * as sandboxState from "../../state/sandbox";
 import * as sandboxSession from "../../state/sandbox-session";
 import * as destroy from "./destroy";
+import * as mcpBridgeProvider from "./mcp-bridge-provider";
 import { rebuildSandbox } from "./rebuild";
 import * as rebuildImagePreflight from "./rebuild-custom-image-preflight";
 import { rebuildOnboardDependencies } from "./rebuild-onboard-dependencies";
-import * as rebuildShields from "./rebuild-shields";
+import * as rebuildRoutePreflight from "./rebuild-preflight-guards";
+import * as rebuildRecreateJournal from "./rebuild-recreate-journal";
 import * as rebuildUsageNotice from "./rebuild-usage-notice";
+import * as policyGet from "./policy-get";
+import * as openClawLifecycle from "./runtime/openclaw-lifecycle";
+
+const policyBoundaryMocks = vi.hoisted(() => ({
+  inspectSandboxPolicy: vi.fn(async () => ({
+    ok: true as const,
+    value: {
+      policySource: "sandbox" as const,
+      effectivePolicy: { version: 1, network_policies: {} },
+      policyIdentity: { hash: "sha256:resume-policy", activeVersion: 1 },
+    },
+  })),
+  readSandboxPolicy: vi.fn(async () => ({
+    ok: true as const,
+    value: {
+      document: "version: 1\nnetwork_policies: {}\n",
+      appliedRevision: null,
+    },
+  })),
+}));
+
+vi.mock("../../adapters/openshell/sandbox-policy-cli", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../adapters/openshell/sandbox-policy-cli")>()),
+  cliOpenShellSandboxPolicyReader: {
+    inspectSandboxPolicy: policyBoundaryMocks.inspectSandboxPolicy,
+    readSandboxPolicy: policyBoundaryMocks.readSandboxPolicy,
+    readSandboxPolicyRevision: vi.fn(),
+  },
+}));
+
+vi.mock("./forward-recovery", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./forward-recovery")>()),
+  teardownSandboxDashboardForward: vi.fn(() => true),
+}));
 
 function cloneSession(session: Session): Session {
   return JSON.parse(JSON.stringify(session));
@@ -34,6 +75,7 @@ describe("rebuild resume snapshot repair", () => {
   let errorSpy: MockInstance;
   let logSpy: MockInstance;
   let session: Session;
+  let backupPath: string;
   const originalSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
   const observed = {
     handoffOptions: null as Record<string, unknown> | null,
@@ -47,6 +89,7 @@ describe("rebuild resume snapshot repair", () => {
   };
 
   beforeEach(() => {
+    backupPath = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-rebuild-resume-"));
     spies = [];
     observed.handoffOptions = null;
     observed.preRepairMachineState = null;
@@ -59,10 +102,15 @@ describe("rebuild resume snapshot repair", () => {
 
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    spies.push(
+      vi
+        .spyOn(rebuildRecreateJournal, "recordRebuildRecoveryBackup")
+        .mockImplementation(() => undefined),
+    );
 
     session = onboardSession.createSession({
       sandboxName: "alpha",
-      provider: "ollama-local",
+      provider: "build",
       model: "nvidia/nemotron",
       lastCompletedStep: "gateway",
       status: "complete",
@@ -86,29 +134,79 @@ describe("rebuild resume snapshot repair", () => {
       session = cloneSession((mutator as (value: Session) => Session | void)(current) ?? current);
       return loadSession();
     };
+    const resolveGatewayAuthority = ({
+      gatewayName,
+      gatewayPort,
+    }: {
+      gatewayName: string;
+      gatewayPort: number;
+    }) => ({
+      gatewayName,
+      gatewayPort,
+      mode: "nemoclaw-managed" as const,
+      source: "standalone" as const,
+      endpoint: null,
+      stateDir: null,
+      supervisor: null,
+      requiredCapabilities: [],
+    });
 
     spies.push(
-      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcPreflightIssue").mockReturnValue(null),
-      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcResultIssue").mockReturnValue(null),
+      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcPreflightIssue").mockResolvedValue(null),
+      vi.spyOn(gatewayDrift, "detectOpenShellStateRpcResultIssue").mockResolvedValue(null),
+      vi
+        .spyOn(gatewayTeardownAuthority, "resolveGatewayTeardownAuthority")
+        .mockImplementation(resolveGatewayAuthority),
+      vi
+        .spyOn(gatewayTeardownAuthority, "resolveGatewayRebuildAuthority")
+        .mockImplementation(resolveGatewayAuthority),
       vi.spyOn(gatewayRuntime, "recoverNamedGatewayRuntime").mockResolvedValue({
         recovered: true,
-        before: { state: "healthy_named", status: "", gatewayInfo: "", activeGateway: null },
-        after: { state: "healthy_named", status: "", gatewayInfo: "", activeGateway: null },
+        before: {
+          state: "healthy_named",
+          activeGateway: null,
+          diagnostic: "",
+          recoveryBlocked: false,
+          unavailable: false,
+        },
+        after: {
+          state: "healthy_named",
+          activeGateway: null,
+          diagnostic: "",
+          recoveryBlocked: false,
+          unavailable: false,
+        },
         attempted: false,
       }),
       vi.spyOn(sandboxList, "captureSandboxListWithGatewayRecovery").mockResolvedValue({
-        result: { status: 0, output: "alpha Ready" },
+        result: {
+          ok: true,
+          value: {
+            sandboxes: [{ name: "alpha", phase: "Ready", readiness: "ready" }],
+          },
+        },
         recoveryAttempted: false,
         recoverySucceeded: false,
       }),
       vi.spyOn(resolve, "resolveOpenshell").mockReturnValue(null),
       vi.spyOn(agentDefs, "loadAgent").mockReturnValue({
         name: "langchain-deepagents-code",
+        displayName: "Deep Agents Code",
+        configPaths: { dir: "/sandbox/.deepagents" },
+        mcpCapability: { support: "disabled", reason: "not relevant to this fixture" },
       } as never),
       vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue(null),
       vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw"),
       vi.spyOn(onboardSession, "loadSession").mockImplementation(loadSession),
+      vi.spyOn(onboardSession, "loadRebuildSession").mockImplementation(loadSession),
+      vi.spyOn(onboardSession, "selectRebuildSession").mockImplementation(() => undefined),
       vi.spyOn(onboardSession, "updateSession").mockImplementation(updateSession),
+      vi.spyOn(onboardSession, "compareAndSwapSession").mockImplementation((matches, mutator) => {
+        const current = cloneSession(session);
+        return matches(current)
+          ? ((session = cloneSession(mutator(current) ?? current)), "updated")
+          : "mismatch";
+      }),
       vi.spyOn(onboardSession, "acquireOnboardLock").mockReturnValue({
         acquired: true,
         lockFile: "/tmp/nemoclaw-onboard.lock",
@@ -118,9 +216,8 @@ describe("rebuild resume snapshot repair", () => {
       vi.spyOn(onboardSession, "markStepFailed").mockImplementation(() => loadSession()),
       vi.spyOn(registry, "getSandbox").mockReturnValue({
         name: "alpha",
-        provider: "ollama-local",
+        provider: "build",
         model: "nvidia/nemotron",
-        policies: [],
         agent: null,
         nimContainer: null,
         nemoclawVersion: "0.1.0",
@@ -130,19 +227,36 @@ describe("rebuild resume snapshot repair", () => {
       } as never),
       vi.spyOn(registry, "updateSandbox").mockReturnValue(true),
       vi.spyOn(registry, "listSandboxes").mockReturnValue({ sandboxes: [] } as never),
+      vi.spyOn(mcpBridgeProvider, "getMcpProviderInspectionRuntimeSelection").mockReturnValue({
+        gatewayName: "nemoclaw",
+        workspace: "default",
+      }),
+      vi.spyOn(rebuildRoutePreflight, "commitRebuildRoutePreflight").mockReturnValue({
+        ok: true,
+        receipt: {
+          sandboxName: "alpha",
+          gatewayName: "nemoclaw",
+          route: {
+            provider: "build",
+            model: "nvidia/nemotron",
+            endpointUrl: null,
+            preferredInferenceApi: null,
+            credentialEnv: null,
+          },
+          migratedSandboxNames: [],
+        },
+      }),
+      vi
+        .spyOn(rebuildRoutePreflight, "revalidateRebuildRouteBeforeDelete")
+        .mockImplementation((receipt) => ({ ok: true, receipt })),
       vi.spyOn(sandboxSession, "getActiveSandboxSessions").mockReturnValue({
         detected: false,
         sessions: [],
       }),
-      vi.spyOn(sandboxVersion, "checkAgentVersion").mockReturnValue({
+      vi.spyOn(sandboxVersion, "checkAgentVersion").mockResolvedValue({
         expectedVersion: "0.1.0",
         sandboxVersion: "0.0.1",
       } as never),
-      vi.spyOn(rebuildShields, "openRebuildShieldsWindow").mockReturnValue({
-        relocked: false,
-        wasLocked: false,
-      }),
-      vi.spyOn(rebuildShields, "relockRebuildShieldsWindow").mockReturnValue(true),
       vi.spyOn(sandboxState, "backupSandboxState").mockReturnValue({
         success: true,
         backedUpDirs: [],
@@ -150,34 +264,94 @@ describe("rebuild resume snapshot repair", () => {
         failedDirs: [],
         failedFiles: [],
         manifest: {
-          backupPath: "/tmp/nemoclaw-rebuild-backup",
+          version: 2,
+          sandboxName: "alpha",
+          backupPath,
           timestamp: "2026-06-01T00:00:00.000Z",
-          policyPresets: [],
+          agentType: "openclaw",
+          agentVersion: "0.0.1",
+          expectedVersion: "0.1.0",
+          nativeState: {
+            root: "/sandbox",
+            archive: "native-home.tar",
+            sha256: "a".repeat(64),
+          },
+          blueprintDigest: null,
         },
       } as never),
-      vi.spyOn(openshellRuntime, "runOpenshell").mockImplementation((args: unknown) => {
-        const argv = Array.isArray(args) ? args.map(String) : [];
-        return argv.join(" ") === "sandbox get alpha"
-          ? ({
-              status: 1,
-              output: "sandbox alpha not found",
-              stdout: "",
-              stderr: "sandbox alpha not found",
-            } as never)
-          : ({ status: 0, output: "", stdout: "", stderr: "" } as never);
+      vi.spyOn(openshellRuntime, "runOpenshell").mockImplementation(
+        (args: string[]) =>
+          ({
+            status: 0,
+            output:
+              args[0] === "provider" && args[1] === "get" && args[2] === "build"
+                ? "Name: build\nType: openai\nCredential keys: <none>\nConfig keys: <none>\n"
+                : "",
+          }) as never,
+      ),
+      vi.spyOn(openshellRuntime, "captureOpenshell").mockReturnValue({
+        status: 1,
+        output: "",
+        stdout: "",
+        stderr: "Error: sandbox alpha not found",
+      } as never),
+      vi
+        .spyOn(openshellRuntime, "captureResolvedOpenshell")
+        .mockImplementation((args: string[]) => {
+          const output = args.includes("--output")
+            ? JSON.stringify({
+                scope: "sandbox",
+                sandbox: "alpha",
+                status: "effective",
+                policy_source: "sandbox",
+                hash: "sha256:resume-policy",
+                active_version: 1,
+                policy: { version: 1, network_policies: {} },
+              })
+            : "Version: 1\nActive: 1\n---\nversion: 1\nnetwork_policies: {}\n";
+          return { status: 0, output, stdout: output, stderr: "" } as never;
+        }),
+      vi.spyOn(destroy, "removeSandboxRegistryEntryWithReceipt").mockReturnValue({
+        entry: {
+          name: "alpha",
+          agent: null,
+        } as never,
+        wasDefault: true,
+        fallbackDefault: null,
+        postRemovalDefaultSelectionRevision: 1,
       }),
-      vi.spyOn(destroy, "removeSandboxRegistryEntry").mockReturnValue(true),
-      vi.spyOn(nim, "stopNimContainer").mockImplementation(() => undefined),
-      vi.spyOn(nim, "stopNimContainerByName").mockImplementation(() => undefined),
+      vi.spyOn(registry, "restoreSandboxEntryIfMissing").mockReturnValue(true),
+      vi.spyOn(nim, "stopNimContainer").mockReturnValue(true),
+      vi.spyOn(nim, "stopNimContainerByName").mockReturnValue(true),
       vi.spyOn(nim, "detectGpu").mockReturnValue(null),
+      vi.spyOn(openClawLifecycle, "beginOpenClawBackupQuiesce").mockResolvedValue({
+        ok: true,
+        window: { sandboxName: "alpha", kind: "backup" },
+      }),
+      vi
+        .spyOn(openClawLifecycle, "retireOpenClawPostRestoreDoctorForDelete")
+        .mockResolvedValue({ ok: true }),
       vi
         .spyOn(rebuildOnboardDependencies, "preflightAuthoritativeRebuildTarget")
-        .mockResolvedValue(undefined),
+        .mockResolvedValue({
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          mode: "nemoclaw-managed",
+          source: "standalone",
+          endpoint: null,
+          stateDir: null,
+          supervisor: null,
+          requiredCapabilities: [],
+        }),
       vi.spyOn(rebuildImagePreflight, "preflightRebuildImage").mockResolvedValue({
         ok: true,
         imageTag: null,
       } as never),
       vi.spyOn(rebuildUsageNotice, "ensureRebuildUsageNoticeAccepted").mockResolvedValue(true),
+      vi.spyOn(policyGet, "getSandboxPolicy").mockReturnValue({
+        raw: "version: 1\nnetwork_policies: {}\n",
+        yaml: "version: 1\nnetwork_policies: {}\n",
+      } as never),
       vi
         .spyOn(rebuildOnboardDependencies, "onboard")
         .mockImplementation(async (options: unknown) => {
@@ -200,6 +374,7 @@ describe("rebuild resume snapshot repair", () => {
     for (const spy of spies) spy.mockRestore();
     errorSpy.mockRestore();
     logSpy.mockRestore();
+    fs.rmSync(backupPath, { recursive: true, force: true });
     if (originalSandboxName === undefined) {
       delete process.env.NEMOCLAW_SANDBOX_NAME;
     } else {

@@ -5,163 +5,111 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import type { McpBridgeEntry } from "../../state/registry";
+import type { McpSourceEntry } from "./mcp-bridge-contracts";
 import {
-  buildOpenClawMcporterRegisterCommand,
-  buildOpenClawMcporterRemoveCommand,
+  buildStrictOpenClawMcpInspectCommand,
   MCPORTER_VERSION,
 } from "./mcp-bridge-adapter-openclaw";
-import {
-  buildOpenClawMcporterInspectCommand,
-  mcporterHeadersMatchExpected,
-} from "./mcp-bridge-adapter-status";
+import { entryHeaders, openClawHeadersMatchExpected } from "./mcp-bridge-adapter-status";
 
-const baseEntry: McpBridgeEntry = {
+const JSON5_MODULE_PATH = fileURLToPath(import.meta.resolve("json5"));
+
+const entry: McpSourceEntry = {
   server: "github",
   agent: "openclaw",
-  adapter: "mcporter",
+  adapter: "openclaw-config",
   url: "https://api.githubcopilot.com/mcp/",
   env: ["GITHUB_TOKEN"],
   providerName: "alpha-mcp-github",
   policyName: "mcp-bridge-github",
-  addedAt: new Date(0).toISOString(),
 };
 
-describe("OpenClaw mcporter MCP adapter", () => {
-  it("constructs a mcporter HTTP registration with OpenShell env placeholders", () => {
-    const command = buildOpenClawMcporterRegisterCommand(baseEntry);
-
-    expect(command).toContain("'mcporter' 'config' 'add' 'github'");
-    expect(command).toContain("'--url' 'https://api.githubcopilot.com/mcp/'");
-    expect(command).toContain(
-      "'--header' 'Authorization=Bearer openshell:resolve:env:GITHUB_TOKEN'",
-    );
-    expect(command).toContain("'--scope' 'home'");
-    expect(command).toContain("already exists in mcporter config");
-    expect(command).not.toContain("fake-secret");
-  });
-
-  it("accepts only mcporter's synthesized HTTP Accept header in ownership checks", () => {
-    const expected = {
-      Authorization: "Bearer openshell:resolve:env:GITHUB_TOKEN",
-    };
-
-    expect(
-      mcporterHeadersMatchExpected(
-        {
-          ...expected,
-          accept: "application/json, text/event-stream",
-        },
-        expected,
+function run(command: string) {
+  return spawnSync(
+    "/bin/sh",
+    [
+      "-c",
+      command.replaceAll(
+        "/usr/local/lib/node_modules/openclaw/node_modules/json5",
+        JSON5_MODULE_PATH,
       ),
-    ).toBe(true);
-    expect(mcporterHeadersMatchExpected(expected, expected)).toBe(true);
-    expect(
-      mcporterHeadersMatchExpected(
-        {
-          ...expected,
-          accept: "application/json",
-        },
-        expected,
-      ),
-    ).toBe(false);
-    expect(
-      mcporterHeadersMatchExpected(
-        {
-          ...expected,
-          accept: "application/json, text/event-stream",
-          "x-unowned": "drift",
-        },
-        expected,
-      ),
-    ).toBe(false);
-    expect(
-      mcporterHeadersMatchExpected(
-        {
-          Authorization: "Bearer changed",
-          accept: "application/json, text/event-stream",
-        },
-        expected,
-      ),
-    ).toBe(false);
-  });
+    ],
+    { encoding: "utf8" },
+  );
+}
 
-  it("uses the normalized-header ownership rule in mcporter inspect and remove commands", () => {
-    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcporter-owner-"));
-    try {
-      const fakeMcporter = path.join(temp, "mcporter");
-      const removeMarker = path.join(temp, "removed");
-      fs.writeFileSync(
-        fakeMcporter,
-        [
-          "#!/usr/bin/env node",
-          'const fs = require("node:fs");',
-          'const headers = JSON.parse(process.env.FAKE_MCPORTER_HEADERS || "{}");',
-          'if (process.argv[3] === "get") {',
-          "  process.stdout.write(JSON.stringify({",
-          '    name: "github", transport: "http",',
-          '    baseUrl: "https://api.githubcopilot.com/mcp/", headers,',
-          "  }));",
-          "  process.exit(0);",
-          "}",
-          'if (process.argv[3] === "remove") {',
-          '  fs.writeFileSync(process.env.FAKE_MCPORTER_REMOVE_MARKER, "removed");',
-          "  process.exit(0);",
-          "}",
-          "process.exit(3);",
-        ].join("\n"),
-        { mode: 0o755 },
-      );
-      const run = (command: string, headers: Record<string, string>) =>
-        spawnSync("/bin/sh", ["-c", command], {
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            PATH: `${temp}:${process.env.PATH ?? ""}`,
-            FAKE_MCPORTER_HEADERS: JSON.stringify(headers),
-            FAKE_MCPORTER_REMOVE_MARKER: removeMarker,
+describe("OpenClaw native MCP adapter", () => {
+  it("inspects a native OpenClaw entry without changing its configuration", () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-mcp-"));
+    const configPath = path.join(temp, "openclaw.json");
+    const content = `{
+      // Native OpenClaw configuration accepts JSON5.
+      preserved: true,
+      mcp: {
+        servers: {
+          github: {
+            transport: "streamable-http",
+            url: ${JSON.stringify(entry.url)},
+            headers: ${JSON.stringify(entryHeaders(entry))},
           },
-        });
-      const normalizedHeaders = {
-        Authorization: "Bearer openshell:resolve:env:GITHUB_TOKEN",
-        accept: "application/json, text/event-stream",
-      };
-
-      const inspect = run(buildOpenClawMcporterInspectCommand(baseEntry, true), normalizedHeaders);
-      expect(inspect.status).toBe(0);
-      expect(inspect.stdout.trim()).toBe("registered");
-
-      const remove = run(buildOpenClawMcporterRemoveCommand(baseEntry), normalizedHeaders);
-      expect(remove.status).toBe(0);
-      expect(fs.readFileSync(removeMarker, "utf8")).toBe("removed");
-
-      fs.rmSync(removeMarker, { force: true });
-      const drifted = run(buildOpenClawMcporterRemoveCommand(baseEntry), {
-        ...normalizedHeaders,
-        "x-unowned": "drift",
-      });
-      expect(drifted.status).toBe(2);
-      expect(drifted.stderr).toContain("Refusing to remove modified mcporter MCP server");
-      expect(fs.existsSync(removeMarker)).toBe(false);
+        },
+      },
+    }`;
+    try {
+      fs.writeFileSync(configPath, content, { mode: 0o600 });
+      const inspection = run(buildStrictOpenClawMcpInspectCommand(entry, true, temp));
+      expect(inspection.status).toBe(0);
+      expect(inspection.stdout.trim()).toBe("registered");
+      expect(fs.readFileSync(configPath, "utf8")).toBe(content);
     } finally {
       fs.rmSync(temp, { recursive: true, force: true });
     }
   });
 
-  it("does not fabricate Authorization headers for legacy entries without credentials", () => {
-    const command = buildOpenClawMcporterRegisterCommand({
-      ...baseEntry,
-      env: [],
-    });
-
-    expect(command).not.toContain("Authorization=");
-    expect(command).toContain("'--url' 'https://api.githubcopilot.com/mcp/'");
+  it("projects the exact OpenShell credential revision into native headers", () => {
+    const command = buildStrictOpenClawMcpInspectCommand(entry, true, "/sandbox/.openclaw", "v12");
+    expect(command).toContain('\\"transport\\":\\"streamable-http\\"');
+    expect(command).toContain("Bearer openshell:resolve:env:v12_GITHUB_TOKEN");
+    expect(
+      openClawHeadersMatchExpected(
+        { Authorization: "Bearer openshell:resolve:env:v12_GITHUB_TOKEN" },
+        entryHeaders(entry, "v12"),
+      ),
+    ).toBe(true);
   });
 
-  it("keeps the mcporter runtime pin visible for image tests", () => {
+  it("rejects a URL-only entry that OpenClaw would otherwise treat as legacy SSE", () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-mcp-transport-"));
+    const configPath = path.join(temp, "openclaw.json");
+    try {
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          mcp: {
+            servers: {
+              github: {
+                url: entry.url,
+                headers: { Authorization: "Bearer openshell:resolve:env:GITHUB_TOKEN" },
+              },
+            },
+          },
+        }),
+        { mode: 0o600 },
+      );
+
+      const inspection = run(buildStrictOpenClawMcpInspectCommand(entry, true, temp));
+      expect(inspection.status).toBe(2);
+      expect(inspection.stdout.trim()).toBe("mismatch");
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the legacy mcporter pin available only for migration", () => {
     expect(MCPORTER_VERSION).toBe("0.7.3");
   });
 });

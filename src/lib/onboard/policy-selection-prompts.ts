@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { takePendingStdinEof } from "../core/pending-stdin-eof";
 import type { TierDefinition } from "../policy/tiers";
 import type { SandboxCancelRollback } from "./cancel-rollback";
+import { OnboardDeferredExitError } from "./session-bootstrap";
 
 type PresetWithDescription = { name: string; description?: string };
 type PresetWithAccess = { name: string; access: string };
@@ -22,8 +24,8 @@ type PolicyPromptOutput = {
   write(chunk: string): unknown;
 };
 type PolicyPromptProcessEvents = {
-  once(event: "SIGTERM", listener: () => void): unknown;
-  removeListener(event: "SIGTERM", listener: () => void): unknown;
+  once(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+  removeListener(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
 };
 
 export interface PolicySelectionPromptDeps {
@@ -41,12 +43,19 @@ export interface PolicySelectionPromptDeps {
   makeOnboardCancelExit(
     rollback: Pick<SandboxCancelRollback, "markCancelled">,
     cleanup: () => void,
+    exit?: (code: number) => void,
   ): () => void;
   sandboxCancelRollback: Pick<SandboxCancelRollback, "markCancelled">;
   useColor: boolean;
   stdin?: PolicyPromptInput;
   stdout?: PolicyPromptOutput;
   processEvents?: PolicyPromptProcessEvents;
+  /**
+   * Report whether stdin closed before a raw-mode menu opened. Defaults to the
+   * shared terminal check for the real stdin and to "nothing pending" for an
+   * injected one.
+   */
+  takePendingStdinEof?: () => Promise<boolean> | false;
 }
 
 export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDeps): {
@@ -75,9 +84,71 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
   const stdin = deps.stdin ?? process.stdin;
   const stdout = deps.stdout ?? process.stdout;
   const processEvents = deps.processEvents ?? process;
+  const takePendingEof =
+    deps.takePendingStdinEof ?? (() => (stdin === process.stdin ? takePendingStdinEof() : false));
 
   /**
-   * Prompt the user to select a policy tier (restricted / balanced / open).
+   * Cancel a raw-mode menu whose stdin closed before it opened. Switching the
+   * terminal to raw mode drops a Ctrl-D queued between questions, so the menu
+   * would otherwise wait for a key that never arrives (#12169). Callers check
+   * `takePendingEof()` first, which stays synchronous when nothing is pending
+   * so the menu attaches its key listener on the same tick as before. The
+   * cancellation takes the same path as Ctrl-C at these selectors.
+   */
+  function cancelForClosedStdin(): Promise<never> {
+    return new Promise<never>((_resolve, reject) => {
+      makeOnboardCancelExit(
+        sandboxCancelRollback,
+        () => undefined,
+        (code) => reject(new OnboardDeferredExitError(code)),
+      )();
+    });
+  }
+
+  function promptWithOnboardCancel(question: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      let cancelled = false;
+      const cleanup = () => {
+        processEvents.removeListener("SIGINT", onCancel);
+        processEvents.removeListener("SIGTERM", onCancel);
+      };
+      const cancelExit = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
+      const onCancel = () => {
+        if (cancelled) return;
+        cancelled = true;
+        cancelExit();
+      };
+      processEvents.once("SIGINT", onCancel);
+      processEvents.once("SIGTERM", onCancel);
+      let answer: Promise<string>;
+      try {
+        answer = prompt(question);
+      } catch (error) {
+        cleanup();
+        reject(error);
+        return;
+      }
+      void answer.then(
+        (value) => {
+          cleanup();
+          resolve(value);
+        },
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException)?.code === "SIGINT") {
+            onCancel();
+            return;
+          }
+          cleanup();
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * Prompt the user to select a policy tier (restricted / balanced / open / personal).
    * Uses the same radio-style TUI as presetsCheckboxSelector (single-select).
    * In non-interactive mode reads NEMOCLAW_POLICY_TIER (default: balanced).
    * Returns the tier name string.
@@ -108,7 +179,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         console.log(`    ${marker} ${tier.label}`);
       });
       console.log("");
-      const answer = await prompt(
+      const answer = await promptWithOnboardCancel(
         `  Select tier [1-${allTiers.length}] (default: ${allTiers.indexOf(defaultTier) + 1} ${defaultTier.name}): `,
       );
       const chosen = selectFromNumberedMenuOrExit(
@@ -156,6 +227,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
       lineCount = lines.length;
     };
 
+    const pending = takePendingEof();
+    if (pending !== false && (await pending)) return cancelForClosedStdin();
+
     // Re-attach stdin to the event loop. A prior prompt cleanup may have
     // unref'd it (sticky), and resume() alone would leave the raw-mode read
     // detached from the loop.
@@ -164,7 +238,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<string>((resolve) => {
+    return new Promise<string>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -175,7 +249,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -186,8 +262,10 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         } else if (key === " ") {
           selectedIdx = cursor;
           redraw();
-        } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+        } else if (key === "\x03" || key === "\x04") {
+          // Raw mode delivers Ctrl-D as an ordinary byte instead of an
+          // end-of-file; the menu has no typed answer to protect.
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();
@@ -279,7 +357,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         console.log(`    ${check} ${badge} ${preset.name}`);
       });
       console.log("");
-      const rawInclude = await prompt(
+      const rawInclude = await promptWithOnboardCancel(
         "  Include presets (comma-separated names, Enter to keep defaults): ",
       );
       if (rawInclude.trim()) {
@@ -336,6 +414,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
       lineCount = lines.length;
     };
 
+    const pending = takePendingEof();
+    if (pending !== false && (await pending)) return cancelForClosedStdin();
+
     // Re-attach stdin to the event loop. A prior prompt cleanup may have
     // unref'd it (sticky), and resume() alone would leave the raw-mode read
     // detached from the loop.
@@ -344,7 +425,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<PresetWithAccess[]>((resolve) => {
+    return new Promise<PresetWithAccess[]>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -355,7 +436,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -367,8 +450,10 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
               .filter((preset) => included.has(preset.name))
               .map((preset) => ({ name: preset.name, access: accessModes[preset.name] })),
           );
-        } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+        } else if (key === "\x03" || key === "\x04") {
+          // Raw mode delivers Ctrl-D as an ordinary byte instead of an
+          // end-of-file; the menu has no typed answer to protect.
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();
@@ -427,7 +512,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         console.log(`    ${marker} ${preset.name.padEnd(14)} — ${preset.description}`);
       });
       console.log("");
-      const raw = await prompt("  Select presets (comma-separated names, Enter to skip): ");
+      const raw = await promptWithOnboardCancel(
+        "  Select presets (comma-separated names, Enter to skip): ",
+      );
       if (!raw.trim()) {
         console.log("  Skipping policy presets.");
         return [];
@@ -482,6 +569,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
       lineCount = lines.length;
     };
 
+    const pending = takePendingEof();
+    if (pending !== false && (await pending)) return cancelForClosedStdin();
+
     // Re-attach stdin to the event loop. A prior prompt cleanup may have
     // unref'd it (sticky), and resume() alone would leave the raw-mode read
     // detached from the loop.
@@ -490,7 +580,7 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
     stdin.resume();
     stdin.setEncoding("utf8");
 
-    return new Promise<string[]>((resolve) => {
+    return new Promise<string[]>((resolve, reject) => {
       const cleanup = () => {
         stdin.setRawMode(false);
         stdin.pause();
@@ -501,7 +591,9 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
         processEvents.removeListener("SIGTERM", onSigterm);
       };
 
-      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup);
+      const onSigterm = makeOnboardCancelExit(sandboxCancelRollback, cleanup, (code) =>
+        reject(new OnboardDeferredExitError(code)),
+      );
       processEvents.once("SIGTERM", onSigterm);
 
       const onData = (key: string) => {
@@ -509,8 +601,10 @@ export function createPolicySelectionPromptHelpers(deps: PolicySelectionPromptDe
           cleanup();
           stdout.write("\n");
           resolve([...selected]);
-        } else if (key === "\x03") {
-          makeOnboardCancelExit(sandboxCancelRollback, cleanup)();
+        } else if (key === "\x03" || key === "\x04") {
+          // Raw mode delivers Ctrl-D as an ordinary byte instead of an
+          // end-of-file; the menu has no typed answer to protect.
+          onSigterm();
         } else if (key === "\x1b[A" || key === "k") {
           cursor = (cursor - 1 + n) % n;
           redraw();

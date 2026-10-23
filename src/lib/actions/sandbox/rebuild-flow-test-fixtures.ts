@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fixedNativeProvider } from "../../inference/native-provider/fixed";
+
 export function makeActiveTeamsMessagingPlan() {
   return {
     schemaVersion: 1,
@@ -62,7 +67,18 @@ export function makeActiveTeamsMessagingPlan() {
       },
     ],
     disabledChannels: [],
-    credentialBindings: [],
+    credentialBindings: [
+      {
+        channelId: "teams",
+        credentialId: "teamsClientSecret",
+        sourceInput: "clientSecret",
+        providerName: "alpha-teams-bridge",
+        providerEnvKey: "MSTEAMS_APP_PASSWORD",
+        placeholder: "openshell:resolve:env:MSTEAMS_APP_PASSWORD",
+        credentialAvailable: true,
+        credentialHash: "teams-client-secret-hash",
+      },
+    ],
     networkPolicy: { presets: ["teams"], entries: [] },
     agentRender: [],
     buildSteps: [],
@@ -71,7 +87,17 @@ export function makeActiveTeamsMessagingPlan() {
   };
 }
 
+const preparedRecoveryTempDirs: string[] = [];
+
+export function cleanupPreparedRecoveryManifests(): void {
+  for (const directory of preparedRecoveryTempDirs.splice(0)) {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 export function makePreparedRecoveryManifest() {
+  const backupPath = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-rebuild-recovery-"));
+  preparedRecoveryTempDirs.push(backupPath);
   return {
     version: 1,
     sandboxName: "alpha",
@@ -79,13 +105,75 @@ export function makePreparedRecoveryManifest() {
     agentType: "openclaw",
     agentVersion: "0.1.0",
     expectedVersion: "0.2.0",
-    stateDirs: ["workspace"],
-    backedUpDirs: ["workspace"],
-    stateFiles: [],
     dir: "/sandbox/.openclaw",
-    backupPath: "/tmp/rebuild-backups/alpha/2026-07-01T06-50-42-044Z",
+    backupPath,
     blueprintDigest: null,
-    policyPresets: ["npm"],
-    customPolicies: [],
+    rebuildMcpHandoff: {
+      entries: [],
+      runtimeSelection: {
+        gatewayName: "nemoclaw",
+        workspace: "default" as const,
+      },
+    },
   };
+}
+
+/** Model a native provider retained across backup, optionally replaced before deletion. */
+export function nativeProviderRebuildScenario(replaced: boolean, provider = "nvidia-prod") {
+  const definition = fixedNativeProvider(provider)!;
+  const providerName = definition.providerName;
+  const profile = definition.profileId;
+  const id = "11111111-2222-4333-8444-555555555555";
+  let backedUp = false;
+  const reads: string[] = [];
+  const overrides = {
+    sandboxEntry: {
+      provider,
+      model: "test/model",
+      credentialEnv: definition.credentialEnv,
+      ...(provider === "hermes-provider"
+        ? {
+            hermesAuthMethod: "oauth" as const,
+            endpointUrl: "https://inference-api.nousresearch.com/v1",
+          }
+        : {}),
+      [provider === "nvidia-prod"
+        ? "nativeNvidiaProviderAttachment"
+        : "nativeHostedProviderAttachment"]: {
+        schemaVersion: 1,
+        providerName,
+        profileId: profile,
+        providerId: id,
+      },
+    },
+    hydrateCredentialEnv: () => null,
+    beforeBackup: () => {
+      backedUp = true;
+    },
+    runOpenshell: (args: string[]) => {
+      if (args[0] !== "provider") return undefined;
+      let stdout: string;
+      if (args[1] === "get") {
+        reads.push(args[2]!);
+        stdout = [
+          `Name: ${providerName}`,
+          `Type: ${profile}`,
+          `Credential keys: ${definition.credentialEnv}`,
+          "Config keys: <none>",
+          `Id: ${backedUp && replaced ? "22222222-2222-4333-8444-555555555555" : id}`,
+          "Resource version: 1",
+        ].join("\n");
+      } else if (args[1] === "list") {
+        stdout = JSON.stringify([
+          {
+            name: providerName,
+            credential_keys: [definition.credentialEnv],
+            credential_expires_at_ms: {},
+          },
+        ]);
+      } else return undefined;
+      return { status: 0, stdout, output: stdout, stderr: "" };
+    },
+  };
+  return { overrides, reads, providerName };
 }

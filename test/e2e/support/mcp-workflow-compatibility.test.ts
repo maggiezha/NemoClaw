@@ -12,7 +12,28 @@ import { validateMcpOpenShellWorkflowBoundary } from "../../../tools/e2e/mcp-wor
 import { requireFixture } from "./require-fixture";
 
 describe("MCP workflow runtime compatibility", () => {
-  it("accepts harmless classifier key reordering (#6426)", () => {
+  it.each([
+    ["22.19.0", "openshell-dev-artifact"],
+    ["22.19.0", "mcp-bridge-dev"],
+    ["^22.19.0", "openshell-dev-artifact"],
+    ["^22.19.0", "mcp-bridge-dev"],
+  ])("accepts the compatible Node selector %s in %s", (version, jobName) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-node-selector-"));
+    const workflowPath = path.join(directory, "e2e.yaml");
+    try {
+      const workflow = YAML.parse(fs.readFileSync(".github/workflows/e2e.yaml", "utf8"));
+      const setup = workflow.jobs[jobName].steps.find((step: { uses?: string }) =>
+        step.uses?.startsWith("actions/setup-node@"),
+      );
+      setup.with["node-version"] = version;
+      fs.writeFileSync(workflowPath, YAML.stringify(workflow));
+      expect(validateMcpOpenShellWorkflowBoundary(workflowPath)).toEqual([]);
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("accepts compatibility-step keys in any order (#6426)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-workflow-"));
     const workflowPath = path.join(directory, "e2e.yaml");
     try {
@@ -38,7 +59,7 @@ describe("MCP workflow runtime compatibility", () => {
     }
   });
 
-  it("gates the dev full lifecycle on the canonical runtime classifier (#6426)", () => {
+  it("runs the development MCP test only for the reviewed OpenShell version (#6426)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-workflow-"));
     const workflowPath = path.join(directory, "e2e.yaml");
     try {
@@ -73,7 +94,7 @@ describe("MCP workflow runtime compatibility", () => {
     }
   });
 
-  it("rejects dev compatibility classifier identity or ordering drift (#6426)", () => {
+  it("pins the compatibility script and runs it before the development MCP test (#6426)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-workflow-"));
     const workflowPath = path.join(directory, "e2e.yaml");
     try {
@@ -109,7 +130,7 @@ describe("MCP workflow runtime compatibility", () => {
     }
   });
 
-  it("rejects bypasses around the dev compatibility classifier (#6426)", () => {
+  it("does not skip or ignore compatibility-check failures (#6426)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-workflow-"));
     const workflowPath = path.join(directory, "e2e.yaml");
     try {
@@ -145,7 +166,7 @@ describe("MCP workflow runtime compatibility", () => {
     }
   });
 
-  it("keeps the stable MCP lifecycle independent of dev compatibility branching (#6426)", () => {
+  it("runs the stable MCP test without the development compatibility check (#6426)", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-mcp-workflow-"));
     const workflowPath = path.join(directory, "e2e.yaml");
     try {

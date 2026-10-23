@@ -8,7 +8,7 @@ import type {
   ChannelPolicyPresetSpec,
   MessagingAgentId,
 } from "../manifest";
-import { BUILT_IN_CHANNEL_MANIFESTS } from "./built-ins";
+import { BUILT_IN_CHANNEL_MANIFESTS } from "./built-ins.ts";
 
 const CONFIG_ENV_ALIASES_BY_ENV_KEY: Readonly<Record<string, readonly string[]>> = {
   DISCORD_SERVER_ID: ["DISCORD_SERVER_IDS"],
@@ -35,6 +35,14 @@ export interface MessagingCredentialMetadata {
   readonly primary: boolean;
 }
 
+export interface MessagingCredentialEnvAssignmentMetadata {
+  readonly channelId: string;
+  readonly agent: MessagingAgentId;
+  readonly sourceEnvKey: string;
+  readonly targetEnvKey: string;
+  readonly placeholder: string;
+}
+
 export interface MessagingConfigEnvMetadata {
   readonly channelId: string;
   readonly inputId: string;
@@ -50,6 +58,7 @@ export interface MessagingPolicyPresetMetadata {
   readonly agentPolicyKeys: Partial<Record<MessagingAgentId, readonly string[]>>;
   readonly requiredAtCreate: boolean;
   readonly validationWarningLines: readonly string[];
+  readonly validationWarningLinesByAgent: Partial<Record<MessagingAgentId, readonly string[]>>;
 }
 
 export interface OpenClawRuntimeChannelMetadata {
@@ -94,6 +103,59 @@ export function listMessagingCredentialMetadata(
       primary: credential.primary === true,
     })),
   );
+}
+
+export function listMessagingCredentialEnvAssignments(
+  options: MessagingManifestMetadataOptions = {},
+): MessagingCredentialEnvAssignmentMetadata[] {
+  return selectManifests(options).flatMap((manifest) => {
+    const credentialsByTemplate = new Map(
+      manifest.credentials.map((credential) => [
+        `{{credential.${credential.id}.placeholder}}`,
+        credential,
+      ]),
+    );
+    const renderedAssignments = manifest.render.flatMap((render) => {
+      if (options.agent && render.agent !== options.agent) return [];
+      if (render.kind !== "env-lines") return [];
+      return render.lines.flatMap((line) => {
+        const separator = line.indexOf("=");
+        if (separator <= 0) return [];
+        const credential = credentialsByTemplate.get(line.slice(separator + 1));
+        if (!credential) return [];
+        return [
+          {
+            channelId: manifest.id,
+            agent: render.agent,
+            sourceEnvKey: credential.providerEnvKey,
+            targetEnvKey: line.slice(0, separator),
+            placeholder: credential.placeholder,
+          },
+        ];
+      });
+    });
+    const runtimeAssignments = (["openclaw", "hermes"] as const).flatMap((agent) => {
+      if (options.agent && agent !== options.agent) return [];
+      if (!manifest.supportedAgents.includes(agent)) return [];
+      return (manifest.runtime?.[agent]?.envAliases ?? []).flatMap((alias) => {
+        if (!alias.targetEnvKey) return [];
+        const credential = manifest.credentials.find(
+          (candidate) => candidate.providerEnvKey === alias.envKey,
+        );
+        if (!credential) return [];
+        return [
+          {
+            channelId: manifest.id,
+            agent,
+            sourceEnvKey: alias.envKey,
+            targetEnvKey: alias.targetEnvKey,
+            placeholder: credential.placeholder,
+          },
+        ];
+      });
+    });
+    return [...renderedAssignments, ...runtimeAssignments];
+  });
 }
 
 export function getMessagingCredentialEnvKeysByChannel(
@@ -206,6 +268,7 @@ export function listMessagingPolicyPresetMetadata(
         agentPolicyKeys: normalized.agentPolicyKeys ?? {},
         requiredAtCreate: normalized.requiredAtCreate === true,
         validationWarningLines: normalized.validationWarningLines ?? [],
+        validationWarningLinesByAgent: normalized.validationWarningLinesByAgent ?? {},
       };
     }),
   );
@@ -280,10 +343,14 @@ export function getMessagingPolicyPresetValidationWarnings(
 ): Readonly<Record<string, readonly string[]>> {
   const result: Record<string, string[]> = {};
   for (const preset of listMessagingPolicyPresetMetadata(options)) {
-    if (preset.validationWarningLines.length === 0) continue;
+    const agentLines = options.agent
+      ? (preset.validationWarningLinesByAgent[options.agent] ?? [])
+      : Object.values(preset.validationWarningLinesByAgent).flatMap((lines) => lines ?? []);
+    const warningLines = [...preset.validationWarningLines, ...agentLines];
+    if (warningLines.length === 0) continue;
     result[preset.presetName] = uniqueStrings([
       ...(result[preset.presetName] ?? []),
-      ...preset.validationWarningLines,
+      ...warningLines,
     ]);
   }
   return result;

@@ -4,7 +4,7 @@
 import path from "node:path";
 
 import { GATEWAY_PORT } from "../../core/ports";
-import { resolveGatewayStateDirName } from "../../onboard/gateway-binding";
+import { resolveGatewayStateDirForPort } from "../../onboard/gateway/state-dir";
 import { nemoclawStateRoot } from "../../state/state-root";
 
 export const DEFAULT_GATEWAY_NAME = "nemoclaw";
@@ -15,7 +15,6 @@ export const NEMOCLAW_PROVIDERS = [
   "nvidia-ncp",
   "nim-local",
 ] as const;
-export const NEMOCLAW_OLLAMA_MODELS = ["nemotron-3-super:120b", "nemotron-3-nano:30b"] as const;
 export const OPENSHELL_MANAGED_BINARIES = [
   "openshell",
   "openshell-gateway",
@@ -24,22 +23,24 @@ export const OPENSHELL_MANAGED_BINARIES = [
 ] as const;
 
 export interface UninstallPathOptions {
+  gatewayStateDir?: string;
   home: string;
   repoRoot?: string;
   tmpDir?: string;
   xdgBinHome?: string;
 }
 
-/** Agent-alias CLI shims installed alongside `nemoclaw` (e.g. nemohermes). */
-export const AGENT_ALIAS_CLI_BINARIES = ["nemohermes", "nemo-deepagents"] as const;
+/** CLI shims installed alongside the primary `nemoclaw` executable. */
+export const SIBLING_CLI_BINARIES = ["nemoclaw-acp", "nemohermes", "nemo-deepagents"] as const;
 
 export interface UninstallPaths {
   helperServiceGlob: string;
+  huggingFaceModelCacheDir: string;
   managedSwapMarkerPath: string;
   nemoclawConfigDir: string;
   nemoclawShimPath: string;
-  /** Sibling agent-alias shims (nemohermes, nemo-deepagents) in the same bin dir. */
-  agentAliasShimPaths: Array<{ binName: string; path: string }>;
+  /** Sibling CLI shims in the same user-local bin directory. */
+  siblingCliShimPaths: Array<{ binName: string; path: string }>;
   nemoclawStateDir: string;
   gatewayLocalStateDir: string;
   selectedGatewayLocalStateDir: string;
@@ -67,19 +68,21 @@ export function defaultUninstallPaths(options: UninstallPathOptions): UninstallP
   const gatewayLocalStateDir = path.join(options.home, ".local", "state", "nemoclaw");
   return {
     helperServiceGlob: path.join(tmpDir, "nemoclaw-services-*"),
+    huggingFaceModelCacheDir: path.join(options.home, ".cache", "huggingface"),
     managedSwapMarkerPath: path.join(options.home, ".nemoclaw", "managed_swap"),
     nemoclawConfigDir: path.join(options.home, ".config", "nemoclaw"),
     nemoclawShimPath: path.join(options.home, ".local", "bin", "nemoclaw"),
-    agentAliasShimPaths: AGENT_ALIAS_CLI_BINARIES.map((binName) => ({
+    siblingCliShimPaths: SIBLING_CLI_BINARIES.map((binName) => ({
       binName,
       path: path.join(options.home, ".local", "bin", binName),
     })),
     nemoclawStateDir: nemoclawStateRoot(options.home, GATEWAY_PORT),
     gatewayLocalStateDir,
-    selectedGatewayLocalStateDir: path.join(
-      gatewayLocalStateDir,
-      resolveGatewayStateDirName(GATEWAY_PORT),
-    ),
+    selectedGatewayLocalStateDir: resolveGatewayStateDirForPort({
+      configured: options.gatewayStateDir,
+      home: options.home,
+      port: GATEWAY_PORT,
+    }),
     openshellConfigDir: path.join(options.home, ".config", "openshell"),
     openshellInstallPaths: openshellInstallPathsForBinDirs(["/usr/local/bin", xdgBinHome]),
     repoRoot: options.repoRoot || path.resolve(__dirname, "..", "..", "..", ".."),
@@ -99,15 +102,35 @@ export function defaultUninstallPaths(options: UninstallPathOptions): UninstallP
   };
 }
 
+export function selectedGatewayStateDirIsWithinDefaultRoot(
+  paths: Pick<UninstallPaths, "gatewayLocalStateDir" | "selectedGatewayLocalStateDir">,
+): boolean {
+  const relative = path.relative(
+    path.resolve(paths.gatewayLocalStateDir),
+    path.resolve(paths.selectedGatewayLocalStateDir),
+  );
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
+}
+
 export function uninstallStatePaths(
   paths: Pick<
     UninstallPaths,
-    "nemoclawConfigDir" | "nemoclawStateDir" | "openshellConfigDir" | "gatewayLocalStateDir"
+    | "gatewayLocalStateDir"
+    | "nemoclawConfigDir"
+    | "nemoclawStateDir"
+    | "openshellConfigDir"
+    | "selectedGatewayLocalStateDir"
   >,
 ): string[] {
   return [
     paths.nemoclawStateDir,
     paths.gatewayLocalStateDir,
+    ...(selectedGatewayStateDirIsWithinDefaultRoot(paths)
+      ? []
+      : [paths.selectedGatewayLocalStateDir]),
     paths.openshellConfigDir,
     paths.nemoclawConfigDir,
   ];

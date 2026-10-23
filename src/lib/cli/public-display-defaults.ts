@@ -62,11 +62,11 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "[--quick] [--output FILE|-o FILE] [--sandbox NAME]",
     },
   ],
-  deploy: [
+  doctor: [
     {
-      group: "Compatibility Commands",
-      order: 31,
-      deprecated: true,
+      group: "Troubleshooting",
+      order: 36,
+      flags: "[--json|--text]",
     },
   ],
   gc: [
@@ -202,7 +202,7 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       order: 25,
       usage: "nemoclaw <name> channels status",
       description: "Messaging channel status",
-      flags: "[--channel <channel>] [--json]",
+      flags: "[--channel <channel>] [--wait] [--timeout <seconds>] [--json]",
     },
   ],
   ...SANDBOX_MCP_DISPLAY_LAYOUT,
@@ -241,6 +241,8 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
     {
       group: "Sandbox Management",
       order: 3.2,
+      description:
+        "Print the dashboard URL (not supported for the experimental Hermes portable profile)",
       flags: "[--quiet|-q]",
     },
   ],
@@ -249,7 +251,7 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       group: "Sandbox Management",
       order: 15,
       description: "Stop NIM + delete sandbox",
-      flags: "[--yes|-y|--force] [--cleanup-gateway|--no-cleanup-gateway]",
+      flags: "[--yes|-y|--force] [--cleanup-gateway|--no-cleanup-gateway] [--keep-vllm]",
     },
   ],
   "sandbox:download": [
@@ -360,7 +362,8 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
     {
       group: "Policy Presets",
       order: 17,
-      flags: "(--yes, -y, --dry-run, --from-file <path>, --from-dir <path>)",
+      flags:
+        "(--yes, -y, --dry-run, --from-file <path>, --from-dir <path>, --trusted-private-host <host>)",
     },
   ],
   "sandbox:policy:explain": [
@@ -384,6 +387,24 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       order: 18,
       description: "Remove an applied policy preset (built-in or custom)",
       flags: "(--yes, -y, --dry-run)",
+    },
+  ],
+  "sandbox:policy:exclude": [
+    {
+      group: "Policy Presets",
+      order: 21,
+      usage: "nemoclaw <name> policy exclude <key>",
+      description: "Remove a baseline entry from the current OpenShell policy",
+      flags: "(--force, --yes, -y, --dry-run)",
+    },
+  ],
+  "sandbox:policy:restore": [
+    {
+      group: "Policy Presets",
+      order: 22,
+      usage: "nemoclaw <name> policy restore <key>",
+      description: "Restore a previously excluded baseline entry",
+      flags: "(--force, --yes, -y, --dry-run)",
     },
   ],
   "sandbox:rebuild": [
@@ -435,28 +456,6 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "[local-mount-point]",
     },
   ],
-  "sandbox:shields:down": [
-    {
-      group: "Sandbox Management",
-      order: 25,
-      flags: "[--timeout 5m] [--reason <text>] [--policy permissive]",
-      hidden: true,
-    },
-  ],
-  "sandbox:shields:status": [
-    {
-      group: "Sandbox Management",
-      order: 27,
-      hidden: true,
-    },
-  ],
-  "sandbox:shields:up": [
-    {
-      group: "Sandbox Management",
-      order: 26,
-      hidden: true,
-    },
-  ],
   "sandbox:skill:install": [
     {
       group: "Skills",
@@ -471,24 +470,10 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "<skill>",
     },
   ],
-  "sandbox:snapshot:create": [
+  "sandbox:skill:list": [
     {
-      group: "Sandbox Management",
-      order: 7,
-      flags: "[--name <name>]",
-    },
-  ],
-  "sandbox:snapshot:list": [
-    {
-      group: "Sandbox Management",
-      order: 8,
-    },
-  ],
-  "sandbox:snapshot:restore": [
-    {
-      group: "Sandbox Management",
-      order: 9,
-      flags: "[selector] [--to <dst>] [--force] [--yes|-y]",
+      group: "Skills",
+      order: 16.2,
     },
   ],
   "sandbox:status": [
@@ -568,11 +553,18 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "[--json]",
     },
   ],
+  launch: [
+    {
+      group: "Sandbox Management",
+      order: 2.6,
+      usage: "nemoclaw launch <name>",
+    },
+  ],
   update: [
     {
       group: "Upgrade",
       order: 40,
-      flags: "(--check, --fresh, --yes|-y)",
+      flags: "(--check, --fresh, --allow-downgrade, --yes|-y)",
     },
   ],
   "upgrade-sandboxes": [

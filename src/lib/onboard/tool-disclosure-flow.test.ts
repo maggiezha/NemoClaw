@@ -23,6 +23,7 @@ vi.mock("./dockerfile-tool-disclosure-contract", () => ({
 
 import {
   applyOnboardToolDisclosureRequest,
+  prepareHermesPortableToolDisclosure,
   prepareSandboxToolDisclosure,
 } from "./tool-disclosure-flow";
 
@@ -153,19 +154,17 @@ describe("onboard tool-disclosure flow", () => {
     expect(mocks.removeSandbox).not.toHaveBeenCalled();
   });
 
-  it("still clears a stale registry entry that has no live sandbox and no pending reservation", () => {
-    prepareSandboxToolDisclosure(
-      "beta",
-      null,
-      false,
-      () => ({
-        existingEntry: { name: "beta", toolDisclosure: "progressive" },
-        preservedMcpState: undefined,
-        liveExists: false,
-      }),
-      "progressive",
-    );
+  it("resolves schema-5 tool disclosure without reading or writing session state (#9203)", () => {
+    const result = prepareHermesPortableToolDisclosure("direct");
 
-    expect(mocks.removeSandbox).toHaveBeenCalledWith("beta");
+    expect(result).toMatchObject({
+      existingEntry: null,
+      liveExists: false,
+      effectiveToolDisclosure: "direct",
+      toolDisclosureMigrationNeeded: false,
+    });
+    expect(mocks.loadSession).not.toHaveBeenCalled();
+    expect(mocks.updateSession).not.toHaveBeenCalled();
+    expect(mocks.removeSandbox).not.toHaveBeenCalled();
   });
 });

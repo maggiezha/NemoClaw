@@ -5,7 +5,6 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { loadManifestsFromDir, validateManifest } from "../registry/manifests.ts";
-import { listTargets } from "../registry/registry.ts";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
 const E2E_SUITE_DIR = path.join(REPO_ROOT, "test/e2e");
@@ -51,19 +50,5 @@ describe("NemoClawInstance manifests", () => {
     expect(() => validateManifest(badManifest, "bad-secret.yaml")).toThrow(
       /raw secret|credentialRefs/i,
     );
-  });
-
-  // source-shape-contract: compatibility -- Every shipped target path must load through the validated E2E manifest consumer
-  it("resolves every typed target manifest path to a validated manifest", () => {
-    const manifestPaths = new Set(
-      loadManifestsFromDir(MANIFEST_DIR).map((manifest) => path.resolve(manifest.filePath)),
-    );
-    const missingManifests = listTargets()
-      .map((target) => target.manifestPath)
-      .filter((manifestPath): manifestPath is string => Boolean(manifestPath))
-      .map((manifestPath) => path.resolve(REPO_ROOT, manifestPath))
-      .filter((manifestPath) => !manifestPaths.has(manifestPath));
-
-    expect(missingManifests, `missing manifest files: ${missingManifests.join(", ")}`).toEqual([]);
   });
 });

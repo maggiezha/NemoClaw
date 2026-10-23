@@ -28,13 +28,11 @@ describe("command-registry", () => {
       expect(new Set(usages).size).toBe(usages.length);
     });
 
-    it("every command has required fields", () => {
-      for (const cmd of COMMANDS) {
-        expect(cmd.usage).toBeTruthy();
-        expect(cmd.description).toBeTruthy();
-        expect(cmd.group).toBeTruthy();
-        expect(["global", "sandbox"]).toContain(cmd.scope);
-      }
+    it.each(COMMANDS)("$usage has the required command metadata", (cmd) => {
+      expect(cmd.usage).toBeTruthy();
+      expect(cmd.description).toBeTruthy();
+      expect(cmd.group).toBeTruthy();
+      expect(["global", "sandbox"]).toContain(cmd.scope);
     });
   });
 
@@ -46,33 +44,29 @@ describe("command-registry", () => {
       expect(usages).toContain("nemoclaw tunnel stop");
       expect(usages).toContain("nemoclaw tunnel status");
       expect(usages).toContain("nemoclaw status");
+      expect(usages).toContain("nemoclaw doctor");
     });
 
-    it("every entry has scope global", () => {
-      for (const cmd of globalCommands()) {
-        expect(cmd.scope).toBe("global");
-      }
+    it.each(globalCommands())("$usage has global scope", (cmd) => {
+      expect(cmd.scope).toBe("global");
     });
   });
 
   describe("sandboxCommands()", () => {
-    it("should return exactly 60 entries", () => {
-      // 52 visible + 8 hidden (shields×3 + config get/set/rotate-token +
-      // inference get/set).
-      // 52 visible includes the sessions group (root + list + reset + delete +
+    it("returns exactly 59 entries", () => {
+      // 54 visible + 5 hidden (config get/set/rotate-token + inference get/set).
+      // 54 visible includes the skill list command, the sessions group (root + list + reset + delete +
       // export), the agents quartet (add + apply + delete + list), the
       // singular `agent` passthrough that forwards to `openclaw agent`, the
       // download + upload host-side openshell wrappers, the stop + start
-      // container lifecycle pair (#6026), plus five MCP bridge display entries
-      // under the `mcp` parent and the gateway restart command under the
-      // `gateway` parent.
-      expect(sandboxCommands()).toHaveLength(60);
+      // container lifecycle pair (#6026), the policy baseline exclude + restore
+      // pair, plus seven MCP bridge display entries under the `mcp` parent and
+      // the gateway restart command under the `gateway` parent.
+      expect(sandboxCommands()).toHaveLength(59);
     });
 
-    it("every entry has scope sandbox", () => {
-      for (const cmd of sandboxCommands()) {
-        expect(cmd.scope).toBe("sandbox");
-      }
+    it.each(sandboxCommands())("$usage has sandbox scope", (cmd) => {
+      expect(cmd.scope).toBe("sandbox");
     });
   });
 
@@ -81,17 +75,15 @@ describe("command-registry", () => {
       expect(visibleCommands()).toEqual(COMMANDS.filter((cmd) => !cmd.hidden));
     });
 
-    it("no visible command has hidden=true", () => {
-      for (const cmd of visibleCommands()) {
-        expect(cmd.hidden).not.toBe(true);
-      }
+    it.each(visibleCommands())("$usage remains visible", (cmd) => {
+      expect(cmd.hidden).not.toBe(true);
     });
   });
 
   describe("hidden commands", () => {
-    it("exactly 14 hidden commands: help/version aliases + shields + config + inference", () => {
+    it("keeps exactly 11 help, version, config, and inference aliases hidden", () => {
       const hidden = COMMANDS.filter((c) => c.hidden);
-      expect(hidden).toHaveLength(14);
+      expect(hidden).toHaveLength(11);
       const usages = hidden.map((c) => c.usage).sort();
       expect(usages).toEqual([
         "nemoclaw --help",
@@ -103,9 +95,6 @@ describe("command-registry", () => {
         "nemoclaw <name> config set",
         "nemoclaw <name> inference get",
         "nemoclaw <name> inference set",
-        "nemoclaw <name> shields down",
-        "nemoclaw <name> shields status",
-        "nemoclaw <name> shields up",
         "nemoclaw help",
         "nemoclaw version",
       ]);
@@ -113,38 +102,37 @@ describe("command-registry", () => {
   });
 
   describe("oclif discovery coverage", () => {
-    it("requires public leaf commands to have display metadata", () => {
-      const metadataById = getRegisteredOclifCommandsMetadata();
-      const discoveredIds = Object.keys(metadataById).sort();
+    const discoveredIds = Object.keys(getRegisteredOclifCommandsMetadata()).sort();
+    const publicLeafCommandIds = discoveredIds.filter(
+      (commandId) =>
+        !commandId.startsWith("internal:") &&
+        !discoveredIds.some((id) => id.startsWith(`${commandId}:`)),
+    );
+
+    it.each(publicLeafCommandIds)("%s has display metadata", (commandId) => {
       const displayCommandIds = new Set(COMMANDS.map((command) => command.commandId));
-
-      for (const commandId of discoveredIds) {
-        if (commandId.startsWith("internal:")) continue;
-
-        const hasSubcommands = discoveredIds.some((id) => id.startsWith(`${commandId}:`));
-        if (hasSubcommands) continue;
-
-        expect(displayCommandIds.has(commandId), commandId).toBe(true);
-      }
+      expect(displayCommandIds.has(commandId), commandId).toBe(true);
     });
 
-    it("keeps every public display entry attached to a discovered oclif command", () => {
+    it.each(COMMANDS)("$usage remains attached to a discovered oclif command", (command) => {
       const discoveredIds = new Set(Object.keys(getRegisteredOclifCommandsMetadata()));
-      for (const command of COMMANDS) {
-        expect(discoveredIds.has(command.commandId), command.usage).toBe(true);
-      }
+      expect(discoveredIds.has(command.commandId), command.usage).toBe(true);
+    });
+
+    it("does not discover the removed deploy command (#10572)", () => {
+      expect(getRegisteredOclifCommandsMetadata()).not.toHaveProperty("deploy");
     });
   });
 
   describe("deprecated commands", () => {
-    it("should include setup, setup-spark, deploy, start, stop", () => {
+    it("includes the remaining compatibility commands and excludes deploy (#10572)", () => {
       const deprecated = COMMANDS.filter((c) => c.deprecated);
       const usages = deprecated.map((c) => c.usage).sort();
       expect(usages).toContain("nemoclaw setup");
       expect(usages).toContain("nemoclaw setup-spark");
-      expect(usages).toContain("nemoclaw deploy");
       expect(usages).toContain("nemoclaw start");
       expect(usages).toContain("nemoclaw stop");
+      expect(usages).not.toContain("nemoclaw deploy");
     });
   });
 
@@ -155,27 +143,20 @@ describe("command-registry", () => {
       expect(list).toEqual(sorted);
     });
 
-    it("every entry starts with nemoclaw", () => {
-      for (const entry of canonicalUsageList()) {
-        expect(entry).toMatch(/^nemoclaw /);
-      }
+    it.each(canonicalUsageList())("%s starts with nemoclaw", (entry) => {
+      expect(entry).toMatch(/^nemoclaw /);
     });
 
-    it("no entry contains description text (double spaces)", () => {
-      for (const entry of canonicalUsageList()) {
-        expect(entry).not.toMatch(/\s{2,}/);
-      }
+    it.each(canonicalUsageList())("%s excludes description text", (entry) => {
+      expect(entry).not.toMatch(/\s{2,}/);
     });
 
-    it("keeps optional flags out of canonical usage strings", () => {
-      for (const entry of canonicalUsageList()) {
-        expect(entry).not.toContain("[");
-      }
+    it.each(canonicalUsageList())("%s excludes optional flags", (entry) => {
+      expect(entry).not.toContain("[");
     });
 
     it("excludes hidden commands", () => {
       const list = canonicalUsageList();
-      expect(list).not.toContain("nemoclaw <name> shields down");
       expect(list).not.toContain("nemoclaw <name> config get");
       expect(list).not.toContain("nemoclaw <name> config set");
       expect(list).not.toContain("nemoclaw <name> config rotate-token");
@@ -189,22 +170,26 @@ describe("command-registry", () => {
   });
 
   describe("globalCommandTokens()", () => {
-    it("returns the exact set of 27 tokens matching the global dispatch commands", () => {
+    it("returns the exact set of 30 tokens matching the global dispatch commands", () => {
       const tokens = globalCommandTokens();
       const expected = new Set([
         "agents",
         "completion",
+        "config",
+        "host",
         "onboard",
+        "profiles",
         "update",
         "list",
         "use",
-        "deploy",
+        "launch",
         "setup",
         "setup-spark",
         "start",
         "stop",
         "tunnel",
         "status",
+        "doctor",
         "debug",
         "uninstall",
         "credentials",
@@ -225,9 +210,9 @@ describe("command-registry", () => {
   });
 
   describe("sandboxActionTokens()", () => {
-    it("returns exactly 35 unique action tokens including empty string", () => {
+    it("returns exactly 29 unique action tokens including empty string", () => {
       const tokens = sandboxActionTokens();
-      expect(tokens).toHaveLength(35);
+      expect(tokens).toHaveLength(29);
       // Must contain every first-level sandbox action plus the empty default action.
       const expected = new Set([
         "agent",
@@ -242,11 +227,7 @@ describe("command-registry", () => {
         "doctor",
         "inference",
         "logs",
-        "policy-add",
-        "policy-explain",
-        "policy-get",
-        "policy-remove",
-        "policy-list",
+        "policy",
         "hosts-add",
         "hosts-list",
         "hosts-remove",
@@ -255,9 +236,7 @@ describe("command-registry", () => {
         "skill",
         "rebuild",
         "recover",
-        "snapshot",
         "share",
-        "shields",
         "config",
         "channels",
         "mcp",
@@ -276,27 +255,22 @@ describe("command-registry", () => {
   });
 
   describe("commandsByGroup()", () => {
-    it("groups visible commands by group name", () => {
-      const grouped = commandsByGroup();
-      // All group keys should appear in GROUP_ORDER
-      for (const key of grouped.keys()) {
-        expect(GROUP_ORDER).toContain(key);
-      }
-      // Total visible commands across all groups
-      let total = 0;
-      for (const cmds of grouped.values()) {
-        total += cmds.length;
-      }
+    it.each([...commandsByGroup().keys()])(
+      "includes the %s group in the display order",
+      (group) => {
+        expect(GROUP_ORDER).toContain(group);
+      },
+    );
+
+    it("groups every visible command", () => {
+      const total = [...commandsByGroup().values()].reduce((count, commands) => {
+        return count + commands.length;
+      }, 0);
       expect(total).toBe(visibleCommands().length);
     });
 
-    it("no hidden commands in any group", () => {
-      const grouped = commandsByGroup();
-      for (const cmds of grouped.values()) {
-        for (const cmd of cmds) {
-          expect(cmd.hidden).not.toBe(true);
-        }
-      }
+    it.each([...commandsByGroup().values()].flat())("keeps $usage visible in its group", (cmd) => {
+      expect(cmd.hidden).not.toBe(true);
     });
 
     it("exposes the default-sandbox command in root help", () => {

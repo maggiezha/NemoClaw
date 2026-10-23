@@ -16,7 +16,7 @@ function baseInput(overrides: Partial<TelegramProbeInput> = {}): TelegramProbeIn
     gatewayProcessAlive: true,
     breadcrumbs: null,
     probedAt: "2026-07-14T00:00:00.000Z",
-    presetInRegistry: true,
+    presetApplied: true,
     presetOnGateway: true,
     channelEnabledInRegistry: true,
     ...overrides,
@@ -71,6 +71,41 @@ describe("evaluateTelegramDiagnostics verdict", () => {
     ).toBe(true);
   });
 
+  it.each([403, 429, 500, 502, 503])(
+    "reports unreachable for a definitive Bot API startup HTTP error [case %#]",
+    (status) => {
+      const report = evaluateTelegramDiagnostics(
+        baseInput({ breadcrumbs: breadcrumbs({ startupHttpError: status }) }),
+      );
+      expect(report.verdict).toBe("unreachable");
+    },
+  );
+
+  it("keeps provider-ready ahead of a stale Bot API startup error", () => {
+    const idle = evaluateTelegramDiagnostics(
+      baseInput({ breadcrumbs: breadcrumbs({ providerReady: true, startupHttpError: 502 }) }),
+    );
+    expect(idle.verdict).toBe("idle");
+
+    const healthy = evaluateTelegramDiagnostics(
+      baseInput({
+        breadcrumbs: breadcrumbs({
+          providerReady: true,
+          inboundReceived: true,
+          startupHttpError: 502,
+        }),
+      }),
+    );
+    expect(healthy.verdict).toBe("healthy");
+  });
+
+  it("stays unknown when there is no conclusive breadcrumb", () => {
+    expect(evaluateTelegramDiagnostics(baseInput({ breadcrumbs: null })).verdict).toBe("unknown");
+    expect(evaluateTelegramDiagnostics(baseInput({ breadcrumbs: breadcrumbs() })).verdict).toBe(
+      "unknown",
+    );
+  });
+
   it("reports not_started when the gateway process is dead or the bridge never started", () => {
     expect(evaluateTelegramDiagnostics(baseInput({ gatewayProcessAlive: false })).verdict).toBe(
       "not_started",
@@ -86,7 +121,7 @@ describe("evaluateTelegramDiagnostics verdict", () => {
     expect(
       evaluateTelegramDiagnostics(baseInput({ channelEnabledInRegistry: false })).verdict,
     ).toBe("config_gap");
-    expect(evaluateTelegramDiagnostics(baseInput({ presetInRegistry: false })).verdict).toBe(
+    expect(evaluateTelegramDiagnostics(baseInput({ presetApplied: false })).verdict).toBe(
       "policy_gap",
     );
   });
@@ -165,6 +200,20 @@ describe("parseTelegramBreadcrumbs", () => {
         "[telegram] [default] credential placeholder configured but TELEGRAM_BOT_TOKEN is missing from runtime env",
       ]),
     ).toMatchObject({ credentialUnresolved: true });
+  });
+
+  it.each([
+    "[telegram] [default] credential placeholder configured but TELEGRAM_BOT_TOKEN is missing from runtime env",
+    "[telegram] [default] credential placeholder mismatch: openclaw.json botToken does not match runtime TELEGRAM_BOT_TOKEN placeholder",
+    "[telegram] [default] runtime TELEGRAM_BOT_TOKEN is an identityless canonical placeholder; a revision-scoped OpenShell credential is required",
+    "[telegram] [default] runtime TELEGRAM_BOT_TOKEN placeholder is malformed",
+    "[telegram] [default] runtime credential available from a non-placeholder source",
+  ])("classifies an invalid runtime credential diagnostic [case %#]", (line) => {
+    const bc = parseTelegramBreadcrumbs([line]);
+    expect(bc).toMatchObject({ credentialUnresolved: true });
+    expect(evaluateTelegramDiagnostics(baseInput({ breadcrumbs: bc })).verdict).toBe(
+      "token_rejected",
+    );
   });
 
   it("captures a non-auth HTTP startup error code", () => {

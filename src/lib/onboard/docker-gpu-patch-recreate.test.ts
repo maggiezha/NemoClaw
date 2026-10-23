@@ -2,29 +2,79 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from "vitest";
+import type { OpenShellSandboxBufferedCommandExecutor } from "../adapters/openshell/sandbox-command";
 import { createDockerGpuInspectFixture as inspectFixture } from "./__test-helpers__/docker-gpu-patch-fixtures";
-import { recreateOpenShellDockerSandboxWithGpu } from "./docker-gpu-patch";
+import {
+  getDockerGpuPatchFailureContext,
+  recreateOpenShellDockerSandboxWithGpu,
+} from "./docker-gpu-patch";
+
+const OLD_CONTAINER_ID = "a".repeat(64);
+const NEW_CONTAINER_ID = "b".repeat(64);
 
 function dockerCaptureFixture() {
   const responses: Record<string, string> = {
-    ps: "old-container-id\n",
+    ps: `${OLD_CONTAINER_ID}\n`,
     inspect: JSON.stringify([inspectFixture()]),
     info: "",
   };
   return vi.fn((args: readonly string[]) => responses[args[0]] ?? "");
 }
 
+function commandExecutorThrough(
+  runOpenshell: (
+    args: string[],
+    opts?: Record<string, unknown>,
+  ) => {
+    status: number | null;
+    stdout?: string;
+    stderr?: string;
+  },
+): OpenShellSandboxBufferedCommandExecutor {
+  return {
+    runBuffered: vi.fn(async (request) => {
+      const result = runOpenshell(
+        ["sandbox", "exec", "-n", request.sandboxName, "--", ...request.command],
+        { ignoreError: true, suppressOutput: true },
+      );
+      return {
+        outcome:
+          result.status === null
+            ? {
+                kind: "failed" as const,
+                error: { kind: "invocation" as const, message: "failed" },
+              }
+            : { kind: "completed" as const, exitCode: result.status },
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+      };
+    }),
+  };
+}
+
 describe("Docker GPU recreate orchestration", () => {
-  it("recreates the OpenShell-managed container and waits for supervisor exec", () => {
+  it("recreates the OpenShell-managed container and waits for supervisor exec", async () => {
     const dockerCapture = dockerCaptureFixture();
-    const dockerRun = vi.fn(() => ({ status: 0, stdout: "probe-id\n" }));
-    const dockerRunDetached = vi.fn(() => ({ status: 0, stdout: "new-container-id\n" }));
+    const dockerRunResults = {
+      ps: { status: 0, stdout: `${NEW_CONTAINER_ID}\n` },
+      inspect: { status: 0, stdout: "true\n" },
+    };
+    const dockerRun = vi.fn(
+      (args: readonly string[]) =>
+        dockerRunResults[String(args[0]) as keyof typeof dockerRunResults] ?? {
+          status: 0,
+          stdout: "probe-id\n",
+        },
+    );
+    const dockerRunDetached = vi.fn(() => ({ status: 0, stdout: `${NEW_CONTAINER_ID}\n` }));
     const dockerRename = vi.fn(() => ({ status: 0 }));
     const dockerStop = vi.fn(() => ({ status: 0 }));
     const dockerRm = vi.fn(() => ({ status: 0 }));
+    const dockerStart = vi.fn(() => ({ status: 0 }));
     const runOpenshell = vi.fn(() => ({ status: 0 }));
+    const runCaptureOpenshell = vi.fn(() => "alpha  2026-08-23 10:00:02  Ready\n");
 
-    const result = recreateOpenShellDockerSandboxWithGpu(
+    const result = await recreateOpenShellDockerSandboxWithGpu(
       { sandboxName: "alpha", timeoutSecs: 1 },
       {
         dockerCapture,
@@ -33,18 +83,23 @@ describe("Docker GPU recreate orchestration", () => {
         dockerRename,
         dockerStop,
         dockerRm,
+        dockerStart,
+        runCaptureOpenshell,
         runOpenshell,
+        commandExecutor: commandExecutorThrough(runOpenshell),
         sleep: vi.fn(),
         now: () => new Date("2026-05-12T00:00:00Z"),
+        detectSandboxFallbackDns: vi.fn(() => null),
         readDir: vi.fn(() => null),
         readFile: vi.fn(() => null),
       },
     );
 
-    expect(result.newContainerId).toBe("new-container-id");
+    expect(result.newContainerId).toBe(NEW_CONTAINER_ID);
+    expect(result.backupRemoved).toBe(true);
     expect(result.mode.kind).toBe("gpus");
     expect(dockerStop).toHaveBeenCalledWith(
-      "old-container-id",
+      OLD_CONTAINER_ID,
       expect.objectContaining({ timeout: 90_000 }),
     );
     expect(dockerRunDetached).toHaveBeenCalledWith(
@@ -73,13 +128,68 @@ describe("Docker GPU recreate orchestration", () => {
       expect.objectContaining({ ignoreError: true, suppressOutput: true }),
     );
     const dockerRmCalls = dockerRm.mock.calls as unknown[][];
-    const backupRmCall = dockerRmCalls.findIndex((call) =>
-      String(call[0]).includes("nemoclaw-gpu-backup"),
-    );
+    const backupRmCall = dockerRmCalls.findIndex((call) => call[0] === OLD_CONTAINER_ID);
     expect(backupRmCall).toBeGreaterThanOrEqual(0);
     expect(dockerRm.mock.invocationCallOrder[backupRmCall]).toBeGreaterThan(
       runOpenshell.mock.invocationCallOrder[0],
     );
+    expect(dockerStart).not.toHaveBeenCalled();
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "stop", "alpha"],
+      expect.objectContaining({ ignoreError: true, timeout: 1000 }),
+    );
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "start", "alpha"],
+      expect.objectContaining({ ignoreError: true, timeout: 1000 }),
+    );
+    expect(runCaptureOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "list"],
+      expect.objectContaining({ ignoreError: true, suppressOutput: true }),
+    );
+  });
+
+  it("does not report success when the final OpenShell phase is Deleting (#9531)", async () => {
+    const runOpenshell = vi.fn(() => ({ status: 0 }));
+    let failure: unknown;
+    try {
+      await recreateOpenShellDockerSandboxWithGpu(
+        { sandboxName: "alpha", timeoutSecs: 1 },
+        {
+          dockerCapture: dockerCaptureFixture(),
+          dockerRun: vi.fn(() => ({ status: 0, stdout: `${NEW_CONTAINER_ID}\n` })),
+          dockerRunDetached: vi.fn(() => ({ status: 0, stdout: `${NEW_CONTAINER_ID}\n` })),
+          dockerRename: vi.fn(() => ({ status: 0 })),
+          dockerStop: vi.fn(() => ({ status: 0 })),
+          dockerRm: vi.fn(() => ({ status: 0 })),
+          dockerStart: vi.fn(() => ({ status: 0 })),
+          runCaptureOpenshell: vi
+            .fn()
+            .mockReturnValueOnce("alpha  2026-08-23 10:00:01  Ready\n")
+            .mockReturnValue("alpha  2026-08-23 10:00:02  Deleting\n"),
+          runOpenshell,
+          commandExecutor: commandExecutorThrough(runOpenshell),
+          sleep: vi.fn(),
+          now: () => new Date("2026-05-12T00:00:00Z"),
+          detectSandboxFallbackDns: vi.fn(() => null),
+          readDir: vi.fn(() => null),
+          readFile: vi.fn(() => null),
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("final replacement handoff");
+    expect((failure as Error).message).toContain("automatic rollback is unavailable");
+    expect((failure as Error).message).toContain("Rebuild the sandbox before retrying");
+    expect(getDockerGpuPatchFailureContext(failure)).toMatchObject({
+      backupRemoved: true,
+      oldContainerId: OLD_CONTAINER_ID,
+      newContainerId: NEW_CONTAINER_ID,
+      lastSandboxPhase: "Deleting",
+      rolledBack: false,
+    });
   });
 
   it("can recreate during sandbox create before supervisor exec is allowed", () => {
@@ -110,6 +220,7 @@ describe("Docker GPU recreate orchestration", () => {
         runOpenshell,
         sleep: vi.fn(),
         now: () => new Date("2026-05-12T00:00:00Z"),
+        detectSandboxFallbackDns: vi.fn(() => null),
       },
     );
 

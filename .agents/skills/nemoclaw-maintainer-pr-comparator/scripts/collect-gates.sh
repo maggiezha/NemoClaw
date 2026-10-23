@@ -53,40 +53,43 @@ gate_state_open=$([ "$state" = "OPEN" ] && echo true || echo false)
 
 # Gate 2: CI passes on the PR SHA. statusCheckRollup contains the run for that SHA.
 # Fail closed when required checks are missing, including an empty rollup.
-required_checks='["checks","check-hash","changes","commit-lint","dco-check","E2E / PR Gate"]'
+required_checks='["checks","check-hash","changes","commit-lint","dco-check"]'
 observed_checks=$(printf '%s' "$raw" | jq -c '[(.statusCheckRollup // [])[] | (.name // .context // empty)] | unique')
 missing_checks=$(jq -cn --argjson required "$required_checks" --argjson observed "$observed_checks" '$required - $observed')
 missing_check_count=$(printf '%s' "$missing_checks" | jq 'length')
-# Keep this allowlist aligned with check-gates.ts checkCi(): every other completed
-# CheckRun conclusion or terminal StatusContext state fails closed.
-ci_failing_checks=$(printf '%s' "$raw" | jq -c '[
+# Former PR E2E contexts are advisory. Every other completed CheckRun
+# conclusion or terminal StatusContext state fails closed.
+advisory_e2e_names='["E2E / PR Gate","E2E / PR Gate / Rollup","E2E / PR Gate Coordination"]'
+ci_failing_checks=$(printf '%s' "$raw" | jq -c --argjson advisory "$advisory_e2e_names" '[
   (.statusCheckRollup // [])[]
+  | (.name // .context // "(unknown)") as $name
+  | (.workflowName // "") as $workflow
+  | select(($advisory | index($name)) == null or $workflow != "E2E / PR Gate Controller")
   | if .state != null then
       (.state | ascii_upcase) as $state
       | select($state != "SUCCESS" and $state != "PENDING" and $state != "EXPECTED")
-      | "\(.context // .name // "(unknown)"): \($state)"
+      | "\($name): \($state)"
     else
       (.status // "" | ascii_upcase) as $status
       | (.conclusion // "" | ascii_upcase) as $conclusion
-      | (.name // .context // "(unknown)") as $name
       | select($status == "COMPLETED")
-      | select(
-          ($name == "E2E / PR Gate" and $conclusion != "SUCCESS") or
-          ($name != "E2E / PR Gate" and $conclusion != "SUCCESS" and $conclusion != "NEUTRAL" and $conclusion != "SKIPPED")
-        )
+      | select($conclusion != "SUCCESS" and $conclusion != "NEUTRAL" and $conclusion != "SKIPPED")
       | "\($name): \($conclusion)"
     end
 ]')
-ci_pending_checks=$(printf '%s' "$raw" | jq -c '[
+ci_pending_checks=$(printf '%s' "$raw" | jq -c --argjson advisory "$advisory_e2e_names" '[
   (.statusCheckRollup // [])[]
+  | (.name // .context // "(unknown)") as $name
+  | (.workflowName // "") as $workflow
+  | select(($advisory | index($name)) == null or $workflow != "E2E / PR Gate Controller")
   | if .state != null then
       (.state | ascii_upcase) as $state
       | select($state == "PENDING" or $state == "EXPECTED" or $state == "")
-      | (.context // .name // "(unknown)")
+      | $name
     else
       (.status // "" | ascii_upcase) as $status
       | select($status != "COMPLETED")
-      | (.name // .context // "(unknown)")
+      | $name
     end
 ]')
 ci_failure_count=$(printf '%s' "$ci_failing_checks" | jq 'length')
@@ -95,10 +98,19 @@ gate_ci_green=$(
   [ "$ci_failure_count" = "0" ] && [ "$ci_pending_count" = "0" ] && [ "$missing_check_count" = "0" ] && echo true || echo false
 )
 
-# Gate 3: mergeable
+# Gate 3: mergeable without conflicts, transient merge-state evidence, or an
+# unidentified protection blocker. BEHIND alone does not make the candidate
+# ineligible, but UNSTABLE and BLOCKED fail closed because this collector cannot
+# prove a stable merge result or every GitHub branch-protection condition.
 mergeable=$(printf '%s' "$raw" | jq -r .mergeable)
 merge_state=$(printf '%s' "$raw" | jq -r .mergeStateStatus)
-gate_mergeable=$([ "$mergeable" = "MERGEABLE" ] && [ "$merge_state" = "CLEAN" ] && echo true || echo false)
+case "$merge_state" in
+  BEHIND | CLEAN | HAS_HOOKS) merge_state_permitted=true ;;
+  *) merge_state_permitted=false ;;
+esac
+gate_mergeable=$(
+  [ "$mergeable" = "MERGEABLE" ] && [ "$merge_state_permitted" = "true" ] && echo true || echo false
+)
 
 # Gate 4: contributor compliance (PR-body DCO + every commit GitHub Verified)
 if printf '%s' "$raw" | jq -r '.body // ""' | grep -Eq '^Signed-off-by:[[:space:]]+.+[[:space:]]+<[^<>[:space:]]+@[^<>[:space:]]+>[[:space:]]*$'; then
@@ -144,9 +156,8 @@ gate_branch_protection=$([ "$review_decision" = "APPROVED" ] && echo true || ech
 
 head_sha=$(printf '%s' "$raw" | jq -r .headRefOid)
 
-# Classify failures as trivial vs substantive (used by degraded mode).
-# Substantive: CI red/cancelled, merge conflict, missing approvals.
-# Trivial: stale base only (everything else here is substantive).
+# Classify failures for degraded mode. A behind branch is not itself a failure;
+# CI failures, merge conflicts, and missing approvals are substantive.
 classify_failures=()
 [ "$gate_state_open" = "false" ] && classify_failures+=("substantive:not_open")
 [ "$gate_ci_green" = "false" ] && classify_failures+=("substantive:ci_failures=$ci_failure_count,pending=$ci_pending_count,missing=$(printf '%s' "$missing_checks" | jq -r 'join(",")')")

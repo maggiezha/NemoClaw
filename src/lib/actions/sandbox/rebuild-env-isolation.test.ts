@@ -6,9 +6,53 @@ import { describe, expect, it } from "vitest";
 import {
   AMBIENT_RECREATE_ENV_VARS,
   assessAmbientRecreateEnv,
+  describeIgnoredDashboardOriginEnv,
   isolateAmbientRecreateEnv,
   sanitizeEnvValueForDisplay,
 } from "./rebuild-env-isolation.js";
+
+describe("describeIgnoredDashboardOriginEnv (#13177)", () => {
+  const recorded = "https://launchpad.example.test:18790";
+
+  it("warns when an exported CHAT_UI_URL differs from the replayed origin", () => {
+    expect(
+      describeIgnoredDashboardOriginEnv({
+        sandboxName: "alpha",
+        cliName: "nemoclaw",
+        replayedChatUiUrl: recorded,
+        env: { CHAT_UI_URL: "https://other.example.test" },
+      }),
+    ).toEqual([
+      "Ignoring CHAT_UI_URL='https://other.example.test' — rebuilding 'alpha' with its recorded dashboard URL 'https://launchpad.example.test:18790'.",
+      "To change the dashboard origin, run: CHAT_UI_URL=<url> nemoclaw onboard --name alpha, then nemoclaw alpha rebuild.",
+    ]);
+  });
+
+  it.each([
+    { case: "unset", env: {} },
+    { case: "empty", env: { CHAT_UI_URL: "" } },
+    { case: "the replayed origin", env: { CHAT_UI_URL: "https://launchpad.example.test:18790/" } },
+  ])("stays quiet when CHAT_UI_URL is $case", ({ env }) => {
+    expect(
+      describeIgnoredDashboardOriginEnv({
+        sandboxName: "alpha",
+        cliName: "nemoclaw",
+        replayedChatUiUrl: recorded,
+        env,
+      }),
+    ).toEqual([]);
+  });
+
+  it("renders an untrusted CHAT_UI_URL on one safe line", () => {
+    const [first] = describeIgnoredDashboardOriginEnv({
+      sandboxName: "alpha",
+      cliName: "nemoclaw",
+      replayedChatUiUrl: recorded,
+      env: { CHAT_UI_URL: "https://x.test\n\u001b[2KDone" },
+    });
+    expect(first).not.toMatch(/[\n\u001b]/);
+  });
+});
 
 describe("sanitizeEnvValueForDisplay PRA-7 (#5735)", () => {
   it("collapses a multi-line / ANSI value into a single safe line", () => {
@@ -51,6 +95,7 @@ describe("AMBIENT_RECREATE_ENV_VARS contract PRA-4 (#5735)", () => {
       "NEMOCLAW_CLOUD_EXPERIMENTAL_MODEL",
       "NEMOCLAW_PREFERRED_API",
       "NEMOCLAW_REASONING",
+      "NEMOCLAW_REASONING_EFFORT",
       "NEMOCLAW_VLLM_MODEL",
       "NEMOCLAW_VLLM_EXTRA_ARGS_JSON",
       "NEMOCLAW_FROM_DOCKERFILE",
@@ -113,58 +158,62 @@ describe("assessAmbientRecreateEnv", () => {
 });
 
 describe("isolateAmbientRecreateEnv", () => {
-  it("removes ambient selection vars and restores the originals (including unset)", () => {
-    const env: NodeJS.ProcessEnv = {
-      NEMOCLAW_AGENT: "langchain-deepagents-code",
-      NEMOCLAW_PROVIDER_KEY: "sk-bogus",
-      NEMOCLAW_MODEL: "some-model",
-      NEMOCLAW_COMPAT_MODEL: "some-compat-model",
-      NEMOCLAW_PREFERRED_API: "openai-responses",
-      NEMOCLAW_REASONING: "false",
-      NEMOCLAW_VLLM_MODEL: "ambient-vllm-model",
-      NEMOCLAW_VLLM_EXTRA_ARGS_JSON: '{"ambient":true}',
-      NEMOCLAW_FROM_DOCKERFILE: "/tmp/unrelated.Dockerfile",
-      NEMOCLAW_WEB_SEARCH_PROVIDER: "tavily",
-      NEMOCLAW_POLICY_TIER: "permissive",
-      NEMOCLAW_POLICY_MODE: "customize",
-      NEMOCLAW_POLICY_PRESETS: "ambient-preset",
-      NEMOCLAW_SANDBOX_GPU: "0",
-      NEMOCLAW_SANDBOX_GPU_DEVICE: "9",
-      NVIDIA_INFERENCE_API_KEY: "hosted-source-key",
-      // not part of the selection set — must be left untouched
-      NVIDIA_API_KEY: "nvapi-keep-me",
-    };
+  it.each(AMBIENT_RECREATE_ENV_VARS)(
+    "removes ambient selection vars and restores the originals (including unset) [case %#]",
+    (name) => {
+      const env: NodeJS.ProcessEnv = {
+        NEMOCLAW_AGENT: "langchain-deepagents-code",
+        NEMOCLAW_PROVIDER_KEY: "sk-bogus",
+        NEMOCLAW_MODEL: "some-model",
+        NEMOCLAW_COMPAT_MODEL: "some-compat-model",
+        NEMOCLAW_PREFERRED_API: "openai-responses",
+        NEMOCLAW_REASONING: "false",
+        NEMOCLAW_REASONING_EFFORT: "medium",
+        NEMOCLAW_VLLM_MODEL: "ambient-vllm-model",
+        NEMOCLAW_VLLM_EXTRA_ARGS_JSON: '{"ambient":true}',
+        NEMOCLAW_FROM_DOCKERFILE: "/tmp/unrelated.Dockerfile",
+        NEMOCLAW_WEB_SEARCH_PROVIDER: "tavily",
+        NEMOCLAW_POLICY_TIER: "permissive",
+        NEMOCLAW_POLICY_MODE: "customize",
+        NEMOCLAW_POLICY_PRESETS: "ambient-preset",
+        NEMOCLAW_SANDBOX_GPU: "0",
+        NEMOCLAW_SANDBOX_GPU_DEVICE: "9",
+        NVIDIA_INFERENCE_API_KEY: "hosted-source-key",
+        // not part of the selection set — must be left untouched
+        NVIDIA_API_KEY: "nvapi-keep-me",
+      };
 
-    const restore = isolateAmbientRecreateEnv(env);
+      const restore = isolateAmbientRecreateEnv(env);
 
-    for (const name of AMBIENT_RECREATE_ENV_VARS) {
       expect(env[name]).toBeUndefined();
-    }
-    expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
-    expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
 
-    restore();
+      expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
+      expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
 
-    expect(env.NEMOCLAW_AGENT).toBe("langchain-deepagents-code");
-    expect(env.NEMOCLAW_PROVIDER_KEY).toBe("sk-bogus");
-    expect(env.NEMOCLAW_MODEL).toBe("some-model");
-    expect(env.NEMOCLAW_COMPAT_MODEL).toBe("some-compat-model");
-    expect(env.NEMOCLAW_PREFERRED_API).toBe("openai-responses");
-    expect(env.NEMOCLAW_REASONING).toBe("false");
-    expect(env.NEMOCLAW_VLLM_MODEL).toBe("ambient-vllm-model");
-    expect(env.NEMOCLAW_VLLM_EXTRA_ARGS_JSON).toBe('{"ambient":true}');
-    expect(env.NEMOCLAW_FROM_DOCKERFILE).toBe("/tmp/unrelated.Dockerfile");
-    expect(env.NEMOCLAW_WEB_SEARCH_PROVIDER).toBe("tavily");
-    expect(env.NEMOCLAW_POLICY_TIER).toBe("permissive");
-    expect(env.NEMOCLAW_POLICY_MODE).toBe("customize");
-    expect(env.NEMOCLAW_POLICY_PRESETS).toBe("ambient-preset");
-    expect(env.NEMOCLAW_SANDBOX_GPU).toBe("0");
-    expect(env.NEMOCLAW_SANDBOX_GPU_DEVICE).toBe("9");
-    expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
-    expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
-    // A var that was never set stays unset after restore.
-    expect("NEMOCLAW_PROVIDER" in env).toBe(false);
-  });
+      restore();
+
+      expect(env.NEMOCLAW_AGENT).toBe("langchain-deepagents-code");
+      expect(env.NEMOCLAW_PROVIDER_KEY).toBe("sk-bogus");
+      expect(env.NEMOCLAW_MODEL).toBe("some-model");
+      expect(env.NEMOCLAW_COMPAT_MODEL).toBe("some-compat-model");
+      expect(env.NEMOCLAW_PREFERRED_API).toBe("openai-responses");
+      expect(env.NEMOCLAW_REASONING).toBe("false");
+      expect(env.NEMOCLAW_REASONING_EFFORT).toBe("medium");
+      expect(env.NEMOCLAW_VLLM_MODEL).toBe("ambient-vllm-model");
+      expect(env.NEMOCLAW_VLLM_EXTRA_ARGS_JSON).toBe('{"ambient":true}');
+      expect(env.NEMOCLAW_FROM_DOCKERFILE).toBe("/tmp/unrelated.Dockerfile");
+      expect(env.NEMOCLAW_WEB_SEARCH_PROVIDER).toBe("tavily");
+      expect(env.NEMOCLAW_POLICY_TIER).toBe("permissive");
+      expect(env.NEMOCLAW_POLICY_MODE).toBe("customize");
+      expect(env.NEMOCLAW_POLICY_PRESETS).toBe("ambient-preset");
+      expect(env.NEMOCLAW_SANDBOX_GPU).toBe("0");
+      expect(env.NEMOCLAW_SANDBOX_GPU_DEVICE).toBe("9");
+      expect(env.NVIDIA_INFERENCE_API_KEY).toBe("hosted-source-key");
+      expect(env.NVIDIA_API_KEY).toBe("nvapi-keep-me");
+      // A var that was never set stays unset after restore.
+      expect("NEMOCLAW_PROVIDER" in env).toBe(false);
+    },
+  );
 
   it("is idempotent — a second restore call is a no-op", () => {
     const env: NodeJS.ProcessEnv = { NEMOCLAW_AGENT: "hermes" };

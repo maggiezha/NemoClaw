@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ChannelManifest } from "../../manifest";
+import { TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT } from "./contract.ts";
 
 export const teamsManifest = {
   schemaVersion: 1,
@@ -96,27 +97,37 @@ export const teamsManifest = {
       primary: true,
     },
   ],
-  policyPresets: [{ name: "teams", policyKeys: ["teams"] }],
+  // requiredAtCreate - the preset carries this channel's credential_binding:
+  // - The provider profile is endpointless, so the binding is the only thing that
+  //   makes MSTEAMS_APP_PASSWORD injectable.
+  // - The sandbox reads the provider environment once, at boot, so a preset
+  //   applied afterwards never reaches the running agent.
+  policyPresets: [{ name: "teams", policyKeys: ["teams"], requiredAtCreate: true }],
   hostForward: {
     port: "{{teamsConfig.webhookPort}}",
     label: "Microsoft Teams webhook",
   },
   render: [
     {
-      id: "teams-openclaw-channel",
-      kind: "json-fragment",
-      agent: "openclaw",
-      target: "openclaw.json",
+      id: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.renderId,
+      kind: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.kind,
+      agent: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.agent,
+      target: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.target,
       fragment: {
-        path: "channels.msteams",
+        path: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.configPath,
         value: {
           enabled: true,
           appId: "{{teamsConfig.appId}}",
-          appPassword: "{{credential.teamsClientSecret.placeholder}}",
+          // No appPassword here: OpenShell 0.0.116 injects
+          // MSTEAMS_APP_PASSWORD as a revision-scoped placeholder and rejects
+          // the canonical form once the policy binds the credential. The
+          // OpenClaw Teams token resolver falls back to
+          // process.env.MSTEAMS_APP_PASSWORD. Hermes receives the same runtime
+          // placeholder under TEAMS_CLIENT_SECRET through its runtime alias.
           tenantId: "{{teamsConfig.tenantId}}",
           webhook: {
             port: "{{teamsConfig.webhookPort}}",
-            path: "/api/messages",
+            path: TEAMS_OPENCLAW_WEBHOOK_RENDER_CONTRACT.webhookPath,
           },
           healthMonitor: {
             enabled: false,
@@ -152,7 +163,6 @@ export const teamsManifest = {
       target: "~/.hermes/.env",
       lines: [
         "TEAMS_CLIENT_ID={{teamsConfig.appId}}",
-        "TEAMS_CLIENT_SECRET={{credential.teamsClientSecret.placeholder}}",
         "TEAMS_TENANT_ID={{teamsConfig.tenantId}}",
         "TEAMS_ALLOWED_USERS={{allowedIds.teams.csv}}",
         "TEAMS_PORT={{teamsConfig.webhookPort}}",
@@ -193,6 +203,16 @@ export const teamsManifest = {
         },
       ],
     },
+    hermes: {
+      envAliases: [
+        {
+          envKey: "MSTEAMS_APP_PASSWORD",
+          targetEnvKey: "TEAMS_CLIENT_SECRET",
+          match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_MSTEAMS_APP_PASSWORD$",
+          value: "openshell:resolve:env:MSTEAMS_APP_PASSWORD",
+        },
+      ],
+    },
   },
   agentPackages: [
     {
@@ -202,11 +222,14 @@ export const teamsManifest = {
       spec: "npm:@openclaw/msteams@{{openclaw.version}}",
       pin: true,
       integrityByVersion: {
-        "2026.7.1":
-          "sha512-gG/Yk6HZAguHwrmKjsqdONbFz5WNy126PEAXQWNW/TulO1kIifQ6tktM16BQPNLnkmWqLbj+TrrO55Cjas1aFg==",
+        "2026.9.2":
+          "sha512-py5KvGOTcd0qGGRf3EuqbH2jO+kZtvMquDMjwGkT6x9F4XZtaCBL/lmLitb4hDb5xaIpPP8ZLIbT8GIMXQr3Og==",
+        "2026.9.1":
+          "sha512-seRGr9/X6Vk9xU5elLVpDwq8R+TO0QFvUmxPEitqkngqDnMoXW0LEEXkriG6jgue74w2YLcNnAv/Rjf0a9jong==",
       },
       tarballUrlByVersion: {
-        "2026.7.1": "https://registry.npmjs.org/@openclaw/msteams/-/msteams-2026.7.1.tgz",
+        "2026.9.2": "https://registry.npmjs.org/@openclaw/msteams/-/msteams-2026.9.2.tgz",
+        "2026.9.1": "https://registry.npmjs.org/@openclaw/msteams/-/msteams-2026.9.1.tgz",
       },
       required: true,
     },
@@ -215,13 +238,6 @@ export const teamsManifest = {
       agent: "hermes",
       manager: "hermes-uv-pip",
       spec: "microsoft-teams-apps==2.0.13.4",
-      required: true,
-    },
-    {
-      id: "hermesAiohttpPackage",
-      agent: "hermes",
-      manager: "hermes-uv-pip",
-      spec: "aiohttp==3.14.1",
       required: true,
     },
   ],
@@ -287,4 +303,5 @@ export const teamsManifest = {
       ],
     },
   ],
+  state: {},
 } as const satisfies ChannelManifest;

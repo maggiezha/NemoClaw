@@ -210,6 +210,7 @@ describe("ManifestCompiler", () => {
       "discord:discord-openclaw-channel",
       "discord:discord-openclaw-plugin",
       "wechat:wechat-openclaw-plugin",
+      "wechat:wechat-openclaw-channel",
       "slack:slack-openclaw-channel",
       "slack:slack-openclaw-plugin",
       "whatsapp:whatsapp-openclaw-channel",
@@ -220,7 +221,12 @@ describe("ManifestCompiler", () => {
     expect(plan.agentRender.every((render) => render.handler === "common.staticOutputs")).toBe(
       true,
     );
-    expect(JSON.stringify(plan.agentRender)).toContain("openshell:resolve:env:TELEGRAM_BOT_TOKEN");
+    // The credential placeholder stays out of the agent render: OpenShell injects
+    // it into the sandbox environment, and writing the canonical form into config
+    // is what 0.0.106 refuses once the policy binds the credential.
+    expect(JSON.stringify(plan.agentRender)).not.toContain(
+      "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
+    );
     expect(plan.buildSteps.map(({ value: _value, ...step }) => step)).toEqual([
       {
         channelId: "discord",
@@ -292,7 +298,7 @@ describe("ManifestCompiler", () => {
           kind: "package-install",
           value: {
             manager: "openclaw-plugin",
-            spec: "npm:@tencent-weixin/openclaw-weixin@2.4.3",
+            spec: "npm:@tencent-weixin/openclaw-weixin@2.4.9",
             pin: true,
           },
         }),
@@ -402,43 +408,43 @@ describe("ManifestCompiler", () => {
       source: "manifest",
     });
     expect(plan.agentRender.map((render) => `${render.channelId}:${render.target}`)).toEqual([
-      "telegram:~/.hermes/.env",
+      // No telegram .env entry: this case configures no allowed IDs, so every
+      // remaining Telegram env line resolves to undefined once the bot-token
+      // line is gone.
       "telegram:~/.hermes/config.yaml",
       "telegram:~/.hermes/config.yaml",
-      "discord:~/.hermes/.env",
+      // No discord .env entry: this case configures no server ID, so every
+      // remaining Discord env line resolves to undefined once the bot-token
+      // line is gone, and agent-render-engine drops a render with no lines.
       "discord:~/.hermes/config.yaml",
       "discord:~/.hermes/config.yaml",
       "wechat:~/.hermes/.env",
       "wechat:~/.hermes/config.yaml",
-      "slack:~/.hermes/.env",
+      // Same as Discord above: this case configures no Slack allowlist, so with
+      // the bot/app token lines gone every remaining Slack env line resolves to
+      // undefined and the render is dropped for having no lines.
       "slack:~/.hermes/config.yaml",
       "whatsapp:~/.hermes/.env",
       "whatsapp:~/.hermes/config.yaml",
       "teams:~/.hermes/.env",
       "teams:~/.hermes/config.yaml",
     ]);
-    expect(JSON.stringify(plan.agentRender)).toContain(
-      "WEIXIN_TOKEN=openshell:resolve:env:WECHAT_BOT_TOKEN",
-    );
-    expect(JSON.stringify(plan.agentRender)).toContain(
-      "TEAMS_CLIENT_SECRET=openshell:resolve:env:MSTEAMS_APP_PASSWORD",
-    );
+    expect(JSON.stringify(plan.agentRender)).not.toContain("WEIXIN_TOKEN=");
+    expect(JSON.stringify(plan.agentRender)).not.toContain("TEAMS_CLIENT_SECRET=");
     expect(plan.runtimeSetup?.envAliases).toEqual([
       {
-        channelId: "slack",
-        envKey: "SLACK_BOT_TOKEN",
-        match: "^openshell:resolve:env:(v[0-9]+_)?SLACK_BOT_TOKEN$",
-        value: "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
-        message:
-          "[channels] Normalized SLACK_BOT_TOKEN runtime placeholder to the Bolt-compatible alias",
+        channelId: "wechat",
+        envKey: "WECHAT_BOT_TOKEN",
+        targetEnvKey: "WEIXIN_TOKEN",
+        match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_WECHAT_BOT_TOKEN$",
+        value: "openshell:resolve:env:WECHAT_BOT_TOKEN",
       },
       {
-        channelId: "slack",
-        envKey: "SLACK_APP_TOKEN",
-        match: "^openshell:resolve:env:(v[0-9]+_)?SLACK_APP_TOKEN$",
-        value: "xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
-        message:
-          "[channels] Normalized SLACK_APP_TOKEN runtime placeholder to the Bolt-compatible alias",
+        channelId: "teams",
+        envKey: "MSTEAMS_APP_PASSWORD",
+        targetEnvKey: "TEAMS_CLIENT_SECRET",
+        match: "^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_MSTEAMS_APP_PASSWORD$",
+        value: "openshell:resolve:env:MSTEAMS_APP_PASSWORD",
       },
     ]);
     expect(plan.buildSteps).toEqual([
@@ -452,16 +458,6 @@ describe("ManifestCompiler", () => {
           spec: "microsoft-teams-apps==2.0.13.4",
         },
       },
-      {
-        channelId: "teams",
-        kind: "package-install",
-        outputId: "hermesAiohttpPackage",
-        required: true,
-        value: {
-          manager: "hermes-uv-pip",
-          spec: "aiohttp==3.14.1",
-        },
-      },
     ]);
     expect(
       plan.channels
@@ -473,63 +469,58 @@ describe("ManifestCompiler", () => {
     });
   });
 
-  it("rejects line feeds in Slack Hermes env render values", async () => {
-    for (const [envKey, value] of [
-      ["SLACK_ALLOWED_USERS", "U123\nEVIL=1"],
-      ["SLACK_ALLOWED_CHANNELS", "C123\nEVIL=1"],
-    ] as const) {
-      await expect(
-        withEnv(
-          {
-            SLACK_BOT_TOKEN: "xoxb-test-slack-token",
-            SLACK_APP_TOKEN: "xapp-test-slack-token",
-            [envKey]: value,
-          },
-          () =>
-            compiler().compile({
-              sandboxName: "demo",
-              agent: "hermes",
-              workflow: "rebuild",
-              isInteractive: false,
-              configuredChannels: ["slack"],
-              credentialAvailability: {
-                SLACK_BOT_TOKEN: true,
-                SLACK_APP_TOKEN: true,
-              },
-            }),
-        ),
-      ).rejects.toThrow(/line breaks/);
-    }
+  it.each([
+    ["SLACK_ALLOWED_USERS", "U123\nEVIL=1"],
+    ["SLACK_ALLOWED_CHANNELS", "C123\nEVIL=1"],
+  ] as const)("rejects a line feed in Slack Hermes env value %s", async (envKey, value) => {
+    await expect(
+      withEnv(
+        {
+          SLACK_BOT_TOKEN: "xoxb-test-slack-token",
+          SLACK_APP_TOKEN: "xapp-test-slack-token",
+          [envKey]: value,
+        },
+        () =>
+          compiler().compile({
+            sandboxName: "demo",
+            agent: "hermes",
+            workflow: "rebuild",
+            isInteractive: false,
+            configuredChannels: ["slack"],
+            credentialAvailability: {
+              SLACK_BOT_TOKEN: true,
+              SLACK_APP_TOKEN: true,
+            },
+          }),
+      ),
+    ).rejects.toThrow(/line breaks/);
   });
 
-  it("rejects unsafe Microsoft Teams Hermes env render values", async () => {
-    const cases: Array<readonly [string, string]> = [
-      ["MSTEAMS_APP_ID", "teams-app\nEVIL=1"],
-      ["MSTEAMS_TENANT_ID", "teams-tenant\nEVIL=1"],
-      ["TEAMS_ALLOWED_USERS", "user-one\nEVIL=1"],
-    ];
-
-    for (const [envKey, value] of cases) {
-      await expect(
-        withEnv(
-          {
-            ...TEST_TEAMS_ENV,
-            [envKey]: value,
-          },
-          () =>
-            compiler().compile({
-              sandboxName: "demo",
-              agent: "hermes",
-              workflow: "rebuild",
-              isInteractive: false,
-              configuredChannels: ["teams"],
-              credentialAvailability: {
-                MSTEAMS_APP_PASSWORD: true,
-              },
-            }),
-        ),
-      ).rejects.toThrow(/line breaks/);
-    }
+  it.each([
+    ["MSTEAMS_APP_ID", "teams-app\nEVIL=1"],
+    ["MSTEAMS_TENANT_ID", "teams-tenant\nEVIL=1"],
+    ["MSTEAMS_APP_PASSWORD", "teams-password\r\nEVIL=1"],
+    ["TEAMS_ALLOWED_USERS", "user-one\nEVIL=1"],
+  ] as const)("rejects unsafe Microsoft Teams Hermes env value %s", async (envKey, value) => {
+    await expect(
+      withEnv(
+        {
+          ...TEST_TEAMS_ENV,
+          [envKey]: value,
+        },
+        () =>
+          compiler().compile({
+            sandboxName: "demo",
+            agent: "hermes",
+            workflow: "rebuild",
+            isInteractive: false,
+            configuredChannels: ["teams"],
+            credentialAvailability: {
+              MSTEAMS_APP_PASSWORD: true,
+            },
+          }),
+      ),
+    ).rejects.toThrow(/line breaks/);
   });
 
   it("applies Microsoft Teams manifest defaults when optional env keys are unset", async () => {
@@ -664,40 +655,37 @@ describe("ManifestCompiler", () => {
     ).rejects.toThrow(/Microsoft Teams webhook port/);
   });
 
-  it("rejects unsafe WeChat Hermes env render values", async () => {
-    const cases: Array<readonly [string, string]> = [
-      ["WECHAT_ACCOUNT_ID", "wechat-account\nEVIL=1"],
-      ["WECHAT_BASE_URL", "https://ilinkai.wechat.com\nEVIL=1"],
-      ["WECHAT_ALLOWED_IDS", "friend-one\nEVIL=1"],
-    ];
-
-    for (const [envKey, value] of cases) {
-      await expect(
-        withEnv(
-          {
-            WECHAT_ACCOUNT_ID: "wechat-account",
-            WECHAT_BASE_URL: "https://ilinkai.wechat.com",
-            WECHAT_ALLOWED_IDS: "friend-one",
-            [envKey]: value,
-          },
-          () =>
-            compiler().compile({
-              sandboxName: "demo",
-              agent: "hermes",
-              workflow: "rebuild",
-              isInteractive: false,
-              configuredChannels: ["wechat"],
-              credentialAvailability: {
-                WECHAT_BOT_TOKEN: true,
-              },
-            }),
-        ),
-      ).rejects.toThrow(/line breaks/);
-    }
+  it.each([
+    ["WECHAT_ACCOUNT_ID", "wechat-account\nEVIL=1"],
+    ["WECHAT_BASE_URL", "https://ilinkai.wechat.com\nEVIL=1"],
+    ["WECHAT_ALLOWED_IDS", "friend-one\nEVIL=1"],
+  ] as const)("rejects unsafe WeChat Hermes env value %s", async (envKey, value) => {
+    await expect(
+      withEnv(
+        {
+          WECHAT_ACCOUNT_ID: "wechat-account",
+          WECHAT_BASE_URL: "https://ilinkai.wechat.com",
+          WECHAT_ALLOWED_IDS: "friend-one",
+          [envKey]: value,
+        },
+        () =>
+          compiler().compile({
+            sandboxName: "demo",
+            agent: "hermes",
+            workflow: "rebuild",
+            isInteractive: false,
+            configuredChannels: ["wechat"],
+            credentialAvailability: {
+              WECHAT_BOT_TOKEN: true,
+            },
+          }),
+      ),
+    ).rejects.toThrow(/line breaks/);
   });
 
-  it("rejects non-HTTPS or non-iLink WeChat baseUrl values", async () => {
-    for (const baseUrl of ["http://ilinkai.wechat.com", "https://example.com"] as const) {
+  it.each(["http://ilinkai.wechat.com", "https://example.com"] as const)(
+    "rejects unsafe WeChat baseUrl %s",
+    async (baseUrl) => {
       await expect(
         withEnv(
           {
@@ -717,8 +705,8 @@ describe("ManifestCompiler", () => {
             }),
         ),
       ).rejects.toThrow(/WeChat baseUrl/);
-    }
-  });
+    },
+  );
 
   it("does not activate a requested channel while any required manifest input is missing", async () => {
     const plan = await withEnv(
@@ -778,6 +766,45 @@ describe("ManifestCompiler", () => {
       kind: "config",
       value: "https://ilinkai.wechat.com",
     });
+  });
+
+  it("asks only Hermes operators for the WhatsApp reply mode (#8312)", async () => {
+    // The mode reaches the sandbox through the Hermes env, and the OpenClaw
+    // fragment carries no sender policy, so an OpenClaw operator must not be
+    // asked a question nothing consumes. The manifest expresses that with the
+    // hook's agents list; this proves the compiler honors it.
+    const asked: string[] = [];
+    const compileFor = (agent: "openclaw" | "hermes") =>
+      new ManifestCompiler(
+        createBuiltInChannelManifestRegistry(),
+        createBuiltInMessagingHookRegistry({
+          common: {
+            env: {},
+            getCredential: (key) => TEST_CREDENTIALS[key] ?? null,
+            saveCredential: () => {},
+            prompt: async (question) => {
+              asked.push(question);
+              return "";
+            },
+            log: () => {},
+          },
+        }),
+        createBuiltInRenderTemplateResolver(),
+      ).compile({
+        sandboxName: "demo",
+        agent,
+        workflow: "onboard",
+        isInteractive: true,
+        configuredChannels: ["whatsapp"],
+      });
+
+    await compileFor("openclaw");
+
+    expect(asked).toEqual([]);
+
+    await compileFor("hermes");
+
+    expect(asked).toEqual(["  WhatsApp reply mode [self-chat/bot; default: self-chat]: "]);
   });
 
   it("disables a channel when enrollment opts to skip it", async () => {
@@ -988,6 +1015,45 @@ describe("ManifestCompiler", () => {
     );
   });
 
+  it.each([
+    ["openclaw", "onboard", true, true, "\n"],
+    ["openclaw", "add-channel", true, true, "\r\n"],
+    ["hermes", "onboard", false, true, "\r\n"],
+    ["hermes", "add-channel", false, true, "\n"],
+    ["openclaw", "onboard", false, false, "\n"],
+  ] as const)(
+    "accepts formatted Google Chat JSON for %s %s interactive=%s (#10383)",
+    async (agent, workflow, isInteractive, active, eol) => {
+      const secret = "synthetic-googlechat-private-key";
+      const account = { client_email: "bot@example.test", private_key: `${secret}\nkey-material` };
+      const serviceAccountJson = JSON.stringify(account, null, 2).replaceAll("\n", eol);
+      await withEnv(
+        {
+          GOOGLECHAT_SERVICE_ACCOUNT: serviceAccountJson,
+          GOOGLECHAT_AUDIENCE: "https://chat.test/googlechat",
+        },
+        async () => {
+          const plan = await compiler().compile({
+            sandboxName: "demo",
+            agent,
+            workflow,
+            isInteractive,
+            configuredChannels: ["googlechat"],
+          });
+          expect(plan.channels[0]?.active).toBe(active);
+          expect(plan.channels[0]?.inputs).toContainEqual(
+            expect.objectContaining({
+              inputId: "serviceAccount",
+              kind: "secret",
+              credentialAvailable: true,
+            }),
+          );
+          expect(JSON.stringify(plan)).not.toContain(secret);
+        },
+      );
+    },
+  );
+
   it("reads config default values when env keys are unset", async () => {
     const customManifest = {
       schemaVersion: 1,
@@ -1022,7 +1088,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [],
     } as const satisfies ChannelManifest;
@@ -1090,7 +1155,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [
         {
@@ -1173,7 +1237,6 @@ describe("ManifestCompiler", () => {
         },
       ],
       credentials: [],
-      policyPresets: [],
       render: [],
       hooks: [],
     } as const satisfies ChannelManifest;
@@ -1318,7 +1381,7 @@ describe("ManifestCompiler", () => {
           placeholder: "openshell:resolve:env:MATRIX_ACCESS_TOKEN",
         },
       ],
-      policyPresets: ["matrix"],
+      policyPresets: [{ name: "matrix", policyKeys: ["matrix"] }],
       render: [],
       hooks: [
         {

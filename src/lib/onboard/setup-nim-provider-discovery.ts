@@ -10,12 +10,23 @@ interface ProviderDiscoveryDeps {
   remoteProviderConfig: Record<string, { providerName: string }>;
   isNonInteractive(): boolean;
   getNonInteractiveProvider(): string | null;
-  getNonInteractiveModel(providerKey: string): string | null;
+  getNonInteractiveModel(
+    providerKey: string,
+    options?: { allowProviderModelFallback?: boolean },
+  ): string | null;
   readRecordedProvider(
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
   ): string | null;
   readRecordedNimContainer(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): string | null;
+  readRecordedManagedLlamaCpp?(
+    sandboxName: string | null | undefined,
+    recoverySessionId?: string | null,
+  ): boolean;
+  readRecordedManagedLlamaCppRecipeId?(
     sandboxName: string | null | undefined,
     recoverySessionId?: string | null,
   ): string | null;
@@ -28,6 +39,8 @@ interface ProviderDiscoveryDeps {
 interface RecordedProviderReaders {
   readRecordedProvider(sandboxName: string | null | undefined): string | null;
   readRecordedNimContainer(sandboxName: string | null | undefined): string | null;
+  readRecordedManagedLlamaCpp(sandboxName: string | null | undefined): boolean;
+  readRecordedManagedLlamaCppRecipeId(sandboxName: string | null | undefined): string | null;
   readRecordedModel(sandboxName: string | null | undefined): string | null;
 }
 
@@ -67,6 +80,8 @@ function bindRecordedProviderReaders(
     return {
       readRecordedProvider: () => null,
       readRecordedNimContainer: () => null,
+      readRecordedManagedLlamaCpp: () => false,
+      readRecordedManagedLlamaCppRecipeId: () => null,
       readRecordedModel: () => null,
     };
   }
@@ -74,6 +89,10 @@ function bindRecordedProviderReaders(
     readRecordedProvider: (name) =>
       recoveredRegistryRoute?.provider ?? deps.readRecordedProvider(name, recoverySessionId),
     readRecordedNimContainer: (name) => deps.readRecordedNimContainer(name, recoverySessionId),
+    readRecordedManagedLlamaCpp: (name) =>
+      deps.readRecordedManagedLlamaCpp?.(name, recoverySessionId) ?? false,
+    readRecordedManagedLlamaCppRecipeId: (name) =>
+      deps.readRecordedManagedLlamaCppRecipeId?.(name, recoverySessionId) ?? null,
     readRecordedModel: (name) =>
       recoveredRegistryRoute?.model ?? deps.readRecordedModel(name, recoverySessionId),
   };
@@ -104,11 +123,6 @@ export function prepareProviderDiscovery(options: {
     canProbeRoute,
     recoverySessionId,
   } = options;
-  const nonInteractive = deps.isNonInteractive();
-  const requestedProvider = deps.getNonInteractiveProvider();
-  const requestedModel = nonInteractive
-    ? deps.getNonInteractiveModel(requestedProvider || "build")
-    : null;
   const recoveredRegistryRoute =
     rebuildRegistryInferenceRoute?.sandboxName === sandboxName &&
     rebuildRegistryInferenceRoute.route.source === "registry"
@@ -120,6 +134,35 @@ export function prepareProviderDiscovery(options: {
     recoveredRegistryRoute,
     recoverySessionId,
   );
+  const nonInteractive = deps.isNonInteractive();
+  const requestedProvider = deps.getNonInteractiveProvider();
+  let providerChanged = false;
+  if (nonInteractive && requestedProvider && recoverProvider) {
+    const recordedProviderName = recordedProviderReaders.readRecordedProvider(sandboxName);
+    const hasRecordedNimContainer =
+      recordedProviderName === "vllm-local" &&
+      Boolean(recordedProviderReaders.readRecordedNimContainer(sandboxName));
+    const hasRecordedManagedLlamaCpp =
+      recordedProviderName === "llama-cpp-local" &&
+      recordedProviderReaders.readRecordedManagedLlamaCpp(sandboxName);
+    const recordedProviderKey = providerNameToOptionKey(
+      deps.remoteProviderConfig,
+      recordedProviderName,
+      {
+        hasManagedLlamaCpp: hasRecordedManagedLlamaCpp,
+        hasNimContainer: hasRecordedNimContainer,
+      },
+    );
+    providerChanged = Boolean(recordedProviderKey && recordedProviderKey !== requestedProvider);
+  }
+  // NEMOCLAW_PROVIDER_MODEL is a provider-specific compatibility fallback.
+  // Do not carry it across a provider switch. NEMOCLAW_MODEL remains explicit
+  // input for the current run and keeps precedence in getNonInteractiveModel.
+  const requestedModel = nonInteractive
+    ? deps.getNonInteractiveModel(requestedProvider || "build", {
+        allowProviderModelFallback: !providerChanged,
+      })
+    : null;
   const recoveredProbeProvider =
     nonInteractive && !requestedProvider
       ? recordedProviderReaders.readRecordedProvider(sandboxName)
@@ -128,6 +171,7 @@ export function prepareProviderDiscovery(options: {
     deps.remoteProviderConfig,
     recoveredProbeProvider,
     {
+      hasManagedLlamaCpp: recordedProviderReaders.readRecordedManagedLlamaCpp(sandboxName),
       hasNimContainer:
         recoveredProbeProvider === "vllm-local" &&
         Boolean(recordedProviderReaders.readRecordedNimContainer(sandboxName)),

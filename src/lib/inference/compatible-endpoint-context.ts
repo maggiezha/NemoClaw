@@ -8,7 +8,7 @@ import {
   assertEndpointResolvesPublic,
   buildResolvePinArgs,
   type EndpointDnsLookupFn,
-  parseTrustedPrivateInferenceHosts,
+  parseTrustedPrivateInferenceHostsFromEnv,
   type TrustedPrivateEndpointCapability,
 } from "./endpoint-ssrf-preflight";
 import {
@@ -47,7 +47,7 @@ export type CompatibleEndpointModelsFetcher = (
    * fakes can ignore it.
    */
   pinnedAddresses?: string[],
-  /** Non-forgeable proof of the exact private subset admitted by the SSRF preflight. */
+  /** Non-forgeable proof of the exact host and complete pins admitted by SSRF preflight. */
   trustedPrivateCapability?: TrustedPrivateEndpointCapability,
 ) => unknown | null;
 
@@ -135,6 +135,38 @@ export function fetchCompatibleEndpointModels(
 // provider adopts the same "auto-detected vs user override" pattern, extract a
 // shared trackAutoDetectedContextWindow helper instead of duplicating it again.
 let autoDetectedCompatibleContextWindow: string | null = null;
+
+/** Adopt already-authenticated endpoint metadata without repeating a network probe. */
+export function applyDetectedEndpointContextWindow(
+  contextWindow: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  logger: Pick<Console, "warn"> = console,
+): void {
+  const current = env.NEMOCLAW_CONTEXT_WINDOW;
+  const previousAuto = !!current && current === autoDetectedCompatibleContextWindow;
+  const configured = parsePositiveInteger(current);
+  if (!previousAuto && configured && configured <= MAX_COMPATIBLE_CONTEXT_WINDOW) return;
+  const validDetectedContextWindow =
+    contextWindow !== undefined &&
+    Number.isSafeInteger(contextWindow) &&
+    contextWindow > 0 &&
+    contextWindow <= MAX_COMPATIBLE_CONTEXT_WINDOW;
+  if (!previousAuto && hasExplicitContextWindow(current)) {
+    const replacement = validDetectedContextWindow
+      ? `Using the server's served context window: ${contextWindow} tokens.`
+      : "The server did not report a valid served context window, so leaving it unset.";
+    logger.warn(
+      `  ⚠ Ignoring invalid NEMOCLAW_CONTEXT_WINDOW="${current}"; it must be a positive ` +
+        `integer ≤ ${MAX_COMPATIBLE_CONTEXT_WINDOW}. ${replacement}`,
+    );
+  }
+  if (previousAuto || hasExplicitContextWindow(current)) delete env.NEMOCLAW_CONTEXT_WINDOW;
+  autoDetectedCompatibleContextWindow = null;
+  if (!validDetectedContextWindow) return;
+  const value = String(contextWindow);
+  env.NEMOCLAW_CONTEXT_WINDOW = value;
+  autoDetectedCompatibleContextWindow = value;
+}
 
 /** Test-only: forget any tracked auto value without touching the environment. */
 export function resetCompatibleEndpointContextWindowAutoState(): void {
@@ -246,9 +278,7 @@ export async function applyCompatibleEndpointContextWindow(
   // options.resolveHost. No env-gated bypass: an ambient VITEST flag must never
   // disable SSRF enforcement (cv review, PR #6293).
   const preflight = await assertEndpointResolvesPublic(endpointUrl, options.resolveHost, {
-    trustedPrivateHosts: parseTrustedPrivateInferenceHosts(
-      env.NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS,
-    ),
+    trustedPrivateHosts: parseTrustedPrivateInferenceHostsFromEnv(env),
   });
   if (!preflight.ok) {
     logger.warn(

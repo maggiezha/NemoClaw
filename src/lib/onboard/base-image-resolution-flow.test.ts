@@ -44,16 +44,21 @@ describe("base image resolution flow", () => {
     vi.clearAllMocks();
   });
 
-  it.each([
-    "1",
-    "true",
-    "YES",
-    "on",
-  ])("recognizes the %s refresh environment value (#4680)", (value) => {
-    expect(isSandboxBaseImageRefreshRequested({ NEMOCLAW_SANDBOX_BASE_IMAGE_REFRESH: value })).toBe(
-      true,
-    );
+  it("does not inspect Docker for a recorded Podman image during recreate", () => {
+    const context = createBaseImageResolutionContext({ fresh: false, env: {} });
+    captureBaseResolution(context, "registry.example/agent@sha256:" + "a".repeat(64), "podman");
+    expect(context.resolutionHint).toBeNull();
+    expect(mocks.dockerImageInspectFormat).not.toHaveBeenCalled();
   });
+
+  it.each(["1", "true", "YES", "on"])(
+    "recognizes the %s refresh environment value (#4680)",
+    (value) => {
+      expect(
+        isSandboxBaseImageRefreshRequested({ NEMOCLAW_SANDBOX_BASE_IMAGE_REFRESH: value }),
+      ).toBe(true);
+    },
+  );
 
   it("captures a recorded hint for warm runs and exposes patch options (#4680)", () => {
     mocks.dockerImageInspectFormat.mockReturnValue(
@@ -119,11 +124,60 @@ describe("base image resolution flow", () => {
     expect(context.preResolvedMetadata).toBe(resolvedMetadata);
   });
 
-  it("retains a rebuild handoff when a bound local override has no new metadata (#7144)", () => {
+  it("uses the authenticated outer rebuild resolution instead of the source sandbox hint", () => {
+    const targetMetadata: SandboxBaseImageResolutionMetadata = {
+      ...recordedMetadata,
+      key: "target-key",
+      ref: "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:target",
+      digest: "sha256:target",
+      imageId: "sha256:target-image",
+    };
     const context = createBaseImageResolutionContext({
       fresh: false,
       initialHint: recordedMetadata,
-      initialPreResolvedMetadata: recordedMetadata,
+      initialPreResolvedMetadata: targetMetadata,
+      env: {},
+    });
+    const createAgentSandbox = vi.fn(() => ({
+      buildCtx: "/tmp/hermes-build",
+      stagedDockerfile: "/tmp/hermes-build/Dockerfile",
+      baseImageResolutionMetadata: targetMetadata,
+    }));
+
+    createAgentSandboxWithResolution(
+      context,
+      { name: "hermes" } as AgentDefinition,
+      createAgentSandbox,
+    );
+
+    expect(createAgentSandbox).toHaveBeenCalledWith(
+      { name: "hermes" },
+      {
+        resolutionHint: targetMetadata,
+        forceBaseImageRefresh: false,
+      },
+    );
+    expect(getBaseImageResolutionPatchOptions(context)).toEqual({
+      resolutionHint: targetMetadata,
+      preResolvedBaseImageMetadata: targetMetadata,
+      forceBaseImageRefresh: false,
+    });
+  });
+
+  it("retains canonical outer metadata when a bound local lease emits no metadata", () => {
+    const imageId = `sha256:${"a".repeat(64)}`;
+    const stableMetadata: SandboxBaseImageResolutionMetadata = {
+      ...recordedMetadata,
+      key: "stable-outer-key",
+      ref: `nemoclaw-hermes-sandbox-base-local:image-${"a".repeat(64)}`,
+      digest: null,
+      source: "local",
+      imageId,
+    };
+    const context = createBaseImageResolutionContext({
+      fresh: false,
+      initialHint: stableMetadata,
+      initialPreResolvedMetadata: stableMetadata,
       env: {},
     });
     const agent = { name: "hermes" } as AgentDefinition;
@@ -139,9 +193,75 @@ describe("base image resolution flow", () => {
       vi.fn(() => staged),
     );
 
-    expect(context.preResolvedMetadata).toBe(recordedMetadata);
+    expect(context.preResolvedMetadata).toBe(stableMetadata);
     expect(getBaseImageResolutionPatchOptions(context).preResolvedBaseImageMetadata).toBe(
-      recordedMetadata,
+      stableMetadata,
     );
+    expect(context.preResolvedMetadata?.key).toBe("stable-outer-key");
+  });
+
+  it("retains stable outer metadata when inner staging uses a disposable local handoff", () => {
+    const imageId = `sha256:${"a".repeat(64)}`;
+    const stableMetadata: SandboxBaseImageResolutionMetadata = {
+      ...recordedMetadata,
+      ref: "nemoclaw-hermes-sandbox-base-local:3ef2ca87",
+      digest: null,
+      source: "local",
+      imageId,
+    };
+    const disposableMetadata: SandboxBaseImageResolutionMetadata = {
+      ...stableMetadata,
+      ref: `nemoclaw-hermes-sandbox-base-local:rebuild-123-${"b".repeat(16)}-image-${"a".repeat(64)}`,
+    };
+    const context = createBaseImageResolutionContext({
+      fresh: false,
+      initialPreResolvedMetadata: stableMetadata,
+      env: {},
+    });
+
+    createAgentSandboxWithResolution(
+      context,
+      { name: "hermes" } as AgentDefinition,
+      vi.fn(() => ({
+        buildCtx: "/tmp/hermes-build",
+        stagedDockerfile: "/tmp/hermes-build/Dockerfile",
+        baseImageResolutionMetadata: disposableMetadata,
+      })),
+    );
+
+    expect(context.preResolvedMetadata).toBe(stableMetadata);
+    expect(context.preResolvedMetadata?.ref).toBe(stableMetadata.ref);
+  });
+
+  it("rejects disposable metadata from a different outer resolution contract", () => {
+    const stableMetadata: SandboxBaseImageResolutionMetadata = {
+      ...recordedMetadata,
+      ref: "nemoclaw-hermes-sandbox-base-local:3ef2ca87",
+      digest: null,
+      source: "local",
+      imageId: `sha256:${"a".repeat(64)}`,
+    };
+    const context = createBaseImageResolutionContext({
+      fresh: false,
+      initialPreResolvedMetadata: stableMetadata,
+      env: {},
+    });
+
+    expect(() =>
+      createAgentSandboxWithResolution(
+        context,
+        { name: "hermes" } as AgentDefinition,
+        vi.fn(() => ({
+          buildCtx: "/tmp/hermes-build",
+          stagedDockerfile: "/tmp/hermes-build/Dockerfile",
+          baseImageResolutionMetadata: {
+            ...stableMetadata,
+            key: "different-resolution-key",
+            ref: `nemoclaw-hermes-sandbox-base-local:rebuild-123-${"b".repeat(16)}-image-${"a".repeat(64)}`,
+          },
+        })),
+      ),
+    ).toThrow("did not match the stable outer resolution");
+    expect(context.preResolvedMetadata).toBe(stableMetadata);
   });
 });

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
 
 import {
@@ -9,14 +9,20 @@ import {
   createBuiltInRenderTemplateResolver,
 } from "../channels";
 import { MessagingWorkflowPlanner } from "../compiler";
-import { createBuiltInMessagingHookRegistry, runMessagingHook } from "../hooks";
+import {
+  createBuiltInMessagingHookRegistry,
+  MessagingHookConflictError,
+  runMessagingHook,
+} from "../hooks";
 import type {
   ChannelHookSpec,
   MessagingAgentId,
   MessagingSerializableObject,
   SandboxMessagingPlan,
 } from "../manifest";
+import { compactSandboxMessagingPlanForPersistence } from "../persistence";
 import { MessagingSetupApplier } from "./setup-applier";
+import { messagingSandboxFiles } from "../../../../test/support/messaging-sandbox-files";
 import {
   MESSAGING_SETUP_APPLIER_ENV_KEY,
   type MessagingOpenShellRunner,
@@ -30,6 +36,17 @@ const TEST_CREDENTIALS: Readonly<Record<string, string>> = {
   SLACK_BOT_TOKEN: "xoxb-test-slack-token",
   SLACK_APP_TOKEN: "xapp-test-slack-token",
   MSTEAMS_APP_PASSWORD: "test-teams-client-secret",
+};
+
+const EXACT_MESSAGING_PROFILE = {
+  status: 0,
+  stdout: JSON.stringify({
+    id: "nemoclaw-mcp-v1",
+    credentials: [],
+    endpoints: [],
+    binaries: [],
+    inference_capable: false,
+  }),
 };
 
 const ALL_CHANNEL_ENV = {
@@ -52,11 +69,20 @@ const ALL_CHANNEL_ENV = {
   MSTEAMS_TENANT_ID: "teams-tenant-id",
   TEAMS_ALLOWED_USERS: "00000000-0000-0000-0000-000000000001",
   MSTEAMS_PORT: "3978",
+  // The service-account validator only requires non-empty client_email and
+  // private_key, so keep the fixture free of PEM markers: a real-looking key
+  // block trips the detect-private-key pre-commit hook.
+  GOOGLECHAT_SERVICE_ACCOUNT:
+    '{"client_email":"bot@demo.iam.gserviceaccount.com","private_key":"test-key-material","project_id":"demo"}',
+  GOOGLE_CHAT_PROJECT_ID: "demo",
+  GOOGLE_CHAT_SUBSCRIPTION_NAME: "projects/demo/subscriptions/hermes-chat-events-sub",
+  GOOGLECHAT_ALLOWED_USERS: "user@example.com",
 } as const;
 
 const ALL_CHANNELS = createBuiltInChannelManifestRegistry()
   .listAvailable({ agent: "hermes" })
   .map((manifest) => manifest.id);
+const E2E_STOP_START_CHANNELS = ["telegram", "discord", "wechat", "slack", "whatsapp"] as const;
 
 async function withEnv<T>(
   values: Readonly<Record<string, string | undefined>>,
@@ -187,6 +213,89 @@ describe("MessagingSetupApplier", () => {
     expect(() => MessagingSetupApplier.encodePlan(cyclic as never)).toThrow(/circular/i);
   });
 
+  it("reuses the Hermes image-build plan after the five-channel stop/start lifecycle (#7144)", async () => {
+    await withEnv(ALL_CHANNEL_ENV, async () => {
+      const lifecyclePlanner = planner();
+      const onboardPlan = await lifecyclePlanner.buildPlan({
+        sandboxName: "demo",
+        agent: "hermes",
+        workflow: "onboard",
+        isInteractive: false,
+        configuredChannels: E2E_STOP_START_CHANNELS,
+      });
+      let lifecyclePlan = onboardPlan;
+
+      for (const channelId of E2E_STOP_START_CHANNELS) {
+        const stopped = await lifecyclePlanner.buildChannelStopPlanFromSandboxEntry({
+          sandboxName: "demo",
+          agent: "hermes",
+          channelId,
+          sandboxEntry: {
+            name: "demo",
+            messaging: {
+              schemaVersion: 1,
+              plan: compactSandboxMessagingPlanForPersistence(
+                lifecyclePlan,
+              ) as unknown as SandboxMessagingPlan,
+            },
+          },
+        });
+        expect(stopped).not.toBeNull();
+        lifecyclePlan = stopped!;
+      }
+
+      for (const channelId of E2E_STOP_START_CHANNELS) {
+        const started = await lifecyclePlanner.buildChannelStartPlanFromSandboxEntry({
+          sandboxName: "demo",
+          agent: "hermes",
+          channelId,
+          sandboxEntry: {
+            name: "demo",
+            messaging: {
+              schemaVersion: 1,
+              plan: compactSandboxMessagingPlanForPersistence(
+                lifecyclePlan,
+              ) as unknown as SandboxMessagingPlan,
+            },
+          },
+        });
+        expect(started).not.toBeNull();
+        lifecyclePlan = started!;
+      }
+
+      expect(lifecyclePlan.disabledChannels).toEqual([]);
+      const { workflow: onboardWorkflow, ...onboardImageBuildPlan } = onboardPlan;
+      const { workflow: lifecycleWorkflow, ...lifecycleImageBuildPlan } = lifecyclePlan;
+      expect([onboardWorkflow, lifecycleWorkflow]).toEqual(["onboard", "start-channel"]);
+      expect(lifecycleImageBuildPlan).toEqual(onboardImageBuildPlan);
+      expect(JSON.stringify(lifecycleImageBuildPlan)).not.toBe(
+        JSON.stringify(onboardImageBuildPlan),
+      );
+      expect(MessagingSetupApplier.encodePlan(lifecyclePlan)).not.toBe(
+        MessagingSetupApplier.encodePlan(onboardPlan),
+      );
+
+      const imageBuildEncoding = MessagingSetupApplier.encodePlanForImageBuild(onboardPlan);
+      expect(MessagingSetupApplier.encodePlanForImageBuild(lifecyclePlan)).toBe(imageBuildEncoding);
+      expect(
+        MessagingSetupApplier.encodePlanForImageBuild({
+          ...lifecyclePlan,
+          channels: [...lifecyclePlan.channels].reverse(),
+        }),
+      ).not.toBe(imageBuildEncoding);
+
+      const imageBuildPlan = JSON.parse(
+        Buffer.from(imageBuildEncoding, "base64").toString("utf8"),
+      ) as Record<string, unknown>;
+      expect(imageBuildPlan).not.toHaveProperty("workflow");
+      expect(imageBuildPlan).toMatchObject({
+        schemaVersion: 1,
+        sandboxName: "demo",
+        agent: "hermes",
+      });
+    });
+  });
+
   it("lists hook requests by phase without executing hook implementations", async () => {
     const plan = await buildOnboardPlan(
       {
@@ -278,14 +387,18 @@ describe("MessagingSetupApplier", () => {
       await expect(
         MessagingSetupApplier.applyPreEnableChecks(plan, {
           runHook: () => {
-            throw new Error(`blocked ${request?.channelId ?? "channel"}`);
+            throw new MessagingHookConflictError(`blocked ${request?.channelId ?? "channel"}`);
           },
         }),
-      ).rejects.toThrow(`blocked ${request?.channelId ?? "channel"}`);
+      ).rejects.toMatchObject({
+        message: `blocked ${request?.channelId ?? "channel"}`,
+        channelId: request?.channelId,
+        onFailure: "abort",
+      });
     }
   });
 
-  it("upserts OpenShell generic providers from plan credential bindings", async () => {
+  it("upserts profile-backed OpenShell providers from plan credential bindings (#9875)", async () => {
     const plan = await buildOnboardPlan(
       {
         TELEGRAM_BOT_TOKEN: "123456:telegram-token",
@@ -298,15 +411,30 @@ describe("MessagingSetupApplier", () => {
       args: readonly string[];
       env?: Readonly<Record<string, string>>;
     }> = [];
+    const created = new Map<string, string>();
     const runOpenshell: MessagingOpenShellRunner = (args, options) => {
       calls.push({ args, env: options?.env });
-      if (args[0] === "provider" && args[1] === "get") {
-        return { status: args[2] === "demo-slack-bridge" ? 0 : 1 };
+      switch (args[1]) {
+        case "profile":
+          return EXACT_MESSAGING_PROFILE;
+        case "get": {
+          const name = String(args[2]);
+          const credentialKey =
+            name === "demo-slack-bridge" ? "SLACK_BOT_TOKEN" : created.get(name);
+          return credentialKey
+            ? {
+                status: 0,
+                stdout: `Name: ${name}\nType: nemoclaw-mcp-v1\nCredential keys: ${credentialKey}\nConfig keys: <none>\n`,
+              }
+            : { status: 1, stderr: `provider '${name}' not found` };
+        }
+        case "create":
+          created.set(String(args[3]), String(args[7]));
       }
       return { status: 0 };
     };
 
-    const result = MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+    const result = await MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
       env: {
         TELEGRAM_BOT_TOKEN: "123456:telegram-token",
         SLACK_BOT_TOKEN: "xoxb-slack-token",
@@ -317,31 +445,37 @@ describe("MessagingSetupApplier", () => {
 
     expect(calls.map((call) => call.args)).toEqual([
       ["provider", "get", "demo-telegram-bridge"],
+      ["provider", "get", "demo-slack-bridge"],
+      ["provider", "get", "demo-slack-app"],
+      ["provider", "profile", "export", "nemoclaw-mcp-v1", "--output", "json"],
       [
         "provider",
         "create",
         "--name",
         "demo-telegram-bridge",
         "--type",
-        "generic",
+        "nemoclaw-mcp-v1",
         "--credential",
         "TELEGRAM_BOT_TOKEN",
       ],
-      ["provider", "get", "demo-slack-bridge"],
+      ["provider", "profile", "export", "nemoclaw-mcp-v1", "--output", "json"],
+      ["provider", "get", "demo-telegram-bridge"],
       ["provider", "update", "demo-slack-bridge", "--credential", "SLACK_BOT_TOKEN"],
-      ["provider", "get", "demo-slack-app"],
+      ["provider", "get", "demo-slack-bridge"],
       [
         "provider",
         "create",
         "--name",
         "demo-slack-app",
         "--type",
-        "generic",
+        "nemoclaw-mcp-v1",
         "--credential",
         "SLACK_APP_TOKEN",
       ],
+      ["provider", "profile", "export", "nemoclaw-mcp-v1", "--output", "json"],
+      ["provider", "get", "demo-slack-app"],
     ]);
-    expect(calls[1]?.env).toEqual({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" });
+    expect(calls[4]?.env).toEqual({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" });
     expect(result.upserted.map((entry) => `${entry.action}:${entry.providerName}`)).toEqual([
       "create:demo-telegram-bridge",
       "update:demo-slack-bridge",
@@ -359,21 +493,93 @@ describe("MessagingSetupApplier", () => {
     expect(JSON.stringify(result)).not.toContain("slack-token");
   });
 
+  it("rejects a legacy generic provider instead of reusing its credential (#9875)", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
+    const calls: string[] = [];
+    const runOpenshell: MessagingOpenShellRunner = (args) => {
+      calls.push(args.join(" "));
+      return args[1] === "profile"
+        ? EXACT_MESSAGING_PROFILE
+        : args[1] === "get"
+          ? {
+              status: 0,
+              stdout:
+                "Name: demo-telegram-bridge\nType: generic\nCredential keys: TELEGRAM_BOT_TOKEN\nConfig keys: <none>\n",
+            }
+          : { status: 0 };
+    };
+
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: { TELEGRAM_BOT_TOKEN: "123456:telegram-token" },
+        runOpenshell,
+      }),
+    ).rejects.toThrow(/does not match the required endpointless credential binding/);
+    expect(calls.some((command) => /provider (create|update)/u.test(command))).toBe(false);
+  });
+
+  it("rejects credential-free reuse backed by an incompatible global profile (#9875)", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
+    const calls: string[] = [];
+
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: {},
+        runOpenshell: (args) => {
+          calls.push(args.join(" "));
+          switch (`${args[1]} ${args[2]}`) {
+            case "profile import":
+              return { status: 1, stderr: "profile already exists" };
+            case "profile export":
+              return {
+                status: 0,
+                stdout: JSON.stringify({
+                  id: "nemoclaw-mcp-v1",
+                  credentials: [],
+                  endpoints: ["https://foreign.invalid"],
+                  binaries: [],
+                  inference_capable: false,
+                }),
+              };
+            default:
+              return {
+                status: 0,
+                stdout:
+                  "Name: demo-telegram-bridge\nType: nemoclaw-mcp-v1\nCredential keys: TELEGRAM_BOT_TOKEN\nConfig keys: <none>\n",
+              };
+          }
+        },
+      }),
+    ).rejects.toThrow("does not match the checked-in credential boundary");
+    expect(calls.some((command) => /provider (create|update)/u.test(command))).toBe(false);
+  });
+
   it("redacts OpenShell provider failure output", async () => {
     const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "tokensecretvalue" }, ["telegram"]);
     const runOpenshell: MessagingOpenShellRunner = (args) => {
-      if (args[0] === "provider" && args[1] === "get") {
-        return { status: 1 };
+      switch (args[1]) {
+        case "profile":
+          return EXACT_MESSAGING_PROFILE;
+        case "get":
+          return {
+            status: 1,
+            stderr: "provider 'demo-telegram-bridge' not found",
+          };
+        default:
+          return {
+            status: 1,
+            stderr: "provider rejected TELEGRAM_BOT_TOKEN=tokensecretvalue",
+          };
       }
-      return {
-        status: 1,
-        stderr: "provider rejected TELEGRAM_BOT_TOKEN=tokensecretvalue",
-      };
     };
 
     let message = "";
     try {
-      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+      await MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
         env: { TELEGRAM_BOT_TOKEN: "tokensecretvalue" },
         runOpenshell,
       });
@@ -381,33 +587,114 @@ describe("MessagingSetupApplier", () => {
       message = error instanceof Error ? error.message : String(error);
     }
 
-    expect(message).toContain("TELEGRAM_BOT_TOKEN=toke");
+    expect(message).toContain("TELEGRAM_BOT_TOKEN=<REDACTED>");
     expect(message).not.toContain("tokensecretvalue");
   });
 
-  it("applies agent config render plans into sandbox files through OpenShell", async () => {
+  it("does not create a provider after an ambiguous lookup failure (#9875)", async () => {
     const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
       "telegram",
     ]);
-    const files: Record<string, string> = {
-      "/sandbox/.openclaw/openclaw.json": JSON.stringify({
-        agents: {
-          list: ["default"],
+    const calls: string[] = [];
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: { TELEGRAM_BOT_TOKEN: "123456:telegram-token" },
+        runOpenshell: (args) => {
+          calls.push(args.join(" "));
+          return args[1] === "profile"
+            ? EXACT_MESSAGING_PROFILE
+            : { status: 1, stderr: "gateway unavailable" };
         },
       }),
-    };
+    ).rejects.toThrow("Could not inspect messaging provider 'demo-telegram-bridge'");
+    expect(calls.some((command) => command.startsWith("provider create"))).toBe(false);
+  });
+
+  it("treats a null provider mutation status as failure (#9875)", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
+
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: { TELEGRAM_BOT_TOKEN: "123456:telegram-token" },
+        runOpenshell: (args) => {
+          switch (args[1]) {
+            case "profile":
+              return EXACT_MESSAGING_PROFILE;
+            case "get":
+              return { status: 1, stderr: "provider 'demo-telegram-bridge' not found" };
+            default:
+              return { status: null, stderr: "transport closed" };
+          }
+        },
+      }),
+    ).rejects.toThrow("Failed to create messaging provider 'demo-telegram-bridge'");
+  });
+
+  it("rejects a provider mutation whose exact postcondition is absent (#9875)", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
+    let lookups = 0;
+
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: { TELEGRAM_BOT_TOKEN: "123456:telegram-token" },
+        runOpenshell: (args) => {
+          switch (args[1]) {
+            case "profile":
+              return EXACT_MESSAGING_PROFILE;
+            case "create":
+              return { status: 0 };
+            default:
+              lookups += 1;
+              return lookups === 1
+                ? { status: 1, stderr: "provider 'demo-telegram-bridge' not found" }
+                : {
+                    status: 0,
+                    stdout:
+                      "Name: demo-telegram-bridge\nType: generic\nCredential keys: TELEGRAM_BOT_TOKEN\nConfig keys: <none>\n",
+                  };
+          }
+        },
+      }),
+    ).rejects.toThrow(
+      "OpenShell did not confirm messaging provider 'demo-telegram-bridge' after create.",
+    );
+  });
+
+  it("does not mutate after a not-found message with an unavailable status (#9875)", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
+    const calls: string[] = [];
+
+    await expect(
+      MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+        env: { TELEGRAM_BOT_TOKEN: "123456:telegram-token" },
+        runOpenshell: (args) => {
+          calls.push(args.join(" "));
+          return args[1] === "profile"
+            ? EXACT_MESSAGING_PROFILE
+            : {
+                status: 1,
+                stderr: 'Error: status: Unavailable, message: "provider not found"',
+              };
+        },
+      }),
+    ).rejects.toThrow(/Could not inspect messaging provider/u);
+    expect(calls.some((command) => /provider (create|update)/u.test(command))).toBe(false);
+  });
+
+  it("applies OpenClaw render plans through one native path-scoped patch", async () => {
+    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+      "telegram",
+    ]);
     const calls: Array<{ args: readonly string[]; input?: string }> = [];
     const runOpenshell: MessagingOpenShellRunner = (args, options) => {
       calls.push({ args, input: options?.input });
-      const target = String(args.at(-1));
-      if (args.includes("cat") && !options?.input) {
-        return { status: files[target] === undefined ? 1 : 0, stdout: files[target] ?? "" };
-      }
-      if (options?.input !== undefined) {
-        files[target] = options.input;
-        return { status: 0 };
-      }
-      return { status: 1 };
+      return { status: 0 };
     };
 
     const result = await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, {
@@ -415,91 +702,163 @@ describe("MessagingSetupApplier", () => {
     });
 
     expect(calls.map((call) => call.args)).toEqual([
-      ["sandbox", "exec", "--name", "demo", "--", "cat", "/sandbox/.openclaw/openclaw.json"],
       [
         "sandbox",
         "exec",
         "--name",
         "demo",
+        "--env",
+        "HOME=/sandbox",
         "--",
-        "sh",
-        "-c",
-        'mkdir -p "$(dirname "$1")" && cat > "$1"',
-        "sh",
-        "/sandbox/.openclaw/openclaw.json",
+        "openclaw",
+        "config",
+        "patch",
+        "--stdin",
       ],
     ]);
-    expect(calls[1]?.input).toBeTruthy();
-    const openclawConfig = JSON.parse(files["/sandbox/.openclaw/openclaw.json"] ?? "{}");
-    expect(openclawConfig.agents.list).toEqual(["default"]);
-    expect(openclawConfig.channels.telegram.accounts.default).toMatchObject({
-      botToken: "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
-      enabled: true,
-      groupPolicy: "open",
+    const openclawPatch = JSON.parse(calls[0]?.input ?? "{}") as MessagingSerializableObject;
+    expect(openclawPatch).not.toHaveProperty("agents");
+    // No botToken: OpenClaw resolves the default account from the injected
+    // environment, so the config carries no credential placeholder.
+    expect(openclawPatch.channels).toMatchObject({
+      telegram: {
+        accounts: { default: { enabled: true, groupPolicy: "open" } },
+        groups: { "*": { requireMention: true } },
+      },
     });
-    expect(openclawConfig.channels.telegram.groups).toEqual({ "*": { requireMention: true } });
+    expect(openclawPatch).not.toHaveProperty("channels.telegram.accounts.default.botToken");
     expect(result.appliedTargets).toEqual(["/sandbox/.openclaw/openclaw.json"]);
     expect(result.appliedHooks).toEqual([]);
     expect(result.unresolvedTemplateRefs).toEqual([]);
   });
 
-  it("preserves runtime-scoped credential placeholders when reapplying render plans", async () => {
+  it("leaves runtime-scoped credential placeholders outside its native patch", async () => {
     const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
       "telegram",
     ]);
     const scoped = "openshell:resolve:env:v42_TELEGRAM_BOT_TOKEN";
-    const files: Record<string, string> = {
-      "/sandbox/.openclaw/openclaw.json": JSON.stringify({
-        channels: {
-          telegram: {
-            accounts: {
-              default: {
-                botToken: scoped,
-              },
-            },
-          },
-        },
-      }),
+    const nativeConfig = {
+      channels: { telegram: { accounts: { default: { botToken: scoped } } } },
     };
-    const runOpenshell: MessagingOpenShellRunner = (args, options) => {
-      const target = String(args.at(-1));
-      if (args.includes("cat") && !options?.input) {
-        return { status: files[target] === undefined ? 1 : 0, stdout: files[target] ?? "" };
-      }
-      if (options?.input !== undefined) {
-        files[target] = options.input;
-        return { status: 0 };
-      }
-      return { status: 1 };
+    let nativePatch: MessagingSerializableObject = {};
+    const runOpenshell: MessagingOpenShellRunner = (_args, options) => {
+      nativePatch = JSON.parse(options?.input ?? "{}") as MessagingSerializableObject;
+      return { status: 0 };
     };
 
     await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, { runOpenshell });
 
-    const openclawConfig = JSON.parse(files["/sandbox/.openclaw/openclaw.json"] ?? "{}");
-    expect(openclawConfig.channels.telegram.accounts.default).toMatchObject({
-      botToken: scoped,
-      enabled: true,
-      groupPolicy: "open",
+    expect(nativePatch.channels).toMatchObject({
+      telegram: { accounts: { default: { enabled: true, groupPolicy: "open" } } },
     });
+    expect(nativePatch).not.toHaveProperty("channels.telegram.accounts.default.botToken");
+    expect(nativeConfig.channels.telegram.accounts.default.botToken).toBe(scoped);
+  });
+
+  it("drops a stale credential env line the plan no longer renders", async () => {
+    const plan = await buildOnboardPlan(
+      {
+        DISCORD_BOT_TOKEN: "discord-token",
+        DISCORD_SERVER_ID: "guild-1",
+        DISCORD_USER_ID: "discord-user-1",
+      },
+      ["discord"],
+      "hermes",
+    );
+    // What a pre-0.0.106 install left behind. Hermes loads .env with
+    // override=True, so carrying this line forward would shadow the
+    // revision-scoped placeholder OpenShell injects.
+    const files: Record<string, string> = {
+      "/sandbox/.hermes/.env": [
+        "DISCORD_BOT_TOKEN=openshell:resolve:env:DISCORD_BOT_TOKEN",
+        "NEMOCLAW_DISCORD_GUILD_IDS=stale-guild",
+        "OPERATOR_OWNED=keep-me",
+        "",
+      ].join("\n"),
+    };
+    const runOpenshell = messagingSandboxFiles(files);
+
+    await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, { runOpenshell });
+
+    const renderedEnv = files["/sandbox/.hermes/.env"] ?? "";
+    expect(renderedEnv).not.toContain("DISCORD_BOT_TOKEN=");
+    expect(renderedEnv).not.toContain("SLACK_BOT_TOKEN=");
+    expect(renderedEnv).not.toContain("SLACK_APP_TOKEN=");
+    // Non-credential lines the plan still renders are updated in place, and
+    // keys the plan does not own are left alone.
+    expect(renderedEnv).toContain("NEMOCLAW_DISCORD_GUILD_IDS=guild-1");
+    expect(renderedEnv).toContain("OPERATOR_OWNED=keep-me");
+  });
+
+  it("drops a stale credential env line when the plan renders nothing into the file", async () => {
+    // Telegram's only remaining Hermes env line is the allowlist, so without
+    // allowed IDs the whole env render collapses and the target never appears
+    // in the render plan. The file on disk still has to be cleaned.
+    const plan = await buildOnboardPlan(
+      { TELEGRAM_BOT_TOKEN: "telegram-token" },
+      ["telegram"],
+      "hermes",
+    );
+    const files: Record<string, string> = {
+      "/sandbox/.hermes/.env": [
+        "TELEGRAM_BOT_TOKEN=openshell:resolve:env:TELEGRAM_BOT_TOKEN",
+        "OPERATOR_OWNED=keep-me",
+        "",
+      ].join("\n"),
+    };
+    const runOpenshell = messagingSandboxFiles(files);
+
+    expect(plan.agentRender.some((render) => render.target === "~/.hermes/.env")).toBe(false);
+
+    await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, { runOpenshell });
+
+    const renderedEnv = files["/sandbox/.hermes/.env"] ?? "";
+    expect(renderedEnv).not.toContain("TELEGRAM_BOT_TOKEN=");
+    expect(renderedEnv).toContain("OPERATOR_OWNED=keep-me");
+  });
+
+  it.each([
+    { status: 1, stderr: "restored config cannot be read" },
+    { status: null, signal: "SIGTERM" },
+  ])("refuses to replace restored Hermes config after a failed read: %j", async (failure) => {
+    const plan = await buildOnboardPlan(ALL_CHANNEL_ENV, ["teams"], "hermes");
+    // Both the read and the absence check fail: the file is not safely absent.
+    const runOpenshell = vi.fn<MessagingOpenShellRunner>().mockReturnValue(failure);
+    const result = MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, { runOpenshell });
+
+    await expect(result).rejects.toThrow("Failed to read messaging agent config");
+    expect(runOpenshell.mock.calls.filter(([, options]) => options?.input !== undefined)).toEqual(
+      [],
+    );
   });
 
   it("renders every built-in Hermes credential and allowlist through the sandbox applier", async () => {
     const plan = await buildOnboardPlan(ALL_CHANNEL_ENV, ALL_CHANNELS, "hermes");
     const files: Record<string, string> = {};
-    const runOpenshell: MessagingOpenShellRunner = (args, options) => {
-      const target = String(args.at(-1));
-      const reading = args.includes("cat") && options?.input === undefined;
-      const written = options?.input;
-      Object.assign(files, written === undefined ? {} : { [target]: written });
-      return reading
-        ? { status: files[target] === undefined ? 1 : 0, stdout: files[target] ?? "" }
-        : { status: written === undefined ? 1 : 0 };
-    };
+    const providers = new Map<string, string>();
+    const runOpenshell = messagingSandboxFiles(files);
 
-    const credentialResult = MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+    const credentialResult = await MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
       env: ALL_CHANNEL_ENV,
-      runOpenshell: (args) =>
-        args[0] === "provider" && args[1] === "get" ? { status: 1 } : { status: 0 },
+      runOpenshell: (args) => {
+        switch (args[1]) {
+          case "profile":
+            return EXACT_MESSAGING_PROFILE;
+          case "get": {
+            const name = String(args[2]);
+            const credentialKey = providers.get(name);
+            return credentialKey
+              ? {
+                  status: 0,
+                  stdout: `Name: ${name}\nType: nemoclaw-mcp-v1\nCredential keys: ${credentialKey}\nConfig keys: <none>\n`,
+                }
+              : { status: 1, stderr: `provider '${name}' not found` };
+          }
+          case "create":
+            providers.set(String(args[3]), String(args[7]));
+        }
+        return { status: 0 };
+      },
     });
     const policyResult = MessagingSetupApplier.applyPolicyAtOpenShell(plan, {
       applyPresets: (_sandboxName, presetNames, context) => {
@@ -528,6 +887,7 @@ describe("MessagingSetupApplier", () => {
       "slack",
       "whatsapp",
       "teams",
+      "googlechat_hermes",
     ]);
     expect(renderResult.appliedTargets).toEqual([
       "/sandbox/.hermes/.env",
@@ -537,22 +897,22 @@ describe("MessagingSetupApplier", () => {
     const renderedEnv = files["/sandbox/.hermes/.env"] ?? "";
     expect(renderedEnv.split("\n")).toEqual(
       expect.arrayContaining([
-        "TELEGRAM_BOT_TOKEN=openshell:resolve:env:TELEGRAM_BOT_TOKEN",
         "TELEGRAM_ALLOWED_USERS=1001,1002",
-        "DISCORD_BOT_TOKEN=openshell:resolve:env:DISCORD_BOT_TOKEN",
         "NEMOCLAW_DISCORD_GUILD_IDS=guild-1",
         "DISCORD_ALLOWED_USERS=discord-user-1",
-        "WEIXIN_TOKEN=openshell:resolve:env:WECHAT_BOT_TOKEN",
         "WEIXIN_ALLOWED_USERS=wechat-user-1,wechat-user-2",
-        "SLACK_BOT_TOKEN=xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
-        "SLACK_APP_TOKEN=xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
         "SLACK_ALLOWED_USERS=U100,U200",
         "SLACK_ALLOWED_CHANNELS=C100,C200",
         "WHATSAPP_ALLOWED_USERS=+15550000001,+15550000002",
-        "TEAMS_CLIENT_SECRET=openshell:resolve:env:MSTEAMS_APP_PASSWORD",
         "TEAMS_ALLOWED_USERS=00000000-0000-0000-0000-000000000001",
       ]),
     );
+    // Discord renders no token line: OpenShell injects DISCORD_BOT_TOKEN as a
+    // revision-scoped placeholder and the policy binding rejects the canonical
+    // form, so Hermes must read the injected value instead.
+    expect(renderedEnv).not.toContain("DISCORD_BOT_TOKEN=");
+    expect(renderedEnv).not.toContain("WEIXIN_TOKEN=");
+    expect(renderedEnv).not.toContain("TEAMS_CLIENT_SECRET=");
     expect(renderedEnv).not.toContain("telegram-token");
     expect(renderedEnv).not.toContain("discord-token");
     expect(renderedEnv).not.toContain("wechat-token");
@@ -572,13 +932,13 @@ describe("MessagingSetupApplier", () => {
   });
 
   it("excludes disabled channels at the applier boundary", async () => {
-    const plan = await withEnv(
-      {
-        TELEGRAM_BOT_TOKEN: "123456:telegram-token",
-        SLACK_BOT_TOKEN: "xoxb-slack-token",
-        SLACK_APP_TOKEN: "xapp-slack-token",
-      },
-      () =>
+    const environment = {
+      TELEGRAM_BOT_TOKEN: "123456:telegram-token",
+      SLACK_BOT_TOKEN: "xoxb-slack-token",
+      SLACK_APP_TOKEN: "xapp-slack-token",
+    };
+    const [plan, enabledPlan] = await withEnv(environment, () =>
+      Promise.all([
         planner().buildPlan({
           sandboxName: "demo",
           agent: "openclaw",
@@ -587,6 +947,14 @@ describe("MessagingSetupApplier", () => {
           configuredChannels: ["telegram", "slack"],
           disabledChannels: ["telegram"],
         }),
+        planner().buildPlan({
+          sandboxName: "demo",
+          agent: "openclaw",
+          workflow: "rebuild",
+          isInteractive: false,
+          configuredChannels: ["telegram", "slack"],
+        }),
+      ]),
     );
     expect(plan.disabledChannels).toEqual(["telegram"]);
     expect(plan.credentialBindings.map((binding) => binding.channelId)).toEqual([
@@ -606,13 +974,15 @@ describe("MessagingSetupApplier", () => {
       "slack:slack-socket-mode-gateway-conflict",
       "slack:slack-openclaw-bridge-health",
       "slack:slack-socket-mode-gateway-status",
+      "slack:slack-status-health",
       "slack:slack-token-paste",
       "slack:slack-config-prompt",
       "slack:slack-credential-validation",
     ]);
 
     const providerCalls: string[][] = [];
-    const credentialResult = MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
+    const providers = new Map<string, string>();
+    const credentialResult = await MessagingSetupApplier.applyCredentialsAtOpenShell(plan, {
       env: {
         TELEGRAM_BOT_TOKEN: "123456:telegram-token",
         SLACK_BOT_TOKEN: "xoxb-slack-token",
@@ -620,7 +990,22 @@ describe("MessagingSetupApplier", () => {
       },
       runOpenshell: (args) => {
         providerCalls.push([...args]);
-        if (args[0] === "provider" && args[1] === "get") return { status: 1 };
+        switch (args[1]) {
+          case "profile":
+            return EXACT_MESSAGING_PROFILE;
+          case "get": {
+            const name = String(args[2]);
+            const credentialKey = providers.get(name);
+            return credentialKey
+              ? {
+                  status: 0,
+                  stdout: `Name: ${name}\nType: nemoclaw-mcp-v1\nCredential keys: ${credentialKey}\nConfig keys: <none>\n`,
+                }
+              : { status: 1, stderr: `provider '${name}' not found` };
+          }
+          case "create":
+            providers.set(String(args[3]), String(args[7]));
+        }
         return { status: 0 };
       },
     });
@@ -638,32 +1023,73 @@ describe("MessagingSetupApplier", () => {
     expect(policyCalls).toEqual([["demo", "slack"]]);
     expect(policyResult.appliedPolicyKeys).toEqual(["slack"]);
 
-    const files: Record<string, string> = {
-      "/sandbox/.openclaw/openclaw.json": "{}",
-    };
-    await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, {
-      runOpenshell: (args, options) => {
-        const target = String(args.at(-1));
-        if (args.includes("cat") && options?.input === undefined) {
-          return { status: files[target] === undefined ? 1 : 0, stdout: files[target] ?? "" };
-        }
-        if (options?.input !== undefined) {
-          files[target] = options.input;
-          return { status: 0 };
-        }
-        return { status: 1 };
+    let nativePatch: MessagingSerializableObject = {};
+    await MessagingSetupApplier.applyAgentConfigAtOpenShell(
+      {
+        ...plan,
+        // Stop/rebuild plans retain the prior render entries so the applier can
+        // remove stale configuration restored by OpenClaw doctor.
+        agentRender: enabledPlan.agentRender,
       },
+      {
+        runOpenshell: (args, options) => {
+          if (args.includes("get")) return { status: 0, stdout: "{}" };
+          nativePatch = JSON.parse(options?.input ?? "{}") as MessagingSerializableObject;
+          return { status: 0 };
+        },
+      },
+    );
+    expect(nativePatch.channels).toMatchObject({
+      telegram: null,
+      slack: { accounts: { default: { enabled: true } } },
     });
-    const openclawConfig = JSON.parse(files["/sandbox/.openclaw/openclaw.json"] ?? "{}");
-    expect(openclawConfig.channels.telegram).toBeUndefined();
-    expect(openclawConfig.channels.slack.accounts.default).toMatchObject({
-      botToken: "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
-      appToken: "xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
-      enabled: true,
-    });
+    // No rendered tokens: OpenClaw resolves the default account from the
+    // injected SLACK_BOT_TOKEN and SLACK_APP_TOKEN environment values.
+    expect(nativePatch).not.toHaveProperty("channels.slack.accounts.default.botToken");
+    expect(nativePatch).not.toHaveProperty("channels.slack.accounts.default.appToken");
   });
 
-  it("runs post-install hook implementations and writes their build-file outputs", async () => {
+  it("removes hook-created WeChat config when the channel is disabled", async () => {
+    const enabledPlan = await buildOnboardPlan(
+      {
+        WECHAT_BOT_TOKEN: "wechat-token",
+        WECHAT_ACCOUNT_ID: "wechat-account",
+      },
+      ["wechat"],
+    );
+    const stoppedPlan = await planner().buildChannelStopPlanFromSandboxEntry({
+      sandboxName: "demo",
+      agent: "openclaw",
+      channelId: "wechat",
+      sandboxEntry: {
+        name: "demo",
+        messaging: {
+          schemaVersion: 1,
+          plan: compactSandboxMessagingPlanForPersistence(
+            enabledPlan,
+          ) as unknown as SandboxMessagingPlan,
+        },
+      },
+    });
+    expect(stoppedPlan?.disabledChannels).toEqual(["wechat"]);
+
+    let nativePatch: MessagingSerializableObject = {};
+    await MessagingSetupApplier.applyAgentConfigAtOpenShell(stoppedPlan!, {
+      runOpenshell: (args, options) => {
+        if (args.includes("get")) return { status: 0, stdout: "{}" };
+        nativePatch = JSON.parse(options?.input ?? "{}") as MessagingSerializableObject;
+        return { status: 0 };
+      },
+    });
+
+    expect(nativePatch).toEqual({
+      channels: { "openclaw-weixin": null },
+      plugins: { entries: { "openclaw-weixin": null } },
+    });
+    expect(nativePatch).not.toHaveProperty("preserved");
+  });
+
+  it("applies WeChat post-install config natively without reading or replacing the native file", async () => {
     const plan = await buildOnboardPlan(
       {
         WECHAT_BOT_TOKEN: "wechat-token",
@@ -682,6 +1108,11 @@ describe("MessagingSetupApplier", () => {
     });
     const files: Record<string, string> = {
       "/sandbox/.openclaw/openclaw.json": JSON.stringify({
+        channels: {
+          "openclaw-weixin": {
+            enabled: false,
+          },
+        },
         plugins: {
           entries: {
             acpx: {
@@ -692,8 +1123,16 @@ describe("MessagingSetupApplier", () => {
       }),
     };
 
+    const originalConfig = files["/sandbox/.openclaw/openclaw.json"];
+    const nativePatches: MessagingSerializableObject[] = [];
     const result = await MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, {
       runOpenshell: (args, options) => {
+        expect(args).not.toContain("/sandbox/.openclaw/openclaw.json");
+        if (args.includes("patch")) {
+          expect(args.slice(-4)).toEqual(["openclaw", "config", "patch", "--stdin"]);
+          nativePatches.push(JSON.parse(options?.input ?? "{}"));
+          return { status: 0 };
+        }
         const command = String(args[7] ?? "");
         const target =
           options?.input !== undefined && command.includes("chmod")
@@ -734,17 +1173,17 @@ describe("MessagingSetupApplier", () => {
       baseUrl: "https://ilinkai.wechat.com",
       userId: "wechat-user",
     });
-    const openclawConfig = JSON.parse(files["/sandbox/.openclaw/openclaw.json"] ?? "{}");
-    expect(openclawConfig.plugins.entries.acpx.enabled).toBe(false);
-    expect(openclawConfig.plugins.entries["openclaw-weixin"].enabled).toBe(true);
-    expect(openclawConfig.plugins.installs["openclaw-weixin"].spec).toBe(
-      "@tencent-weixin/openclaw-weixin@2.4.3",
-    );
-    expect(openclawConfig.plugins.load?.paths ?? []).not.toContain(
-      "/sandbox/.openclaw/extensions/openclaw-weixin",
-    );
-    expect(openclawConfig.channels["openclaw-weixin"].accounts["wechat-account"]).toEqual({
-      enabled: true,
+    expect(files["/sandbox/.openclaw/openclaw.json"]).toBe(originalConfig);
+    expect(nativePatches).toHaveLength(2);
+    expect(nativePatches[1]).toEqual({
+      plugins: { entries: { "openclaw-weixin": { enabled: true } } },
+      channels: {
+        "openclaw-weixin": {
+          enabled: true,
+          channelConfigUpdatedAt: "2026-01-01T00:00:00.000Z",
+          accounts: { "wechat-account": { enabled: true } },
+        },
+      },
     });
     expect(result.appliedTargets).toEqual([
       "/sandbox/.openclaw/openclaw.json",
@@ -833,23 +1272,23 @@ describe("MessagingSetupApplier", () => {
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
   });
 
-  it("rejects render targets outside the selected agent config root", async () => {
-    const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
-      "telegram",
-    ]);
-    const runOpenshell: MessagingOpenShellRunner = (args, options) => {
-      if (args.includes("cat") && options?.input === undefined) {
-        return { status: 0, stdout: "{}" };
-      }
-      return { status: 0 };
-    };
-    const unsafeTargets = [
-      { target: "/tmp/openclaw.json", error: "must stay inside /sandbox/.openclaw" },
-      { target: "~/.openclaw/../openclaw.json", error: "must not traverse directories" },
-      { target: "~/.hermes/config.yaml", error: "Cannot apply Hermes messaging target" },
-    ];
+  it.each([
+    { target: "/tmp/openclaw.json", error: "must stay inside /sandbox/.openclaw" },
+    { target: "~/.openclaw/../openclaw.json", error: "must not traverse directories" },
+    { target: "~/.hermes/config.yaml", error: "Cannot apply Hermes messaging target" },
+  ])(
+    "rejects render target $target outside the selected agent config root",
+    async ({ target, error }) => {
+      const plan = await buildOnboardPlan({ TELEGRAM_BOT_TOKEN: "123456:telegram-token" }, [
+        "telegram",
+      ]);
+      const runOpenshell: MessagingOpenShellRunner = (args, options) => {
+        if (args.includes("cat") && options?.input === undefined) {
+          return { status: 0, stdout: "{}" };
+        }
+        return { status: 0 };
+      };
 
-    for (const { target, error } of unsafeTargets) {
       const unsafePlan = {
         ...plan,
         agentRender: [
@@ -868,10 +1307,50 @@ describe("MessagingSetupApplier", () => {
       await expect(
         MessagingSetupApplier.applyAgentConfigAtOpenShell(unsafePlan, { runOpenshell }),
       ).rejects.toThrow(error);
-    }
-  });
+    },
+  );
 
-  it("rejects unsafe build-file hook output paths and modes", async () => {
+  it.each([
+    {
+      value: { path: "openclaw.json", content: { channels: {} } },
+      error: "must provide an object merge",
+    },
+    {
+      value: { path: "openclaw.json", merge: ["invalid"] },
+      error: "must provide an object merge",
+    },
+    {
+      value: { path: "openclaw.json", merge: { channels: { telegram: null } } },
+      error: "cannot set null",
+    },
+    {
+      value: { path: "openclaw-weixin/accounts/../../openclaw.json", content: {} },
+      error: "must not traverse directories",
+    },
+    {
+      value: { path: "/tmp/openclaw.json", content: {} },
+      error: "must be a safe relative path",
+    },
+    {
+      value: { path: "openclaw-weixin//accounts.json", content: {} },
+      error: "must not contain empty segments",
+    },
+    {
+      value: { path: "openclaw-weixin/\u0001accounts.json", content: {} },
+      error: "must be a safe relative path",
+    },
+    {
+      value: { path: "openclaw-weixin/accounts.json", mode: "0777", content: {} },
+      error: "must not be group/world writable",
+    },
+    {
+      value: { path: "openclaw-weixin/accounts.json", mode: "u+s", content: {} },
+      error: "mode must be an octal file mode",
+    },
+  ] as ReadonlyArray<{
+    readonly value: MessagingSerializableObject;
+    readonly error: string;
+  }>)("rejects an unsafe build-file hook output: $error", async ({ value, error }) => {
     const plan = await buildOnboardPlan(
       {
         WECHAT_BOT_TOKEN: "wechat-token",
@@ -885,51 +1364,20 @@ describe("MessagingSetupApplier", () => {
       }
       return { status: 0 };
     };
-    const unsafeFiles: Array<{
-      readonly value: MessagingSerializableObject;
-      readonly error: string;
-    }> = [
-      {
-        value: { path: "openclaw-weixin/accounts/../../openclaw.json", content: {} },
-        error: "must not traverse directories",
-      },
-      {
-        value: { path: "/tmp/openclaw.json", content: {} },
-        error: "must be a safe relative path",
-      },
-      {
-        value: { path: "openclaw-weixin//accounts.json", content: {} },
-        error: "must not contain empty segments",
-      },
-      {
-        value: { path: "openclaw-weixin/\u0001accounts.json", content: {} },
-        error: "must be a safe relative path",
-      },
-      {
-        value: { path: "openclaw-weixin/accounts.json", mode: "0777", content: {} },
-        error: "must not be group/world writable",
-      },
-      {
-        value: { path: "openclaw-weixin/accounts.json", mode: "u+s", content: {} },
-        error: "mode must be an octal file mode",
-      },
-    ];
 
-    for (const { value, error } of unsafeFiles) {
-      await expect(
-        MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, {
-          runOpenshell,
-          runHook: () => ({
-            outputs: {
-              openclawWeixinAccountFile: {
-                kind: "build-file",
-                value,
-              },
+    await expect(
+      MessagingSetupApplier.applyAgentConfigAtOpenShell(plan, {
+        runOpenshell,
+        runHook: () => ({
+          outputs: {
+            openclawWeixinAccountFile: {
+              kind: "build-file",
+              value,
             },
-          }),
+          },
         }),
-      ).rejects.toThrow(error);
-    }
+      }),
+    ).rejects.toThrow(error);
   });
 
   it("applies policy presets directly from the serializable plan", async () => {

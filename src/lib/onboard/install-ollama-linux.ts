@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 
-import { OLLAMA_PORT } from "../core/ports";
 import { sleepSeconds, waitForHttp } from "../core/wait";
 import {
   MIN_AUTODETECTED_OLLAMA_CONTEXT_WINDOW,
   resolveOllamaContextWindowFloor,
 } from "../inference/ollama-runtime-context";
+import { MIN_OLLAMA_VERSION } from "../inference/ollama-version";
 import { cliName } from "./branding";
+import {
+  OLLAMA_PORT,
+  recordUserLocalOllamaOwnership,
+  removeUserLocalOllamaOwnership,
+} from "./experimental/ollama-user-local-runtime";
 import {
   decideInstallOllamaLinuxMode,
   hostCommandExists,
@@ -31,13 +37,23 @@ const {
   setResolvedOllamaHost,
 }: typeof import("../inference/local") = require("../inference/local");
 
+export const OFFICIAL_OLLAMA_INSTALLER_URL =
+  "https://raw.githubusercontent.com/ollama/ollama/de25dd526f4c9ba367ee69022168c6c5f2dc3285/scripts/install.sh";
+export const OFFICIAL_OLLAMA_INSTALLER_SHA256 =
+  "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f";
+const OFFICIAL_OLLAMA_INSTALLER_PROCESS_TIMEOUT_MS = 190_000;
+
+export function sha256File(filePath: string): string {
+  return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
 /**
  * Install location modes.
  *
- *  - `system`     installs into `/usr/local` via the official Ollama
- *                 installer script (`https://ollama.com/install.sh`). Requires
- *                 sudo, configures a systemd service, and writes to a system
- *                 user (`ollama`). This is the historical path.
+ *  - `system`     installs into `/usr/local` via a digest-verified snapshot of
+ *                 the official Ollama installer. Requires sudo, configures a
+ *                 systemd service, and writes to a system user (`ollama`).
+ *                 This is the historical path.
  *  - `user-local` installs into `${HOME}/.local` by downloading the official
  *                 release tarball directly and extracting it as the invoking
  *                 user. No sudo, no systemd, no system user. The daemon is
@@ -51,12 +67,16 @@ export type InstallOllamaLinuxResult = {
 };
 
 export type InstallOllamaLinuxOptions = InstallOllamaLinuxModeOptions & {
+  /** Restart the daemon for an already-current binary without running the pinned installer. */
+  restartOnly?: boolean;
   /** Test seam: override `os.homedir()`. */
   homedir?: () => string;
   /** Test seam: override `process.arch`. */
   arch?: () => NodeJS.Architecture;
   /** Test seam: override `runShell`. */
   runShellImpl?: typeof runShell;
+  /** Test seam: override local SHA-256 calculation. */
+  sha256FileImpl?: typeof sha256File;
   /** Test seam: override systemd loopback override. */
   ensureManagedOllamaLoopbackSystemdOverrideImpl?: typeof ensureManagedOllamaLoopbackSystemdOverride;
   /** Minimum daemon context length to request for the selected agent. */
@@ -71,6 +91,10 @@ export type InstallOllamaLinuxOptions = InstallOllamaLinuxModeOptions & {
   readFileImpl?: (path: string) => string;
   /** Test seam: redirect log output. */
   log?: (message: string) => void;
+  /** Test seam: override the durable user-local ownership write. */
+  recordUserLocalOllamaOwnershipImpl?: typeof recordUserLocalOllamaOwnership;
+  /** Test seam: override removal after a successful system installation. */
+  removeUserLocalOllamaOwnershipImpl?: typeof removeUserLocalOllamaOwnership;
 };
 
 /**
@@ -105,21 +129,107 @@ function detectJetpackVariant(opts: InstallOllamaLinuxOptions): "jetpack5" | "je
 }
 
 /**
- * Run the official `https://ollama.com/install.sh`. Sudo-bound. Configures
- * the systemd `ollama.service`, creates the `ollama` system user, and
- * installs CUDA drivers when applicable.
+ * Run the pinned official Ollama installer. Sudo-bound. Configures the
+ * systemd `ollama.service`, creates the `ollama` system user, and installs
+ * CUDA drivers when applicable. An upgrade that replaces a stale binary asks
+ * the installer for `MIN_OLLAMA_VERSION` by name; a fresh install has no floor
+ * to satisfy and takes latest.
  */
 function runOfficialInstallScript(opts: InstallOllamaLinuxOptions): void {
   const log = opts.log ?? ((m: string) => console.log(m));
+  const errorLog = opts.errorLog ?? ((m: string) => console.error(m));
+  const runCaptureExImpl = opts.runCaptureExImpl ?? runCaptureEx;
   const runShellImpl = opts.runShellImpl ?? runShell;
+  const sha256FileImpl = opts.sha256FileImpl ?? sha256File;
   ensureOllamaLinuxExtractionDependencies(opts);
   log(
     "  The Ollama installer creates a system user, a systemd service, and writes to /usr/local. " +
       "It uses sudo, may ask for your password, and can take a few minutes; installer output will stream below.",
   );
-  runShellImpl("set -o pipefail; curl -fsSL https://ollama.com/install.sh | sh", {
-    stdio: "inherit",
-  });
+  const versionPin = opts.isUpgrade ? `OLLAMA_VERSION=${MIN_OLLAMA_VERSION} ` : "";
+  if (versionPin) {
+    log(`  Requesting Ollama ${MIN_OLLAMA_VERSION} from the installer.`);
+  }
+
+  const installerDirectory = fs.mkdtempSync(
+    nodePath.join(os.tmpdir(), "nemoclaw-ollama-installer-"),
+  );
+  const installerPath = nodePath.join(installerDirectory, "install.sh");
+
+  let failure: { exitCode: number; message: string } | null = null;
+  try {
+    fs.writeFileSync(installerPath, "", { flag: "wx", mode: 0o600 });
+    const fetchResult = runCaptureExImpl(
+      [
+        "curl",
+        "--fail",
+        "--show-error",
+        "--silent",
+        "--location",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "--retry",
+        "3",
+        "--retry-all-errors",
+        "--retry-delay",
+        "1",
+        "--retry-max-time",
+        "180",
+        "--output",
+        installerPath,
+        OFFICIAL_OLLAMA_INSTALLER_URL,
+      ],
+      { timeout: OFFICIAL_OLLAMA_INSTALLER_PROCESS_TIMEOUT_MS },
+    );
+    if (fetchResult.exitCode !== 0) {
+      failure = {
+        exitCode: fetchResult.exitCode ?? 1,
+        message: `  Ollama installer download failed after bounded retries (exit ${fetchResult.exitCode ?? "unknown"}).`,
+      };
+    } else {
+      let actualSha256 = "";
+      try {
+        actualSha256 = sha256FileImpl(installerPath);
+      } catch (error) {
+        failure = {
+          exitCode: 1,
+          message: `  Unable to verify Ollama installer integrity: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (!failure && actualSha256 !== OFFICIAL_OLLAMA_INSTALLER_SHA256) {
+        failure = {
+          exitCode: 1,
+          message:
+            "  Ollama installer integrity check failed; refusing to execute downloaded content.",
+        };
+      }
+    }
+    if (!failure) {
+      const installResult = runShellImpl(`${versionPin}sh ${shellQuote(installerPath)}`, {
+        ignoreError: true,
+        stdio: "inherit",
+      });
+      if (installResult.error || installResult.status !== 0) {
+        failure = {
+          exitCode: installResult.status ?? 1,
+          message: `  Ollama installer failed (exit ${installResult.status ?? "unknown"}).`,
+        };
+      }
+    }
+  } finally {
+    fs.rmSync(installerDirectory, { force: true, recursive: true });
+  }
+
+  if (failure) {
+    errorLog(failure.message);
+    process.exit(failure.exitCode);
+  }
 }
 
 /**
@@ -308,12 +418,19 @@ function installOllamaSystem(opts: InstallOllamaLinuxOptions): InstallOllamaLinu
     opts.ensureManagedOllamaLoopbackSystemdOverrideImpl ??
     ensureManagedOllamaLoopbackSystemdOverride;
 
-  runOfficialInstallScript(opts);
-  sleepSecondsImpl(2);
+  if (opts.restartOnly) {
+    log(
+      `  Installed Ollama already meets ${MIN_OLLAMA_VERSION}; restarting its daemon without replacing the binary.`,
+    );
+  } else {
+    runOfficialInstallScript(opts);
+    sleepSecondsImpl(2);
+  }
 
   const overrideState: OllamaLoopbackSystemdOverrideState = ensureOverrideImpl({
     isNonInteractive: opts.isNonInteractive,
     contextWindowFloor: opts.contextWindowFloor,
+    isUpgrade: opts.isUpgrade,
   });
   if (overrideState === "failed") {
     errorLog("  Ollama systemd restart did not recover after applying the loopback override.");
@@ -365,6 +482,24 @@ export function installOllamaOnLinux(opts: InstallOllamaLinuxOptions): InstallOl
   const result = mode === "user-local" ? installOllamaUserLocal(opts) : installOllamaSystem(opts);
   // Pin to local loopback so a cached `host.docker.internal` from an
   // earlier WSL probe cannot route validation/pull at the Windows host.
-  if (result.ok) setResolvedOllamaHost("127.0.0.1");
+  if (result.ok) {
+    setResolvedOllamaHost("127.0.0.1");
+    const ownershipDeps = { homeDir: (opts.homedir ?? (() => os.homedir()))() };
+    try {
+      if (result.mode === "user-local") {
+        (opts.recordUserLocalOllamaOwnershipImpl ?? recordUserLocalOllamaOwnership)(
+          result.binPath,
+          ownershipDeps,
+        );
+      } else {
+        (opts.removeUserLocalOllamaOwnershipImpl ?? removeUserLocalOllamaOwnership)(ownershipDeps);
+      }
+    } catch (error) {
+      (opts.errorLog ?? ((message: string) => console.error(message)))(
+        `  Ollama install could not update its NemoClaw ownership receipt: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { ...result, ok: false };
+    }
+  }
   return result;
 }

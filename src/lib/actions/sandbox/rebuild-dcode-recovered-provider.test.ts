@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   configureDcodeSession,
@@ -11,15 +11,36 @@ import {
 } from "../../../../test/helpers/rebuild-dcode-flow-helpers";
 import {
   createRebuildFlowHarness,
+  installRebuildFlowTestHooks,
   makePreparedRecoveryManifest,
-  resetRebuildFlowTestEnvironment,
-  restoreRebuildFlowTestEnvironment,
   snapshotEnv,
-} from "../../../../test/helpers/rebuild-flow-harness";
+} from "../../../../test/helpers/rebuild-flow-generic-harness";
 
 describe("rebuildSandbox DCode recovered provider", () => {
-  beforeEach(resetRebuildFlowTestEnvironment);
-  afterEach(restoreRebuildFlowTestEnvironment);
+  installRebuildFlowTestHooks({ acceptThirdPartySoftware: true });
+
+  it.each([null, {}, { providerId: "" }])(
+    "rejects malformed native authority before any rebuild mutation (%j)",
+    async (nativeNvidiaProviderAttachment) => {
+      const harness = createRebuildFlowHarness({
+        agentName: "langchain-deepagents-code",
+        sandboxEntry: {
+          ...makeDcodeSandboxEntry(),
+          provider: "nvidia-prod",
+          nativeNvidiaProviderAttachment,
+        },
+      });
+      configureDcodeSession(harness);
+
+      await expect(
+        harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
+      ).rejects.toThrow("Malformed native provider attachment; sandbox is untouched");
+
+      expect(harness.preflightDcodeRouteSpy).not.toHaveBeenCalled();
+      expect(harness.prepareManagedDcodeRebuildImageSpy).not.toHaveBeenCalled();
+      expectNoDcodeMutation(harness);
+    },
+  );
 
   it("rejects incompatible keyless provider reuse after the live DCode route proof", async () => {
     const restoreEnv = snapshotEnv(["COMPATIBLE_API_KEY"]);
@@ -66,13 +87,15 @@ describe("rebuildSandbox DCode recovered provider", () => {
       const harness = createRebuildFlowHarness({
         agentName: "langchain-deepagents-code",
         sandboxEntry: makeDcodeSandboxEntry(),
-        sandboxListOutput: "alpha Error",
+        sandboxInventory: {
+          sandboxes: [{ name: "alpha", phase: "Error", readiness: "terminal" }],
+        },
         preDeleteLatestManifest: recoveryManifest,
       });
       configureDcodeSession(harness);
       setGatewayProviderMetadata(
         harness,
-        "Name: compatible-endpoint\nType: openai\nCredential keys: COMPATIBLE_API_KEY\n",
+        "Name: compatible-endpoint\nType: openai\nCredential keys: COMPATIBLE_API_KEY\nConfig keys: <none>\n",
       );
 
       await expect(

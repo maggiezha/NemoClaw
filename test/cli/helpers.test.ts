@@ -14,7 +14,7 @@ import {
   sourceLoaderNodeOptions,
 } from "../helpers/source-loader-options";
 import { testTimeoutOptions } from "../helpers/timeouts";
-import { runWithEnv } from "./helpers";
+import { runCliScriptAsync, runWithEnv } from "./helpers";
 
 const tempDirs = new Set<string>();
 
@@ -53,31 +53,29 @@ describe("source-loader Node options", () => {
     ).toBe(inspect);
   });
 
-  it("preserves malformed or unrelated options byte-for-byte (#6245)", () => {
+  it.each([
+    '--conditions="development mode --trace-warnings',
+    "--conditions='development mode --trace-warnings",
+    "--conditions=trailing\\",
+  ])("preserves malformed or unrelated options byte-for-byte [%s] (#6245)", (malformed) => {
     const nodeOptions =
       '--require=/tmp/onboard-script-mocks.cjs.backup --conditions="development mode"';
-    const malformedOptions = [
-      '--conditions="development mode --trace-warnings',
-      "--conditions='development mode --trace-warnings",
-      "--conditions=trailing\\",
-    ];
 
     expect(nodeOptionsWithoutSourceLoader(nodeOptions)).toBe(nodeOptions);
-    for (const malformed of malformedOptions) {
-      expect(nodeOptionsWithoutSourceLoader(malformed)).toBe(malformed);
-      const loaderBeforeMalformed = `${sourceLoaderNodeOptions(undefined)} ${malformed}`;
-      expect(nodeOptionsWithoutSourceLoader(loaderBeforeMalformed)).toBe(loaderBeforeMalformed);
-    }
+
+    expect(nodeOptionsWithoutSourceLoader(malformed)).toBe(malformed);
+    const loaderBeforeMalformed = `${sourceLoaderNodeOptions(undefined)} ${malformed}`;
+    expect(nodeOptionsWithoutSourceLoader(loaderBeforeMalformed)).toBe(loaderBeforeMalformed);
   });
 
-  it("preserves malformed source-loader assignments byte-for-byte (#6245)", () => {
-    const hook = "hook";
-    const malformedAssignments = ["--require='hook", '--require="hook', '--require=foo"bar'];
+  it.each(["--require='hook", '--require="hook', '--require=foo"bar'])(
+    "preserves malformed source-loader assignments byte-for-byte [%s] (#6245)",
+    (malformed) => {
+      const hook = "hook";
 
-    for (const malformed of malformedAssignments) {
       expect(nodeOptionsWithoutSourceLoader(malformed, hook)).toBe(malformed);
-    }
-  });
+    },
+  );
 
   it("removes an unquoted source-loader assignment with escaped backslashes (#6245)", () => {
     const escapedWindowsHook = String.raw`C:\\path\\hook`;
@@ -233,6 +231,23 @@ describe("source-loader Node options", () => {
     } finally {
       mkdtemp.mockRestore();
     }
+  });
+
+  it("rejects an async CLI run when implicit HOME cleanup fails", async () => {
+    const cleanupError = new Error("cleanup failed");
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-cleanup-error-"));
+    tempDirs.add(directory);
+    const script = path.join(directory, "exit.cjs");
+    fs.writeFileSync(script, "");
+
+    await expect(
+      runCliScriptAsync(script, "", {
+        removeImplicitHome: (home) => {
+          fs.rmSync(home, { force: true, recursive: true });
+          throw cleanupError;
+        },
+      }),
+    ).rejects.toBe(cleanupError);
   });
 
   it("quotes preload paths that contain spaces for Node (#6245)", () => {

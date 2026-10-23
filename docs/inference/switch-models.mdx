@@ -29,22 +29,25 @@ Use the provider ID in the output with the new model ID.
 Runtime model changes update the OpenShell route and synchronize the selected running agent configuration.
 Pass `--sandbox <name>` when you do not want to use the default sandbox.
 
-Open the sandbox for managed configuration changes, switch the model, and restore shields.
+Switch the model with one host command.
 
 ```bash
-$$nemoclaw <name> shields down
 $$nemoclaw inference set --provider <provider> --model <new-model> --sandbox <name>
-$$nemoclaw <name> shields up
 ```
 
 For a compatible endpoint, omit `--endpoint-url` when the durable registry entry already contains the endpoint and API-family metadata.
 NemoClaw reuses the recorded route and does not repoint the gateway.
 You can also re-supply the same endpoint URL when the registry records that onboarding established it.
-NemoClaw requires an exact canonical match and does not extend that trust to a different URL or an endpoint recorded by `inference set`.
+NemoClaw requires a canonical match and does not extend that trust to a different URL or an endpoint recorded by `inference set`.
 If the route metadata is incomplete, NemoClaw stops and tells you to re-run onboarding.
 
-For Hermes, the command also mirrors the selected model into the dashboard profile.
-If it reports that the Dashboard config did not converge, the route and main Hermes config remain committed; follow [Hermes dashboard config did not converge](../../reference/troubleshooting#hermes-dashboard-config-did-not-converge) before using Dashboard Chat.
+</AgentOnly>
+
+<AgentOnly variant="hermes">
+
+For Hermes, the command recomputes the target model's context window before it updates the shared native configuration.
+NemoClaw writes `model.context_length` when it resolves a value.
+When it cannot resolve a value, NemoClaw omits the field so Hermes can discover the model metadata from the endpoint.
 
 </AgentOnly>
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { WebSearchConfig } from "../../inference/web-search";
+import type { OpenShellRuntimeSelection } from "../../adapters/openshell/runtime-selection";
 import type { DcodeAutoApprovalMode } from "../../onboard/dcode-auto-approval";
 import type { Session } from "../../state/onboard-session";
 import type { ToolDisclosure } from "../../tool-disclosure";
@@ -12,19 +13,24 @@ import {
   type PreparedDcodeReplacement,
   prepareDcodeReplacementBeforeMutation,
   revalidateDcodeReplacementAtMutationEdge,
+  revalidateManagedDcodeWorkloadAtMutationEdge,
 } from "./rebuild-dcode-preflight";
 import { DCODE_AGENT_NAME } from "./rebuild-dcode-target";
 import type { RebuildAgentBaseImageOptions, RebuildSandboxEntry } from "./rebuild-flow-helpers";
 import type { RebuildResumeConfig } from "./rebuild-resume-config";
 
 type DcodeRebuildOrchestratorDeps = {
-  checkGatewaySchema(sandboxName: string, bail: DcodeRebuildPreflightBail): boolean;
+  checkGatewaySchema(
+    sandboxName: string,
+    bail: DcodeRebuildPreflightBail,
+    runtimeSelection?: OpenShellRuntimeSelection,
+  ): boolean | Promise<boolean>;
   preflightCredentials(
     sandboxName: string,
     entry: RebuildSandboxEntry,
     log: (message: string) => void,
     bail: DcodeRebuildPreflightBail,
-  ): boolean;
+  ): boolean | Promise<boolean>;
   ensureAgentBaseImage(
     agentName: string | null,
     bail: DcodeRebuildPreflightBail,
@@ -36,6 +42,7 @@ type CreateDcodeRebuildOrchestratorOptions = {
   sandboxName: string;
   entry: RebuildSandboxEntry;
   rebuildAgent: string | null;
+  managedWorkloadRebuild?: boolean;
   log(message: string): void;
   bail: DcodeRebuildPreflightBail;
   deps: DcodeRebuildOrchestratorDeps;
@@ -46,7 +53,7 @@ export type DcodeRebuildOrchestrator = {
   readonly preparedReplacement: PreparedDcodeReplacement | null;
   run<T>(action: () => Promise<T>): Promise<T>;
   runSync<T>(action: () => T): T;
-  preflightCredentials(): Promise<boolean>;
+  preflightCredentials(runtimeSelection?: OpenShellRuntimeSelection): Promise<boolean>;
   prepareImage(
     resumeConfig: RebuildResumeConfig,
     webSearchConfig: WebSearchConfig | null,
@@ -55,6 +62,7 @@ export type DcodeRebuildOrchestrator = {
     skipLiveRoute: boolean,
     gatewayPort: number,
     baseImageOptions?: RebuildAgentBaseImageOptions,
+    runtimeSelection?: OpenShellRuntimeSelection,
   ): Promise<boolean>;
   revalidateBeforeDelete(
     resumeConfig: RebuildResumeConfig,
@@ -62,6 +70,7 @@ export type DcodeRebuildOrchestrator = {
     dcodeAutoApprovalMode: DcodeAutoApprovalMode,
     skipLiveRoute: boolean,
     gatewayPort: number,
+    runtimeSelection?: OpenShellRuntimeSelection,
   ): Promise<boolean>;
   checkAtDeleteEdge(
     resumeConfig: RebuildResumeConfig,
@@ -69,6 +78,7 @@ export type DcodeRebuildOrchestrator = {
     dcodeAutoApprovalMode: DcodeAutoApprovalMode,
     skipLiveRoute: boolean,
     gatewayPort: number,
+    runtimeSelection?: OpenShellRuntimeSelection,
   ): Promise<{ ok: true } | { ok: false; message: string; code?: number }>;
   clearManagedCustomDockerfile(session: Session): void;
   storedDockerfile(sessionMatchesSandbox: boolean, session: Session | null): string | null;
@@ -97,7 +107,15 @@ export function isDcodeRebuildAgent(agentName: string | null): boolean {
 export function createDcodeRebuildOrchestrator(
   options: CreateDcodeRebuildOrchestratorOptions,
 ): DcodeRebuildOrchestrator {
-  const { sandboxName, entry, rebuildAgent, log, bail, deps } = options;
+  const {
+    sandboxName,
+    entry,
+    rebuildAgent,
+    managedWorkloadRebuild = false,
+    log,
+    bail,
+    deps,
+  } = options;
   const scope = createDcodeRebuildPreflightScope(isDcodeRebuildAgent(rebuildAgent), bail);
 
   const run = async <T>(action: () => Promise<T>): Promise<T> => {
@@ -125,15 +143,23 @@ export function createDcodeRebuildOrchestrator(
     },
     run,
     runSync,
-    preflightCredentials: () =>
+    preflightCredentials: (runtimeSelection) =>
       run(async () => {
         if (scope.enabled) {
           if (
-            !(await ensureDcodeRebuildTargetGatewaySelected(sandboxName, entry, log, scope.bail))
+            !(await ensureDcodeRebuildTargetGatewaySelected(
+              sandboxName,
+              entry,
+              log,
+              scope.bail,
+              runtimeSelection,
+            ))
           ) {
             return false;
           }
-          if (!deps.checkGatewaySchema(sandboxName, scope.bail)) return false;
+          if (!(await deps.checkGatewaySchema(sandboxName, scope.bail, runtimeSelection))) {
+            return false;
+          }
         }
         return deps.preflightCredentials(sandboxName, entry, log, scope.bail);
       }),
@@ -145,10 +171,27 @@ export function createDcodeRebuildOrchestrator(
       skipLiveRoute,
       gatewayPort,
       baseImageOptions,
+      runtimeSelection,
     ) =>
       run(async () => {
         if (!scope.enabled) {
           return deps.ensureAgentBaseImage(rebuildAgent, scope.bail, baseImageOptions);
+        }
+        if (managedWorkloadRebuild) {
+          return revalidateManagedDcodeWorkloadAtMutationEdge({
+            sandboxName,
+            entry,
+            resumeConfig,
+            toolDisclosure,
+            dcodeAutoApprovalMode,
+            skipLiveRoute,
+            gatewayPort,
+            log,
+            bail: scope.bail,
+            checkGatewaySchema: (selection) =>
+              deps.checkGatewaySchema(sandboxName, scope.bail, selection),
+            runtimeSelection,
+          });
         }
         const replacement = await prepareDcodeReplacementBeforeMutation({
           sandboxName,
@@ -159,9 +202,12 @@ export function createDcodeRebuildOrchestrator(
           dcodeAutoApprovalMode,
           skipLiveRoute,
           gatewayPort,
+          baseImageOptions,
           log,
           bail: scope.bail,
-          checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, scope.bail),
+          checkGatewaySchema: (selection) =>
+            deps.checkGatewaySchema(sandboxName, scope.bail, selection),
+          runtimeSelection,
         });
         if (!replacement) {
           scope.cleanup();
@@ -176,9 +222,26 @@ export function createDcodeRebuildOrchestrator(
       dcodeAutoApprovalMode,
       skipLiveRoute,
       gatewayPort,
+      runtimeSelection,
     ) =>
       run(async () => {
         if (!scope.enabled) return true;
+        if (managedWorkloadRebuild) {
+          return revalidateManagedDcodeWorkloadAtMutationEdge({
+            sandboxName,
+            entry,
+            resumeConfig,
+            toolDisclosure,
+            dcodeAutoApprovalMode,
+            skipLiveRoute,
+            gatewayPort,
+            log,
+            bail: scope.bail,
+            checkGatewaySchema: (selection) =>
+              deps.checkGatewaySchema(sandboxName, scope.bail, selection),
+            runtimeSelection,
+          });
+        }
         const replacement = scope.preparedReplacement;
         if (!replacement) return scope.bail("DCode replacement preflight was not retained.");
         return revalidateDcodeReplacementAtMutationEdge({
@@ -191,7 +254,9 @@ export function createDcodeRebuildOrchestrator(
           gatewayPort,
           log,
           bail: scope.bail,
-          checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, scope.bail),
+          checkGatewaySchema: (selection) =>
+            deps.checkGatewaySchema(sandboxName, scope.bail, selection),
+          runtimeSelection,
           replacement,
         });
       }),
@@ -201,34 +266,54 @@ export function createDcodeRebuildOrchestrator(
       dcodeAutoApprovalMode,
       skipLiveRoute,
       gatewayPort,
+      runtimeSelection,
     ) => {
       if (!scope.enabled) return { ok: true };
       const replacement = scope.preparedReplacement;
-      if (!replacement) {
+      if (!managedWorkloadRebuild && !replacement) {
         return { ok: false, message: "DCode replacement preflight was not retained." };
       }
       const capturedBail = (message: string, code?: number): never => {
         throw new CapturedDcodeRebuildBail(message, code);
       };
       try {
-        const valid = await revalidateDcodeReplacementAtMutationEdge({
-          sandboxName,
-          entry,
-          resumeConfig,
-          toolDisclosure,
-          dcodeAutoApprovalMode,
-          skipLiveRoute,
-          gatewayPort,
-          log,
-          bail: capturedBail,
-          checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, capturedBail),
-          replacement,
-        });
+        const valid = await (managedWorkloadRebuild
+          ? revalidateManagedDcodeWorkloadAtMutationEdge({
+              sandboxName,
+              entry,
+              resumeConfig,
+              toolDisclosure,
+              dcodeAutoApprovalMode,
+              skipLiveRoute,
+              gatewayPort,
+              log,
+              bail: capturedBail,
+              checkGatewaySchema: (selection) =>
+                deps.checkGatewaySchema(sandboxName, capturedBail, selection),
+              runtimeSelection,
+            })
+          : revalidateDcodeReplacementAtMutationEdge({
+              sandboxName,
+              entry,
+              resumeConfig,
+              toolDisclosure,
+              dcodeAutoApprovalMode,
+              skipLiveRoute,
+              gatewayPort,
+              log,
+              bail: capturedBail,
+              checkGatewaySchema: (selection) =>
+                deps.checkGatewaySchema(sandboxName, capturedBail, selection),
+              runtimeSelection,
+              replacement: replacement!,
+            }));
         if (!valid) {
           scope.cleanup();
           return {
             ok: false,
-            message: "DCode replacement validation failed before sandbox deletion.",
+            message: managedWorkloadRebuild
+              ? "Managed DCode workload validation failed before sandbox deletion."
+              : "DCode replacement validation failed before sandbox deletion.",
           };
         }
         return { ok: true };

@@ -3,9 +3,14 @@
 
 import { dockerContainerInspectFormat } from "../../adapters/docker/inspect";
 import { dockerCapture } from "../../adapters/docker/run";
-import { findLabeledSandboxContainers } from "../../onboard/docker-driver-sandbox-recovery";
+import { resolveSandboxContainerOwner } from "../../domain/sandbox/container-owner";
+import { findLabeledSandboxContainers } from "../../onboard/docker-driver-container-observation";
 import * as registry from "../../state/registry";
-import { resolveSandboxContainerOwner } from "./sandbox-container-owner";
+import {
+  findSandboxAcrossGatewayRoots,
+  listPublishedSandboxNamesAcrossGatewayRoots,
+} from "../../state/registry/cross-port";
+import type { SandboxEntry } from "../../state/registry/types";
 
 export type DockerHealthState = "healthy" | "unhealthy" | "starting" | "none" | "unknown";
 
@@ -16,7 +21,7 @@ export interface SandboxDockerHealth {
 
 /**
  * Combined Docker runtime view for a docker-driver sandbox container: the
- * HEALTHCHECK signal plus whether the container is paused (`docker pause`).
+ * HEALTHCHECK signal plus whether the container is running or paused (`docker pause`).
  * A paused container can surface upstream as `Phase: Error` even though the
  * sandbox is intact, so `status` reads `paused` to print a recovery hint
  * without rewriting the authoritative phase. See #4495.
@@ -24,11 +29,16 @@ export interface SandboxDockerHealth {
 export interface SandboxDockerRuntime {
   health: DockerHealthState;
   paused: boolean;
+  running: boolean;
   containerName: string | null;
+  /** True only after a successful owned-container observation returned no rows. */
+  containerAbsenceConfirmed: boolean;
+  /** A failed container lookup cannot establish an identity mismatch. */
+  containerObservationFailed?: boolean;
 }
 
 interface ResolveDeps {
-  getSandbox: (name: string) => registry.SandboxEntry | null;
+  getSandbox: (name: string) => SandboxEntry | null;
   listSandboxNames: () => string[];
   dockerPsNames: () => string;
   findLabeledSandboxContainers: typeof findLabeledSandboxContainers;
@@ -36,11 +46,29 @@ interface ResolveDeps {
   dockerInspectPaused: (containerName: string) => string;
 }
 
+export function listPublishedSandboxNamesForDockerRuntime(): string[] {
+  return listPublishedSandboxNamesAcrossGatewayRoots();
+}
+
+function missingDockerRuntime(containerAbsenceConfirmed = false): SandboxDockerRuntime {
+  return {
+    health: "none",
+    paused: false,
+    running: false,
+    containerName: null,
+    containerAbsenceConfirmed,
+  };
+}
+
 const defaultDeps: ResolveDeps = {
-  getSandbox: (name) => registry.getSandbox(name),
-  listSandboxNames: () => registry.listSandboxes().sandboxes.map((entry) => entry.name),
+  getSandbox: (name) => {
+    const entry = findSandboxAcrossGatewayRoots(name)?.entry ?? null;
+    return entry && registry.isPublishedSandboxRegistration(entry) ? entry : null;
+  },
+  listSandboxNames: listPublishedSandboxNamesForDockerRuntime,
   dockerPsNames: () => dockerCapture(["ps", "--format", "{{.Names}}"], { ignoreError: true }),
-  findLabeledSandboxContainers: (sandboxName) => findLabeledSandboxContainers(sandboxName),
+  findLabeledSandboxContainers: (sandboxName) =>
+    findLabeledSandboxContainers(sandboxName, { ignoreError: false }),
   dockerInspectHealth: (containerName) =>
     dockerContainerInspectFormat(
       "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
@@ -55,17 +83,23 @@ const defaultDeps: ResolveDeps = {
     ),
 };
 
+/** True only when the registry records the sandbox on the docker driver. */
+export function isDockerDriverSandbox(
+  sandboxName: string,
+  getSandbox: ResolveDeps["getSandbox"] = defaultDeps.getSandbox,
+): boolean {
+  try {
+    return getSandbox(sandboxName)?.openshellDriver === "docker";
+  } catch {
+    return false;
+  }
+}
+
 function resolveDockerDriverSandboxContainer(
   sandboxName: string,
   deps: ResolveDeps,
 ): string | null {
-  try {
-    if (deps.getSandbox(sandboxName)?.openshellDriver !== "docker") {
-      return null;
-    }
-  } catch {
-    return null;
-  }
+  if (!isDockerDriverSandbox(sandboxName, deps.getSandbox)) return null;
   return resolveSandboxContainerOwner(deps.dockerPsNames(), sandboxName, deps.listSandboxNames());
 }
 
@@ -110,30 +144,24 @@ function normalizePausedState(raw: string): boolean {
 
 /**
  * Resolve an OpenShell-labeled docker-driver sandbox container across all states
- * and read both its HEALTHCHECK state and `.State.Paused` flag. Label-scoped
- * discovery matches the ownership boundary enforced by `start`; preferring its
- * running rows preserves paused-container guidance before falling back to an
- * exited container that `start` can recover (#7222). Returns `health: "none",
- * paused: false` when the sandbox is not on the docker driver or no owned
- * container is found. See #4495.
+ * and read its HEALTHCHECK state, running state, and `.State.Paused` flag.
+ * Label-scoped discovery matches the ownership boundary enforced by `start`;
+ * preferring its running rows preserves paused-container guidance before
+ * falling back to an exited container that `start` can recover (#7222).
+ * Returns `health: "none"`, `paused: false`, and `running: false` when the
+ * sandbox is not on the docker driver or no owned container is found. See #4495.
  */
 export function getSandboxDockerRuntime(
   sandboxName: string,
   depsOverride: Partial<ResolveDeps> = {},
 ): SandboxDockerRuntime {
   const deps: ResolveDeps = { ...defaultDeps, ...depsOverride };
-  try {
-    if (deps.getSandbox(sandboxName)?.openshellDriver !== "docker") {
-      return { health: "none", paused: false, containerName: null };
-    }
-  } catch {
-    return { health: "none", paused: false, containerName: null };
-  }
+  if (!isDockerDriverSandbox(sandboxName, deps.getSandbox)) return missingDockerRuntime();
   let labeledContainers: ReturnType<typeof findLabeledSandboxContainers>;
   try {
     labeledContainers = deps.findLabeledSandboxContainers(sandboxName);
   } catch {
-    return { health: "none", paused: false, containerName: null };
+    return { ...missingDockerRuntime(), containerObservationFailed: true };
   }
   const runningNames = labeledContainers
     .filter((container) => container.running)
@@ -149,7 +177,12 @@ export function getSandboxDockerRuntime(
       ...deps,
       dockerPsNames: () => allNames,
     });
-  if (!containerName) return { health: "none", paused: false, containerName: null };
+  if (!containerName) {
+    return missingDockerRuntime(labeledContainers.length === 0);
+  }
+  const running = labeledContainers.some(
+    (container) => container.name === containerName && container.running,
+  );
   let health: DockerHealthState;
   try {
     health = normalizeHealthState(deps.dockerInspectHealth(containerName));
@@ -162,5 +195,5 @@ export function getSandboxDockerRuntime(
   } catch {
     paused = false;
   }
-  return { health, paused, containerName };
+  return { health, paused, running, containerName, containerAbsenceConfirmed: false };
 }

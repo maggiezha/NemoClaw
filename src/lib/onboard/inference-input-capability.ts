@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { resolveVllmModelAlias } from "../inference/vllm-models";
+
 type InferenceInputCapabilityDeps = {
   env?: NodeJS.ProcessEnv;
   isNonInteractive: () => boolean;
@@ -8,8 +10,7 @@ type InferenceInputCapabilityDeps = {
 };
 
 const VALID_INFERENCE_INPUTS = new Set(["text", "image"]);
-const MULTIMODAL_MODEL_HINT_PATTERN =
-  /(^|[\/:_\-.])(omni|vision|vl|image|multimodal)([\/:_\-.]|$)/i;
+const MULTIMODAL_MODEL_HINT_PATTERN = /(^|[/:_\-.])(omni|vision|vl|image|multimodal)([/:_\-.]|$)/i;
 
 export function isValidInferenceInputsOverride(value: string | undefined): boolean {
   if (!value) return false;
@@ -29,13 +30,21 @@ export async function maybePromptForInferenceInputCapability(
   deps: InferenceInputCapabilityDeps,
 ): Promise<void> {
   const env = deps.env || process.env;
-  if (
-    deps.isNonInteractive() ||
-    !shouldPromptForInferenceInputCapability(model) ||
-    isValidInferenceInputsOverride(env.NEMOCLAW_INFERENCE_INPUTS)
-  ) {
+  if (isValidInferenceInputsOverride(env.NEMOCLAW_INFERENCE_INPUTS)) return;
+  // The hosted model has a different identity from the local NVFP4 checkpoint.
+  if (model === "nvidia/nemotron-3.5-super-vl-120b-a12b") {
+    env.NEMOCLAW_INFERENCE_INPUTS = "text,image";
     return;
   }
+  if (deps.isNonInteractive()) {
+    // Unattended onboarding cannot answer the vision prompt. Use declared
+    // catalog capabilities, never a model-name hint, for its default.
+    if (model && resolveVllmModelAlias(model)?.capabilities?.multimodal) {
+      env.NEMOCLAW_INFERENCE_INPUTS = "text,image";
+    }
+    return;
+  }
+  if (!shouldPromptForInferenceInputCapability(model)) return;
 
   console.log("");
   console.log(`  Selected model: ${model}`);

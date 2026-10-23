@@ -3,12 +3,20 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { OpenShellForwardObservation } from "../adapters/openshell/forward";
+import type { OpenShellForwardPortObserver } from "./dashboard-port";
 import {
+  authoritativeRebuildSandboxFlowOptions,
+  authoritativeRebuildRuntimePreflightOptions,
+  beginAuthoritativeRebuildRuntimeSelectionScope,
   type AuthoritativeRebuildTargetDeps,
+  type AuthoritativeRebuildPreflightOptions,
   preflightAuthoritativeRebuildTarget,
   rebuildProviderFlowOptions,
   resolveAuthoritativeOnboardGatewayBinding,
+  resolveAuthoritativeRebuildDashboardBind,
 } from "./authoritative-rebuild-target";
+import type { InferenceRouteState } from "./inference-route";
 import {
   mintProviderRecoveryReceipt,
   type ProviderRecoveryReceiptTarget,
@@ -23,13 +31,132 @@ const target = {
 };
 const originalGateway = process.env.OPENSHELL_GATEWAY;
 
+function forwardObserver(
+  state: "absent" | "foreign" | "owned" | "stale" | "indeterminate" = "owned",
+): OpenShellForwardPortObserver {
+  return vi.fn<OpenShellForwardPortObserver>(async (ports) =>
+    ports.map((port): OpenShellForwardObservation => {
+      const forward = {
+        gatewayEndpoint: "https://127.0.0.1:12345",
+        gatewayName: "nemoclaw-12345",
+        workspace: "default",
+        sandboxName: "alpha",
+        localHost: "127.0.0.1" as const,
+        port,
+      };
+      return state === "indeterminate"
+        ? {
+            state,
+            forward,
+            error: {
+              kind: "ownership",
+              message: "NemoClaw could not prove OpenShell forward ownership.",
+            },
+          }
+        : { state, forward };
+    }),
+  );
+}
+
+describe("authoritative rebuild sandbox flow options", () => {
+  it("carries only the bounded live OpenShell policy handoff", () => {
+    const projected = authoritativeRebuildSandboxFlowOptions({
+      authoritativeResumeConfig: true,
+      rebuildPolicySourcePath: "/tmp/current-policy.yaml",
+    });
+
+    expect(projected).toEqual({
+      authoritativeResumeConfig: true,
+      rebuildPolicySourcePath: "/tmp/current-policy.yaml",
+    });
+    expect(
+      authoritativeRebuildSandboxFlowOptions({
+        authoritativeResumeConfig: false,
+      }),
+    ).toEqual({ authoritativeResumeConfig: false });
+  });
+});
+
+describe("authoritative rebuild runtime preflight options", () => {
+  it("carries target GPU state and recorded rebuild readiness authority (#9292)", () => {
+    const options = {
+      authoritativeResumeConfig: true,
+      sandboxName: "alpha",
+      provider: "vllm-local",
+      model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      targetGatewayName: "nemoclaw-12345",
+      targetGatewayPort: 12345,
+      controlUiPort: null,
+      sandboxGpu: "enable",
+      sandboxGpuDevice: "nvidia.com/gpu=all",
+      noGpu: false,
+      allowDeferredN1xManagedVllm: true,
+      allowLegacyDgxStationQualification: true,
+    } satisfies AuthoritativeRebuildPreflightOptions;
+
+    expect(authoritativeRebuildRuntimePreflightOptions(options)).toEqual({
+      sandboxGpu: "enable",
+      sandboxGpuDevice: "nvidia.com/gpu=all",
+      noGpu: false,
+      allowDeferredN1xManagedVllm: true,
+      allowLegacyDgxStationQualification: true,
+    });
+
+    const {
+      allowDeferredN1xManagedVllm: _recordedIntent,
+      allowLegacyDgxStationQualification: _legacyStationAuthority,
+      ...withoutRecordedIntent
+    } = options;
+    expect(authoritativeRebuildRuntimePreflightOptions(withoutRecordedIntent)).toEqual({
+      sandboxGpu: "enable",
+      sandboxGpuDevice: "nvidia.com/gpu=all",
+      noGpu: false,
+      allowDeferredN1xManagedVllm: false,
+      allowLegacyDgxStationQualification: false,
+    });
+  });
+});
+
+describe("authoritative rebuild dashboard bind", () => {
+  it.each([
+    {
+      scenario: "persisted remote preparation",
+      env: {},
+      context: { sandbox: { dashboardRemoteBindPrepared: true }, wsl: false },
+    },
+    {
+      scenario: "current remote request",
+      env: { NEMOCLAW_DASHBOARD_BIND: "0.0.0.0" },
+      context: { sandbox: null, wsl: false },
+    },
+    {
+      scenario: "WSL host",
+      env: {},
+      context: { sandbox: null, wsl: true },
+    },
+  ])("preserves a remote bind for $scenario", ({ env, context }) => {
+    expect(resolveAuthoritativeRebuildDashboardBind(env, context)).toBe("0.0.0.0");
+  });
+
+  it("keeps an unprepared native dashboard on loopback", () => {
+    expect(
+      resolveAuthoritativeRebuildDashboardBind(
+        {},
+        { sandbox: { dashboardRemoteBindPrepared: false }, wsl: false },
+      ),
+    ).toBe("127.0.0.1");
+  });
+});
+
 function deps(overrides: Partial<AuthoritativeRebuildTargetDeps> = {}) {
   return {
+    resolveBaselinePolicy: vi.fn(() => ({})),
+    bindGatewayAuthority: vi.fn(),
     runFatalRuntimePreflight: vi.fn(),
     ensureOpenshell: vi.fn(),
-    inferenceRouteReady: vi.fn(() => true),
-    captureForwardList: vi.fn(() => "alpha 127.0.0.1 18789 42 active"),
-    checkPort: vi.fn(async () => ({ ok: true })),
+    assertGatewayReadiness: vi.fn(),
+    inferenceRouteState: vi.fn((): InferenceRouteState => "matched"),
+    observeForwardPorts: forwardObserver(),
     ...overrides,
   } satisfies AuthoritativeRebuildTargetDeps;
 }
@@ -66,15 +193,17 @@ describe("authoritative rebuild gateway binding", () => {
     expect(() => resolve(options)).toThrow(/only together for an authoritative rebuild resume/);
   });
 
-  it("rejects a non-canonical name or invalid target port", () => {
-    expect(() =>
-      resolve({
-        authoritativeResumeConfig: true,
-        targetGatewayName: "nemoclaw-9090",
-        targetGatewayPort: 8081,
-      }),
-    ).toThrow(/does not match port 8081/);
-    for (const port of [0, 65536, 8081.5]) {
+  it.each([0, 65536, 8081.5])(
+    "rejects a non-canonical name or invalid target port [%s]",
+    (port) => {
+      expect(() =>
+        resolve({
+          authoritativeResumeConfig: true,
+          targetGatewayName: "nemoclaw-9090",
+          targetGatewayPort: 8081,
+        }),
+      ).toThrow(/does not match port 8081/);
+
       expect(() =>
         resolve({
           authoritativeResumeConfig: true,
@@ -82,13 +211,55 @@ describe("authoritative rebuild gateway binding", () => {
           targetGatewayPort: port,
         }),
       ).toThrow(/Invalid authoritative rebuild gateway port/);
-    }
-  });
+    },
+  );
 
   it("requires a complete authoritative target when the outer lifecycle owns the lock", () => {
     expect(() => resolve({ onboardLockAlreadyHeld: true })).toThrow(
       /lock handoff requires an authoritative rebuild resume/,
     );
+  });
+});
+
+describe("authoritative rebuild OpenShell runtime selection", () => {
+  it("replaces hostile ambient selectors for inner onboard and restores them (#10514)", () => {
+    const env: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin",
+      OPENSHELL_GATEWAY: "hostile-gateway",
+      OPENSHELL_GATEWAY_AUTH_TOKEN: "hostile-token",
+      OPENSHELL_GATEWAY_ENDPOINT: "https://hostile.invalid",
+      OPENSHELL_LOCAL_TLS_DIR: "/hostile/tls",
+      OPENSHELL_WORKSPACE: "hostile-workspace",
+    };
+    const previous = { ...env };
+    const restore = beginAuthoritativeRebuildRuntimeSelectionScope(
+      {
+        authoritativeResumeConfig: true,
+        onboardLockAlreadyHeld: true,
+        recreateSandbox: true,
+        resume: true,
+        targetGatewayName: "nemoclaw-8081",
+        targetGatewayPort: 8081,
+        runtimeSelection: {
+          gatewayName: "nemoclaw-8081",
+          localTlsDir: "/authority/tls",
+          workspace: "default",
+        },
+      },
+      env,
+    );
+
+    expect(env).toMatchObject({
+      PATH: "/usr/bin",
+      OPENSHELL_GATEWAY: "nemoclaw-8081",
+      OPENSHELL_LOCAL_TLS_DIR: "/authority/tls",
+      OPENSHELL_WORKSPACE: "default",
+    });
+    expect(env.OPENSHELL_GATEWAY_AUTH_TOKEN).toBeUndefined();
+    expect(env.OPENSHELL_GATEWAY_ENDPOINT).toBeUndefined();
+
+    restore();
+    expect(env).toEqual(previous);
   });
 });
 
@@ -122,22 +293,24 @@ describe("prepared provider reconfiguration handoff", () => {
     });
   });
 
-  it("authorizes incomplete-session recovery only for the locked rebuild context", () => {
-    const recoveryOptions = { ...authorizedOptions, rebuildProviderReconfigure: undefined };
-    expect(rebuildProviderFlowOptions(recoveryOptions, providerTarget)).toMatchObject({
-      authoritativeResumeConfig: true,
-      forceInferenceSetup: false,
-    });
-    for (const options of [
-      { ...recoveryOptions, resume: false },
-      { ...recoveryOptions, recreateSandbox: false },
-      { ...recoveryOptions, onboardLockAlreadyHeld: false },
-    ]) {
+  it.each([
+    { scenario: "resume disabled", override: { resume: false } },
+    { scenario: "sandbox recreation disabled", override: { recreateSandbox: false } },
+    { scenario: "onboard lock absent", override: { onboardLockAlreadyHeld: false } },
+  ])(
+    "authorizes incomplete-session recovery only for the locked rebuild context [$scenario]",
+    ({ override }) => {
+      const recoveryOptions = { ...authorizedOptions, rebuildProviderReconfigure: undefined };
+      expect(rebuildProviderFlowOptions(recoveryOptions, providerTarget)).toMatchObject({
+        authoritativeResumeConfig: true,
+        forceInferenceSetup: false,
+      });
+      const options = { ...recoveryOptions, ...override };
       expect(() => rebuildProviderFlowOptions(options, providerTarget)).toThrow(
         "requires a preflighted locked rebuild resume",
       );
-    }
-  });
+    },
+  );
 
   it("activates a matching provider-recovery receipt and binds it to the session", () => {
     const receiptTarget: ProviderRecoveryReceiptTarget = {
@@ -198,27 +371,56 @@ describe("prepared provider reconfiguration handoff", () => {
 });
 
 describe("authoritative rebuild target preflight", () => {
+  it("binds process-local gateway authority before readiness and install (#7411)", async () => {
+    const calls: string[] = [];
+    const targetDeps = deps({
+      bindGatewayAuthority: vi.fn(() => calls.push("bind")),
+      runFatalRuntimePreflight: vi.fn(() => calls.push("readiness")),
+      ensureOpenshell: vi.fn(() => calls.push("install")),
+      assertGatewayReadiness: vi.fn(() => calls.push("post-install-readiness")),
+    });
+
+    await preflightAuthoritativeRebuildTarget(target, targetDeps);
+
+    expect(calls).toEqual(["bind", "readiness", "install", "post-install-readiness"]);
+    expect(targetDeps.bindGatewayAuthority).toHaveBeenCalledOnce();
+    expect(targetDeps.assertGatewayReadiness).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an unreadable replacement baseline before runtime probes (#7194)", async () => {
+    const targetDeps = deps({ resolveBaselinePolicy: vi.fn(() => null) });
+
+    await expect(preflightAuthoritativeRebuildTarget(target, targetDeps)).rejects.toThrow(
+      "Could not read the baseline policy",
+    );
+
+    expect(targetDeps.runFatalRuntimePreflight).not.toHaveBeenCalled();
+    expect(targetDeps.bindGatewayAuthority).not.toHaveBeenCalled();
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+    expect(targetDeps.assertGatewayReadiness).not.toHaveBeenCalled();
+    expect(targetDeps.inferenceRouteState).not.toHaveBeenCalled();
+  });
+
   it("pins the requested gateway for route and forward checks, then restores it", async () => {
     process.env.OPENSHELL_GATEWAY = "before";
     const seen: string[] = [];
-    const checkPort = vi.fn();
+    const observeForwardPorts = vi.fn<OpenShellForwardPortObserver>(async (ports) => {
+      seen.push(`forward:${process.env.OPENSHELL_GATEWAY}`);
+      return forwardObserver("owned")(ports);
+    });
     await preflightAuthoritativeRebuildTarget(
       target,
       deps({
-        inferenceRouteReady: vi.fn(() => {
+        inferenceRouteState: vi.fn((): InferenceRouteState => {
           seen.push(`route:${process.env.OPENSHELL_GATEWAY}`);
-          return true;
+          return "matched";
         }),
-        captureForwardList: vi.fn(() => {
-          seen.push(`forward:${process.env.OPENSHELL_GATEWAY}`);
-          return "alpha 127.0.0.1 18789 42 active";
-        }),
-        checkPort,
+        observeForwardPorts,
       }),
     );
 
     expect(seen).toEqual(["route:nemoclaw-12345", "forward:nemoclaw-12345"]);
-    expect(checkPort).not.toHaveBeenCalled();
+    expect(observeForwardPorts).toHaveBeenCalledWith([18789]);
     expect(process.env.OPENSHELL_GATEWAY).toBe("before");
   });
 
@@ -226,13 +428,25 @@ describe("authoritative rebuild target preflight", () => {
     await expect(
       preflightAuthoritativeRebuildTarget(
         target,
-        deps({ inferenceRouteReady: vi.fn(() => false) }),
+        deps({ inferenceRouteState: vi.fn((): InferenceRouteState => "mismatched") }),
       ),
     ).rejects.toThrow("inference route does not match");
   });
 
+  it("proceeds when the gateway cannot answer the route query (#9310)", async () => {
+    const targetDeps = deps({
+      inferenceRouteState: vi.fn((): InferenceRouteState => "unanswered"),
+    });
+
+    await expect(preflightAuthoritativeRebuildTarget(target, targetDeps)).resolves.toBeUndefined();
+
+    expect(targetDeps.inferenceRouteState).toHaveBeenCalledOnce();
+  });
+
   it("defers route validation for prepared recovery until authoritative onboard (#6114)", async () => {
-    const targetDeps = deps({ inferenceRouteReady: vi.fn(() => false) });
+    const targetDeps = deps({
+      inferenceRouteState: vi.fn((): InferenceRouteState => "mismatched"),
+    });
 
     await expect(
       preflightAuthoritativeRebuildTarget(
@@ -241,7 +455,7 @@ describe("authoritative rebuild target preflight", () => {
       ),
     ).resolves.toBeUndefined();
 
-    expect(targetDeps.inferenceRouteReady).not.toHaveBeenCalled();
+    expect(targetDeps.inferenceRouteState).not.toHaveBeenCalled();
     expect(targetDeps.runFatalRuntimePreflight).toHaveBeenCalledOnce();
     expect(targetDeps.ensureOpenshell).toHaveBeenCalledOnce();
   });
@@ -250,21 +464,50 @@ describe("authoritative rebuild target preflight", () => {
     await expect(
       preflightAuthoritativeRebuildTarget(
         target,
-        deps({ captureForwardList: vi.fn(() => "beta 127.0.0.1 18789 42 active") }),
+        deps({ observeForwardPorts: forwardObserver("foreign") }),
       ),
-    ).rejects.toThrow("belongs to sandbox 'beta'");
+    ).rejects.toThrow("not owned by sandbox 'alpha'");
   });
 
-  it("rejects an occupied dashboard port with no OpenShell owner", async () => {
+  it("accepts a port that typed observation proves absent", async () => {
     await expect(
       preflightAuthoritativeRebuildTarget(
         target,
+        deps({ observeForwardPorts: forwardObserver("absent") }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("accepts an authority-proved stale forward for the exact rebuild target", async () => {
+    await expect(
+      preflightAuthoritativeRebuildTarget(
+        target,
+        deps({ observeForwardPorts: forwardObserver("stale") }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects indeterminate dashboard-port ownership", async () => {
+    await expect(
+      preflightAuthoritativeRebuildTarget(
+        target,
+        deps({ observeForwardPorts: forwardObserver("indeterminate") }),
+      ),
+    ).rejects.toThrow(/Cannot prove dashboard port 18789 ownership/);
+  });
+
+  it("skips forward observation when the rebuild has no dashboard port", async () => {
+    const observer = forwardObserver("foreign");
+
+    await expect(
+      preflightAuthoritativeRebuildTarget(
+        { ...target, controlUiPort: null },
         deps({
-          captureForwardList: vi.fn(() => ""),
-          checkPort: vi.fn(async () => ({ ok: false, process: "node", pid: 99, reason: "" })),
+          observeForwardPorts: observer,
         }),
       ),
-    ).rejects.toThrow("occupied by node (PID 99)");
+    ).resolves.toBeUndefined();
+    expect(observer).not.toHaveBeenCalled();
   });
 
   it("restores gateway scope when a fatal runtime check throws", async () => {
@@ -280,5 +523,49 @@ describe("authoritative rebuild target preflight", () => {
       ),
     ).rejects.toThrow("fatal runtime gate");
     expect(process.env.OPENSHELL_GATEWAY).toBe("before");
+  });
+
+  it("awaits async runtime readiness before OpenShell and route checks", async () => {
+    let releaseRuntime!: () => void;
+    const runtimeReady = new Promise<void>((resolve) => {
+      releaseRuntime = resolve;
+    });
+    const calls: string[] = [];
+    const targetDeps = deps({
+      runFatalRuntimePreflight: vi.fn(async () => {
+        calls.push("runtime-start");
+        await runtimeReady;
+        calls.push("runtime-end");
+      }),
+      ensureOpenshell: vi.fn(() => calls.push("openshell")),
+      assertGatewayReadiness: vi.fn(() => calls.push("gateway")),
+      inferenceRouteState: vi.fn((): InferenceRouteState => {
+        calls.push("route");
+        return "matched";
+      }),
+    });
+
+    const pending = preflightAuthoritativeRebuildTarget(target, targetDeps);
+    await vi.waitFor(() => expect(calls).toEqual(["runtime-start"]));
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+
+    releaseRuntime();
+    await pending;
+    expect(calls).toEqual(["runtime-start", "runtime-end", "openshell", "gateway", "route"]);
+  });
+
+  it("stops rebuild checks when async runtime readiness rejects", async () => {
+    const targetDeps = deps({
+      runFatalRuntimePreflight: vi.fn(async () => {
+        throw new Error("gateway readiness changed");
+      }),
+    });
+
+    await expect(preflightAuthoritativeRebuildTarget(target, targetDeps)).rejects.toThrow(
+      "gateway readiness changed",
+    );
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+    expect(targetDeps.assertGatewayReadiness).not.toHaveBeenCalled();
+    expect(targetDeps.inferenceRouteState).not.toHaveBeenCalled();
   });
 });

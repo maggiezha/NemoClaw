@@ -135,10 +135,10 @@ describe("credential-free test discovery", () => {
     const rows = discoverCredentialFreeTests();
     expect(rows.length).toBeGreaterThan(0);
     expect(rows).toEqual([...rows].sort((left, right) => left.id.localeCompare(right.id)));
-    for (const row of rows) {
+    rows.forEach((row) => {
       expect(Object.keys(row)).toEqual(["id", "file", "project"]);
       expect(row.file).toMatch(/^test\/.+\.test\.(?:js|ts)$/);
-    }
+    });
   });
 
   it("prints one compact JSON matrix line from the CLI", () => {
@@ -155,7 +155,7 @@ describe("credential-free test discovery", () => {
   });
 
   it("rejects selector arguments owned by the workflow planner", () => {
-    const result = spawnSync(TSX, [CREDENTIAL_FREE_TESTS_CLI, "--jobs", "docs-validation"], {
+    const result = spawnSync(TSX, [CREDENTIAL_FREE_TESTS_CLI, "--jobs", "vllm-docker-storage"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       timeout: 30_000,

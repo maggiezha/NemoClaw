@@ -13,6 +13,7 @@ def sorted_deep(value):
 
 def render_merged_config(merged, header_lines):
     try:
+        import tomli_w
         rendered = tomli_w.dumps(sorted_deep(merged))
     except Exception:
         fail("merged config could not be serialized safely")

@@ -93,18 +93,17 @@ describe("buildCompletionModel", () => {
 });
 
 describe("generateCompletionScript", () => {
-  it.each([
-    "bash",
-    "zsh",
-    "fish",
-  ] as const)("generates %s from the same metadata model", (shell) => {
-    const script = generateCompletionScript(shell, COMMANDS, "nemoclaw");
-    expect(script).toContain("credentials add");
-    expect(script).toContain("gateway-token");
-    expect(script).toContain("completion --list-sandbox-names");
-    expect(script).not.toContain("nemoclaw list --json");
-    expect(script).not.toContain("credentials:add");
-  });
+  it.each(["bash", "zsh", "fish"] as const)(
+    "generates %s from the same metadata model",
+    (shell) => {
+      const script = generateCompletionScript(shell, COMMANDS, "nemoclaw");
+      expect(script).toContain("credentials add");
+      expect(script).toContain("gateway-token");
+      expect(script).toContain("completion --list-sandbox-names");
+      expect(script).not.toContain("nemoclaw list --json");
+      expect(script).not.toContain("credentials:add");
+    },
+  );
 
   it("uses the active oclif binary name", () => {
     const script = generateCompletionScript("bash", COMMANDS, "nemo-deepagents");
@@ -151,12 +150,21 @@ describe("completion actions", () => {
     expect(written[0]).toContain("#compdef nemoclaw");
   });
 
-  it("emits sorted registry names without running the full list command", () => {
+  it("emits only sorted published sandbox names (#9733)", () => {
     const written: string[] = [];
     runCompletionSandboxNamesAction({
       listRegisteredSandboxes: () => ({
         defaultSandbox: "beta",
-        sandboxes: [{ name: "beta" }, { name: "alpha" }],
+        sandboxes: [
+          { name: "beta" },
+          { name: "stale", pendingRouteReservation: true },
+          {
+            name: "created",
+            pendingRouteReservation: true,
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+          { name: "alpha" },
+        ],
       }),
       write: (output) => written.push(output),
     });

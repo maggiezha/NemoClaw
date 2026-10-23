@@ -8,12 +8,71 @@ import {
   planEntry,
   slackBindings,
   slackChannel,
+  tgBinding,
+  tgChannel,
 } from "../../../test/helpers/messaging-conflict-fixtures";
 import { SLACK_SOCKET_MODE_GATEWAY_CONFLICT_HOOK_HANDLER_ID } from "../messaging/channels/slack/hooks";
+import { TEAMS_HOST_FORWARD_PORT_CONFLICT_HOOK_HANDLER_ID } from "../messaging/channels/teams/hooks";
 import type { SandboxMessagingPlan } from "../messaging/manifest";
 import { enforceMessagingChannelConflicts } from "./messaging-conflict-guard";
+import { checkPortAvailable } from "./preflight";
+
+vi.mock("./preflight", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./preflight")>()),
+  checkPortAvailable: vi.fn(),
+}));
 
 class AbortError extends Error {}
+
+const TEAMS_HOST_FORWARD_PORT_CONFLICT_HOOK = {
+  channelId: "teams",
+  id: "teams-host-forward-port-conflict",
+  phase: "pre-enable",
+  handler: TEAMS_HOST_FORWARD_PORT_CONFLICT_HOOK_HANDLER_ID,
+  inputs: ["webhookPort"],
+  onFailure: "abort",
+} as const satisfies SandboxMessagingPlan["channels"][number]["hooks"][number];
+
+function teamsPlan(sandboxName: string): SandboxMessagingPlan {
+  return makePlan(sandboxName, {
+    channels: [
+      {
+        channelId: "teams",
+        displayName: "Microsoft Teams",
+        authMode: "token-paste",
+        active: true,
+        selected: true,
+        configured: true,
+        disabled: false,
+        inputs: [
+          {
+            channelId: "teams",
+            inputId: "webhookPort",
+            kind: "config",
+            required: false,
+            sourceEnv: "MSTEAMS_PORT",
+            statePath: "teamsConfig.webhookPort",
+            value: "3978",
+          },
+        ],
+        hostForward: { channelId: "teams", port: 3978, label: "Microsoft Teams webhook" },
+        hooks: [TEAMS_HOST_FORWARD_PORT_CONFLICT_HOOK],
+      },
+    ],
+    credentialBindings: [
+      {
+        channelId: "teams",
+        credentialId: "teamsClientSecret",
+        sourceInput: "clientSecret",
+        providerName: `${sandboxName}-teams-bridge`,
+        providerEnvKey: "MSTEAMS_APP_PASSWORD",
+        placeholder: "openshell:resolve:env:MSTEAMS_APP_PASSWORD",
+        credentialAvailable: true,
+        credentialHash: `${sandboxName}-teams-hash`,
+      },
+    ],
+  });
+}
 
 const SLACK_SOCKET_MODE_GATEWAY_CONFLICT_HOOK = {
   channelId: "slack",
@@ -69,34 +128,164 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
 
 describe("enforceMessagingChannelConflicts — Slack Socket Mode gateway axis (#4953)", () => {
   it("aborts a second Slack sandbox on the same gateway in non-interactive mode", async () => {
-    const { deps, log, error } = makeDeps();
+    const { deps, error, promptContinue } = makeDeps();
     await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
       AbortError,
     );
-    expect(log).toHaveBeenCalledWith(
+    expect(error).toHaveBeenCalledWith(
       expect.stringContaining("Slack Socket Mode is already enabled for sandbox 'alice'"),
     );
     expect(error).toHaveBeenCalledWith(
       expect.stringContaining("resolve the messaging pre-enable conflict above"),
     );
+    expect(promptContinue).not.toHaveBeenCalled();
   });
 
-  it("aborts when the interactive operator declines to continue", async () => {
-    const promptContinue = vi.fn(async () => false);
-    const { deps } = makeDeps({ isNonInteractive: () => false, promptContinue });
+  it("aborts an interactive Slack gateway conflict without prompting (#7808)", async () => {
+    const promptContinue = vi.fn(async () => true);
+    const { deps, error } = makeDeps({ isNonInteractive: () => false, promptContinue });
     await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
       AbortError,
     );
-    expect(promptContinue).toHaveBeenCalled();
-  });
-
-  it("proceeds when the interactive operator overrides the conflict", async () => {
-    const promptContinue = vi.fn(async () => true);
-    const { deps, log } = makeDeps({ isNonInteractive: () => false, promptContinue });
-    await expect(enforceMessagingChannelConflicts(deps as never)).resolves.toBeUndefined();
-    expect(log).toHaveBeenCalledWith(
+    expect(error).toHaveBeenCalledWith(
       expect.stringContaining("Slack Socket Mode is already enabled for sandbox 'alice'"),
     );
+    expect(promptContinue).not.toHaveBeenCalled();
+  });
+
+  it("aborts a reused Slack app token across gateways without prompting (#7808)", async () => {
+    const sharedAppHash = "shared-app-hash";
+    const currentPlan = {
+      ...slackPlan("bob"),
+      credentialBindings: slackBindings("bob-bot-hash", sharedAppHash, "bob"),
+    };
+    const otherPlan = {
+      ...slackPlan("alice"),
+      credentialBindings: slackBindings("alice-bot-hash", sharedAppHash, "alice"),
+    };
+    const otherSlack = {
+      ...planEntry("alice", otherPlan),
+      gatewayName: "nemoclaw-9090",
+    };
+    const promptContinue = vi.fn(async () => true);
+    const { deps, error } = makeDeps({
+      currentPlan,
+      registry: {
+        listSandboxes: () => ({ sandboxes: [otherSlack], defaultSandbox: "alice" }),
+        updateSandbox: vi.fn(() => true),
+      },
+      isNonInteractive: () => false,
+      promptContinue,
+    });
+
+    await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
+      AbortError,
+    );
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("same slack credential"));
+    expect(promptContinue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { mode: "interactive", nonInteractive: false },
+    { mode: "non-interactive", nonInteractive: true },
+  ])(
+    "aborts an enabled credential-bearing channel with an unavailable hash in $mode mode (#7808)",
+    async ({ nonInteractive }) => {
+      const currentPlan = makePlan("bob", {
+        channels: [tgChannel()],
+        credentialBindings: [{ ...tgBinding(), credentialAvailable: false }],
+      });
+      const listSandboxes = vi.fn(() => ({
+        sandboxes: [
+          planEntry(
+            "alice",
+            makePlan("alice", {
+              channels: [tgChannel()],
+              credentialBindings: [tgBinding("alice-hash")],
+            }),
+          ),
+        ],
+      }));
+      const promptContinue = vi.fn(async () => true);
+      const { deps, error, exit } = makeDeps({
+        currentPlan,
+        registry: {
+          listSandboxes,
+          updateSandbox: vi.fn(() => true),
+        },
+        isNonInteractive: () => nonInteractive,
+        promptContinue,
+      });
+
+      await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
+        AbortError,
+      );
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("credential hashes are unavailable for telegram"),
+      );
+      expect(error).toHaveBeenCalledWith(
+        expect.stringContaining("Onboarding and rebuild do not support a conflict override"),
+      );
+      expect(listSandboxes).not.toHaveBeenCalled();
+      expect(promptContinue).not.toHaveBeenCalled();
+      expect(exit).toHaveBeenCalledWith(1);
+    },
+  );
+
+  it("aborts when the credential conflict registry read fails (#7808)", async () => {
+    const promptContinue = vi.fn(async () => true);
+    const { deps, error, exit } = makeDeps({
+      registry: {
+        listSandboxes: () => {
+          throw new Error("registry unavailable");
+        },
+        updateSandbox: vi.fn(() => true),
+      },
+      isNonInteractive: () => false,
+      promptContinue,
+    });
+
+    await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
+      AbortError,
+    );
+    expect(error).toHaveBeenCalledWith(
+      "  Could not verify messaging channel conflicts: registry unavailable",
+    );
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("Onboarding and rebuild do not support a conflict override"),
+    );
+    expect(promptContinue).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("aborts when the pre-enable registry read fails (#7808)", async () => {
+    const listSandboxes = vi
+      .fn()
+      .mockReturnValueOnce({ sandboxes: [], defaultSandbox: null })
+      .mockImplementationOnce(() => {
+        throw new Error("registry unavailable");
+      });
+    const promptContinue = vi.fn(async () => true);
+    const { deps, error, exit } = makeDeps({
+      registry: {
+        listSandboxes,
+        updateSandbox: vi.fn(() => true),
+      },
+      isNonInteractive: () => false,
+      promptContinue,
+    });
+
+    await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
+      AbortError,
+    );
+    expect(error).toHaveBeenCalledWith(
+      "  Could not verify messaging pre-enable checks: registry unavailable",
+    );
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("Onboarding and rebuild do not support a conflict override"),
+    );
+    expect(promptContinue).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledWith(1);
   });
 
   it("does not warn when the only other Slack sandbox is on a different gateway", async () => {
@@ -136,7 +325,7 @@ describe("enforceMessagingChannelConflicts — Slack Socket Mode gateway axis (#
           ],
         },
       ],
-      credentialBindings: [],
+      credentialBindings: slackBindings("bob-bot-hash", "bob-app-hash", "bob"),
     });
     const { deps, log, error, promptContinue } = makeDeps({
       currentPlan: badPlan,
@@ -155,5 +344,23 @@ describe("enforceMessagingChannelConflicts — Slack Socket Mode gateway axis (#
     const { deps, log } = makeDeps({ currentPlan: makePlan("bob") });
     await expect(enforceMessagingChannelConflicts(deps as never)).resolves.toBeUndefined();
     expect(log).not.toHaveBeenCalled();
+  });
+});
+
+describe("enforceMessagingChannelConflicts — Microsoft Teams host port axis", () => {
+  it("probes the webhook port through the default hook registry and aborts on an unrelated listener", async () => {
+    vi.mocked(checkPortAvailable).mockResolvedValue({ ok: false, process: "nc", pid: 4321 });
+    const { deps, error, promptContinue } = makeDeps({ currentPlan: teamsPlan("bob") });
+
+    await expect(enforceMessagingChannelConflicts(deps as never)).rejects.toBeInstanceOf(
+      AbortError,
+    );
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Microsoft Teams webhook port 3978 is already in use by nc (PID 4321)",
+      ),
+    );
+    expect(checkPortAvailable).toHaveBeenCalledWith(3978);
+    expect(promptContinue).not.toHaveBeenCalled();
   });
 });

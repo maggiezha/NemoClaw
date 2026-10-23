@@ -3,379 +3,482 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
-import { mergePolicyMessagingChannels } from "../../messaging-policy-presets";
-import { handlePoliciesState, type PoliciesStateOptions } from "./policies";
+import { makeMessagingPlan } from "../../../../../test/helpers/messaging-plan-fixtures";
+import { createSession } from "../../../state/onboard-session";
+import { createPolicyHandlerDeps, basePolicyHandlerOptions } from "./policies-test-fixture";
+import { handlePoliciesState } from "./policies";
 
-type Agent = { name: string } | null;
-type WebSearchConfig = { fetchEnabled: true };
-type MessagingPlan = NonNullable<Session["messagingPlan"]>;
-type MessagingChannelId = MessagingPlan["channels"][number]["channelId"];
-
-function makeMessagingPlan(
-  sandboxName: string,
-  channels: readonly MessagingChannelId[],
-  disabledChannels: readonly MessagingChannelId[] = [],
-): MessagingPlan {
-  const disabled = new Set(disabledChannels);
-  return {
-    schemaVersion: 1,
-    sandboxName,
-    agent: "openclaw",
-    workflow: "onboard",
-    channels: channels.map((channelId) => ({
-      channelId,
-      displayName: channelId,
-      authMode: "token-paste",
-      active: !disabled.has(channelId),
-      selected: true,
-      configured: true,
-      disabled: disabled.has(channelId),
-      inputs: [],
-      hooks: [],
-    })),
-    disabledChannels,
-    credentialBindings: [],
-    networkPolicy: { presets: [], entries: [] },
-    agentRender: [],
-    buildSteps: [],
-    stateUpdates: [],
-    healthChecks: [],
-  };
-}
-
-function createDeps(overrides: Partial<PoliciesStateOptions<Agent, WebSearchConfig>["deps"]> = {}) {
-  let session = createSession();
-  const calls = {
-    load: vi.fn(() => session),
-    activeSandbox: vi.fn(() => ({
-      messaging: { plan: makeMessagingPlan("my-assistant", ["telegram"]) },
-    })),
-    mergeChannels: vi.fn(mergePolicyMessagingChannels),
-    smoke: vi.fn(),
-    prepareResume: vi.fn(
-      (
-        _sandboxName: string,
-        options: Parameters<
-          PoliciesStateOptions<Agent, WebSearchConfig>["deps"]["preparePolicyPresetResumeSelection"]
-        >[1],
-      ) => ({
-        policyPresets: (options.recordedPolicyPresets ?? []).filter(
-          (name) => name !== "unsupported",
-        ),
-        recordedPolicyPresetsNeedReconcile: (options.recordedPolicyPresets ?? []).includes(
-          "unsupported",
-        ),
-        disabledMessagingPolicyPresetApplied: false,
-        suppressedAgentRequiredPresetsLive: false,
-      }),
-    ),
-    appliedCheck: vi.fn(() => false),
-    skipped: vi.fn(),
-    recordSkip: vi.fn(async () => session),
-    startStep: vi.fn(async () => undefined),
-    setupPolicies: vi.fn(async () => ["npm"]),
-    updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-      session = mutator(session) ?? session;
-      return session;
-    }),
-    complete: vi.fn(async () => session),
-    persistPolicies: vi.fn((_sandboxName: string, _appliedPolicyPresets: string[]) => undefined),
-  };
-  return {
-    calls,
-    deps: {
-      loadSession: calls.load,
-      getActiveSandbox: calls.activeSandbox,
-      mergePolicyMessagingChannels: calls.mergeChannels,
-      verifyCompatibleEndpointSandboxSmoke: calls.smoke,
-      preparePolicyPresetResumeSelection: calls.prepareResume,
-      arePolicyPresetsApplied: calls.appliedCheck,
-      skippedStepMessage: calls.skipped,
-      recordStateSkipped: calls.recordSkip,
-      startRecordedStep: calls.startStep,
-      setupPoliciesWithSelection: calls.setupPolicies,
-      updateSession: calls.updateSession,
-      recordStepComplete: calls.complete,
-      toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
-      persistAppliedPolicyPresets: calls.persistPolicies,
-      ...overrides,
-    },
-    setSession(next: Session) {
-      session = next;
-    },
-    getSession: () => session,
-  };
-}
-
-function baseOptions(
-  deps: PoliciesStateOptions<Agent, WebSearchConfig>["deps"],
-): PoliciesStateOptions<Agent, WebSearchConfig> {
-  return {
-    resume: false,
-    sandboxName: "my-assistant",
-    provider: "provider",
-    model: "model",
-    endpointUrl: "https://example.com/v1",
-    credentialEnv: "NVIDIA_INFERENCE_API_KEY",
-    selectedMessagingChannels: [],
-    webSearchConfig: null,
-    webSearchSupported: true,
-    hermesToolGateways: [],
-    agent: null,
-    deps,
-  };
-}
-
-describe("handlePoliciesState", () => {
-  it("runs compatible endpoint smoke before policy selection", async () => {
-    const { deps, calls } = createDeps();
-
-    const result = await handlePoliciesState(baseOptions(deps));
-
-    expect(calls.smoke).toHaveBeenCalledWith({
-      sandboxName: "my-assistant",
-      provider: "provider",
-      model: "model",
-      endpointUrl: "https://example.com/v1",
-      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
-      messagingChannels: ["telegram"],
-      agent: null,
+describe("policy state handler", () => {
+  it("verifies a resumed published Pi local route without a native attachment", async () => {
+    const { deps, calls } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({
+        agent: "pi",
+        provider: "ollama-local",
+        model: "qwen3:8b",
+        endpointUrl: "http://host.openshell.internal:11435/v1",
+        createdAt: "2026-09-01T00:00:00Z",
+      })),
     });
-    expect(calls.startStep).toHaveBeenCalledWith("policies", {
-      sandboxName: "my-assistant",
-      provider: "provider",
-      model: "model",
-      policyPresets: [],
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      agent: { name: "pi" },
+      resume: true,
+      provider: "ollama-local",
+      model: "qwen3:8b",
+      endpointUrl: "http://host.openshell.internal:11435/v1",
     });
-    expect(calls.setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({
-        selectedPresets: null,
-        enabledChannels: ["telegram"],
-        provider: "provider",
-        webSearchSupported: true,
-      }),
-    );
-    expect(calls.complete).toHaveBeenCalledWith(
-      "policies",
-      expect.objectContaining({ policyPresets: ["npm"] }),
-    );
-    expect(result.stateResult).toEqual({
-      type: "transition",
-      next: "finalizing",
-      transitionKind: "advance",
-      updates: undefined,
-      metadata: { state: "policies", policyPresets: ["npm"] },
-    });
-  });
-
-  it("uses recorded messaging channels when no active selection exists", async () => {
-    const session = createSession({ messagingPlan: makeMessagingPlan("my-assistant", ["slack"]) });
-    const { deps, calls, setSession } = createDeps({
-      getActiveSandbox: vi.fn(() => ({ messaging: null })),
-    });
-    setSession(session);
-
-    await handlePoliciesState(baseOptions(deps));
-
-    expect(calls.setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ enabledChannels: ["slack"] }),
+    expect(calls.smoke).toHaveBeenCalledWith(
+      expect.not.objectContaining({ nativeLocalProviderAttachment: expect.anything() }),
     );
   });
 
-  it("resumes policies when all recorded presets are already applied", async () => {
-    const session = createSession({ policyPresets: ["npm"] });
-    const { deps, calls, setSession } = createDeps({
-      arePolicyPresetsApplied: vi.fn(() => true),
-    });
-    setSession(session);
-
-    const result = await handlePoliciesState({ ...baseOptions(deps), resume: true });
-
-    expect(calls.skipped).toHaveBeenCalledWith("policies", "npm");
-    expect(calls.recordSkip).toHaveBeenCalledWith("policies", {
-      reason: "resume",
-      policyPresets: ["npm"],
-    });
+  it("requires a native attachment for a fresh Pi local selection", async () => {
+    const { deps, calls } = createPolicyHandlerDeps();
+    await expect(
+      handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        agent: { name: "pi" },
+        provider: "ollama-local",
+        model: "qwen3:8b",
+        endpointUrl: "http://host.openshell.internal:11435/v1",
+      }),
+    ).rejects.toThrow("requires its recorded provider attachment");
     expect(calls.setupPolicies).not.toHaveBeenCalled();
-    expect(calls.complete).toHaveBeenCalledWith(
-      "policies",
-      expect.objectContaining({ policyPresets: ["npm"] }),
-    );
-    expect(result.appliedPolicyPresets).toEqual(["npm"]);
-    expect(result.stateResult).toMatchObject({
-      next: "finalizing",
-      transitionKind: "advance",
-      metadata: { policyPresets: ["npm"] },
-    });
   });
 
-  it("reconciles unsupported recorded presets before interactive setup", async () => {
-    const session = createSession({ policyPresets: ["npm", "unsupported"] });
-    const { deps, calls, setSession } = createDeps();
-    setSession(session);
-
-    await handlePoliciesState(baseOptions(deps));
-
-    expect(calls.prepareResume).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ recordedPolicyPresets: ["npm", "unsupported"] }),
-    );
-    expect(calls.setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ selectedPresets: ["npm"] }),
-    );
-  });
-
-  it("merges required Hermes tool gateway presets into recorded selections", async () => {
-    const session = createSession({ policyPresets: ["npm"] });
-    const prepareResume = vi.fn((_sandboxName, options) => ({
-      policyPresets: [...(options.recordedPolicyPresets ?? []), ...options.hermesToolGateways],
-      recordedPolicyPresetsNeedReconcile: false,
+  it("resumes from the live OpenShell preset selection", async () => {
+    const prepare = vi.fn(() => ({
+      policyPresets: ["npm"],
+      livePolicyPresetsNeedUpdate: false,
       disabledMessagingPolicyPresetApplied: false,
       suppressedAgentRequiredPresetsLive: false,
     }));
-    const { deps, calls, setSession } = createDeps({
-      preparePolicyPresetResumeSelection: prepareResume,
+    const { deps, calls } = createPolicyHandlerDeps({
+      arePolicyPresetsApplied: vi.fn(() => true),
+      preparePolicyPresetResumeSelection: prepare,
     });
-    setSession(session);
-
-    await handlePoliciesState({ ...baseOptions(deps), hermesToolGateways: ["github"] });
-
-    expect(prepareResume).toHaveBeenCalledWith(
+    const result = await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      resume: true,
+    });
+    expect(prepare).toHaveBeenCalledWith(
       "my-assistant",
-      expect.objectContaining({ hermesToolGateways: ["github"] }),
+      expect.not.objectContaining({ recordedPolicyPresets: expect.anything() }),
     );
+    expect(calls.skipped).toHaveBeenCalledWith("policies", "npm");
+    expect(calls.setupPolicies).not.toHaveBeenCalled();
+    expect(result.appliedPolicyPresets).toEqual(["npm"]);
+    expect(result.session).not.toHaveProperty("policyPresets");
+  });
+
+  it("passes the observed selection to reconciliation on resume", async () => {
+    const { deps, calls } = createPolicyHandlerDeps({
+      preparePolicyPresetResumeSelection: vi.fn(() => ({
+        policyPresets: ["npm", "github"],
+        livePolicyPresetsNeedUpdate: true,
+        disabledMessagingPolicyPresetApplied: false,
+        suppressedAgentRequiredPresetsLive: false,
+      })),
+    });
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      resume: true,
+    });
     expect(calls.setupPolicies).toHaveBeenCalledWith(
       "my-assistant",
       expect.objectContaining({ selectedPresets: ["npm", "github"] }),
     );
   });
 
-  it("forwards 'openclaw' to setupPoliciesWithSelection when agent is null (default OpenClaw)", async () => {
-    const { deps, calls } = createDeps();
+  it("reconciles a pending selection on resume even when live presets are empty", async () => {
+    const prepare = vi.fn(() => ({
+      policyPresets: ["npm", "openclaw-pricing"],
+      livePolicyPresetsNeedUpdate: false,
+      disabledMessagingPolicyPresetApplied: false,
+      suppressedAgentRequiredPresetsLive: false,
+    }));
+    const { deps, calls, setSession } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ createdAt: "2026-10-19T00:00:00Z" })),
+      preparePolicyPresetResumeSelection: prepare,
+    });
+    setSession(
+      createSession({
+        sandboxName: "my-assistant",
+        pendingPolicySelection: {
+          sandboxName: "my-assistant",
+          sandboxIdentity: "created:2026-10-19T00:00:00Z",
+          tierName: "balanced",
+          presetNames: ["npm", "openclaw-pricing"],
+        },
+      }),
+    );
 
-    await handlePoliciesState({ ...baseOptions(deps), agent: null });
+    await handlePoliciesState({ ...basePolicyHandlerOptions(deps), resume: true });
 
+    expect(prepare).toHaveBeenCalledWith(
+      "my-assistant",
+      expect.objectContaining({
+        tierName: "balanced",
+        pendingPolicyPresets: ["npm", "openclaw-pricing"],
+      }),
+    );
     expect(calls.setupPolicies).toHaveBeenCalledWith(
       "my-assistant",
-      expect.objectContaining({ agent: "openclaw" }),
+      expect.objectContaining({ selectedPresets: ["npm", "openclaw-pricing"] }),
+    );
+    expect(calls.skipped).not.toHaveBeenCalled();
+  });
+
+  it("rejects pending selection for a different sandbox identity before policy mutation", async () => {
+    const { deps, calls, setSession } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ createdAt: "2026-10-19T00:00:00Z" })),
+    });
+    setSession(
+      createSession({
+        sandboxName: "my-assistant",
+        pendingPolicySelection: {
+          sandboxName: "my-assistant",
+          sandboxIdentity: "created:2026-10-18T00:00:00Z",
+          tierName: null,
+          presetNames: ["npm"],
+        },
+      }),
+    );
+
+    await expect(
+      handlePoliciesState({ ...basePolicyHandlerOptions(deps), resume: true }),
+    ).rejects.toThrow("saved policy selection belongs to a different sandbox identity");
+    expect(calls.prepareResume).not.toHaveBeenCalled();
+    expect(calls.setupPolicies).not.toHaveBeenCalled();
+  });
+
+  it("starts a fresh selection without a shadow preset list", async () => {
+    const { deps, calls } = createPolicyHandlerDeps();
+    await handlePoliciesState(basePolicyHandlerOptions(deps));
+    expect(calls.setupPolicies).toHaveBeenCalledWith(
+      "my-assistant",
+      expect.objectContaining({ selectedPresets: null }),
+    );
+    expect(calls.complete).toHaveBeenCalledWith(
+      "policies",
+      expect.not.objectContaining({ policyPresets: expect.anything() }),
     );
   });
 
-  it("forwards 'hermes' to setupPoliciesWithSelection when agent.name is hermes", async () => {
-    const { deps, calls } = createDeps();
+  it("does not reconcile presets after a rebuild consumed OpenShell's live policy", async () => {
+    const { deps, calls } = createPolicyHandlerDeps();
 
-    await handlePoliciesState({ ...baseOptions(deps), agent: { name: "hermes" } });
+    const result = await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      preserveRebuildLivePolicy: true,
+      provider: "compatible-endpoint",
+    });
 
-    expect(calls.setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ agent: "hermes" }),
+    expect(calls.smoke).not.toHaveBeenCalled();
+    expect(calls.prepareResume).not.toHaveBeenCalled();
+    expect(calls.setupPolicies).not.toHaveBeenCalled();
+    expect(calls.skipped).toHaveBeenCalledWith("policies", "live OpenShell rebuild policy");
+    expect(result.appliedPolicyPresets).toEqual([]);
+  });
+
+  it("retains the pre-restore provider-neutral proof for host-local rebuilds", async () => {
+    const { deps, calls } = createPolicyHandlerDeps();
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      preserveRebuildLivePolicy: true,
+      hostLocalInferenceRouteOnly: true,
+    });
+    expect(calls.smoke).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ forceCanonicalRoute: true }),
     );
   });
 
-  it("treats whitespace-only agent.name as default OpenClaw", async () => {
-    const { deps, calls } = createDeps();
+  it.each(["compatible-anthropic-endpoint", "nvidia-prod"])(
+    "retains the earlier rebuild check for provider %s",
+    async (provider) => {
+      const { deps, calls } = createPolicyHandlerDeps();
+      await handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        preserveRebuildLivePolicy: true,
+        provider,
+      });
+      expect(calls.smoke).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ provider }));
+    },
+  );
 
-    await handlePoliciesState({ ...baseOptions(deps), agent: { name: "   " } });
-
-    expect(calls.setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ agent: "openclaw" }),
-    );
-  });
-
-  // Regression for #4621: the sandbox is registered with only create-time/boot
-  // presets, so the effective interactive selection must be written back to the
-  // registry. Otherwise recreate/re-onboard reads a stale list and reapplies
-  // removed tier defaults.
-  // The mocks below mirror the real setupPoliciesWithSelection contract: every
-  // path that reconciles the live gateway calls onSelection with the effective
-  // set; the skip path returns [] without calling it.
-  type SetupOptions = {
-    selectedPresets: string[] | null;
-    onSelection: (presets: string[]) => void;
-  };
-
-  it("persists the effective interactive selection to the registry (#4621)", async () => {
-    // Operator picked Balanced, removed the `npm` tier default, and added `github`.
-    const { deps, calls } = createDeps({
-      setupPoliciesWithSelection: vi.fn(async (_name: string, options: SetupOptions) => {
-        options.onSelection(["dns", "github"]);
-        return ["dns", "github"];
+  it("retains compatible endpoint verification during ordinary onboarding", async () => {
+    const failure = new Error("compatible endpoint smoke failed");
+    const { deps, calls } = createPolicyHandlerDeps({
+      verifyCompatibleEndpointSandboxSmoke: vi.fn(() => {
+        throw failure;
       }),
     });
-
-    const result = await handlePoliciesState(baseOptions(deps));
-
-    expect(calls.persistPolicies).toHaveBeenCalledWith("my-assistant", ["dns", "github"]);
-    // The removed Balanced default must not survive into what we persist...
-    const [, persisted] = calls.persistPolicies.mock.calls[0] as [string, string[]];
-    expect(persisted).not.toContain("npm");
-    // ...and the unrelated added preset must be preserved.
-    expect(persisted).toContain("github");
-    expect(result.appliedPolicyPresets).toEqual(["dns", "github"]);
-  });
-
-  it("re-onboard carries the persisted set forward without re-adding removed defaults (#4621)", async () => {
-    // A prior onboard recorded the custom "Balanced minus npm plus github" set.
-    // On re-onboard the recorded set is re-applied verbatim and persisted back —
-    // npm is never reintroduced.
-    const session = createSession({ policyPresets: ["dns", "github"] });
-    const setupPolicies = vi.fn(async (_name: string, options: SetupOptions) => {
-      const presets = options.selectedPresets ?? [];
-      options.onSelection(presets);
-      return presets;
-    });
-    const { deps, calls, setSession } = createDeps({
-      setupPoliciesWithSelection: setupPolicies,
-    });
-    setSession(session);
-
-    const result = await handlePoliciesState(baseOptions(deps));
-
-    expect(setupPolicies).toHaveBeenCalledWith(
-      "my-assistant",
-      expect.objectContaining({ selectedPresets: ["dns", "github"] }),
-    );
-    expect(calls.persistPolicies).toHaveBeenCalledWith("my-assistant", ["dns", "github"]);
-    const [, persisted] = calls.persistPolicies.mock.calls[0] as [string, string[]];
-    expect(persisted).not.toContain("npm");
-    expect(result.appliedPolicyPresets).toEqual(["dns", "github"]);
-  });
-
-  it("does not finalize the registry on the resume (already-applied) branch (#4621)", async () => {
-    // The resume branch only confirms recorded presets are a *subset* of what is
-    // applied (arePolicyPresetsApplied), not that the live set matches. An
-    // interrupted prior run may still have an extra applied preset whose removal
-    // never completed, so persisting/finalizing the narrowed recorded set here
-    // would wrongly claim that preset is gone. Leave the registry untouched.
-    const session = createSession({ policyPresets: ["dns", "github"] });
-    const { deps, calls, setSession } = createDeps({
-      arePolicyPresetsApplied: vi.fn(() => true),
-    });
-    setSession(session);
-
-    const result = await handlePoliciesState({ ...baseOptions(deps), resume: true });
-
+    await expect(handlePoliciesState(basePolicyHandlerOptions(deps))).rejects.toBe(failure);
     expect(calls.setupPolicies).not.toHaveBeenCalled();
-    expect(calls.persistPolicies).not.toHaveBeenCalled();
-    expect(result.appliedPolicyPresets).toEqual(["dns", "github"]);
+    expect(calls.complete).not.toHaveBeenCalled();
   });
 
-  it("does not clobber the registry when policy presets are skipped (#4621)", async () => {
-    // NEMOCLAW_POLICY_MODE=skip/none/no returns [] without touching the live
-    // applied set (onSelection never fires). Persisting [] here would wipe the
-    // sandbox's real policies, so the write-back must be suppressed.
-    const { deps, calls } = createDeps({
-      setupPoliciesWithSelection: vi.fn(async () => []),
+  it("verifies an owned Local NIM through the shared route before applying policies", async () => {
+    const { deps, calls } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ nimContainer: "nemoclaw-nim-owned" })),
     });
 
-    const result = await handlePoliciesState(baseOptions(deps));
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      provider: "vllm-local",
+      endpointUrl: "http://127.0.0.1:8000/v1",
+      agent: { name: "openclaw" },
+    });
 
-    expect(calls.persistPolicies).not.toHaveBeenCalled();
-    expect(result.appliedPolicyPresets).toEqual([]);
+    expect(calls.smoke).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        provider: "vllm-local",
+        agent: { name: "openclaw" },
+      }),
+    );
+    const smokeOptions = calls.smoke.mock.calls[0]?.[0];
+    expect(smokeOptions).not.toHaveProperty("nativeLocalProviderAttachment");
+    expect(smokeOptions).not.toHaveProperty("forceCanonicalRoute");
+    expect(smokeOptions).not.toHaveProperty("hostLocalInferenceProofAuthority");
+    expect(calls.smoke.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.setupPolicies.mock.invocationCallOrder[0]!,
+    );
+    expect(calls.setupPolicies).toHaveBeenCalledWith(
+      "my-assistant",
+      expect.objectContaining({ provider: "vllm-local" }),
+    );
+    expect(calls.complete).toHaveBeenCalledOnce();
+  });
+
+  it("stops Local NIM policy application when shared-route verification fails", async () => {
+    const failure = new Error("Local NIM shared-route smoke failed");
+    const { deps, calls } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ nimContainer: "nemoclaw-nim-owned" })),
+    });
+    calls.smoke.mockImplementation(() => {
+      throw failure;
+    });
+
+    await expect(
+      handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        provider: "vllm-local",
+        endpointUrl: "http://127.0.0.1:8000/v1",
+        agent: { name: "openclaw" },
+      }),
+    ).rejects.toBe(failure);
+
+    expect(calls.smoke).toHaveBeenCalledOnce();
+    expect(calls.setupPolicies).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("keeps a channel in policy requirements when every credential binding matches its gateway provider (#10667)", async () => {
+    const discordPlan = makeMessagingPlan({
+      channels: ["discord"],
+      agent: "hermes",
+      credentialBindings: [
+        {
+          channelId: "discord",
+          credentialId: "discordBotToken",
+          sourceInput: "botToken",
+          providerName: "my-assistant-discord-bridge",
+          providerEnvKey: "DISCORD_BOT_TOKEN",
+          placeholder: "openshell:resolve:env:DISCORD_BOT_TOKEN",
+          credentialAvailable: true,
+          credentialHash: "discord-token-hash",
+        },
+      ],
+    });
+    const providerMatcher = vi.fn(async (name: string, type: string, credentialEnv: string) =>
+      name === "my-assistant-discord-bridge" &&
+      type === "discord-hermes-static-v1" &&
+      credentialEnv === "DISCORD_BOT_TOKEN"
+        ? { kind: "exact" as const }
+        : { kind: "missing" as const },
+    );
+    const { deps, calls } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ messaging: { plan: discordPlan } })),
+      inspectGatewayCredential: providerMatcher,
+    });
+    calls.unconfiguredChannels.mockImplementation((_planChannels, configuredChannels) =>
+      configuredChannels.includes("discord") ? [] : ["discord"],
+    );
+
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      selectedMessagingChannels: [],
+      agent: { name: "hermes" },
+    });
+
+    expect(calls.unconfiguredChannels).toHaveBeenCalledWith(["discord"], ["discord"], {
+      name: "hermes",
+    });
+    expect(providerMatcher).toHaveBeenCalledExactlyOnceWith(
+      "my-assistant-discord-bridge",
+      "discord-hermes-static-v1",
+      "DISCORD_BOT_TOKEN",
+    );
+    expect(calls.mergeChannels).toHaveBeenCalledWith([], [], ["discord"], []);
+    expect(calls.setupPolicies).toHaveBeenCalledWith(
+      "my-assistant",
+      expect.objectContaining({
+        enabledChannels: ["discord"],
+        disabledChannels: [],
+      }),
+    );
+  });
+
+  it.each([
+    {
+      condition: "both bindings match",
+      inspectGatewayCredential: async () => ({ kind: "exact" as const }),
+      expectedEnabled: ["slack"],
+      expectedDisabled: [] as string[],
+    },
+    {
+      condition: "one binding is missing",
+      inspectGatewayCredential: async (_name: string, _type: string, credentialEnv: string) =>
+        credentialEnv === "SLACK_BOT_TOKEN"
+          ? { kind: "exact" as const }
+          : { kind: "missing" as const },
+      expectedEnabled: [] as string[],
+      expectedDisabled: ["slack"],
+    },
+  ])(
+    "requires every Slack binding before retaining its policy when $condition (#10667)",
+    async ({ inspectGatewayCredential, expectedEnabled, expectedDisabled }) => {
+      const slackPlan = makeMessagingPlan({
+        channels: ["slack"],
+        agent: "hermes",
+        credentialBindings: [
+          {
+            channelId: "slack",
+            credentialId: "slackBotToken",
+            sourceInput: "botToken",
+            providerName: "my-assistant-slack-bridge",
+            providerEnvKey: "SLACK_BOT_TOKEN",
+            placeholder: "openshell:resolve:env:SLACK_BOT_TOKEN",
+            credentialAvailable: true,
+          },
+          {
+            channelId: "slack",
+            credentialId: "slackAppToken",
+            sourceInput: "appToken",
+            providerName: "my-assistant-slack-app",
+            providerEnvKey: "SLACK_APP_TOKEN",
+            placeholder: "openshell:resolve:env:SLACK_APP_TOKEN",
+            credentialAvailable: true,
+          },
+        ],
+      });
+      const providerMatcher = vi.fn(inspectGatewayCredential);
+      const { deps, calls } = createPolicyHandlerDeps({
+        getActiveSandbox: vi.fn(() => ({ messaging: { plan: slackPlan } })),
+        inspectGatewayCredential: providerMatcher,
+      });
+      calls.unconfiguredChannels.mockImplementation((_planChannels, configuredChannels) =>
+        configuredChannels.includes("slack") ? [] : ["slack"],
+      );
+
+      await handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        selectedMessagingChannels: [],
+        agent: { name: "hermes" },
+      });
+
+      expect(providerMatcher).toHaveBeenCalledTimes(2);
+      expect(calls.setupPolicies).toHaveBeenCalledWith(
+        "my-assistant",
+        expect.objectContaining({
+          enabledChannels: expectedEnabled,
+          disabledChannels: expectedDisabled,
+        }),
+      );
+    },
+  );
+
+  it.each([
+    ["openclaw", "google-chat-bridge"],
+    ["hermes", "google-chat-hermes-bridge"],
+  ] as const)(
+    "keeps Google Chat in %s policy requirements when its gateway-minted bridge provider matches",
+    async (agent, providerType) => {
+      const googlechatPlan = makeMessagingPlan({
+        channels: ["googlechat"],
+        agent,
+      });
+      const providerMatcher = vi.fn(async (name: string, type: string, credentialEnv: string) =>
+        name === "my-assistant-googlechat-bridge" &&
+        type === providerType &&
+        credentialEnv === "GOOGLE_CHAT_ACCESS_TOKEN"
+          ? { kind: "exact" as const }
+          : { kind: "missing" as const },
+      );
+      const { deps, calls } = createPolicyHandlerDeps({
+        getActiveSandbox: vi.fn(() => ({
+          messaging: { plan: googlechatPlan },
+        })),
+        inspectGatewayCredential: providerMatcher,
+      });
+      calls.unconfiguredChannels.mockImplementation((_planChannels, configuredChannels) =>
+        configuredChannels.includes("googlechat") ? [] : ["googlechat"],
+      );
+
+      await handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        selectedMessagingChannels: [],
+        agent: { name: agent },
+      });
+
+      expect(providerMatcher).toHaveBeenCalledExactlyOnceWith(
+        "my-assistant-googlechat-bridge",
+        providerType,
+        "GOOGLE_CHAT_ACCESS_TOKEN",
+      );
+      expect(calls.setupPolicies).toHaveBeenCalledWith(
+        "my-assistant",
+        expect.objectContaining({
+          enabledChannels: ["googlechat"],
+          disabledChannels: [],
+        }),
+      );
+    },
+  );
+
+  it("stops before policy reconciliation when gateway credential inspection fails", async () => {
+    const plan = makeMessagingPlan({
+      channels: ["googlechat"],
+      agent: "hermes",
+    });
+    const { deps, calls } = createPolicyHandlerDeps({
+      getActiveSandbox: vi.fn(() => ({ messaging: { plan } })),
+      inspectGatewayCredential: vi.fn().mockResolvedValue({ kind: "indeterminate" }),
+    });
+
+    await expect(
+      handlePoliciesState({
+        ...basePolicyHandlerOptions(deps),
+        selectedMessagingChannels: [],
+        agent: { name: "hermes" },
+      }),
+    ).rejects.toThrow("Could not inspect gateway credentials for messaging channel 'googlechat'");
+
+    expect(calls.unconfiguredChannels).not.toHaveBeenCalled();
+    expect(calls.setupPolicies).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("merges live messaging channels into policy requirements", async () => {
+    const { deps, calls } = createPolicyHandlerDeps();
+    await handlePoliciesState({
+      ...basePolicyHandlerOptions(deps),
+      selectedMessagingChannels: [],
+    });
+    expect(calls.mergeChannels).toHaveBeenCalled();
+    expect(calls.setupPolicies).toHaveBeenCalledWith(
+      "my-assistant",
+      expect.objectContaining({ enabledChannels: ["telegram"] }),
+    );
   });
 });

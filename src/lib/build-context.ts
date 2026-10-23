@@ -9,7 +9,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CLI_NAME } from "./cli/branding";
-import { noteOnboardResumeHintShown } from "./onboard/resume-hint";
+import { isPortableExperimentalProfile } from "./onboard/experimental/portable-profile";
+import { noteOnboardResumeHintShown, onboardResumeRecoveryCommand } from "./onboard/resume-hint";
 
 import { classifySandboxCreateFailure, planSandboxCreateRecovery } from "./validation";
 
@@ -98,16 +99,36 @@ export function printSandboxCreateRecoveryHints(
     platform = process.platform,
     arch = process.arch,
     createArgs,
+    createContext,
   }: {
     platform?: NodeJS.Platform;
     arch?: NodeJS.Architecture;
     createArgs?: readonly string[];
+    createContext?: import("./onboard/created-sandbox-failure").SandboxCreateRecoveryContext;
   } = {},
 ): void {
   // Every branch below prints tailored `--resume` recovery guidance, so suppress
   // the generic incomplete-exit backstop (#6003).
   noteOnboardResumeHintShown();
+  const portable = isPortableExperimentalProfile();
+  const recoveryCommand = onboardResumeRecoveryCommand();
   const failure = classifySandboxCreateFailure(output);
+  if (createContext) {
+    const resources = [
+      createContext.cpu ? `cpu=${createContext.cpu}` : null,
+      createContext.memory ? `memory=${createContext.memory}` : null,
+    ].filter((value): value is string => value !== null);
+    console.error("  NemoClaw create context (runtime environment omitted):");
+    console.error(`    source: ${createContext.sourceReference}`);
+    console.error(`    policy: ${createContext.policyAttached ? "attached" : "none"}`);
+    console.error(
+      `    providers: ${createContext.providers.length > 0 ? createContext.providers.join(", ") : "none"}`,
+    );
+    console.error(
+      `    gpu: ${createContext.gpuRequested ? (createContext.gpuDevice ?? "requested") : "none"}`,
+    );
+    console.error(`    resources: ${resources.length > 0 ? resources.join(", ") : "defaults"}`);
+  }
   if (failure.kind === "image_upload_container_missing") {
     const { arm64ImageRefWorkaround } = planSandboxCreateRecovery(failure, { platform, arch });
     const builtRef = extractBuiltImageRef(output);
@@ -118,69 +139,74 @@ export function printSandboxCreateRecoveryHints(
       "        (Docker 404 'container does not exist'). The gateway container is healthy — this is the",
     );
     console.error("        OpenShell large-tar upload path failing, not a missing gateway.");
-    if (arm64ImageRefWorkaround) {
-      console.error(
-        "  This is a known limitation on Linux ARM64 (aarch64). Workaround without rebuilding:",
-      );
-    } else {
-      console.error("  Workaround without rebuilding the image:");
-    }
-    console.error("    1. Start a local registry the gateway can reach:");
-    console.error(
-      "         docker run -d -p 5000:5000 --restart=always --name registry registry:2",
-    );
     const sourceRef = builtRef ?? "<built-image>";
     const registryRef = `localhost:5000/${sourceRef}`;
-    // OpenShell builds the sandbox image with whichever builder the host uses
-    // (Docker on most hosts; buildah on the Linux ARM64 path that triggers
-    // #3266). A docker-only push fails with "No such image" when the image
-    // lives in buildah/containers storage, so emit both forms and let the
-    // operator match whichever the build log above showed. See #3266.
-    console.error("    2. Push the image OpenShell just built to that registry, using the same");
-    console.error("       builder the build log above used —");
-    console.error("       Docker build:");
-    console.error(`         docker tag ${sourceRef} ${registryRef}`);
-    console.error(`         docker push ${registryRef}`);
-    console.error("       buildah build (log shows `COMMIT` / buildah steps):");
-    console.error(`         buildah push ${sourceRef} docker://${registryRef}`);
-    // Reconstruct NemoClaw's own create command (when we have the structured
-    // args) so the operator does not have to guess the provider/GPU/resource
-    // flags onboard added. A pared-down command would build a misconfigured
-    // sandbox that then blocks `onboard --resume`. When the args are not
-    // available, fall back to describing the one-token swap.
-    if (createArgs && createArgs.length > 0) {
-      console.error("    3. Re-create the sandbox from that image ref. This is the create command");
+    const manualImageRefWorkaround = (createArgs?.length ?? 0) > 0 || !createContext;
+    if (manualImageRefWorkaround) {
+      if (arm64ImageRefWorkaround) {
+        console.error(
+          "  This is a known limitation on Linux ARM64 (aarch64). Workaround without rebuilding:",
+        );
+      } else {
+        console.error("  Workaround without rebuilding the image:");
+      }
+      console.error("    1. Start a local registry the gateway can reach:");
       console.error(
-        "       NemoClaw ran, with --from swapped to the pushed image. Replace the policy",
+        "         docker run -d -p 5000:5000 --restart=always --name registry registry:2",
       );
-      console.error(
-        "       placeholder with your policy file (onboard's was a temporary file) and the",
-      );
-      console.error(
-        "       runtime env placeholder with the env NemoClaw set (dashboard port, proxy):",
-      );
-      console.error(`         ${reconstructImageRefCreateCommand(createArgs, registryRef)}`);
-    } else {
-      console.error("    3. Re-run the sandbox create OpenShell just attempted, but replace the");
-      console.error(
-        `       \`--from <…/Dockerfile>\` argument with \`--from ${registryRef}\` (this skips`,
-      );
-      console.error(
-        "       the tar upload). Keep every other flag NemoClaw used — the providers, any",
-      );
-      console.error(
-        "       GPU/resource flags, and the trailing `-- env … nemoclaw-start` command.",
-      );
+      // OpenShell builds the sandbox image with whichever builder the host uses
+      // (Docker on most hosts; buildah on the Linux ARM64 path that triggers
+      // #3266). A docker-only push fails with "No such image" when the image
+      // lives in buildah/containers storage, so emit both forms and let the
+      // operator match whichever the build log above showed. See #3266.
+      console.error("    2. Push the image OpenShell just built to that registry, using the same");
+      console.error("       builder the build log above used —");
+      console.error("       Docker build:");
+      console.error(`         docker tag ${sourceRef} ${registryRef}`);
+      console.error(`         docker push ${registryRef}`);
+      console.error("       buildah build (log shows `COMMIT` / buildah steps):");
+      console.error(`         buildah push ${sourceRef} docker://${registryRef}`);
+      // Reconstruct NemoClaw's own create command (when we have the structured
+      // args) so the operator does not have to guess the provider/GPU/resource
+      // flags onboard added. A pared-down command would build a misconfigured
+      // sandbox that then blocks `onboard --resume`. When the args are not
+      // available, fall back to describing the one-token swap.
+      if (createArgs && createArgs.length > 0) {
+        console.error(
+          "    3. Re-create the sandbox from that image ref. This is the create command",
+        );
+        console.error(
+          "       NemoClaw ran, with --from swapped to the pushed image. Replace the policy",
+        );
+        console.error(
+          "       placeholder with your policy file (onboard's was a temporary file) and the",
+        );
+        console.error(
+          "       runtime env placeholder with the env NemoClaw set (dashboard port, proxy):",
+        );
+        console.error(`         ${reconstructImageRefCreateCommand(createArgs, registryRef)}`);
+      } else {
+        console.error("    3. Re-run the sandbox create OpenShell just attempted, but replace the");
+        console.error(
+          `       \`--from <…/Dockerfile>\` argument with \`--from ${registryRef}\` (this skips`,
+        );
+        console.error(
+          "       the tar upload). Keep every other flag NemoClaw used — the providers, any",
+        );
+        console.error(
+          "       GPU/resource flags, and the trailing `-- env … nemoclaw-start` command.",
+        );
+      }
     }
     console.error(
-      `  If you would rather let NemoClaw rebuild and retry from scratch: ${CLI_NAME} onboard --resume`,
+      `  If you would rather let NemoClaw rebuild and retry from scratch: ${recoveryCommand}`,
     );
     return;
   }
   if (failure.kind === "image_transfer_timeout") {
     console.error("  Hint: image upload into the OpenShell gateway timed out.");
-    console.error(`  Recovery: ${CLI_NAME} onboard --resume`);
-    if (failure.uploadedToGateway) {
+    console.error(`  Recovery: ${recoveryCommand}`);
+    if (failure.uploadedToGateway && !portable) {
       console.error(
         "  Progress reached the gateway upload stage, so resume may be able to reuse existing gateway state.",
       );
@@ -190,7 +216,7 @@ export function printSandboxCreateRecoveryHints(
   }
   if (failure.kind === "image_transfer_reset") {
     console.error("  Hint: the image push/import stream was interrupted.");
-    console.error(`  Recovery: ${CLI_NAME} onboard --resume`);
+    console.error(`  Recovery: ${recoveryCommand}`);
     if (failure.uploadedToGateway) {
       console.error("  The image appears to have reached the gateway before the stream failed.");
     }
@@ -199,7 +225,7 @@ export function printSandboxCreateRecoveryHints(
   }
   if (failure.kind === "sandbox_create_incomplete") {
     console.error("  Hint: sandbox creation started but the create stream did not finish cleanly.");
-    console.error(`  Recovery: ${CLI_NAME} onboard --resume`);
+    console.error(`  Recovery: ${recoveryCommand}`);
     console.error(
       "  Check: openshell sandbox list        # verify whether the sandbox became ready",
     );
@@ -210,7 +236,7 @@ export function printSandboxCreateRecoveryHints(
       "  Hint: TLS certificate mismatch — the gateway certificate changed since the CLI last trusted it.",
     );
     console.error("  Fix:  openshell gateway trust -g nemoclaw");
-    console.error(`  Then: ${CLI_NAME} onboard --resume`);
+    console.error(`  Then: ${recoveryCommand}`);
     return;
   }
   if (failure.kind === "gpu_cdi_injection_failed") {
@@ -220,9 +246,9 @@ export function printSandboxCreateRecoveryHints(
     );
     console.error("        NEMOCLAW_DOCKER_GPU_PATCH=0 does not bypass this path.");
     console.error("  Skip GPU passthrough entirely with either:");
-    console.error(`    ${CLI_NAME} onboard --no-gpu`);
+    console.error(`    ${portable ? recoveryCommand : `${CLI_NAME} onboard`} --no-gpu`);
     console.error("    NEMOCLAW_SANDBOX_GPU=0  (env var, applies to subsequent runs)");
-    console.error(`  Recovery: ${CLI_NAME} onboard --resume --no-gpu`);
+    if (!portable) console.error(`  Recovery: ${recoveryCommand} --no-gpu`);
     return;
   }
   if (failure.kind === "plugin_install_network_denied") {
@@ -237,9 +263,9 @@ export function printSandboxCreateRecoveryHints(
     console.error(
       "        feature that requires this plugin (e.g. NEMOCLAW_WEB_SEARCH_ENABLED=0).",
     );
-    console.error(`  Recovery: ${CLI_NAME} onboard --resume`);
+    console.error(`  Recovery: ${recoveryCommand}`);
     return;
   }
-  console.error(`  Recovery: ${CLI_NAME} onboard --resume`);
-  console.error(`  Or:      ${CLI_NAME} onboard`);
+  console.error(`  Recovery: ${recoveryCommand}`);
+  if (!portable) console.error(`  Or:      ${CLI_NAME} onboard`);
 }

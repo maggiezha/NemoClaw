@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { listMessagingProviderNamesForChannel } from "../messaging/channels";
+import type { RegistryMessagingAuthority } from "../messaging/plan-authority";
+import { getChannelsFromPlan, getDisabledChannelsFromPlan } from "./messaging-plan-session";
 
 type MessagingChannel = { name: string; envKey?: string };
 
@@ -21,17 +23,16 @@ function getKnownMessagingChannels(
   return [...new Set(channels.filter((channel) => known.has(channel)))];
 }
 
-export function getNonInteractiveStoredMessagingChannels(
+export async function getNonInteractiveStoredMessagingChannels(
   resume: boolean,
   sessionChannels: string[] | null | undefined,
   sandboxName: string | null,
   messagingChannels: readonly MessagingChannel[],
   hasMessagingToken: (envKey: string) => boolean,
-  getConfiguredChannels: (sandboxName: string) => string[],
-  getDisabledChannels: (sandboxName: string) => string[],
-  providerExists: (providerName: string) => boolean,
+  getRegistryMessagingAuthority: (sandboxName: string) => RegistryMessagingAuthority,
+  providerExists: (providerName: string) => boolean | Promise<boolean>,
   nonInteractive: boolean,
-): string[] | null {
+): Promise<string[] | null> {
   if (!nonInteractive) return null;
   if (resume && Array.isArray(sessionChannels)) {
     const knownSessionChannels = getKnownMessagingChannels(sessionChannels, messagingChannels);
@@ -45,15 +46,22 @@ export function getNonInteractiveStoredMessagingChannels(
     return null;
   }
 
+  const registryAuthority = getRegistryMessagingAuthority(sandboxName);
+  if (!registryAuthority.authoritative) return null;
   const configuredChannels = getKnownMessagingChannels(
-    getConfiguredChannels(sandboxName),
+    getChannelsFromPlan(registryAuthority.plan),
     messagingChannels,
   );
-  const disabledChannels = new Set(getDisabledChannels(sandboxName));
-  const reusableChannels = configuredChannels.filter((channel) => {
-    if (disabledChannels.has(channel)) return false;
-    const providers = getMessagingProviderNamesForChannel(sandboxName, channel);
-    return providers.length > 0 && providers.every((provider) => providerExists(provider));
-  });
+  const disabledChannels = new Set(getDisabledChannelsFromPlan(registryAuthority.plan));
+  const reusableChannels = (
+    await Promise.all(
+      configuredChannels.map(async (channel) => {
+        if (disabledChannels.has(channel)) return null;
+        const providers = getMessagingProviderNamesForChannel(sandboxName, channel);
+        const exists = await Promise.all(providers.map((provider) => providerExists(provider)));
+        return providers.length > 0 && exists.every(Boolean) ? channel : null;
+      }),
+    )
+  ).filter((channel): channel is string => channel !== null);
   return reusableChannels.length > 0 ? reusableChannels : null;
 }

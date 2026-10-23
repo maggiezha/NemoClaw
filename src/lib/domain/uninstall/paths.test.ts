@@ -32,6 +32,7 @@ describe("uninstall paths", () => {
       ...OPENSHELL_MANAGED_BINARIES.map((binary) => path.join("/xdg/bin", binary)),
     ]);
     expect(paths.helperServiceGlob).toBe(path.join("/tmp/nemo", "nemoclaw-services-*"));
+    expect(paths.huggingFaceModelCacheDir).toBe(path.join("/home/test", ".cache", "huggingface"));
     expect(paths.runtimeTempGlobs).toEqual([
       path.join("/tmp/nemo", "nemoclaw-create-*.log"),
       path.join("/tmp/nemo", "nemoclaw-tg-ssh-*.conf"),
@@ -53,6 +54,21 @@ describe("uninstall paths", () => {
       path.join("/home/test", ".config", "nemoclaw"),
     ]);
   });
+
+  it("includes a configured gateway state directory in cleanup paths", () => {
+    const gatewayStateDir = "/srv/nemoclaw/gateway";
+    const paths = defaultUninstallPaths({ gatewayStateDir, home: "/home/test" });
+
+    expect(paths.selectedGatewayLocalStateDir).toBe(gatewayStateDir);
+    expect(uninstallStatePaths(paths)).toEqual([
+      path.join("/home/test", ".nemoclaw"),
+      path.join("/home/test", ".local", "state", "nemoclaw"),
+      gatewayStateDir,
+      path.join("/home/test", ".config", "openshell"),
+      path.join("/home/test", ".config", "nemoclaw"),
+    ]);
+  });
+
   it("exposes the Linux Docker-driver gateway state dir so uninstall can clean it (#3456)", () => {
     // ~/.local/state/nemoclaw/ holds the openshell-gateway PID file, SQLite
     // database, audit log, and vm-driver/ state. Documented as

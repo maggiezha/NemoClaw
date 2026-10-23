@@ -37,7 +37,7 @@ function validate(
     imageName: metadata.imageName,
     requireOpenshellSandboxAbi: true,
     minGlibcVersion: "2.39",
-    inspected: imageMetadata,
+    inspectLocalImage: () => imageMetadata,
   });
 }
 
@@ -56,6 +56,22 @@ describe("sandbox base-image resolution validation", () => {
       ok: false,
       reason: "repo_digest_missing",
     });
+  });
+
+  it("validates an exact digest reference when Docker reports another repository digest (#9386)", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const exactMetadata = {
+      ...metadata,
+      ref: `${metadata.imageName}@${digest}`,
+      digest,
+    };
+
+    expect(
+      validate(exactMetadata, {
+        ...inspected,
+        RepoDigests: [`${metadata.imageName}@sha256:${"b".repeat(64)}`],
+      }),
+    ).toEqual({ ok: true });
   });
 
   it("validates local fallback images by identity without RepoDigests (#4680)", () => {

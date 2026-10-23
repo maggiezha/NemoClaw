@@ -1,6 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { normalizeReasoningEffort, type ReasoningEffort } from "../onboard/reasoning-mode";
+import {
+  readModelSelectionProvenance,
+  type ModelSelectionProvenance,
+} from "../domain/telemetry/provenance";
+import { usesNativeLocalInferenceForAgent } from "./native-local/contract";
+
+export {
+  isPersistedPiSharedLocalInferenceRoute,
+  normalizeNativeLocalProviderAttachment,
+  usesNativeLocalInferenceForAgent,
+} from "./native-local/contract";
+
+/** Identify an existing local selection that predates sandbox-attached providers. */
+export function hasLegacySharedLocalInferenceRoute(recorded: {
+  agent?: string | null;
+  provider?: string | null;
+  endpointUrl?: string | null;
+  nimContainer?: string | null;
+  nativeLocalProviderAttachment?: unknown;
+}): boolean {
+  return (
+    recorded.nativeLocalProviderAttachment === undefined &&
+    !recorded.nimContainer &&
+    usesNativeLocalInferenceForAgent(
+      recorded.agent ?? "openclaw",
+      recorded.provider,
+      recorded.endpointUrl,
+      Boolean(recorded.nimContainer),
+    )
+  );
+}
+
+export {
+  type ReasoningEffortRequest,
+  resolveReasoningEffortRequest,
+} from "../onboard/reasoning-mode";
+
 export type InferenceEndpointSource = "onboard" | "inference-set";
 
 export interface InferenceSelection {
@@ -11,12 +49,25 @@ export interface InferenceSelection {
   credentialEnv: string | null;
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: "true" | "false" | null;
+  compatibleEndpointReasoningEffort: ReasoningEffort | null;
   nimContainer: string | null;
+  modelSelectionProvenance?: ModelSelectionProvenance;
 }
 
+export type EffectiveReasoningEffort = ReasoningEffort | "endpoint-default";
+
 export type InferenceSelectionInput =
-  | (Partial<Omit<InferenceSelection, "compatibleEndpointReasoning">> & {
+  | (Partial<
+      Omit<
+        InferenceSelection,
+        | "compatibleEndpointReasoning"
+        | "compatibleEndpointReasoningEffort"
+        | "modelSelectionProvenance"
+      >
+    > & {
       compatibleEndpointReasoning?: unknown;
+      compatibleEndpointReasoningEffort?: unknown;
+      modelSelectionProvenance?: unknown;
     })
   | null
   | undefined;
@@ -51,12 +102,25 @@ function nullableCompatibleEndpointReasoning(
   return normalized === "true" || normalized === "false" ? normalized : null;
 }
 
+function nullableCompatibleEndpointReasoningEffort(
+  provider: string | null,
+  value: unknown,
+): ReasoningEffort | null {
+  if (provider !== "compatible-endpoint") return null;
+  return normalizeReasoningEffort(value);
+}
+
 export function normalizeInferenceSelection(input: InferenceSelectionInput): InferenceSelection {
   const provider = nullableString(input?.provider);
   const endpointUrl = nullableString(input?.endpointUrl);
+  const model = nullableString(input?.model);
+  const provenance = readModelSelectionProvenance(input?.modelSelectionProvenance);
   return {
     provider,
-    model: nullableString(input?.model),
+    model,
+    ...(provenance?.model === model && provenance.provider === provider
+      ? { modelSelectionProvenance: provenance }
+      : {}),
     endpointUrl,
     endpointSource: endpointUrl ? normalizeInferenceEndpointSource(input?.endpointSource) : null,
     credentialEnv: nullableString(input?.credentialEnv),
@@ -65,8 +129,38 @@ export function normalizeInferenceSelection(input: InferenceSelectionInput): Inf
       provider,
       input?.compatibleEndpointReasoning,
     ),
+    compatibleEndpointReasoningEffort: nullableCompatibleEndpointReasoningEffort(
+      provider,
+      input?.compatibleEndpointReasoningEffort,
+    ),
     nimContainer: nullableString(input?.nimContainer),
   };
+}
+
+/**
+ * Return the non-secret reasoning-effort setting that actually applies to a
+ * compatible OpenAI Completions route. An absent override delegates to the
+ * endpoint instead of silently looking like an unknown value.
+ */
+export function getEffectiveReasoningEffort(
+  input:
+    | Partial<
+        Pick<
+          InferenceSelection,
+          "provider" | "preferredInferenceApi" | "compatibleEndpointReasoningEffort"
+        >
+      >
+    | null
+    | undefined,
+): EffectiveReasoningEffort | null {
+  const selection = normalizeInferenceSelection(input);
+  if (
+    selection.provider !== "compatible-endpoint" ||
+    selection.preferredInferenceApi !== "openai-completions"
+  ) {
+    return null;
+  }
+  return selection.compatibleEndpointReasoningEffort ?? "endpoint-default";
 }
 
 export function inferenceSelectionRegistryFields(

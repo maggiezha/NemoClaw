@@ -5,7 +5,7 @@ function recordDeepAgentsRuntimeCall(
   args: string[],
   calls: string[],
   probeOutput: string,
-  smokeVersion = "0.1.34",
+  smokeVersion = "0.1.71",
 ): string {
   calls.push(args.join(" "));
   const separatorIndex = args.indexOf("--");
@@ -22,19 +22,19 @@ function recordDeepAgentsRuntimeCall(
     return probeOutput;
   }
   if (command.includes("dcode --version")) {
-    return `dcode ${smokeVersion}\nNEMOCLAW_AGENT_SMOKE_EXIT:0`;
+    return `NEMOCLAW_AGENT_SMOKE_BEGIN\ndcode ${smokeVersion}\nNEMOCLAW_AGENT_SMOKE_EXIT:0`;
   }
   if (command.includes("NEMOCLAW_DCODE_EMPTY_PROMPT_OK")) {
-    return "NEMOCLAW_DCODE_EMPTY_PROMPT_OK\nNEMOCLAW_AGENT_SMOKE_EXIT:0";
+    return "NEMOCLAW_AGENT_SMOKE_BEGIN\nNEMOCLAW_DCODE_EMPTY_PROMPT_OK\nNEMOCLAW_AGENT_SMOKE_EXIT:0";
   }
   if (command.includes("/sandbox/.deepagents/config.toml")) {
-    return "NEMOCLAW_DEEPAGENTS_CONFIG_OK\nNEMOCLAW_AGENT_SMOKE_EXIT:0";
+    return "NEMOCLAW_AGENT_SMOKE_BEGIN\nNEMOCLAW_DEEPAGENTS_CONFIG_OK\nNEMOCLAW_AGENT_SMOKE_EXIT:0";
   }
   return "";
 }
 
 export function recordSuccessfulDeepAgentsRuntimeCall(args: string[], calls: string[]): string {
-  return recordDeepAgentsRuntimeCall(args, calls, "dcode 0.1.34");
+  return recordDeepAgentsRuntimeCall(args, calls, "dcode 0.1.71");
 }
 
 // Like recordSuccessfulDeepAgentsRuntimeCall, but the plain version-drift
@@ -62,5 +62,5 @@ export function recordFailingDeepAgentsSmokeCall(args: string[]): string {
   const command = args.slice(args.indexOf("--") + 1).at(-1) ?? "";
   return command.includes("NEMOCLAW_AGENT_BINARY_CHECK")
     ? "NEMOCLAW_AGENT_BINARY_CHECK:ok"
-    : "dcode provider route failed\nNEMOCLAW_AGENT_SMOKE_EXIT:42";
+    : "NEMOCLAW_AGENT_SMOKE_BEGIN\ndcode provider route failed\nNEMOCLAW_AGENT_SMOKE_EXIT:42";
 }

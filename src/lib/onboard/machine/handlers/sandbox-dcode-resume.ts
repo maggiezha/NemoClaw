@@ -17,7 +17,9 @@ export interface Deps {
     provider: string,
     model: string,
     preferredInferenceApi: string | null,
-  ): { changed: boolean; unknown: boolean };
+    endpointUrl: string | null,
+    nativeProvider: boolean,
+  ): Promise<{ changed: boolean; unknown: boolean }>;
   error(message?: string): void;
   exitProcess(code: number): never;
 }
@@ -32,6 +34,7 @@ interface SelectionOptions<Agent> {
 interface ResumeOptions<Agent> extends SelectionOptions<Agent> {
   readonly resume: boolean;
   readonly preferredInferenceApi: string | null;
+  readonly endpointUrl: string | null;
   readonly requestedDcodeAutoApprovalMode?: DcodeAutoApprovalMode | null;
 }
 
@@ -47,6 +50,8 @@ function agentName<Agent>(agent: Agent): string | null | undefined {
 export function resolveAutoApprovalMode<Agent>(
   options: SelectionOptions<Agent> & {
     readonly requestedDcodeAutoApprovalMode?: DcodeAutoApprovalMode | null;
+    readonly resume?: boolean;
+    readonly session?: Session | null;
   },
   sandboxName: string | null,
   deps: Pick<Deps, "error" | "exitProcess"> & {
@@ -54,11 +59,21 @@ export function resolveAutoApprovalMode<Agent>(
   },
 ): DcodeAutoApprovalMode {
   const registryEntry = sandboxName ? deps.getSandboxRegistryEntry(sandboxName) : null;
+  // A route reservation precedes registration and does not yet own the capability.
+  // Once registered, its value wins over old session intent, including revocation.
+  const registered =
+    registryEntry &&
+    (!registryEntry.pendingRouteReservation || registryEntry.dcodeAutoApprovalMode != null);
+  const pendingMode =
+    options.resume && !registered && options.session?.dcodeAutoApprovalRequestedExplicitly
+      ? options.session.dcodeAutoApprovalMode
+      : null;
   const resolution = resolveDcodeAutoApprovalRequest({
     agent: usesManagedDcodeIdentity(agentName(options.agent), options.fromDockerfile)
       ? agentName(options.agent)
       : null,
     requestedMode: options.requestedDcodeAutoApprovalMode,
+    pendingMode,
     recordedMode: registryEntry?.dcodeAutoApprovalMode,
   });
   if (!resolution.error) return resolution.mode;
@@ -80,14 +95,14 @@ export function preserveManagedDcodeRegistryEntry<Agent>(
   return { ...decision, removeRegistryEntry: false };
 }
 
-export function resolveSignals<Agent>(
+export async function resolveSignals<Agent>(
   options: ResumeOptions<Agent>,
   state: ResumeState,
   sandboxReuseState: string,
   registryEntry: SandboxEntry | null,
   dcodeAutoApprovalMode: DcodeAutoApprovalMode,
   deps: Deps,
-): { inferenceSelectionChanged: boolean; dcodeAutoApprovalChanged: boolean } {
+): Promise<{ inferenceSelectionChanged: boolean; dcodeAutoApprovalChanged: boolean }> {
   const sandboxName = state.sandboxName;
   const dcodeAutoApprovalChanged = hasDcodeAutoApprovalDrift({
     liveExists: sandboxReuseState === "ready",
@@ -111,11 +126,17 @@ export function resolveSignals<Agent>(
     );
     return deps.exitProcess(1);
   }
-  const drift = deps.getDcodeSelectionDrift(
+  const drift = await deps.getDcodeSelectionDrift(
     sandboxName,
     options.provider,
     options.model,
     options.preferredInferenceApi,
+    registryEntry.nativeLocalProviderAttachment?.endpointUrl ?? options.endpointUrl,
+    Boolean(
+      registryEntry.nativeLocalProviderAttachment ||
+      registryEntry.nativeHostedProviderAttachment ||
+      registryEntry.nativeNvidiaProviderAttachment,
+    ),
   );
   return {
     inferenceSelectionChanged: Boolean(drift.changed || drift.unknown),

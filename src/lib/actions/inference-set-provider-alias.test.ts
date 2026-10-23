@@ -17,16 +17,20 @@ import { shellQuote } from "../core/shell-quote";
 // stay in sync with. Imported here (test only — not into the inference-set hot
 // path) to drive the parity check below. providers.ts is a CJS module.
 import * as onboardProvidersNs from "../onboard/providers";
-import type { ConfigValue } from "../security/credential-filter";
+import type { ConfigObject, ConfigValue } from "../security/credential-filter";
 import {
   INFERENCE_SET_INSTALLER_PROVIDER_ALIASES,
   INFERENCE_SET_SUPPORTED_PROVIDER_NAMES,
   normalizeInferenceSetProvider,
   runInferenceSet,
 } from "./inference-set";
-import { baseSession, createDeps } from "./inference-set.test-support";
+import {
+  baseSession,
+  createCompatibleProviderCapture,
+  createDeps,
+} from "../../../test/helpers/inference-set";
+import type { EnsureHttpsPinRuntimeAdapterOptions } from "./inference-set-route-containment";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const onboardProviders: any =
   (onboardProvidersNs as unknown as { default?: unknown }).default ?? onboardProvidersNs;
 
@@ -37,9 +41,8 @@ function expectNoInferenceMutation(calls: ReturnType<typeof createDeps>["calls"]
   expect(calls.captureOpenshell).not.toHaveBeenCalled();
   expect(calls.updateSandbox).not.toHaveBeenCalled();
   expect(calls.writeSandboxConfig).not.toHaveBeenCalled();
-  expect(calls.recomputeSandboxConfigHash).not.toHaveBeenCalled();
   expect(calls.updateSession).not.toHaveBeenCalled();
-  expect(calls.appendAuditEntry).not.toHaveBeenCalled();
+  expect(calls.recomputeSandboxConfigHash).not.toHaveBeenCalled();
   expect(calls.restartSandboxGateway).not.toHaveBeenCalled();
 }
 
@@ -63,25 +66,66 @@ describe("normalizeInferenceSetProvider — facet 1 provider-name drift (#6321)"
     expect(normalizeInferenceSetProvider("BUILD")).toBe("nvidia-prod");
   });
 
-  it("passes OpenShell provider names through unchanged", () => {
-    for (const name of INFERENCE_SET_SUPPORTED_PROVIDER_NAMES) {
+  it.each(INFERENCE_SET_SUPPORTED_PROVIDER_NAMES)(
+    "passes the OpenShell provider name %s through unchanged",
+    (name) => {
       expect(normalizeInferenceSetProvider(name)).toBe(name);
-    }
-  });
+    },
+  );
 
-  it("passes an unrecognized provider through unchanged (validation still rejects it later)", () => {
+  it("passes an unrecognized provider through unchanged for gateway validation", () => {
     expect(normalizeInferenceSetProvider("totally-made-up")).toBe("totally-made-up");
   });
 
-  it("every installer alias resolves to a supported OpenShell provider name (drift guard)", () => {
-    const supported = new Set<string>(INFERENCE_SET_SUPPORTED_PROVIDER_NAMES);
-    for (const [alias, resolved] of Object.entries(INFERENCE_SET_INSTALLER_PROVIDER_ALIASES)) {
+  // #11369: underscore-spelled provider inputs (installer-style) must normalize
+  // to the canonical hyphenated OpenShell provider name, instead of being
+  // rejected as unsupported.
+  it("normalizes the underscore spelling of a canonical local provider name", () => {
+    expect(normalizeInferenceSetProvider("ollama_local")).toBe("ollama-local");
+    expect(normalizeInferenceSetProvider("vllm_local")).toBe("vllm-local");
+  });
+
+  it("normalizes underscore spellings of other canonical provider names", () => {
+    expect(normalizeInferenceSetProvider("nvidia_prod")).toBe("nvidia-prod");
+    expect(normalizeInferenceSetProvider("llama_cpp_local")).toBe("llama-cpp-local");
+  });
+
+  it("normalizes underscore spellings of installer alias keys", () => {
+    expect(normalizeInferenceSetProvider("open_router")).toBe("openrouter-api");
+    expect(normalizeInferenceSetProvider("nim_local")).toBe("nvidia-nim");
+    expect(normalizeInferenceSetProvider("llama_cpp")).toBe("llama-cpp-local");
+    expect(normalizeInferenceSetProvider("nous_portal")).toBe("hermes-provider");
+  });
+
+  it("is case-insensitive and trims whitespace on underscore spellings", () => {
+    expect(normalizeInferenceSetProvider("  Ollama_Local  ")).toBe("ollama-local");
+    expect(normalizeInferenceSetProvider("VLLM_LOCAL")).toBe("vllm-local");
+  });
+
+  it("passes an unsupported underscore spelling through unchanged (validation still rejects it)", () => {
+    // A made-up name is not rescued by underscore folding; it passes through so
+    // downstream validation still rejects it.
+    expect(normalizeInferenceSetProvider("totally_made_up")).toBe("totally_made_up");
+  });
+
+  it.each([...INFERENCE_SET_SUPPORTED_PROVIDER_NAMES])(
+    "normalizes the underscore spelling of canonical name %s back to the hyphenated form",
+    (name) => {
+      const underscored = name.replaceAll("-", "_");
+      expect(normalizeInferenceSetProvider(underscored)).toBe(name);
+    },
+  );
+
+  it.each(Object.entries(INFERENCE_SET_INSTALLER_PROVIDER_ALIASES))(
+    "resolves the %s installer alias to the supported %s provider",
+    (alias, resolved) => {
+      const supported = new Set<string>(INFERENCE_SET_SUPPORTED_PROVIDER_NAMES);
       expect(
         supported.has(resolved),
         `${alias} -> ${resolved} not in SUPPORTED_PROVIDER_NAMES`,
       ).toBe(true);
-    }
-  });
+    },
+  );
 });
 
 describe("runInferenceSet accepts the installer provider name — facet 1 (#6321)", () => {
@@ -122,20 +166,125 @@ describe("runInferenceSet accepts the installer provider name — facet 1 (#6321
 
     // The persisted provider must be the normalized OpenShell name, not the
     // installer alias, so the sandbox registry stays canonical.
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
-      "alpha",
-      expect.objectContaining({ provider: "compatible-anthropic-endpoint" }),
-    ]);
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual(["alpha", expect.objectContaining({ provider: "compatible-anthropic-endpoint" })]);
   });
 
   it("still rejects a genuinely unsupported provider name", async () => {
+    const output =
+      "nvidia-prod\nqa-non-inference\ncompatible-endpoint\nllama-cpp-local\nollama-local\n";
+    const captureOpenshell = vi.fn(() => ({ status: 0, output, stdout: output, stderr: "" }));
     const deps = createDeps({
       config: { agents: { defaults: { model: { primary: "inference/nvidia/model-a" } } } },
-      entry: { name: "alpha", agent: "openclaw" },
+      entry: {
+        name: "alpha",
+        agent: "openclaw",
+        gatewayName: "nemoclaw-18080",
+      },
+      captureOpenshell,
     });
     await expect(
       runInferenceSet({ provider: "totally-made-up", model: "nvidia/model-a" }, deps),
-    ).rejects.toThrow(/Unsupported provider 'totally-made-up'/);
+    ).rejects.toThrow(
+      "Unsupported provider 'totally-made-up'. Selectable providers registered on gateway " +
+        "'nemoclaw-18080': compatible-endpoint, llama-cpp-local, nvidia-prod, ollama-local, qa-non-inference.",
+    );
+    expect(captureOpenshell).toHaveBeenCalledWith(
+      ["provider", "list", "-g", "nemoclaw-18080", "--names"],
+      expect.objectContaining({ timeout: 5_000 }),
+    );
+    expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSession).not.toHaveBeenCalled();
+    expect(deps.calls.recomputeSandboxConfigHash).not.toHaveBeenCalled();
+    expect(deps.calls.restartSandboxGateway).not.toHaveBeenCalled();
+  });
+
+  it("accepts an additional registered provider without replacing its native config", async () => {
+    const provider = "native-extra";
+    const nativeProviderConfig = {
+      api: "openai-completions",
+      apiKey: "native-owned-reference",
+      baseUrl: "https://native.example/v1",
+      models: [{ id: "vendor/model-a", name: "vendor/model-a" }],
+    };
+    const output = `nvidia-prod\n${provider}\n`;
+    const captureOpenshell = vi.fn(() => ({ status: 0, output, stdout: output, stderr: "" }));
+    const config: ConfigObject = {
+      agents: { defaults: { model: { primary: "inference/nvidia/model-a" } } },
+      models: {
+        providers: {
+          inference: { api: "openai-completions", models: [] },
+          [provider]: nativeProviderConfig,
+        },
+      },
+    };
+    const deps = createDeps({
+      config,
+      entry: {
+        name: "alpha",
+        agent: "openclaw",
+        gatewayName: "nemoclaw-18080",
+        provider: "nvidia-prod",
+        model: "nvidia/model-a",
+      },
+      captureOpenshell,
+    });
+
+    await expect(
+      runInferenceSet({ provider, model: "vendor/model-b", noVerify: true }, deps),
+    ).resolves.toMatchObject({ provider, model: "vendor/model-b" });
+
+    expect(captureOpenshell).toHaveBeenNthCalledWith(
+      1,
+      ["provider", "list", "-g", "nemoclaw-18080", "--names"],
+      expect.objectContaining({ ignoreError: true, timeout: 5_000 }),
+    );
+    expect(captureOpenshell).toHaveBeenNthCalledWith(
+      2,
+      [
+        "inference",
+        "set",
+        "-g",
+        "nemoclaw-18080",
+        "--no-verify",
+        "--provider",
+        provider,
+        "--model",
+        "vendor/model-b",
+      ],
+      expect.objectContaining({ ignoreError: true }),
+    );
+    expect(captureOpenshell).toHaveBeenCalledTimes(2);
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.setOpenClawConfigValues).toHaveBeenCalledOnce();
+    expect(deps.calls.setOpenClawConfigValues).toHaveBeenCalledWith(
+      "alpha",
+      expect.arrayContaining([
+        expect.objectContaining({
+          dotpath: "models.providers.inference",
+          value: expect.objectContaining({
+            models: expect.arrayContaining([expect.objectContaining({ id: "vendor/model-b" })]),
+          }),
+        }),
+      ]),
+      "nemoclaw-18080",
+    );
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
+      "alpha",
+      expect.objectContaining({
+        provider,
+        endpointUrl: null,
+        credentialEnv: null,
+      }),
+    ]);
   });
 
   it("hands OpenShell the exact `compatible-anthropic-endpoint` name, never the `anthropicCompatible` alias (#6321)", async () => {
@@ -241,20 +390,21 @@ describe("runInferenceSet dcode refusal message — facet 3 (#6321)", () => {
     await expect(attempt).rejects.toThrow(`--name ${shellQuote(name)} --fresh`);
     // The bare, unquoted name must not sit directly after --name.
     await expect(attempt).rejects.not.toThrow(`--name ${name} --fresh`);
+  });
 
-    // PRA-2: validateName blocks metacharacter names before this hint, so the
-    // shellQuote layer is defense-in-depth. Assert it keeps spaces, quotes, ';',
-    // '$()' and backticks inside a single quoted argument that a shell cannot
-    // break out of.
-    for (const meta of ["a b", "a'b", "a;b", "a$(id)", "a`id`"]) {
+  // PRA-2: validateName blocks metacharacter names before the recovery hint, so
+  // shellQuote is defense-in-depth.
+  it.each(["a b", "a'b", "a;b", "a$(id)", "a`id`"])(
+    "keeps the metacharacter input %j inside one shell argument",
+    (meta) => {
       const quoted = shellQuote(meta);
       expect(quoted.startsWith("'")).toBe(true);
       expect(quoted.endsWith("'")).toBe(true);
       // After removing the only legal break-out escape ('\''), no bare single
       // quote remains — nothing can terminate the quoted argument early.
       expect(quoted.slice(1, -1).replaceAll("'\\''", "")).not.toContain("'");
-    }
-  });
+    },
+  );
 });
 
 // Hosts the stand-in guard treats as internal-resolving. Parsed exactly from
@@ -279,6 +429,29 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
     });
   }
 
+  // A DNS-backed HTTPS endpoint (the shape every URL in this suite uses) never
+  // reaches rewriteConfigUrlsWithDnsPinning/ssrfGuard above — it is eligible for
+  // the HTTPS-pin runtime adapter, whose real implementation runs its own SSRF
+  // preflight (assertEndpointResolvesPublic) before registering a route. This
+  // stand-in mirrors that preflight against the same STUB_INTERNAL_HOSTS set.
+  function httpsPinAdapterGuard() {
+    return vi.fn(async (options: EnsureHttpsPinRuntimeAdapterOptions) => {
+      const host = new URL(options.endpointUrl).hostname;
+      return STUB_INTERNAL_HOSTS.has(host)
+        ? Promise.reject(
+            new Error(
+              `URL hostname "${host}" resolves to private/internal address "10.48.203.205". This could expose internal services to the sandbox.`,
+            ),
+          )
+        : Promise.resolve({
+            baseUrl: "http://host.openshell.internal:11438/route/test-route",
+            credentialEnv: "NEMOCLAW_HTTPS_PIN_RUNTIME_ADAPTER_TOKEN",
+            token: "test-adapter-token",
+            routeId: "test-route",
+          });
+    });
+  }
+
   it("keeps the SSRF guard when same-endpoint onboarding provenance is missing", async () => {
     // Legacy registry rows have no machine-checkable endpoint source. Exact
     // string equality is insufficient because inference set also persists the
@@ -294,7 +467,7 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "openai-completions",
       },
-      rewriteConfigUrlsWithDnsPinning: ssrfGuard(),
+      ensureHttpsPinRuntimeAdapter: httpsPinAdapterGuard(),
     });
 
     const attempt = runInferenceSet(
@@ -323,6 +496,13 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
     // the canonical supplied URL must match the URL whose registry source is
     // onboarding. DNS re-resolution is not required for that exact identity.
     const guard = ssrfGuard();
+    const adapterGuard = httpsPinAdapterGuard();
+    const captureOpenshell = createCompatibleProviderCapture({
+      name: "compatible-anthropic-endpoint",
+      type: "anthropic",
+      credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
+      configKey: "ANTHROPIC_BASE_URL",
+    });
     const deps = createDeps({
       config: { agents: { defaults: { model: { primary: "inference/anthropic/model-a" } } } },
       entry: {
@@ -336,6 +516,8 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
         preferredInferenceApi: "anthropic-messages",
       },
       rewriteConfigUrlsWithDnsPinning: guard,
+      ensureHttpsPinRuntimeAdapter: adapterGuard,
+      captureOpenshell,
     });
     await expect(
       runInferenceSet(
@@ -349,14 +531,23 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
       ),
     ).resolves.toBeTruthy();
     expect(guard).not.toHaveBeenCalled();
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
-      "alpha",
-      expect.objectContaining({ endpointSource: "onboard" }),
-    ]);
+    expect(adapterGuard).not.toHaveBeenCalled();
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual(["alpha", expect.objectContaining({ endpointSource: "onboard" })]);
   });
 
   it("accepts the same onboard-provenanced internal endpoint after canonicalization (#6321)", async () => {
     const guard = ssrfGuard();
+    const adapterGuard = httpsPinAdapterGuard();
+    const captureOpenshell = createCompatibleProviderCapture({
+      name: "compatible-endpoint",
+      type: "openai",
+      credentialEnv: "COMPATIBLE_API_KEY",
+      configKey: "OPENAI_BASE_URL",
+    });
     const deps = createDeps({
       config: {
         agents: { defaults: { model: { primary: "inference/nvidia/model-a" } } },
@@ -373,6 +564,8 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
         preferredInferenceApi: "openai-completions",
       },
       rewriteConfigUrlsWithDnsPinning: guard,
+      ensureHttpsPinRuntimeAdapter: adapterGuard,
+      captureOpenshell,
     });
 
     await expect(
@@ -387,10 +580,11 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
       ),
     ).resolves.toBeTruthy();
     expect(guard).not.toHaveBeenCalled();
+    expect(adapterGuard).not.toHaveBeenCalled();
   });
 
   it("keeps the SSRF guard for an inference-set-authored endpoint", async () => {
-    const guard = ssrfGuard();
+    const guard = httpsPinAdapterGuard();
     const deps = createDeps({
       config: {
         agents: { defaults: { model: { primary: "inference/nvidia/model-a" } } },
@@ -406,7 +600,7 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "openai-completions",
       },
-      rewriteConfigUrlsWithDnsPinning: guard,
+      ensureHttpsPinRuntimeAdapter: guard,
     });
 
     const attempt = runInferenceSet(
@@ -500,7 +694,7 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
         provider: "nvidia-prod",
         model: "nvidia/model-a",
       },
-      rewriteConfigUrlsWithDnsPinning: ssrfGuard(),
+      ensureHttpsPinRuntimeAdapter: httpsPinAdapterGuard(),
     });
 
     const attempt = runInferenceSet(
@@ -555,46 +749,38 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
 });
 
 describe("installer alias parity with onboard provider config — facet 1 drift guard (#6321)", () => {
-  it("matches onboard's getEffectiveProviderName for every shared provider key", () => {
-    // Bind the local alias map to onboard's source of truth: for every installer
-    // key onboard accepts that resolves to a provider inference set supports,
-    // normalizeInferenceSetProvider must produce the exact same OpenShell name.
-    // If onboard renames a provider or adds an alias, this fails until the local
-    // map is updated — closing the drift gap CodeRabbit / the PR advisor flagged.
-    const supported = new Set<string>(INFERENCE_SET_SUPPORTED_PROVIDER_NAMES);
-    const aliasKeys: string[] = Object.keys(
-      onboardProviders.NON_INTERACTIVE_PROVIDER_ALIASES ?? {},
+  const supported = new Set<string>(INFERENCE_SET_SUPPORTED_PROVIDER_NAMES);
+  const aliasKeys: string[] = Object.keys(onboardProviders.NON_INTERACTIVE_PROVIDER_ALIASES ?? {});
+  const directKeys: string[] = Array.from(
+    (onboardProviders.NON_INTERACTIVE_PROVIDER_KEYS ?? new Set()) as Iterable<string>,
+  );
+  const onboardKeys = [...new Set([...aliasKeys, ...directKeys])];
+  const relevant = onboardKeys
+    .map((key) => ({
+      key,
+      onboardResolved: onboardProviders.getEffectiveProviderName(
+        onboardProviders.NON_INTERACTIVE_PROVIDER_ALIASES?.[key] ?? key,
+      ) as string | null,
+    }))
+    .filter(
+      (entry): entry is { key: string; onboardResolved: string } =>
+        !!entry.onboardResolved && supported.has(entry.onboardResolved),
     );
-    const directKeys: string[] = Array.from(
-      (onboardProviders.NON_INTERACTIVE_PROVIDER_KEYS ?? new Set()) as Iterable<string>,
-    );
-    const onboardKeys = [...new Set([...aliasKeys, ...directKeys])];
+
+  it("loads a meaningful set of onboard provider keys", () => {
     // Sanity: onboard exposes a non-trivial key set (guards against an import
     // that silently resolved to an empty object).
     expect(onboardKeys.length).toBeGreaterThan(5);
+    expect(relevant.length).toBeGreaterThan(3);
+  });
 
-    // Resolve each onboard key to its OpenShell provider name, then keep only
-    // those that are inference-set targets. `.map().filter()` (not a loop with
-    // `if`/`continue`) to satisfy the test-shape gate.
-    const relevant = onboardKeys
-      .map((key) => ({
-        key,
-        onboardResolved: onboardProviders.getEffectiveProviderName(
-          onboardProviders.NON_INTERACTIVE_PROVIDER_ALIASES?.[key] ?? key,
-        ) as string | null,
-      }))
-      .filter(
-        (entry): entry is { key: string; onboardResolved: string } =>
-          !!entry.onboardResolved && supported.has(entry.onboardResolved),
-      );
-
-    for (const { key, onboardResolved } of relevant) {
+  it.each(relevant)(
+    "maps the onboard $key key to the $onboardResolved OpenShell provider",
+    ({ key, onboardResolved }) => {
       expect(
         normalizeInferenceSetProvider(key),
         `inference set must map onboard key '${key}' to '${onboardResolved}'`,
       ).toBe(onboardResolved);
-    }
-    // We actually exercised a meaningful set (anthropicCompatible, build, etc.).
-    expect(relevant.length).toBeGreaterThan(3);
-  });
+    },
+  );
 });

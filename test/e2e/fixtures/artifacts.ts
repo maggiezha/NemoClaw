@@ -131,12 +131,37 @@ export class ArtifactSink {
   async writeText(relativePath: string, text: string): Promise<string> {
     const target = this.pathFor(relativePath);
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, redactString(text, this.redactionValues), "utf8");
+    await fs.writeFile(target, this.redact(text), "utf8");
     return target;
   }
 
+  redact(text: string): string {
+    return redactString(text, this.redactionValues);
+  }
+
   async writeJson(relativePath: string, value: unknown): Promise<string> {
-    return this.writeText(relativePath, `${JSON.stringify(value, null, 2)}\n`);
+    // Redact decoded values before encoding so escaping cannot hide a secret or
+    // let a text replacement consume JSON syntax. Preserve property-name context.
+    const redacted = JSON.parse(JSON.stringify(value), (key, entry: unknown) => {
+      if (entry !== null && typeof entry === "object") {
+        return Array.isArray(entry)
+          ? entry
+          : Object.fromEntries(
+              Object.entries(entry).map(([name, item]) => [this.redact(name), item]),
+            );
+      }
+      const prefix = `${key}="`;
+      const context = `${prefix}${String(entry)}"`;
+      const result = this.redact(context);
+      if (result === context) return entry;
+      return result.startsWith(prefix) && result.endsWith('"')
+        ? result.slice(prefix.length, -1)
+        : "<REDACTED>";
+    });
+    const target = this.pathFor(relativePath);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, `${JSON.stringify(redacted, null, 2)}\n`, "utf8");
+    return target;
   }
 }
 

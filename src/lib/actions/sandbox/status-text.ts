@@ -9,8 +9,10 @@ import { shellQuote } from "../../core/shell-quote";
 import { formatInferenceRouteDriftForDisplay } from "../../inference/config";
 import type { ProviderHealthStatus } from "../../inference/health";
 import * as nim from "../../inference/nim";
+import { getEffectiveReasoningEffort } from "../../inference/selection";
+import { buildSshForwardHintLines } from "../../onboard/ssh-forward-hint";
+import { getGatewayPresets } from "../../policy";
 import * as sandboxVersion from "../../sandbox/version";
-import * as shields from "../../shields";
 import type { SandboxEntry, SandboxGpuProofResult } from "../../state/registry";
 import {
   createSystemDeps as createSessionDeps,
@@ -18,9 +20,10 @@ import {
 } from "../../state/sandbox-session";
 import type { SandboxDockerRuntime } from "./docker-health";
 import type { SandboxGatewayState } from "./gateway-state";
-import { isSandboxGatewayRunningForStatus } from "./process-recovery";
+import { isSandboxGatewayRunningForStatus } from "./status/process-recovery";
 import {
   isInferenceHealthFailing,
+  normalizeSandboxStatusHostMounts,
   resolveSandboxStatusDcodeAutoApprovalMode,
   type SandboxStatusAgentInfo,
   type SandboxStatusRouteDrift,
@@ -28,20 +31,21 @@ import {
   type ServingProcessHealth,
 } from "./status-snapshot";
 
-export interface SandboxStatusTextContext
-  extends Pick<
-    SandboxStatusSnapshot,
-    | "sb"
-    | "lookup"
-    | "currentModel"
-    | "currentProvider"
-    | "routeDrift"
-    | "inferenceHealth"
-    | "terminalRuntimeHealth"
-    | "servingProcessHealth"
-  > {
+export interface SandboxStatusTextContext extends Pick<
+  SandboxStatusSnapshot,
+  | "sb"
+  | "lookup"
+  | "currentModel"
+  | "currentProvider"
+  | "routeDrift"
+  | "llamaCpp"
+  | "inferenceHealth"
+  | "terminalRuntimeHealth"
+  | "servingProcessHealth"
+> {
   sandboxName: string;
   statusAgent: SandboxStatusAgentInfo;
+  phase: string | null;
 }
 
 export interface SandboxStatusTextOutcome {
@@ -51,11 +55,14 @@ export interface SandboxStatusTextOutcome {
 /** Returns true when status can validate an agent version against the running sandbox. */
 function shouldProbeSandboxRuntimeVersion(
   lookup: SandboxGatewayState,
+  phase: string | null,
   sandbox: SandboxEntry,
   agentRuntimeKind: string,
 ): boolean {
   return (
-    lookup.state === "present" && (Boolean(sandbox.agentVersion) || agentRuntimeKind === "terminal")
+    phase !== "Stopped" &&
+    lookup.state === "present" &&
+    (Boolean(sandbox.agentVersion) || agentRuntimeKind === "terminal")
   );
 }
 
@@ -161,6 +168,15 @@ function printSandboxGpuStatus(sandbox: SandboxEntry): void {
   }
 }
 
+function printSandboxHostMounts(sandbox: SandboxEntry): void {
+  const hostMounts = normalizeSandboxStatusHostMounts(sandbox.hostMounts);
+  if (hostMounts.length === 0) return;
+  console.log("    Host mounts:");
+  for (const mount of hostMounts) {
+    console.log(`      ${mount.source} -> ${mount.target} (read-only)`);
+  }
+}
+
 function printTerminalHarness(context: SandboxStatusTextContext): number | null {
   const { lookup, sandboxName, statusAgent, terminalRuntimeHealth } = context;
   if (!statusAgent.agentDefinition || statusAgent.agentRuntime !== "terminal") return null;
@@ -205,29 +221,27 @@ function printActiveSessions(sandboxName: string): void {
     const sessionResult = getActiveSandboxSessions(sandboxName, createSessionDeps(openshell));
     if (!sessionResult.detected) return;
     const count = sessionResult.sessions.length;
-    const connected = count > 0 ? `${G}yes${R} (${count} session${count > 1 ? "s" : ""})` : "no";
-    console.log(`    Connected: ${connected}`);
+    const sessions = count > 0 ? `${G}${count}${R}` : "none";
+    console.log(`    SSH sessions: ${sessions}`);
   } catch {
     // Session detection is informational; an unavailable OpenShell client must
     // not suppress the primary sandbox and gateway health report.
   }
 }
 
-function printShieldsPosture(sandboxName: string): void {
-  const posture = shields.getShieldsPosture(sandboxName, false);
-  if (posture.mode === "locked") return;
-  const detail =
-    posture.mode === "mutable_default"
-      ? posture.detail
-      : `${posture.detail} (check \`shields status\` for details)`;
-  console.log(`    Permissions: ${detail}`);
-}
-
-function printAgentVersion(context: SandboxStatusTextContext, sandbox: SandboxEntry): void {
+async function printAgentVersion(
+  context: SandboxStatusTextContext,
+  sandbox: SandboxEntry,
+): Promise<void> {
   try {
     const { lookup, sandboxName, statusAgent } = context;
-    const shouldProbe = shouldProbeSandboxRuntimeVersion(lookup, sandbox, statusAgent.agentRuntime);
-    const versionCheck = sandboxVersion.checkAgentVersion(sandboxName, {
+    const shouldProbe = shouldProbeSandboxRuntimeVersion(
+      lookup,
+      context.phase,
+      sandbox,
+      statusAgent.agentRuntime,
+    );
+    const versionCheck = await sandboxVersion.checkAgentVersion(sandboxName, {
       forceProbe: shouldProbe,
       skipProbe: !shouldProbe,
     });
@@ -294,7 +308,9 @@ function printInferenceRouteDrift(
 }
 
 /** Render registry-backed sandbox details and return any non-fatal degraded outcome. */
-export function printSandboxDetails(context: SandboxStatusTextContext): SandboxStatusTextOutcome {
+export async function printSandboxDetails(
+  context: SandboxStatusTextContext,
+): Promise<SandboxStatusTextOutcome> {
   const { sb, currentModel, currentProvider, sandboxName } = context;
   if (!sb) return { exitCode: null };
 
@@ -303,19 +319,60 @@ export function printSandboxDetails(context: SandboxStatusTextContext): SandboxS
   console.log(`  Sandbox: ${sb.name}`);
   console.log(`    Model:    ${currentModel}`);
   console.log(`    Provider: ${currentProvider}`);
+  if (sb.servingProfileProvenance) {
+    const provenance = sb.servingProfileProvenance;
+    console.log(`    Serving profile: ${provenance.preset.displayName} (${provenance.preset.id})`);
+    console.log(`    Serving recipe:  ${provenance.recipe.id}`);
+    console.log(`    Catalog digest:  ${provenance.catalogDigest}`);
+  }
+  if (context.llamaCpp) {
+    console.log(`    Llama.cpp: ${context.llamaCpp.kind}`);
+    if (context.llamaCpp.kind === "attached") {
+      console.log(`    Endpoint: ${context.llamaCpp.endpointUrl}`);
+    } else if (context.llamaCpp.kind === "unavailable") {
+      console.log(`    Ownership: ${context.llamaCpp.diagnostic}`);
+      console.log(`    Recovery: ${context.llamaCpp.recovery}`);
+    }
+  }
+  const reasoningEffort = getEffectiveReasoningEffort(sb);
+  if (reasoningEffort) console.log(`    Reasoning effort: ${reasoningEffort}`);
   printInferenceRouteDrift(context.routeDrift, sb.name);
   printInferenceStatus(context);
-  const inferenceExitCode = inferenceHealthExitCode(context.inferenceHealth);
+  // A healthy response from a different live route does not prove readiness
+  // for this sandbox's recorded selection. Keep the drift diagnostic distinct,
+  // but fail status until the routes are reconciled (#12621).
+  const inferenceExitCode = context.routeDrift
+    ? 1
+    : inferenceHealthExitCode(context.inferenceHealth);
   printSandboxGpuStatus(sb);
+  printSandboxHostMounts(sb);
   console.log(
     `    OpenShell: ${sb.openshellVersion || "unknown"} (${sb.openshellDriver || "unknown"})`,
   );
-  console.log(`    Policies: ${(sb.policies || []).join(", ") || "none"}`);
+  const livePolicies = await getGatewayPresets(sandboxName);
+  console.log(
+    `    Policies: ${livePolicies === null ? "unavailable" : livePolicies.join(", ") || "none"}`,
+  );
   const agentExitCode = printAgentHarness(context);
   printActiveSessions(sandboxName);
-  printShieldsPosture(sandboxName);
-  printAgentVersion(context, sb);
+  await printAgentVersion(context, sb);
   return { exitCode: inferenceExitCode ?? agentExitCode };
+}
+
+// `status` does not print the dashboard URL, so direct SSH operators to
+// `dashboard-url` only when the shared SSH port forward check says the
+// dashboard still needs a loopback forward (#5925, #8465).
+function printDashboardRemoteAccessHint(context: SandboxStatusTextContext): void {
+  const { sandboxName, sb } = context;
+  const dashboardPort = sb?.dashboardPort;
+  if (!dashboardPort) return;
+  const accessUrl = sb?.dashboardRemoteBindPrepared
+    ? `http://0.0.0.0:${dashboardPort}`
+    : process.env.CHAT_UI_URL;
+  if (!buildSshForwardHintLines({ port: dashboardPort, accessUrl })) return;
+  console.log(
+    `      Remote access: run \`${CLI_NAME} ${shellQuote(sandboxName)} dashboard-url\` for SSH port forward instructions.`,
+  );
 }
 
 async function printGatewayProcessStatus(context: SandboxStatusTextContext): Promise<void> {
@@ -325,6 +382,7 @@ async function printGatewayProcessStatus(context: SandboxStatusTextContext): Pro
   const agentName = statusAgent.agentDisplayName;
   if (running) {
     console.log(`    ${agentName}: ${G}running${R}`);
+    printDashboardRemoteAccessHint(context);
     return;
   }
   console.log(`    ${agentName}: ${RD}not running${R}`);
@@ -340,7 +398,7 @@ async function printGatewayProcessStatus(context: SandboxStatusTextContext): Pro
 
 /** Render the live agent process status after the gateway lookup is shown. */
 export async function printAgentProcessStatus(context: SandboxStatusTextContext): Promise<void> {
-  if (context.lookup.state !== "present") return;
+  if (context.lookup.state !== "present" || context.phase === "Stopped") return;
   if (context.statusAgent.agentRuntime === "gateway") {
     await printGatewayProcessStatus(context);
     return;

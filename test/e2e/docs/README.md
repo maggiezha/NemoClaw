@@ -24,6 +24,8 @@ Direct E2E implementations now live in Vitest. The former
 | Live target IDs and metadata | `test/e2e/registry/registry.ts`, `test/e2e/registry/definitions/baseline.ts` |
 | GitHub Actions matrix emission | `test/e2e/registry/run.ts --emit-live-matrix` |
 | Live target execution | `test/e2e/live/registry-targets.test.ts` |
+| Homogeneous target catalogue and execution | [Catalogue Targets](../README.md#catalogue-targets) |
+| Main-push and manual selection | `tools/e2e/workflow-plan.mts` |
 | Phase fixtures and clients | `test/e2e/fixtures/` |
 | Expected-state probes | `test/e2e/registry/expected-states.ts` |
 | Product-facing setup/onboarding state | `test/e2e/manifests/*.yaml` |
@@ -46,24 +48,247 @@ Live execution happens through shared fixtures:
 - `environment` checks CLI/install/runtime readiness.
 - `onboard` performs supported onboarding profiles.
 - `lifecycle` performs supported post-onboard mutations.
-- `stateValidation` probes host-observable expected state.
+- `stateValidation` normally probes host-observable expected state before
+  configuration export. Targets with ordered cloud checks run it after export
+  so those checks can first restore any export-relevant settings they change.
+- `configExportValidation` runs against the retained state. Each typed target
+  declares one config export expectation:
+  - `required` must match the target manifest, live sandbox registry, and
+    effective network policy.
+  - `expected-refusal` must complete with its declared category without
+    creating a file.
+  - `no-usable-sandbox` must record an expected preflight or onboarding
+    failure. State validation must also prove that the sandbox is absent. This
+    expectation does not invoke config export.
+
+  The missing-custom-presets target fails after creating its sandbox. It must
+  validate that retained sandbox and export its configuration with `required`.
+  The onboarding fixture still requires the missing-presets failure. Export
+  validation checks the retained runtime configuration, not onboarding completion.
+
 - `artifacts`, `secrets`, `cleanup`, and `shellProbe` provide shared fixture
   services.
 - The automatic `progress` fixture reports the ordered semantic phase plan for
-  each `e2e-live` case. Normal output contains phase transitions, outcomes, and
-  durations. The harness appends `release registered E2E resources` to cover
-  registered cleanup. After five minutes in one phase, a content-free stall
-  diagnostic adds child-output age, current redacted command activity, and
+  each `e2e-live` case. Normal output contains the target/scenario identity,
+  immediate phase starts and completions, and phase plus total durations. The
+  harness appends `release registered E2E resources` to cover registered
+  cleanup. After five minutes in one phase, a content-free stall diagnostic
+  adds child-output age, current redacted command or cleanup activity, and
   runner resources; it repeats every ten minutes while the phase remains
   active.
+- Credential-free integration tests selected by the shared E2E planner use the
+  lightweight `workflow-e2e-test` fixture for the same progress and artifact
+  contract without depending on the stateful live fixture services.
 
 The `test/e2e/fixtures/` path is fixture/support code, not a test
 harness or runner. Vitest remains the only test harness.
 
+Before it validates deployment semantics, the config export fixture scans raw
+export text for literal known fixture secrets, wrapped or YAML-escaped base64
+and base64url forms, and literal, escaped, wrapped, or encoded internal
+credential transport markers. It separately checks decoded YAML scalar keys
+and values, including binary scalars, for literal or encoded secrets and
+internal transport markers.
+The fixture caps each exporter stdout and stderr stream at 64 KiB. Effective
+policy stdout is limited to 1 MiB; truncated observations fail before export.
+Before reading or retaining an export, it opens the file without following symbolic
+links.
+The open descriptor must identify a regular file with exactly one hard link,
+no larger than 1 MiB. After the descriptor read, the published path must still
+identify the same device and inode with exactly one hard link. The fixture
+rejects a replacement or an added hard link. It
+creates the export in a private temporary directory, registers cleanup before
+it invokes the CLI, and removes the directory before it writes retained evidence.
+
+For `required` coverage, the fixture checks the producer-owned v1alpha1 envelope
+and all fields used in its semantic comparison. Cross-branch import
+compatibility remains a separate contract. Semantic expectations remain
+independent of the exporter. The fixture reads the target manifest and host
+registry directly, then queries the effective policy through the OpenShell CLI.
+It captures these expectations before it invokes config export, so exporter-side
+mutations cannot redefine the expected deployment state. It also compares the
+registry before and after the command. It rejects an unsafe registry inference
+endpoint before invoking export or publishing endpoint data in evidence.
+Policy reads and config export use the same filtered host environment as
+onboarding and state validation, preserving configuration paths and runtime
+selection without passing undeclared credentials. When the hosted inference
+adapter is active, its `compatible-endpoint` binding maps the manifest's
+`NVIDIA_INFERENCE_API_KEY` reference to `COMPATIBLE_API_KEY`; other credential
+references must still be declared by the manifest.
+
+The typed live-target timeout contract budgets a two-minute config export
+ceiling for `required` and `expected-refusal`. A `required` target also budgets
+a one-minute effective-policy read and 10 minutes for the pinned v1 consumer.
+A `no-usable-sandbox` target adds none of those ceilings because it does not
+invoke config export. The
+`dcode-rebuild-invalid-credential` target has a 130-minute base budget for its
+lifecycle and ordered cloud checks. With required export, its default test
+timeout is 143 minutes and its job ceiling is 163 minutes.
+`NEMOCLAW_TEST_TIMEOUT`, in milliseconds, can raise but cannot
+lower the derived test timeout. The derived job ceiling keeps at least 20
+minutes of headroom and rounds up to a whole minute.
+
+The `config-export-evidence.v1.json` artifact binds each result to the source
+revision, CLI version, and compiled CLI entry-point hash. Each record includes
+elapsed time and a structured command outcome when the fixture invokes the
+CLI. A timed-out, signaled, or otherwise incomplete command fails as a
+transport error before refusal classification. Successful `required` evidence
+includes the exact validated export bytes, byte count, and SHA-256 hash after
+the security checks and cleanup pass. It also publishes those exact bytes as
+`config-export.yaml` so reviewers can inspect and parse the exported document
+directly. Refusal and failure evidence do not publish the YAML file or export
+metadata.
+Its failure stage distinguishes transport errors from export failures, while
+cleanup has its own diagnostic so it cannot hide the primary failure. Evidence
+diagnostics are bounded and remove literal, encoded, wrapped, or escaped known
+secrets and internal credential transport markers before publication.
+
+The secret scan covers registered fixture values, not arbitrary unregistered
+secrets. Review selected exports before retaining them as migration fixtures.
+
+OpenClaw failure probes read only regular, single-link log files without following symlinks.
+They omit log content above 16 KiB or changed during the read, so truncation cannot split a credential before host redaction.
+Oversized files retain size and permission metadata for diagnosis.
+
+When the missing-custom-presets target fails before its expected policy rejection, it captures these bounded, redacted failure probes before cleanup.
+The probes also capture unexpected JavaScript failures; they do not change the onboarding result or the required policy rejection.
+Container probes use a resolved full container ID and never delete resources or retry onboarding.
+
+The `full-e2e` restart probe selects a UUID-scoped native OpenClaw provider using the already-tested model and route.
+Source installs use `inference.local`; the Brev Launchable uses the native NVIDIA endpoint with its supervisor-issued credential handle.
+After NemoClaw stop/start, a gateway-only turn must report that provider and model before the probe restores the original selection.
+The probe removes its temporary native entries before the launch checks.
+The fixture contains no provider credentials. It sends a JSON patch to native OpenClaw through stdin.
+
+The restart probe no longer rereads native configuration to clone and validate a provider.
+The preceding inference turn already verifies the selected model and route.
+Native `config validate` and the post-restart gateway turn retain the live configuration and inference checks.
+UUID-scoped names replace the fixed-name collision checks; the fixture does not copy existing aliases or credentials.
+Patch construction and unique names are tested in `full-e2e-native-model.test.ts` in `e2e-support`.
+The removed config-reader and child-error-redaction checks belonged to the deleted cloning command.
+Native CLI output still uses the fixture's redaction path.
+The live credential scan, launch-readiness checks, restoration, and temporary-entry cleanup remain unchanged.
+
+After a live target succeeds, the E2E workflow requires
+`config-export-evidence.v1.json`. It also requires `config-export.yaml` when
+the evidence classification is `success`; `expected-refusal` and
+`no-usable-sandbox` do not publish YAML. A missing required file fails the
+target job.
+
 `suiteIds` remain metadata for reporting and migration planning. They do not
 dispatch shell validation suites.
 
-## How To Run
+## Selecting One Target
+
+`.github/workflows/e2e.yaml` runs one matrix target by passing its ID through
+`TARGET_ID`. The workflow selects the test title with the stable
+`-t "^${TARGET_ID}:"` prefix. The title suffix contains the observable outcome,
+agent runtime, and environment or inference endpoint. The selector performs the
+restriction; `TARGET_ID` alone does not limit which targets run.
+
+The `generate-matrix` job resolves dispatch input through `requireTargets`, so
+an unknown id fails there before any target job starts.
+
+`test/e2e/live/registry-targets.test.ts` resolves `TARGET_ID` through the same
+registry at module load, which covers a run that sets it another way. An ID no
+target declares fails collection with `Unknown target '<id>'. Available
+targets: ...`, and an empty ID fails with `Selected target ID '' is not safe
+...`. Without those checks, either ID would build a selector that matches
+nothing and can exit 0 without executing a target. An unsafe ID also fails with
+`Selected target ID '<id>' is not safe ...`; regex-shaped IDs can otherwise
+broaden the selector and run unintended live targets. This module-load guard
+protects the registry-target catalogue when collection includes
+`registry-targets.test.ts`. Both `npm run test:live-e2e` and
+`npm run test:e2e-phases:check` include that file, but a collection command that
+omits it does not run this guard.
+
+Every typed-registry declaration must have executable platform, install,
+runtime, and onboarding routes plus resolved coverage metadata and a config
+export expectation. A declared lifecycle route must also be executable.
+Registry construction rejects invalid declarations. Proposed combinations
+belong in planning issues until their live fixtures exist; they must not be
+added as empty skipped tests. Selecting a removed or unknown target ID fails
+and lists the available IDs.
+
+## Run Live E2E Locally
+
+Review the selected revision and local changes before running setup or live E2E on your workstation.
+A detached worktree shares host privileges, credentials, and Docker access.
+Run source you have not reviewed and trusted in a disposable isolated environment.
+Keep workstation credentials and its Docker socket outside that environment.
+Supply only test-specific credentials and follow the selected test's cleanup and revocation contract.
+
+Run `test:live-e2e` from the checkout whose source you want to test. The command
+deletes and rebuilds `dist/` from source in that checkout before Vitest starts.
+It includes tracked and untracked source inputs, runs selected test files serially,
+and does not retry a failed test. It deletes direct edits under generated `dist/`
+and `nemoclaw/runner-dist/` paths.
+
+| Goal | Checkout | Command |
+| --- | --- | --- |
+| Run one test file with local changes | Current working tree | `npm run test:live-e2e -- test/e2e/live/<name>.test.ts --silent=false --reporter=default` |
+| Run all locally eligible live test files | Current working tree | `npm run test:live-e2e -- --silent=false --reporter=default` |
+| Run one test file at a commit | Detached worktree at the commit | Use the same focused command in that worktree. |
+| Run all locally eligible live test files at a commit | Detached worktree at the commit | Use the same aggregate command in that worktree. |
+
+A local aggregate run is not the GitHub full E2E matrix. Tests that require another
+platform, runner, credential, service, or explicit target-specific opt-in can skip
+or fail locally. GitHub Actions owns those job capabilities and the strict full-run
+aggregate. Interactive TUI targets require the `expect` utility on the local runner.
+For trusted GitHub runs targeting the latest PR commit or current `main`, follow
+[Run Maintainer E2E](../../../.agents/skills/nemoclaw-maintainer-e2e/SKILL.md).
+
+### Run the current working tree
+
+Use a repository-relative test file to select one live E2E implementation.
+Add `-t` when the file contains more than one test and you need one named case:
+
+```bash
+npm run test:live-e2e -- \
+  test/e2e/live/<name>.test.ts \
+  -t '<test-name-regex>' \
+  --silent=false --reporter=default
+```
+
+Omit `-t` to run the complete file. Omit the test file to collect every
+`e2e-live` test file that the local host can run. That aggregate tests `HEAD`
+only when `git status --short` is empty. Otherwise, it tests working-tree source.
+
+Review the selected test's environment checks and cleanup contract before you start
+it. Live tests can install software and mutate Docker, OpenShell, sandbox, and
+external-service state.
+
+### Run a commit without changing the current checkout
+
+Create a detached worktree, prepare that checkout, and run the selected command
+inside it:
+
+```bash
+SHA='<commit-sha>'
+COMMIT="$(git rev-parse --verify "${SHA}^{commit}")"
+WORKTREE="$(mktemp -d -t nemoclaw-e2e-XXXXXXXX)"
+rmdir "$WORKTREE"
+git worktree add --detach "$WORKTREE" "$COMMIT"
+(
+  cd "$WORKTREE"
+  npm run dev:setup
+  NEMOCLAW_E2E_EXPECTED_SHA="$COMMIT" npm run test:live-e2e -- \
+    test/e2e/live/<name>.test.ts \
+    -t '<test-name-regex>' \
+    --silent=false --reporter=default
+)
+```
+
+Omit `-t` to run the complete file. Omit the test file for the aggregate local
+run. The detached worktree selects the commit. `NEMOCLAW_E2E_EXPECTED_SHA` supplies
+that identity to tests that consume it. Do not use it in a dirty checkout to claim
+that a run tested only the named commit.
+
+The subshell returns to the primary checkout and leaves the worktree in place.
+Remove external resources recorded by a failed test. Preserve any needed artifacts.
+Then run `git worktree remove "$WORKTREE"`.
+
+## Inspect E2E Selection and Support
 
 ```bash
 # List canonical target ids
@@ -78,59 +303,72 @@ npx tsx test/e2e/registry/run.ts --emit-live-matrix --targets ubuntu-repo-cloud-
 # Fixture/support tests
 npx vitest run --project e2e-support --silent=false --reporter=default
 
-# Validate every live test's semantic phase metadata without running live bodies
+# Validate every live test and workflow-selected integration test without running bodies
 npm run test:e2e-phases:check
-
-# Opt-in live E2E targets
-npm run test:live-e2e -- --silent=false --reporter=default
 
 # Rank one or more downloaded/extracted live artifact directories
 npm run test:runtime-audit -- e2e-artifacts/run-1 e2e-artifacts/run-2
 ```
 
-The aggregate live command rebuilds the CLI before Vitest starts and runs live
-test files serially.
-Live E2E projects do not retry an entire failed test.
-These tests mutate host, Docker, gateway, and sandbox state, so re-entering one
-on the same runner can replace the original failure with stale-lock,
-storage-exhaustion, or ownership noise. A target may retry a transient operation
-only inside its own cleanup boundary.
-Retry a full target by starting a fresh workflow run and runner.
+After an eligible `E2E main` push workflow completes, `E2E / Main Retry Evidence` records its conclusion and source-attempt evidence.
+It does not request a broad failed-job or workflow rerun.
+An E2E test can retry an external operation only through its checked-in bounded policy.
+The observer records `passed-first-attempt`, `passed-after-retry`, `failed-no-retry`, or `ignored`.
+The `flaky` field is `true` only for `passed-after-retry`.
+`Automation / Recover Platform CI Runner` separately owns one rerun of an eligible `CI / Platform Compatibility` push with authenticated GitHub-hosted runner-loss evidence.
+
+After the observer evaluates attempt N, it uploads an artifact named for that
+attempt. The artifact contains one `attempts` entry for each source attempt through
+N. `totalRunnerMinutes` is the sum across those entries. If evaluation or file
+creation fails, the upload step warns that the file is missing and publishes no
+evidence artifact. The observer ignores manual PR runs and a run
+superseded by a newer `main` push.
 
 During fixture teardown, every passing or failing live test writes
 `test-progress.json` beside its other target artifacts. The runtime audit
 groups those files by target, optional shard, and test name, then reports
 median, p95, maximum, p95-minus-median variability, and the slowest observed
-phase. The summary reads the matrix identity from `E2E_TARGET_ID` and
-`NEMOCLAW_E2E_SHARD` when set. It retains overall start, finish, and duration,
-and records each declared or harness-owned phase's start, finish, duration,
-outcome, output-event count, and last-output timestamp. Use several recent
-workflow artifact directories to distinguish a consistently expensive test
-from a variable one.
+phase with its duration and outcome. Push and ordinary manual workflows
+publish the current run's table in the GitHub Actions scorecard summary. The
+summary reads the target identity from `E2E_TARGET_ID`, falling back to the
+Actions `GITHUB_JOB`, and reads `NEMOCLAW_E2E_SHARD` when set. It retains
+overall start, finish, and duration, and records each declared or harness-owned
+phase's start, finish, duration, outcome, child-output event count, and
+last-output timestamp. Use several recent workflow artifact directories to
+distinguish a consistently expensive test from a variable one.
 
-Normal phase output intentionally omits test identity and test-level timing
-because Vitest and GitHub Actions already provide them. It reports the current
-position and semantic label, then the outcome and duration when that phase
-ends:
+Normal phase output repeats the workflow target and test scenario because a
+long-running Actions step may not expose Vitest's final report yet. It reports
+the current position and semantic label, total and phase elapsed time, and the
+outcome when that phase ends:
 
 ```text
-[e2e phase 1/4] provision a clean sandbox
-[e2e phase 1/4] provision a clean sandbox — passed in 48s; next 2/4: exercise token rotation
-[e2e phase 2/4] still running: exercise token rotation (phase 5m; child output 12s ago; activity command: rotate-token; ...)
-[e2e phase 3/4] verify the rotated credential — passed in 9s; next 4/4: release registered E2E resources
-[e2e phase 4/4] release registered E2E resources — passed in 6s
+[e2e target="token-rotation" scenario="rotates a live sandbox credential"] [phase 1/4] started: provision a clean sandbox (total 0s; phase 0s)
+[e2e target="token-rotation" scenario="rotates a live sandbox credential"] [phase 1/4] completed: provision a clean sandbox — passed in 48s (total 48s)
+[e2e target="token-rotation" scenario="rotates a live sandbox credential"] [phase 2/4] still running: exercise token rotation (total 5m 48s; phase 5m; child output 12s ago; activity command: credential-rotation; ...)
+[e2e target="token-rotation" scenario="rotates a live sandbox credential"] [phase 4/4] event: cleanup started: destroy sandbox e2e-token-rotation (total 6m; phase 0s)
+[e2e target="token-rotation" scenario="rotates a live sandbox credential"] [phase 4/4] completed: release registered E2E resources — passed in 6s (total 6m 6s)
 ```
 
 The `still running` line first appears after five minutes in the same phase and
 then every ten minutes. Shell probes update child-output liveness and redacted
 command activity automatically, but that detail remains hidden until the stall
-threshold. The progress fixture never forwards child output contents.
-The harness-owned final phase captures registered cleanup duration, failures,
-and stalls. Soft assertion failures are recorded against the semantic phase
-where they occurred, while successful resource release retains its own
-`passed` outcome.
+threshold. Automatic child-output observation forwards only the event timestamp
+and stream name, never the output contents.
+Use `progress.event("literal content-free status")` only for immediate semantic
+events such as an operation timeout, retry cleanup, backoff, or the next
+attempt. Event labels are logged, so never include child output, request data,
+credentials, or tokens.
+For the stateful live fixture, the harness-owned final phase captures registered
+cleanup duration, failures, and stalls; each registry entry reports a redacted
+start/outcome event and is shown as the active cleanup operation in a stall
+heartbeat. Workflow-selected integration tests declare their own final release
+phase. Soft assertion failures are recorded against the semantic phase where
+they occurred, while successful resource release retains its own `passed`
+outcome.
 
-Every `e2e-live` test must declare two to twelve behavior-specific phases and
+Every `e2e-live` test and every credential-free integration test selected by
+the shared E2E planner must declare two to twelve behavior-specific phases and
 transition through them in order. For example:
 
 ```typescript
@@ -166,19 +404,48 @@ attribute it to that case. A helper may own the operational boundary by
 accepting a callback that performs the transition.
 Completed phases use `passed`, `failed`, or `skipped` outcomes. A passing path
 must enter the final declared phase before returning, or fixture teardown fails
-the test. Do not declare or enter `release registered E2E resources`; the
-harness appends and enters it automatically after the test's phase plan.
-`npm run test:e2e-phases:check` collects the `e2e-live` project and rejects
-missing or invalid plans without executing live test bodies.
+the test. In `e2e-live`, do not declare or enter
+`release registered E2E resources`; the stateful harness appends and enters it
+automatically after the test's phase plan. Workflow-selected integration tests
+own and enter their final release phase.
+`npm run test:e2e-phases:check` collects every `e2e-live` module plus the
+workflow-selected integration modules from the authoritative shared-job plan.
+It rejects missing or invalid plans without executing test bodies. Live modules
+must import `fixtures/e2e-test.ts`; selected integration modules must import
+`fixtures/workflow-e2e-test.ts` and declare their final release phase explicitly.
+The same check audits direct child-process boundaries reachable through shared
+E2E helpers. Prefer `ShellProbe`; a long-lived process that cannot use it must
+live in an explicitly audited progress-aware boundary, close its activity on
+exit, and report child output only as `{ stream, atMs }`. Blocking child-process
+calls require a positive timeout shorter than the first heartbeat plus
+`killSignal: "SIGKILL"`, so that timeout cannot be ignored. Raw output belongs
+only in redacted artifacts.
+
+Audited subprocess helpers require the fixture-provided frozen, canonical
+`progress` capability. Forward that object unchanged instead of copying
+it or constructing a look-alike or no-op adapter. A module-private brand,
+runtime registry, frozen-object check, type system, and semantic checker enforce
+this boundary.
+
+Progress callbacks are diagnostic-only: callback failures must not change
+command execution, test outcomes, or registered resource release.
 
 The retired `--emit-matrix` and `--plan-only` paths must not be reintroduced.
 
-When adding or changing a live test, update `test/e2e/mock-parity.json` with
-the fast PR-collected test that covers its mockable contract. If the behavior
-cannot be reproduced without real infrastructure, record a concise
-`liveOnlyReason` instead. The PR and `main` CLI coverage shards enforce this
-changed-file policy alongside the `e2e-support` project without requiring an
-immediate backfill of untouched tests.
+When you add or make a non-comment source change to a live E2E test or a
+`test/e2e/live/` helper, update `test/e2e/mock-parity.json`. List each changed
+helper under `liveSources` for its owning live test. Also list each explicitly
+owned `test/e2e/fixtures/` source under `liveSources` for every owning live test.
+The same mapped fast-test rule applies to changes in those shared fixtures.
+Removing an owner in the same PR does not remove its base-manifest fast-test
+requirement for a changed or deleted fixture.
+Unrelated fixtures do not need an owner. If the entry has mapped
+fast tests, make a non-comment source change to at least one mapped fast test
+in the same PR. Use
+`liveOnlyReason` only when no fast test can reproduce the contract. The PR and
+`main` CLI coverage shards enforce this changed-file policy alongside the
+`e2e-support` project without requiring an immediate backfill of untouched
+tests.
 
 ## Repository Layout
 
@@ -195,38 +462,57 @@ test/e2e/
 
 ## CI Entry Points
 
-- `tools/advisors/risk-plan.mts` is the small deterministic selection policy
-  shared by PR Review Advisor and the PR E2E controller. It maps
-  changed runtime surfaces to invariant families and
-  canonical `e2e.yaml` jobs; it is not a second test runner or migration-status
-  ledger. The advisor uses it as recommendation context, while the controller
-  applies it independently without model output.
+- `tools/advisors/risk-plan.mts` is the small deterministic recommendation policy
+  used by PR Review Advisor. It maps changed runtime surfaces to invariant
+  families and canonical `e2e.yaml` jobs; it does not dispatch E2E.
 
-- `.github/workflows/pr-e2e-gate.yaml` reserves the internal
-  `E2E / PR Gate Coordination` check for every PR SHA, including forks,
-  before `CI / Pull Request` completes. Its default-branch
-  `pull_request_target` path also publishes the native GitHub Actions job named
-  `E2E / PR Gate`. The read-only observer runs from `github.workflow_sha`,
-  validates the live PR head and base, waits for the matching trusted
-  coordination identity, and mirrors the terminal verdict into the required
-  job. Its summary is static, while the job log includes the validated trusted
-  controller-run link. Authorization states remain pending while the maintainer
-  decision is recorded. During rollout, the observer also accepts the former
-  `E2E / PR Gate` custom-check name for the same PR/base SHA identity. The
-  controller builds the risk plan from GitHub's complete file list. Internal
-  revisions normally dispatch every selected job and verify each expected
-  `risk-signal.json`; this remains automatic when their `e2e-control-plane`
-  matches are drawn only from the trusted controller workflow and scripts.
-  Other or mixed internal
-  control-plane revisions require a maintainer-authorized run for the PR SHA; only
-  its verified evidence can pass coordination. Risky forks retain the audited
-  credentialed-E2E skip approval. See [NemoClaw E2E CI](../README.md) for the
-  full lifecycle.
+- `.github/workflows/e2e.yaml` compares the before and candidate commits on each
+  push to `main`, then selects the catalogue targets and retained workflow jobs
+  that own the changed files. Each trusted push also selects the CPU-only
+  `jetson-nvmap-gpu` proof. If no other retained E2E owns a changed file,
+  `Relevant E2E` requires only the Jetson proof.
+  Runner, credential, evidence, and cleanup requirements remain job-specific.
+  A maintainer can also dispatch the trusted `main` workflow against the latest
+  commit from an open PR whose source branch is in `NVIDIA/NemoClaw`. The manual path validates the actor,
+  PR number, PR source repository, candidate commit SHA, base commit SHA,
+  workflow SHA, review reason, and allowed jobs, targets, and Launchable
+  combination before candidate checkout.
+  A trusted `main` native runtime producer run requires the executing workflow
+  commit and `workflow_sha` input to equal the PR-recorded base commit.
+  The producer accepts only a same-repository PR and the first workflow attempt.
+  The host-side preparation step receives the long-lived `NVIDIA_API_KEY`
+  repository secret in its environment. It creates runner-local registry
+  authentication and pulls pinned GPU images. It then deletes the registry
+  authentication file and unsets the variable before the separate candidate
+  installer or live-test process starts. Cleanup removes runner-local registry
+  authentication but does not revoke the key. The key remains valid in the
+  issuing NVIDIA service until it expires or that service revokes it.
 
-- `.github/workflows/e2e.yaml` runs selected or all supported
-  live E2E targets and uploads an explicit artifact allowlist with
-  JSON summaries plus action, log, and shell command-evidence directories under
-  14-day retention.
+  Manual PR E2E rejects fork sources, including NVIDIA sibling repositories.
+  Review and adopt fork contributions onto a repository branch before dispatch.
+  Repository writers are trusted to populate the shared compiled cache before merging.
+
+  For a PR revision run, leave `jobs` and `targets` empty for all default-selected
+  workflow E2E, catalogue profiles, shared tests, and registry targets.
+  `Exact staging Brev Launchable` requires its separate opt-in.
+  Keep `allow_jetson_dispatch=false` for the default selection.
+  Supported jobs and targets can also be selected individually.
+  Refer to [NemoClaw E2E CI](../README.md).
+
+- [Jetson dispatch controller](jetson-dispatch.md) defines the NemoClaw-owned
+  HTTP contract, trusted GitHub controller, repository configuration, and
+  evidence for `jetson-nvmap-gpu`. The service behind that contract is
+  operator-owned infrastructure.
+
+- `.github/workflows/e2e.yaml` runs selected or all supported live E2E targets and uploads an explicit artifact allowlist.
+  The shared E2E uploader retains per-target JSON summaries and command-evidence directories for 14 days.
+  The native runtime aggregate upload retains `native-runtime-qualification-<candidate-sha>` for 30 days.
+  Final OpenShell gateway-auth artifacts pass a fail-closed safety scan after
+  cleanup. The scanner copies safe files into a private staging directory,
+  scans that copy again, and adds a marker bound to the current Actions run ID
+  and attempt. Unsafe source files are quarantined or deleted. The workflow
+  uploads only the staged copy, so later changes to the source directory cannot
+  alter the approved payload.
   The allowlist includes each target's sanitized onboard timing summary at
   `e2e-artifacts/live/<target>/cloud-onboard-trace-timing-summary.json`.
   Raw onboard traces stay under the runner temporary directory and are deleted
@@ -234,14 +520,38 @@ test/e2e/
   These per-target timing summaries are artifact evidence only.
   The Slack and GitHub scorecard timing comparison remains scoped to the
   dedicated `cloud-onboard` artifact.
-  PR E2E dispatches validate the PR SHA and controller metadata before
-  preparation, attach `test/e2e/risk-signal-reporter.ts` to live Vitest
-  invocations, and suppress PR reporting and scorecards. The workflow boundary
-  requires every selected job shard to upload its evidence artifact.
-- `.github/workflows/e2e-branch-validation.yaml`, `macos-e2e.yaml`,
-  `wsl-e2e.yaml`, and `regression-e2e.yaml` call focused E2E targets directly
-  for their E2E coverage. Individual repository-hosted targets, including
-  `ollama-auth-proxy`, are selected through `.github/workflows/e2e.yaml`.
+  Manual PR runs attach `test/e2e/risk-signal-reporter.ts` to live Vitest
+  invocations and suppress PR reporting and scorecards. Each risk signal binds
+  its result counts to the expected and tested candidate SHA, correlation ID,
+  job ID, and shard ID. The workflow boundary requires every selected job shard
+  to upload its evidence artifact.
+- `.github/workflows/platform-vitest-main.yaml` publishes `CI / Platform Compatibility`.
+  It runs the Ubuntu 26.04 compatibility contracts and four full-suite Vitest shards on each of macOS and WSL.
+  Runs for the same ref are serialized and retained instead of being canceled by a newer push, preserving distinct-commit evidence on `main`.
+  Each macOS Vitest shard has a 30-minute budget.
+  The independent `macos-live-e2e` job installs pinned OpenShell and has a 150-minute budget, including its 70-minute live test and cleanup.
+  WSL shard 1 has a 180-minute budget for root-required contracts and live E2E; the other shards have 90 minutes.
+  WSL stops Docker before non-live Vitest and starts it afterward only for the main-only live path.
+  The independent macOS job and WSL shard 1 run focused live E2E only when the run tests `main` and Docker is available.
+  Otherwise, those live tests skip and the platform contracts remain as evidence.
+  This conditional result is platform evidence, not `Release qualification`.
+  The live steps give candidate test code the job-scoped `GITHUB_TOKEN` and repository `NVIDIA_INFERENCE_API_KEY`.
+  The macOS step sets both in its process environment.
+  The WSL step uses the trusted PowerShell helper to forward both into the WSL test process.
+  The workflow sets these credentials only for the live steps, but candidate code can copy either value while a step runs.
+  GitHub invalidates `GITHUB_TOKEN` after the job.
+  `NVIDIA_INFERENCE_API_KEY` remains valid until it expires or is revoked; the workflow does not revoke it.
+- `.github/workflows/portable-profile-e2e.yaml` provides experimental portable-profile evidence on matching `main` changes or manual dispatches.
+- The explicit-only `portable-hermes-finalization` job in `.github/workflows/e2e.yaml`
+  runs the portable-profile scenario on the reviewed x86-64 NVIDIA GPU runner with
+  rootless Podman 5.7. The selector stages and uses that runtime directly, including
+  the receipt-bound Hermes build, publication, and OpenShell create transaction.
+- `.github/workflows/podman-cpu-proof.yaml` provides PR-only experimental runtime evidence with Docker disabled.
+- `.github/workflows/sandbox-images.yaml` provides reusable image build and test evidence through manual dispatch and `workflow_call`.
+  `.github/workflows/e2e.yaml` selects free-standing jobs, including `whatsapp-qr-compact` and `ollama-auth-proxy`.
+- The `staging-brev-launchable` job validates the baked candidate in
+  preinstalled mode. Generic Brev VMs with source overlays are not a
+  qualification boundary.
 - `vitest.config.ts` contains `e2e-support` for fast fixture/support tests and
   `e2e-live` for opt-in live target execution. The PR and `main` CLI coverage
   shards include `e2e-support` for code changes; they never opt into live

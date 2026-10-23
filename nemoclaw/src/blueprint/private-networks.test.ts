@@ -35,9 +35,8 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-const { getNetworkEntries, getPrivateNetworks, isPrivateHostname, resetCache } = await import(
-  "./private-networks.js"
-);
+const { getNetworkEntries, getPrivateNetworks, isPrivateHostname, resetCache } =
+  await import("./private-networks.js");
 
 const VALID_YAML = `
 ipv4:
@@ -273,6 +272,22 @@ describe("private-networks loader", () => {
         "ipv4: []\nipv6: []\nnames:\n  - purpose: orphan\n",
       );
       expect(() => getNetworkEntries()).toThrow(/missing or empty 'name'/);
+    });
+
+    it.each([" localhost", "localhost ", "."])("rejects non-canonical name %j", (name) => {
+      seedYaml(
+        "/blueprint/private-networks.yaml",
+        `ipv4: []\nipv6: []\nnames:\n  - name: ${JSON.stringify(name)}\n    purpose: malformed\n`,
+      );
+      expect(() => getNetworkEntries()).toThrow(/'name' must be canonical/);
+    });
+
+    it("accepts a canonical name with a terminal dot", () => {
+      seedYaml(
+        "/blueprint/private-networks.yaml",
+        "ipv4: []\nipv6: []\nnames:\n  - name: localhost.\n    purpose: canonical FQDN\n",
+      );
+      expect(isPrivateHostname("localhost")).toBe(true);
     });
 
     it("rejects a names entry with empty purpose", () => {

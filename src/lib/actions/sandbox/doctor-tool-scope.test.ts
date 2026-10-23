@@ -111,14 +111,15 @@ describe("parseToolScopeProbe (#4616)", () => {
 describe("interpretToolScopeProbe (#4616)", () => {
   const base = { sandboxName: "sb", cliName: "nemoclaw", wantsFix: false };
 
-  it("reports info when the probe is unavailable", () => {
-    for (const p of [null, probe({ ok: false })]) {
+  it.each([null, probe({ ok: false })])(
+    "reports info when the probe is unavailable [case %#]",
+    (p) => {
       const checks = interpretToolScopeProbe(p, base);
       expect(checks).toHaveLength(1);
       expect(checks[0].status).toBe("info");
       expect(checks[0].detail).toContain("unavailable");
-    }
-  });
+    },
+  );
 
   it("fails with a fix hint when allowlisted upgrades are pending", () => {
     const checks = interpretToolScopeProbe(
@@ -207,20 +208,20 @@ describe("interpretToolScopeProbe (#4616)", () => {
 describe("buildToolScopeChecks (#4616)", () => {
   function execReturning(probes: (ToolScopeProbe | null)[]) {
     let call = 0;
-    return vi.fn((_name: string, _script: string) => {
+    return vi.fn(async (_name: string, _script: string) => {
       const p = probes[Math.min(call, probes.length - 1)];
       call += 1;
       return p ? { status: 0, stdout: `${MARKER}${JSON.stringify(p)}`, stderr: "" } : null;
     });
   }
 
-  it("runs the repair pass and re-probes when --fix sees a backlog", () => {
+  it("runs the repair pass and re-probes when --fix sees a backlog", async () => {
     const exec = execReturning([
       probe({ pendingTotal: 1, pendingAllowlisted: 1, watcherActive: false }),
       probe(), // clean after repair
     ]);
     const runApprovalPass = vi.fn(() => ({ reported: true, approved: 1 }));
-    const checks = buildToolScopeChecks("sb", "nemoclaw", true, {
+    const checks = await buildToolScopeChecks("sb", "nemoclaw", true, {
       exec,
       runApprovalPass,
       readPolicyModule: () => "policy",
@@ -231,10 +232,10 @@ describe("buildToolScopeChecks (#4616)", () => {
     expect(checks.some((c) => c.status === "ok" && c.detail.includes("no pending"))).toBe(true);
   });
 
-  it("does not repair when --fix is not requested", () => {
+  it("does not repair when --fix is not requested", async () => {
     const exec = execReturning([probe({ pendingTotal: 1, pendingAllowlisted: 1 })]);
     const runApprovalPass = vi.fn(() => ({ reported: true, approved: 1 }));
-    const checks = buildToolScopeChecks("sb", "nemoclaw", false, {
+    const checks = await buildToolScopeChecks("sb", "nemoclaw", false, {
       exec,
       runApprovalPass,
       readPolicyModule: () => "policy",
@@ -244,10 +245,10 @@ describe("buildToolScopeChecks (#4616)", () => {
     expect(checks[0].status).toBe("fail");
   });
 
-  it("does not repair when --fix is set but no allowlisted backlog exists", () => {
+  it("does not repair when --fix is set but no allowlisted backlog exists", async () => {
     const exec = execReturning([probe({ pendingTotal: 1, pendingUnknown: 1 })]);
     const runApprovalPass = vi.fn(() => ({ reported: true, approved: 0 }));
-    const checks = buildToolScopeChecks("sb", "nemoclaw", true, {
+    const checks = await buildToolScopeChecks("sb", "nemoclaw", true, {
       exec,
       runApprovalPass,
       readPolicyModule: () => "policy",
@@ -256,9 +257,9 @@ describe("buildToolScopeChecks (#4616)", () => {
     expect(checks[0].status).toBe("warn");
   });
 
-  it("surfaces unavailable when the sandbox exec fails", () => {
-    const exec = vi.fn(() => null);
-    const checks = buildToolScopeChecks("sb", "nemoclaw", false, {
+  it("surfaces unavailable when the sandbox exec fails", async () => {
+    const exec = vi.fn(async () => null);
+    const checks = await buildToolScopeChecks("sb", "nemoclaw", false, {
       exec,
       readPolicyModule: () => null,
     });

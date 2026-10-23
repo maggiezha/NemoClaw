@@ -3,11 +3,19 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const mocks = vi.hoisted(() => ({
+  createOnboardActionRuntimeDeps: vi.fn(),
+  onboardRuntimeDeps: { googlechatTunnelRuntime: {} },
+}));
+
 import { runOnboardAction } from "../lib/actions/global";
 import OnboardCliCommand from "./onboard";
 
 vi.mock("../lib/actions/global", () => ({
   runOnboardAction: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../lib/cli/onboard-runtime-deps", () => ({
+  createOnboardActionRuntimeDeps: mocks.createOnboardActionRuntimeDeps,
 }));
 
 const rootDir = process.cwd();
@@ -15,6 +23,7 @@ const rootDir = process.cwd();
 describe("onboard oclif command", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.createOnboardActionRuntimeDeps.mockReturnValue(mocks.onboardRuntimeDeps);
   });
 
   it("rejects mutually exclusive resume and fresh flags before dispatch", async () => {
@@ -37,6 +46,7 @@ describe("onboard oclif command", () => {
         yes: true,
         "yes-i-accept-third-party-software": true,
       }),
+      mocks.onboardRuntimeDeps,
     );
   });
 
@@ -45,7 +55,40 @@ describe("onboard oclif command", () => {
 
     expect(runOnboardAction).toHaveBeenCalledWith(
       expect.objectContaining({ "non-interactive": true, yes: true }),
+      mocks.onboardRuntimeDeps,
     );
+  });
+
+  it("forwards explicit APF interceptor selection as a boolean (#9833)", async () => {
+    await OnboardCliCommand.run(["--apf-interceptor"], rootDir);
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "apf-interceptor": true }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it.each(["--resume", "--recreate-sandbox"])(
+    "rejects --apf-interceptor with %s before dispatch (#9833)",
+    async (lifecycleFlag) => {
+      await expect(
+        OnboardCliCommand.run(["--apf-interceptor", lifecycleFlag], rootDir),
+      ).rejects.toThrow(/apf-interceptor|resume|recreate-sandbox/);
+
+      expect(runOnboardAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it("accepts an exact managed runtime catalog without candidate activation", async () => {
+    await OnboardCliCommand.run(
+      ["--temp-managed-runtime-catalog", "managed-catalog.json"],
+      rootDir,
+    );
+
+    const [flags, deps] = vi.mocked(runOnboardAction).mock.calls[0]!;
+    expect(flags["temp-managed-runtime-catalog"]).toBe("managed-catalog.json");
+    expect(flags["temp-managed-runtime"]).toBeUndefined();
+    expect(deps).toBe(mocks.onboardRuntimeDeps);
   });
 
   it("forwards typed sandbox GPU flags", async () => {
@@ -61,6 +104,22 @@ describe("onboard oclif command", () => {
         "sandbox-gpu-device": "nvidia.com/gpu=0",
         yes: true,
       }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it("forwards the managed vLLM GPU device independently of sandbox GPU flags", async () => {
+    await OnboardCliCommand.run(
+      ["--non-interactive", "--vllm-gpu-device", "GPU-69adb14e-820e-bfb4-0993-171e73f68504"],
+      rootDir,
+    );
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        "non-interactive": true,
+        "vllm-gpu-device": "GPU-69adb14e-820e-bfb4-0993-171e73f68504",
+      }),
+      mocks.onboardRuntimeDeps,
     );
   });
 
@@ -69,6 +128,16 @@ describe("onboard oclif command", () => {
 
     expect(runOnboardAction).toHaveBeenCalledWith(
       expect.objectContaining({ "non-interactive": true, "no-gpu": true }),
+      mocks.onboardRuntimeDeps,
+    );
+  });
+
+  it("accepts the hidden portable experimental profile", async () => {
+    await OnboardCliCommand.run(["--experimental-profile", "portable"], rootDir);
+
+    expect(runOnboardAction).toHaveBeenCalledWith(
+      expect.objectContaining({ "experimental-profile": "portable" }),
+      mocks.onboardRuntimeDeps,
     );
   });
 

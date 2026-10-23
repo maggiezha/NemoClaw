@@ -1,20 +1,73 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import { DEFAULT_GATEWAY_PORT, parsePort } from "../../../src/lib/core/ports.ts";
+import { resolveModelRouterLogPath } from "../../../src/lib/onboard/model-router.ts";
+import type { CleanupRegistry } from "../fixtures/cleanup.ts";
+import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 
-export const MODEL_ROUTER_PUBLIC_KEY_ENV = "NVIDIA_API_KEY";
-
-export interface ModelRouterSecrets {
-  required(name: string): string;
+export function summarizeRouterLog(text: string) {
+  // Export only fixed booleans and counts. Never retain log lines or captured text.
+  return {
+    strategyRegistered: text.includes("strategy registered in"),
+    warmupCompleted: /Warmup route\s+:/.test(text),
+    warmupFailed: text.includes("Warmup route failed"),
+    strategyInjectionFailed: text.includes("Failed to inject routing strategy at startup"),
+    timeoutReported: /timeout|timed out/i.test(text),
+    authenticationErrorReported: /AuthenticationError|Unauthorized|Invalid API Key/i.test(text),
+    rateLimitReported: /RateLimitError|Too Many Requests/i.test(text),
+    connectionErrorReported: /APIConnectionError|ConnectionError|Connection refused/i.test(text),
+    completionResponses: [
+      ...text.matchAll(/"POST \/v1\/chat\/completions HTTP\/1\.[01]" [1-5][0-9]{2}/g),
+    ].length,
+  };
 }
 
-export function requireModelRouterPublicKey(secrets: ModelRouterSecrets): string {
-  const apiKey = secrets.required(MODEL_ROUTER_PUBLIC_KEY_ENV);
-  if (!apiKey.startsWith("nvapi-")) {
-    throw new Error("NVIDIA_API_KEY must be a public NVIDIA Endpoints nvapi-* key");
+export async function retainRouterDiagnostics(
+  artifacts: ArtifactSink,
+  logPath = resolveModelRouterLogPath(),
+): Promise<void> {
+  let descriptor: number | undefined;
+  let summary: object;
+  try {
+    descriptor = fs.openSync(
+      logPath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    );
+    const stat = fs.fstatSync(descriptor);
+    if (stat.isFile()) {
+      const buffer = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+      const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, stat.size - buffer.length);
+      summary = {
+        available: true,
+        truncated: stat.size > buffer.length,
+        ...summarizeRouterLog(buffer.subarray(0, bytes).toString("utf8")),
+      };
+    } else {
+      summary = { available: false };
+    }
+  } catch {
+    summary = { available: false };
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
   }
-  return apiKey;
+  await artifacts.writeJson("router-diagnostics.json", summary);
+}
+
+export function registerRouterDiagnostics(
+  cleanup: CleanupRegistry,
+  artifacts: ArtifactSink,
+  onboardEnv: NodeJS.ProcessEnv,
+): void {
+  // The filtered child environment can select a different port than the test process.
+  const logPath = resolveModelRouterLogPath(
+    undefined,
+    parsePort("NEMOCLAW_GATEWAY_PORT", DEFAULT_GATEWAY_PORT, onboardEnv),
+  );
+  // Register after sandbox cleanup so the LIFO registry captures the log before destruction.
+  cleanup.add("retain Model Router diagnostics", () => retainRouterDiagnostics(artifacts, logPath));
 }
 
 export function buildProviderRoutedEnv(
@@ -34,6 +87,7 @@ export function buildProviderRoutedEnv(
     NEMOCLAW_SANDBOX_NAME: sandboxName,
     NEMOCLAW_NON_INTERACTIVE: "1",
     NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
+    NEMOCLAW_POLICY_MODE: "skip",
     NEMOCLAW_POLICY_TIER: "open",
     NEMOCLAW_PROVIDER: "routed",
   };

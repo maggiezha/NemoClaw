@@ -1,27 +1,59 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { dockerCapture, dockerRun } from "../adapters/docker";
+import { dockerCapture, dockerLogs, dockerRun } from "../adapters/docker";
+import {
+  inspectDockerSandboxIdentities,
+  type DockerSandboxIdentityObservation,
+} from "../adapters/docker/inspect";
+import { captureDockerContainerFailureEvidence } from "./compute/docker-container-failure-evidence";
 import type { DockerGpuPatchDeps } from "./docker-gpu-patch-types";
 
 export const OPENSHELL_MANAGED_BY_LABEL = "openshell.ai/managed-by";
 export const OPENSHELL_MANAGED_BY_VALUE = "openshell";
 export const OPENSHELL_SANDBOX_NAME_LABEL = "openshell.ai/sandbox-name";
+export const OPENSHELL_SANDBOX_ID_LABEL = "openshell.ai/sandbox-id";
+export const OPENSHELL_SANDBOX_NAMESPACE_LABEL = "openshell.ai/sandbox-namespace";
+export const OPENSHELL_SANDBOX_WORKSPACE_LABEL = "openshell.ai/sandbox-workspace";
+
+export type OpenShellSandboxOwnershipLabel = {
+  readonly label: string;
+  readonly value: string;
+};
+
+export function resolveOpenShellSandboxOwnershipLabel(
+  _env: NodeJS.ProcessEnv = process.env,
+): OpenShellSandboxOwnershipLabel {
+  return { label: OPENSHELL_MANAGED_BY_LABEL, value: OPENSHELL_MANAGED_BY_VALUE };
+}
+
+export function hasOpenShellSandboxOwnership(
+  labels: Readonly<Record<string, string>>,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const ownership = resolveOpenShellSandboxOwnershipLabel(env);
+  return labels[ownership.label] === ownership.value;
+}
 
 const DOCKER_SANDBOX_QUERY_TIMEOUT_MS = 30_000;
+const STALE_DOCKER_ORPHAN_TIMEOUT_MS = 30_000;
 
 type DockerSandboxContainerQueryDeps = Pick<DockerGpuPatchDeps, "dockerCapture" | "dockerRun">;
 
-function sandboxContainerFilterArgs(sandboxName: string): string[] {
-  return [
-    "ps",
-    "-a",
-    "--no-trunc",
-    "--filter",
-    `label=${OPENSHELL_MANAGED_BY_LABEL}=${OPENSHELL_MANAGED_BY_VALUE}`,
-    "--filter",
-    `label=${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`,
-  ];
+function sandboxContainerFilterArgs(
+  sandboxName: string,
+  sandboxNamespace?: string,
+  requireManagedBy = true,
+): string[] {
+  const args = ["ps", "-a", "--no-trunc"];
+  if (requireManagedBy) {
+    args.push("--filter", `label=${OPENSHELL_MANAGED_BY_LABEL}=${OPENSHELL_MANAGED_BY_VALUE}`);
+  }
+  args.push("--filter", `label=${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`);
+  if (sandboxNamespace !== undefined) {
+    args.push("--filter", `label=${OPENSHELL_SANDBOX_NAMESPACE_LABEL}=${sandboxNamespace}`);
+  }
+  return args;
 }
 
 function commandResultText(result: {
@@ -47,9 +79,103 @@ export function findOpenShellDockerSandboxContainerIds(
     .filter(Boolean);
 }
 
+/**
+ * One deadline for discovery, inspection, and log reads, so diagnostics delay
+ * rollback by at most this long even when Docker stalls.
+ */
+const SANDBOX_FAILURE_OUTPUT_BUDGET_MS = 4_000;
+
+type SandboxFailureOutputDeps = Pick<
+  DockerGpuPatchDeps,
+  "dockerCapture" | "dockerLogs" | "dockerRun"
+> & { readonly now?: () => number };
+
+/**
+ * Capture redacted recent output from one sandbox container before rollback
+ * can remove or replace it. Use the exact replacement container when the
+ * caller owns one; otherwise require exactly one OpenShell-labeled container.
+ *
+ * SOURCE_OF_TRUTH_REVIEW
+ * invalidState: OpenShell 0.0.116 writes supervisor startup failures, such as
+ *   a Landlock hard_requirement error, only to the sandbox container's stderr;
+ *   neither `openshell logs` nor sandbox status carries the reason (#13178).
+ * sourceBoundary: captureDockerContainerFailureEvidence owns bounded Docker
+ *   inspect, log, and redaction behavior.
+ * whyNotSourceFix: the supervisor runs in the pinned external OpenShell
+ *   release; OpenShell 0.1.x reports the supervisor log tail in sandbox status.
+ * regressionTest: openshell-docker-sandbox-containers.test.ts and
+ *   onboard-sandbox-create-failure.test.ts.
+ * removalCondition: remove once the OpenShell pin reaches 0.1.0.
+ */
+export function captureOpenShellDockerSandboxFailureOutput(
+  sandboxName: string,
+  expectedContainerId: string | null,
+  deps: SandboxFailureOutputDeps = {},
+): string | null {
+  try {
+    const now = deps.now ?? Date.now;
+    const deadlineMs = now() + SANDBOX_FAILURE_OUTPUT_BUDGET_MS;
+    let containerId = expectedContainerId;
+    if (!containerId) {
+      const containers = queryOpenShellDockerSandboxContainers(
+        sandboxName,
+        { dockerRun: deps.dockerRun ?? dockerRun },
+        Math.min(2_000, deadlineMs - now()),
+      );
+      if (!containers.ok || containers.ids.length !== 1) return null;
+      containerId = containers.ids[0];
+    }
+    const evidence = captureDockerContainerFailureEvidence(
+      containerId,
+      {
+        dockerCapture: deps.dockerCapture ?? dockerCapture,
+        dockerLogs: deps.dockerLogs ?? dockerLogs,
+      },
+      { deadlineMs, now },
+    );
+    // Opaque credentials are redacted only after inspect identifies them;
+    // without that, pattern redaction alone could print an opaque value.
+    if (!evidence.inspectRedactionApplied) return null;
+    return evidence.redactedLogTail || null;
+  } catch {
+    return null;
+  }
+}
+
 export type OpenShellDockerSandboxContainerQuery =
   | { ok: true; ids: string[] }
   | { ok: false; ids: []; error: string };
+
+function queryDockerSandboxContainerIds(
+  filterArgs: readonly string[],
+  deps: DockerSandboxContainerQueryDeps,
+  timeoutMs: number,
+): OpenShellDockerSandboxContainerQuery {
+  const run = deps.dockerRun ?? dockerRun;
+  const requestedTimeoutMs = Math.floor(timeoutMs);
+  if (!Number.isFinite(timeoutMs) || requestedTimeoutMs <= 0) {
+    return { ok: false, ids: [], error: "Docker sandbox query deadline expired" };
+  }
+  const result = run([...filterArgs, "--format", "{{.ID}}"], {
+    ignoreError: true,
+    suppressOutput: true,
+    timeout: Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, requestedTimeoutMs),
+  });
+  if (Number(result.status ?? 1) !== 0) {
+    return {
+      ok: false,
+      ids: [],
+      error: commandResultText(result) || "docker ps did not complete successfully",
+    };
+  }
+  return {
+    ok: true,
+    ids: String(result.stdout ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+  };
+}
 
 /**
  * Status-bearing lookup used when an empty container list is a safety proof.
@@ -59,25 +185,232 @@ export type OpenShellDockerSandboxContainerQuery =
 export function queryOpenShellDockerSandboxContainers(
   sandboxName: string,
   deps: DockerSandboxContainerQueryDeps = {},
+  timeoutMs: number = DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+  sandboxNamespace?: string,
 ): OpenShellDockerSandboxContainerQuery {
+  return queryDockerSandboxContainerIds(
+    sandboxContainerFilterArgs(sandboxName, sandboxNamespace),
+    deps,
+    timeoutMs,
+  );
+}
+
+/**
+ * Prove that one durable replacement ID is the sole OpenShell-owned Docker
+ * runtime for its immutable sandbox namespace. Resume callers use the stopped
+ * form before a name-scoped OpenShell start and the running form before
+ * acknowledging the recovered handoff.
+ */
+export function isExactOpenShellDockerSandboxReplacement(
+  sandboxName: string,
+  replacementContainerId: string,
+  requireRunning: boolean,
+  deps: DockerSandboxContainerQueryDeps = {},
+  timeoutMs: number = DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+  now: () => Date = () => new Date(),
+): boolean {
+  const expectedContainerId = replacementContainerId.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(expectedContainerId) || timeoutMs <= 0) return false;
   const run = deps.dockerRun ?? dockerRun;
-  const result = run([...sandboxContainerFilterArgs(sandboxName), "--format", "{{.ID}}"], {
-    ignoreError: true,
-    suppressOutput: true,
-    timeout: DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
-  });
-  if (Number(result.status ?? 1) !== 0) {
-    return {
-      ok: false,
-      ids: [],
-      error: commandResultText(result) || "docker ps did not complete successfully",
-    };
+  try {
+    const deadline = now().getTime() + timeoutMs;
+    const namespace = run(
+      [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        `{{ index .Config.Labels "${OPENSHELL_SANDBOX_NAMESPACE_LABEL}" }}`,
+        expectedContainerId,
+      ],
+      {
+        ignoreError: true,
+        suppressOutput: true,
+        timeout: Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, timeoutMs),
+      },
+    );
+    const sandboxNamespace = String(namespace.stdout ?? "").trim();
+    if (
+      Number(namespace.status ?? 1) !== 0 ||
+      !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(sandboxNamespace)
+    ) {
+      return false;
+    }
+    let remainingMs = deadline - now().getTime();
+    if (remainingMs <= 0) return false;
+    const containers = queryOpenShellDockerSandboxContainers(
+      sandboxName,
+      { dockerRun: run },
+      remainingMs,
+      sandboxNamespace,
+    );
+    if (
+      !containers.ok ||
+      containers.ids.length !== 1 ||
+      containers.ids[0]?.trim().toLowerCase() !== expectedContainerId
+    ) {
+      return false;
+    }
+    if (!requireRunning) return true;
+    remainingMs = deadline - now().getTime();
+    if (remainingMs <= 0) return false;
+    const inspect = run(
+      [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{json .State.Running}}",
+        expectedContainerId,
+      ],
+      {
+        ignoreError: true,
+        suppressOutput: true,
+        timeout: Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, remainingMs),
+      },
+    );
+    return Number(inspect.status ?? 1) === 0 && String(inspect.stdout ?? "").trim() === "true";
+  } catch {
+    return false;
   }
-  const ids = String(result.stdout ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return { ok: true, ids };
+}
+
+type StaleDockerOrphanCleanupDeps = {
+  queryContainers?: typeof queryOpenShellDockerSandboxContainers;
+  forceRemove?: (containerId: string) => { status?: number | null };
+};
+
+type ExactDockerContainerCleanupDeps = {
+  inspectContainers?: (sandboxName: string) => DockerSandboxIdentityObservation;
+  forceRemove?: (containerId: string) => { status?: number | null };
+};
+
+export function inspectDockerSandboxNameLabeledContainers(
+  sandboxName: string,
+  inspect?: Parameters<typeof inspectDockerSandboxIdentities>[2],
+): DockerSandboxIdentityObservation {
+  return inspectDockerSandboxIdentities(
+    `${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`,
+    {
+      managedBy: OPENSHELL_MANAGED_BY_LABEL,
+      workspace: OPENSHELL_SANDBOX_WORKSPACE_LABEL,
+      sandboxId: OPENSHELL_SANDBOX_ID_LABEL,
+    },
+    inspect,
+  );
+}
+
+function exactCleanupContainerIds(
+  observation: DockerSandboxIdentityObservation,
+  phase: "inspect" | "confirm",
+): string[] {
+  const failurePrefix =
+    phase === "inspect"
+      ? "could not inspect the exact Docker cleanup target"
+      : "could not confirm exact Docker container removal";
+  if (observation.status === "probe-failed") {
+    throw new Error(`${failurePrefix}: ${observation.detail || "Docker identity probe failed"}`);
+  }
+  if (observation.malformedRows > 0) {
+    throw new Error(
+      `${failurePrefix}: Docker returned ${String(observation.malformedRows)} malformed container identity row(s)`,
+    );
+  }
+  return observation.rows.map((row) => row.id);
+}
+
+/** Remove the remaining members of one immutable, prequalified Docker container set. */
+export function removeExactOpenShellDockerSandboxContainers(
+  sandboxName: string,
+  expectedContainerIds: readonly string[],
+  log: (message: string) => void,
+  deps: ExactDockerContainerCleanupDeps = {},
+): void {
+  const expected = new Set(expectedContainerIds);
+  if (
+    expected.size !== expectedContainerIds.length ||
+    expectedContainerIds.some((containerId) => !/^[0-9a-f]{12,64}$/iu.test(containerId))
+  ) {
+    throw new Error("exact Docker cleanup contains an invalid or duplicate container identity");
+  }
+
+  // Recovery retirement requires the mutable name itself to be unambiguous.
+  // Inspect every name-labeled container, including foreign containers that do
+  // not carry OpenShell's managed-by marker, while removing only qualified IDs.
+  const inspectContainers = deps.inspectContainers ?? inspectDockerSandboxNameLabeledContainers;
+  const initialIds = exactCleanupContainerIds(inspectContainers(sandboxName), "inspect");
+  const unexpected = initialIds.filter((containerId) => !expected.has(containerId));
+  if (unexpected.length > 0) {
+    throw new Error(
+      `found labeled Docker container(s) outside the retained identity set: ${unexpected.join(", ")}; refusing replacement cleanup`,
+    );
+  }
+
+  const remaining = new Set(initialIds);
+  for (const containerId of expectedContainerIds) {
+    if (!remaining.has(containerId)) continue;
+    const removal = deps.forceRemove
+      ? deps.forceRemove(containerId)
+      : dockerRun(["rm", "-f", containerId], {
+          ignoreError: true,
+          suppressOutput: true,
+          timeout: STALE_DOCKER_ORPHAN_TIMEOUT_MS,
+        });
+    if (Number(removal.status ?? 1) !== 0) {
+      throw new Error(`could not remove exact Docker container '${containerId}'`);
+    }
+    log(`Removed exact Docker container '${containerId}' after OpenShell sandbox deletion`);
+  }
+
+  const confirmedIds = exactCleanupContainerIds(inspectContainers(sandboxName), "confirm");
+  if (confirmedIds.length !== 0) {
+    throw new Error("could not confirm exact Docker container removal");
+  }
+}
+
+/**
+ * Remove one exact Docker-owned orphan when a registry row outlives its OpenShell sandbox.
+ * Docker labels are the remaining authority in this invalid state; see the focused #8720 tests.
+ * Remove this workaround once OpenShell upgrades clean up or expose these orphans natively.
+ */
+export function removeStaleRebuildDockerOrphan(
+  sandboxName: string,
+  openshellDriver: string | null | undefined,
+  log: (message: string) => void,
+  deps: StaleDockerOrphanCleanupDeps = {},
+): void {
+  if (openshellDriver && openshellDriver !== "docker") return;
+  const queryContainers = deps.queryContainers ?? queryOpenShellDockerSandboxContainers;
+  const initial = queryContainers(sandboxName);
+  if (!initial.ok) {
+    if (openshellDriver === "docker") {
+      throw new Error(`could not inspect the owned Docker orphan: ${initial.error}`);
+    }
+    return;
+  }
+  if (initial.ids.length === 0) return;
+  if (initial.ids.length !== 1) {
+    throw new Error(
+      `found ${String(initial.ids.length)} exactly labeled Docker containers; refusing ambiguous orphan cleanup`,
+    );
+  }
+
+  const containerId = initial.ids[0];
+  const removal = deps.forceRemove
+    ? deps.forceRemove(containerId)
+    : dockerRun(["rm", "-f", containerId], {
+        ignoreError: true,
+        suppressOutput: true,
+        timeout: STALE_DOCKER_ORPHAN_TIMEOUT_MS,
+      });
+  if (Number(removal.status ?? 1) !== 0) {
+    throw new Error(`could not remove exactly labeled Docker orphan '${containerId}'`);
+  }
+  const confirmed = queryContainers(sandboxName);
+  if (!confirmed.ok || confirmed.ids.length !== 0) {
+    throw new Error("could not confirm exact Docker orphan removal");
+  }
+  log(`Removed exactly labeled Docker orphan '${containerId}' before stale rebuild`);
 }
 
 export type OpenShellDockerDeviceRequest = {
@@ -107,11 +440,24 @@ export type OpenShellDockerSandboxRuntimeSnapshotQuery =
       deviceRequests: OpenShellDockerDeviceRequest[] | null;
       devices: OpenShellDockerDeviceMapping[] | null;
       runtime: string;
+      /**
+       * Exact allowlisted NVIDIA Container Runtime selector. Other container
+       * environment entries are deliberately never returned by this query.
+       */
+      nvidiaVisibleDevices: string | null;
       /** Closed-world classification of host-owned Docker GPU configuration. */
       nativeGpuAttachmentState: OpenShellDockerGpuAttachmentState;
       containerId: string;
     }
   | { ok: false; error: string };
+
+export interface OpenShellDockerSandboxRuntimeSnapshotOptions {
+  /** Full transaction-owned container ID selected while a rollback backup is retained. */
+  readonly expectedContainerId?: string;
+  /** Total budget for the complete provider observation. */
+  readonly timeoutMs?: number;
+  readonly now?: () => number;
+}
 
 export function isImmutableDockerImageId(value: string): boolean {
   return /^sha256:[0-9a-f]{64}$/i.test(value);
@@ -196,9 +542,9 @@ function classifyGpuAttachment(
   deviceRequests: OpenShellDockerDeviceRequest[] | null,
   devices: OpenShellDockerDeviceMapping[] | null,
   runtime: string,
+  nvidiaVisibleDevices: string | null,
 ): OpenShellDockerGpuAttachmentState {
   const normalizedRuntime = runtime.trim().toLowerCase();
-  if (normalizedRuntime === "nvidia") return "present";
   if (
     deviceRequests?.some(
       (request) =>
@@ -210,6 +556,10 @@ function classifyGpuAttachment(
     )
   ) {
     return "present";
+  }
+  if (normalizedRuntime === "nvidia") {
+    if (nvidiaVisibleDevices === null) return "unknown";
+    return ["", "none", "void"].includes(nvidiaVisibleDevices) ? "absent" : "present";
   }
   if (
     devices?.some(
@@ -228,8 +578,50 @@ function classifyGpuAttachment(
   return noDeviceRequests && noDeviceMappings && knownNonGpuRuntime ? "absent" : "unknown";
 }
 
+function parseNvidiaVisibleDevices(result: {
+  stdout?: string | Buffer | null;
+  stderr?: string | Buffer | null;
+  status?: number | null;
+}): { ok: true; value: string | null } | { ok: false; error: string } {
+  if (Number(result.status ?? 1) !== 0) {
+    return {
+      ok: false,
+      error:
+        commandResultText(result) || "docker inspect could not read NVIDIA_VISIBLE_DEVICES safely",
+    };
+  }
+  const lines = String(result.stdout ?? "")
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return { ok: true, value: null };
+  if (lines.length !== 1 || !lines[0]?.startsWith("NVIDIA_VISIBLE_DEVICES=")) {
+    return { ok: false, error: "docker inspect returned ambiguous NVIDIA_VISIBLE_DEVICES" };
+  }
+  const value = lines[0].slice("NVIDIA_VISIBLE_DEVICES=".length);
+  const identifiers = value.split(",");
+  const validKeyword = ["", "all", "none", "void"].includes(value);
+  const validIdentifiers =
+    !validKeyword &&
+    identifiers.length > 0 &&
+    identifiers.length <= 64 &&
+    identifiers.every(
+      (identifier) =>
+        !["all", "none", "void"].includes(identifier) &&
+        /^[A-Za-z0-9._:/=-]{1,256}$/u.test(identifier) &&
+        Buffer.byteLength(identifier, "utf8") <= 256,
+    ) &&
+    new Set(identifiers).size === identifiers.length;
+  if (!validKeyword && !validIdentifiers) {
+    return { ok: false, error: "docker inspect returned invalid NVIDIA_VISIBLE_DEVICES" };
+  }
+  return { ok: true, value };
+}
+
 /**
- * Inspect the one exactly labeled native container before deletion.
+ * Inspect a native container before deletion. Default callers must resolve one
+ * labeled container. A caller that owns a recreation transaction may instead
+ * provide the full replacement container ID. That ID must be present among
+ * the labeled replacement and retained rollback backup.
  *
  * Docker owns the fields returned here: `.Image` is the immutable retry
  * identity, `.Config.Image` is bookkeeping-only, and HostConfig supplies the
@@ -240,17 +632,38 @@ function classifyGpuAttachment(
 export function queryOpenShellDockerSandboxRuntimeSnapshot(
   sandboxName: string,
   deps: DockerSandboxContainerQueryDeps = {},
+  options: OpenShellDockerSandboxRuntimeSnapshotOptions = {},
 ): OpenShellDockerSandboxRuntimeSnapshotQuery {
-  const containers = queryOpenShellDockerSandboxContainers(sandboxName, deps);
+  const now = options.now ?? Date.now;
+  const totalTimeoutMs = Math.max(
+    1,
+    Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, options.timeoutMs ?? DOCKER_SANDBOX_QUERY_TIMEOUT_MS),
+  );
+  const deadlineMs = now() + totalTimeoutMs;
+  const remainingTimeoutMs = () => Math.floor(deadlineMs - now());
+  const containers = queryOpenShellDockerSandboxContainers(sandboxName, deps, remainingTimeoutMs());
   if (!containers.ok) return { ok: false, error: containers.error };
-  if (containers.ids.length !== 1) {
+  const inspectTimeoutMs = remainingTimeoutMs();
+  if (inspectTimeoutMs <= 0) {
+    return { ok: false, error: "Docker runtime snapshot deadline expired" };
+  }
+  const expectedContainerId = options.expectedContainerId;
+  if (expectedContainerId !== undefined && !/^[a-f0-9]{64}$/u.test(expectedContainerId)) {
+    return { ok: false, error: "expected sandbox container ID is invalid" };
+  }
+  const selectedContainerIds = expectedContainerId
+    ? containers.ids.filter((containerId) => containerId === expectedContainerId)
+    : containers.ids;
+  if (selectedContainerIds.length !== 1) {
     return {
       ok: false,
-      error: `expected one labeled sandbox container, found ${containers.ids.length}`,
+      error: expectedContainerId
+        ? "expected activated sandbox container was not found among labeled containers"
+        : `expected one labeled sandbox container, found ${containers.ids.length}`,
     };
   }
   const run = deps.dockerRun ?? dockerRun;
-  const containerId = containers.ids[0];
+  const containerId = selectedContainerIds[0];
   const inspect = run(
     [
       "inspect",
@@ -263,7 +676,7 @@ export function queryOpenShellDockerSandboxRuntimeSnapshot(
     {
       ignoreError: true,
       suppressOutput: true,
-      timeout: DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+      timeout: inspectTimeoutMs,
     },
   );
   if (Number(inspect.status ?? 1) !== 0) {
@@ -295,6 +708,31 @@ export function queryOpenShellDockerSandboxRuntimeSnapshot(
   const deviceRequests = fields[3];
   const devices = fields[4];
   const runtime = fields[5];
+  let nvidiaVisibleDevices: string | null = null;
+  if (runtime.trim().toLowerCase() === "nvidia") {
+    if (remainingTimeoutMs() <= 0) {
+      return { ok: false, error: "Docker runtime snapshot deadline expired" };
+    }
+    const visibleDevices = parseNvidiaVisibleDevices(
+      run(
+        [
+          "inspect",
+          "--type",
+          "container",
+          "--format",
+          '{{range .Config.Env}}{{if eq (index (split . "=") 0) "NVIDIA_VISIBLE_DEVICES"}}{{println .}}{{end}}{{end}}',
+          containerId,
+        ],
+        {
+          ignoreError: true,
+          suppressOutput: true,
+          timeout: remainingTimeoutMs(),
+        },
+      ),
+    );
+    if (!visibleDevices.ok) return visibleDevices;
+    nvidiaVisibleDevices = visibleDevices.value;
+  }
   return {
     ok: true,
     imageId: fields[0].toLowerCase(),
@@ -303,7 +741,13 @@ export function queryOpenShellDockerSandboxRuntimeSnapshot(
     deviceRequests,
     devices,
     runtime,
-    nativeGpuAttachmentState: classifyGpuAttachment(deviceRequests, devices, runtime),
+    nvidiaVisibleDevices,
+    nativeGpuAttachmentState: classifyGpuAttachment(
+      deviceRequests,
+      devices,
+      runtime,
+      nvidiaVisibleDevices,
+    ),
     containerId,
   };
 }

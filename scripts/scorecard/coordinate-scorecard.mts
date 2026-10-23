@@ -70,7 +70,7 @@ function deriveRunMode(
     ? "Selective dispatch"
     : isDispatch
       ? "Manual full run"
-      : "Scheduled E2E";
+      : "Main push";
   return { runMode, isDispatch, isSelectiveDispatch: selective };
 }
 
@@ -111,6 +111,22 @@ function renderSummaryLines(input: {
     lines.push("", "**Failed jobs:**");
     for (const job of summary.failedJobs) {
       lines.push(job.url ? `  - [${job.name}](${job.url})` : `  - \`${job.name}\``);
+    }
+  }
+  if (summary.timingRows.length > 0) {
+    const duration = (milliseconds: number | null) =>
+      milliseconds === null ? "n/a" : `${(milliseconds / 1_000).toFixed(1)}s`;
+    lines.push(
+      "",
+      "### Runner wait vs execution",
+      "",
+      "| Job | Runner class | Outcome | Queue | Execution |",
+      "| --- | --- | --- | ---: | ---: |",
+    );
+    for (const row of summary.timingRows) {
+      lines.push(
+        `| ${row.name.replaceAll("|", "\\|")} | ${row.runnerClass} | ${row.outcome} | ${duration(row.queueMs)} | ${duration(row.executionMs)} |`,
+      );
     }
   }
   if (input.perfect) lines.push("", "🎉 **All jobs passed!**");

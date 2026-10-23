@@ -15,25 +15,172 @@
  * focuses on the entry-point behaviour and SecretStore delegation.
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ArtifactSink } from "../fixtures/artifacts.ts";
+import { startTestProgress } from "../fixtures/progress.ts";
 import { buildChildEnv, isValidSecretEnvKey, redactString } from "../fixtures/redaction.ts";
 import { SecretStore } from "../fixtures/secrets.ts";
 import { ShellProbe, trustedShellCommand } from "../fixtures/shell-probe.ts";
 
+function supportProgress() {
+  return startTestProgress(
+    "ShellProbe redaction support",
+    ["run redaction probe", "verify redacted evidence"],
+    { logLine: () => undefined },
+  );
+}
+
+async function captureCommandEvidence(outcome: string) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-command-evidence-"));
+  const secret = "sink-only-command-secret";
+  const artifacts = new ArtifactSink(directory, [secret]);
+  const progress = supportProgress();
+  const writes: string[] = [];
+  const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+    writes.push(String(chunk));
+    return true;
+  });
+  vi.stubEnv("NEMOCLAW_E2E_COMMAND_EVIDENCE", outcome === "not-requested" ? "" : "1");
+  try {
+    const probe = new ShellProbe({
+      artifacts,
+      progress,
+      redact: redactString,
+      signal: new AbortController().signal,
+    });
+    let failed = false;
+    await probe
+      .run(
+        trustedShellCommand({
+          command: outcome === "spawn-error" ? "/nonexistent/e2e-command" : process.execPath,
+          args: [
+            "-e",
+            outcome === "timeout"
+              ? "setInterval(() => {}, 1000)"
+              : `console.log('private-output-body'); process.exit(${outcome === "failure" ? 7 : 0})`,
+            secret,
+            ...(outcome === "oversized" ? ["a".repeat(70_000)] : []),
+          ],
+          reason: "verify timestamped command evidence and redaction",
+        }),
+        {
+          artifactName: "command-evidence",
+          timeoutMs: outcome === "timeout" ? 100 : 5000,
+          persistArtifacts: outcome !== "disabled",
+        },
+      )
+      .catch(() => {
+        failed = true;
+      });
+    const lines = writes.filter((line) => line.startsWith("NEMOCLAW_E2E_COMMAND "));
+    const result = await fs
+      .readFile(path.join(directory, "shell/command-evidence.result.json"), "utf8")
+      .catch(() => null);
+    return { lines, result, secret, failed };
+  } finally {
+    stderr.mockRestore();
+    vi.unstubAllEnvs();
+    progress.stop();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
 describe("fixture redaction entry point", () => {
+  it.each([false, true])(
+    "preserves credential presence in redacted legacy JSON (retired=%s)",
+    (retired) => {
+      const secret = "fixture-hosted-key-for-retirement";
+      const retained = {
+        OPENSHELL_GATEWAY: "evil-gw-from-tampered-file",
+        NODE_OPTIONS: "--require=/tmp/evil.js",
+      };
+      const store = new SecretStore({}, (note): never => {
+        throw new Error(note);
+      });
+      const plaintext = JSON.stringify({
+        ...retained,
+        ...(retired ? {} : { NVIDIA_INFERENCE_API_KEY: secret }),
+      });
+
+      expect(JSON.parse(store.redact(plaintext, [secret]))).toEqual({
+        ...retained,
+        ...(retired ? {} : { NVIDIA_INFERENCE_API_KEY: "[REDACTED]" }),
+      });
+    },
+  );
+
+  it.each([
+    { outcome: "success", exitCode: 0, timedOut: false, failed: false, commandOmitted: undefined },
+    { outcome: "failure", exitCode: 7, timedOut: false, failed: false, commandOmitted: undefined },
+    {
+      outcome: "timeout",
+      exitCode: null,
+      timedOut: true,
+      failed: false,
+      commandOmitted: undefined,
+    },
+    {
+      outcome: "spawn-error",
+      exitCode: null,
+      timedOut: false,
+      failed: true,
+      commandOmitted: undefined,
+    },
+    {
+      outcome: "oversized",
+      exitCode: 0,
+      timedOut: false,
+      failed: false,
+      commandOmitted: "size-limit",
+    },
+  ])(
+    "retains redacted UTC command metadata for $outcome without publishing output bodies",
+    async ({ outcome, exitCode, timedOut, failed, commandOmitted }) => {
+      const evidence = await captureCommandEvidence(outcome);
+      expect(evidence.failed).toBe(failed);
+      expect(evidence.lines).toHaveLength(1);
+      const record = JSON.parse(evidence.lines[0]!.slice("NEMOCLAW_E2E_COMMAND ".length));
+      expect(record.schemaVersion).toBe(1);
+      expect(record.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+      expect(Date.parse(record.finishedAt) - Date.parse(record.startedAt)).toBe(record.durationMs);
+      expect(record.exitCode).toBe(exitCode);
+      expect(record.timedOut).toBe(timedOut);
+      expect(evidence.lines[0]).not.toContain(evidence.secret);
+      expect(record).not.toHaveProperty("stdout");
+      expect(record).not.toHaveProperty("stderr");
+      expect(Buffer.byteLength(evidence.lines[0]!)).toBeLessThan(65_600);
+      expect(record.commandOmitted).toBe(commandOmitted);
+      expect(evidence.result).not.toBeNull();
+      expect(evidence.result).not.toContain(evidence.secret);
+    },
+  );
+  it.each(["disabled", "not-requested"])(
+    "emits no command metadata when evidence is %s",
+    async (outcome) => {
+      const evidence = await captureCommandEvidence(outcome);
+      expect(evidence.failed).toBe(false);
+      expect(evidence.lines).toEqual([]);
+    },
+  );
+
   it("recognizes pass env names only at exact or underscore-delimited boundaries", () => {
-    for (const key of ["PASS", "PASSWD", "CUSTOM_PASS", "CUSTOM_PASSWD"]) {
-      expect(isValidSecretEnvKey(key), key).toBe(true);
-    }
-    for (const key of ["COMPASS", "BYPASS", "PASSENGER_COUNT", "PASSED"]) {
-      expect(isValidSecretEnvKey(key), key).toBe(false);
-    }
+    expect(
+      ["PASS", "PASSWD", "CUSTOM_PASS", "CUSTOM_PASSWD"].every((key) =>
+        Object.is(isValidSecretEnvKey(key), true),
+      ),
+    ).toBe(true);
+    expect(
+      ["COMPASS", "BYPASS", "PASSENGER_COUNT", "PASSED"].every((key) =>
+        Object.is(isValidSecretEnvKey(key), false),
+      ),
+    ).toBe(true);
 
     expect(
       buildChildEnv(
@@ -41,6 +188,27 @@ describe("fixture redaction entry point", () => {
         { fixtureOverlay: {}, additionalAllowedEnv: ["COMPASS", "BYPASS"] },
       ),
     ).toMatchObject({ COMPASS: "north", BYPASS: "allowed" });
+  });
+
+  it("rejects secret-shaped names from the non-secret child env channel", () => {
+    expect(() =>
+      buildChildEnv(
+        { CUSTOM_TOKEN: "must-not-pass" },
+        { fixtureOverlay: {}, additionalAllowedEnv: ["CUSTOM_TOKEN"] },
+      ),
+    ).toThrow(/looks secret-bearing; use secretEnv/);
+  });
+
+  it("does not let fixture prefixes or overlays bypass the declared-secret channel", () => {
+    const childEnv = buildChildEnv(
+      { E2E_TARGET_ID: "target-a", E2E_PROVIDER_TOKEN: "must-not-pass" },
+      { fixtureOverlay: {} },
+    );
+    expect(childEnv).toMatchObject({ E2E_TARGET_ID: "target-a" });
+    expect(childEnv.E2E_PROVIDER_TOKEN).toBeUndefined();
+    expect(() =>
+      buildChildEnv({}, { fixtureOverlay: { E2E_PROVIDER_TOKEN: "must-not-pass" } }),
+    ).toThrow(/fixtureOverlay entry 'E2E_PROVIDER_TOKEN' looks secret-bearing/);
   });
 
   it("passes only the workflow-owned trace directory through child env", () => {
@@ -102,6 +270,73 @@ describe("fixture redaction entry point", () => {
     expect(out).toContain("<REDACTED>");
     expect(out).not.toContain(explicit);
     expect(out).not.toContain(canonical);
+
+    // Truncating before redaction would expose this opaque secret's suffix.
+    const cliSecret = "opaque".repeat(4000) + explicit;
+    const cli = spawnSync(
+      process.execPath,
+      ["--no-warnings", fileURLToPath(new URL("../fixtures/redaction.ts", import.meta.url))],
+      {
+        env: { COMPATIBLE_API_KEY: cliSecret },
+        input: `${"diagnostic\n".repeat(2000)}\x1b[31m${cliSecret}\x1b[0m\n${canonical}\nDCODE_EXIT:0\n`,
+        encoding: "utf8",
+        timeout: 5000,
+      },
+    );
+    const notice = "[truncated; last 16 KiB of redacted output]\n";
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(0);
+    expect(cli.stderr).toBe("");
+    expect(cli.stdout).toContain("[REDACTED]");
+    expect(cli.stdout).toContain("<REDACTED>");
+    expect(cli.stdout).not.toContain(explicit);
+    expect(cli.stdout).not.toContain(canonical);
+    expect(cli.stdout).not.toContain("\x1b");
+    expect(cli.stdout.startsWith(notice)).toBe(true);
+    expect(Buffer.byteLength(cli.stdout)).toBeLessThanOrEqual(16 * 1024 + notice.length + 1);
+    expect(cli.stdout).toMatch(/\nDCODE_EXIT:0\n\n?$/);
+  });
+
+  it("returns redacted MCP tunnel URLs exactly as ShellProbe exposes them", async () => {
+    const hostSecret = "fake-compatible-mcp-bridge-key";
+    const secretUrl = `https://${hostSecret}.trycloudflare.com/mcp`;
+    const canonicalLookingUrl = "https://task-butterfly-respected-eminem.trycloudflare.com/mcp";
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-mcp-url-redaction-"));
+    try {
+      const artifacts = new ArtifactSink(path.join(rootDir, "e2e-artifacts/live/mcp-redaction"));
+      await artifacts.ensureRoot();
+      const probe = new ShellProbe({
+        artifacts,
+        progress: supportProgress(),
+        redact: (text, extra) => redactString(text, extra),
+        signal: new AbortController().signal,
+      });
+      const result = await probe.run(
+        trustedShellCommand({
+          command: "bash",
+          args: ["-lc", 'printf "%s\\n%s\\n" "$SECRET_URL" "$CANONICAL_LOOKING_URL"'],
+          reason: "exercise MCP tunnel URL redaction at the ShellProbe boundary",
+        }),
+        {
+          artifactName: "mcp-tunnel-url-redaction",
+          env: {
+            CANONICAL_LOOKING_URL: canonicalLookingUrl,
+            SECRET_URL: secretUrl,
+          },
+          redactionValues: [hostSecret],
+        },
+      );
+
+      expect(result.stdout.trim().split("\n")).toEqual([
+        "https://[REDACTED].trycloudflare.com/mcp",
+        "https://ta<REDACTED>.trycloudflare.com/mcp",
+      ]);
+      await expect(fs.readFile(result.artifacts.stdout, "utf8")).resolves.toBe(result.stdout);
+      expect(result.stdout).not.toContain(hostSecret);
+      expect(result.stdout).not.toContain("sk-butterfly-respected-eminem");
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps explicit sentinels stable without masking adjacent credential text", () => {
@@ -147,6 +382,7 @@ describe("fixture redaction entry point", () => {
   it("preserves managed credential references and non-credential JSON identifiers", () => {
     const discordReference = "openshell:resolve:env:DISCORD_BOT_TOKEN";
     const versionedReference = "openshell:resolve:env:v2237303833964223913_WECHAT_BOT_TOKEN";
+    const stableReference = `openshell:resolve:env:s${"a".repeat(64)}_SLACK_APP_TOKEN`;
     const slackReference = "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN";
     const discordAssignment = `DISCORD_BOT_TOKEN=${discordReference}`;
     const text = JSON.stringify({
@@ -154,6 +390,7 @@ describe("fixture redaction entry point", () => {
       replyMarker: "A2603-REPLY",
       token: discordReference,
       versionedToken: versionedReference,
+      stableToken: stableReference,
       botToken: slackReference,
     });
 
@@ -187,6 +424,9 @@ describe("fixture redaction entry point", () => {
     ["nested assignment", "TOKEN=foo=openshell:resolve:env:FOO"],
     ["short prefix", "TOKEN=short:openshell:resolve:env:FOO"],
     ["oversized revision", `TOKEN=openshell:resolve:env:v${"1".repeat(21)}_FOO`],
+    ["short stable handle", `TOKEN=openshell:resolve:env:s${"a".repeat(63)}_FOO`],
+    ["long stable handle", `TOKEN=openshell:resolve:env:s${"a".repeat(65)}_FOO`],
+    ["uppercase stable handle", `TOKEN=openshell:resolve:env:s${"A".repeat(64)}_FOO`],
     ["oversized identifier", `TOKEN=openshell:resolve:env:${"A".repeat(129)}`],
     ["mixed case", "TOKEN=OpenShell:Resolve:Env:FOO"],
     ["lowercase Slack", "TOKEN=xoxb-openshell-resolve-env-SLACK_BOT_TOKEN"],
@@ -241,7 +481,14 @@ describe("fixture redaction entry point", () => {
     expect(out).not.toContain(canonical);
   });
 
-  it("redacts raw secrets at the uploaded artifact sink", async () => {
+  it.concurrent.each([
+    { scenario: "hosted inference key" },
+    { scenario: "Docker token" },
+    { scenario: "gateway token" },
+    { scenario: "GitHub token" },
+    { scenario: "messaging token" },
+    { scenario: "private key" },
+  ])("redacts raw secrets at the uploaded artifact sink [$scenario]", async ({ scenario }) => {
     const fakeHostedKey = "fake-hosted-inference-key-for-artifact-scan";
     const fakeDockerToken = "fake-docker-token-for-artifact-scan";
     const generatedGatewayToken = "generated-gateway-token-for-artifact-scan";
@@ -267,6 +514,7 @@ describe("fixture redaction entry point", () => {
     );
     const probe = new ShellProbe({
       artifacts,
+      progress: supportProgress(),
       redact: (text, extra) => secrets.redact(text, extra),
       signal: new AbortController().signal,
     });
@@ -309,16 +557,18 @@ describe("fixture redaction entry point", () => {
     expect(result.stdout).toContain("[REDACTED]");
     expect(result.stderr).toContain("[REDACTED]");
     const uploadedText = uploadedTexts.join("\n");
-    for (const secret of [
-      fakeHostedKey,
-      fakeDockerToken,
-      generatedGatewayToken,
-      fakeGitHubToken,
-      fakeMessagingToken,
-      generatedPrivateKey,
-    ]) {
-      expect(uploadedText).not.toContain(secret);
-    }
+    const secret = (
+      {
+        "hosted inference key": fakeHostedKey,
+        "Docker token": fakeDockerToken,
+        "gateway token": generatedGatewayToken,
+        "GitHub token": fakeGitHubToken,
+        "messaging token": fakeMessagingToken,
+        "private key": generatedPrivateKey,
+      } as const
+    )[scenario]!;
+    expect(uploadedText).not.toContain(secret);
+
     expect(uploadedText).toContain("[REDACTED]");
     expect(uploadedText).toContain("<REDACTED>");
     expect(uploadedText).not.toContain("PRIVATE KEY");
@@ -348,6 +598,7 @@ describe("fixture redaction entry point", () => {
       await artifacts.ensureRoot();
       const probe = new ShellProbe({
         artifacts,
+        progress: supportProgress(),
         redact: (text, extra) => redactString(text, extra),
         signal: new AbortController().signal,
       });
@@ -388,39 +639,37 @@ describe("fixture redaction entry point", () => {
     }
   });
 
-  it.each([
-    0,
-    -1,
-    1.5,
-    Number.POSITIVE_INFINITY,
-    Number.MAX_SAFE_INTEGER + 1,
-  ])("rejects invalid capture limit %s before spawning a child or writing artifacts", async (captureLimitBytes) => {
-    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-e2e-invalid-capture-"));
-    try {
-      const artifactRoot = path.join(rootDir, "e2e-artifacts/live/invalid-capture");
-      const spawnMarker = path.join(rootDir, "spawned.txt");
-      const artifacts = new ArtifactSink(artifactRoot);
-      await artifacts.ensureRoot();
-      const probe = new ShellProbe({
-        artifacts,
-        redact: (text, extra) => redactString(text, extra),
-        signal: new AbortController().signal,
-      });
+  it.each([0, -1, 1.5, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid capture limit %s before spawning a child or writing artifacts",
+    async (captureLimitBytes) => {
+      const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-e2e-invalid-capture-"));
+      try {
+        const artifactRoot = path.join(rootDir, "e2e-artifacts/live/invalid-capture");
+        const spawnMarker = path.join(rootDir, "spawned.txt");
+        const artifacts = new ArtifactSink(artifactRoot);
+        await artifacts.ensureRoot();
+        const probe = new ShellProbe({
+          artifacts,
+          progress: supportProgress(),
+          redact: (text, extra) => redactString(text, extra),
+          signal: new AbortController().signal,
+        });
 
-      await expect(
-        probe.run(
-          trustedShellCommand({
-            command: "bash",
-            args: ["-lc", 'printf spawned >"$SPAWN_MARKER"'],
-            reason: "prove invalid output limits fail before child execution",
-          }),
-          { captureLimitBytes, env: { SPAWN_MARKER: spawnMarker } },
-        ),
-      ).rejects.toThrow("captureLimitBytes must be a positive safe integer");
-      await expect(fs.access(spawnMarker)).rejects.toThrow();
-      await expect(fs.readdir(artifactRoot)).resolves.toEqual([]);
-    } finally {
-      await fs.rm(rootDir, { recursive: true, force: true });
-    }
-  });
+        await expect(
+          probe.run(
+            trustedShellCommand({
+              command: "bash",
+              args: ["-lc", 'printf spawned >"$SPAWN_MARKER"'],
+              reason: "prove invalid output limits fail before child execution",
+            }),
+            { captureLimitBytes, env: { SPAWN_MARKER: spawnMarker } },
+          ),
+        ).rejects.toThrow("captureLimitBytes must be a positive safe integer");
+        await expect(fs.access(spawnMarker)).rejects.toThrow();
+        await expect(fs.readdir(artifactRoot)).resolves.toEqual([]);
+      } finally {
+        await fs.rm(rootDir, { recursive: true, force: true });
+      }
+    },
+  );
 });

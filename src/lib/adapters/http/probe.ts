@@ -6,6 +6,7 @@ import {
   type SpawnSyncReturns,
   spawnSync,
 } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,7 +17,11 @@ import type { ProbeResult } from "../../onboard/types";
 import { buildScrubbedCurlProbeEnv, scrubCredentialEnv } from "../../security/credential-env";
 import { ROOT } from "../../state/paths";
 import { addTraceEvent, withTraceSpan } from "../../trace";
-import { buildCurlProbeSpawnArgs, validateCurlProbeArgs } from "./curl-args";
+import {
+  buildBoundedCurlProbeSpawnArgs,
+  buildCurlProbeSpawnArgs,
+  validateCurlProbeArgs,
+} from "./curl-args";
 
 export type CurlProbeResult = ProbeResult;
 
@@ -25,6 +30,8 @@ export interface CurlProbeOptions {
   env?: NodeJS.ProcessEnv;
   replaceEnv?: boolean;
   timeoutMs?: number;
+  /** Maximum response-body bytes captured by the curl process. */
+  maxResponseBytes?: number;
   /** Absolute or cwd-relative curl config files created by trusted NemoClaw callers. */
   trustedConfigFiles?: readonly string[];
   /**
@@ -33,7 +40,7 @@ export interface CurlProbeOptions {
    * connection with ambient proxies disabled.
    */
   pinnedAddresses?: readonly string[];
-  /** Non-forgeable proof of the exact private subset admitted by the SSRF preflight. */
+  /** Non-forgeable proof of the exact host and complete pins admitted by SSRF preflight. */
   trustedPrivateCapability?: TrustedPrivateEndpointCapability;
   spawnSyncImpl?: (
     command: string,
@@ -50,6 +57,8 @@ export interface StreamingProbeResult {
 
 const DEFAULT_CURL_PROCESS_TIMEOUT_MS = 30_000;
 const CURL_PROCESS_TIMEOUT_SLACK_MS = 5_000;
+const CURL_HTTP_STATUS_MARKER_PREFIX = "\n__NEMOCLAW_HTTP_STATUS_";
+const CURL_OVERSIZED_RESPONSE_STATUS = 63;
 
 function resolveCurlProbeSpawnEnv(
   args: readonly string[],
@@ -150,6 +159,31 @@ function normalizeSpawnErrorCode(error: unknown): number {
   if (isErrnoException(error) && error.code === "ETIMEDOUT") return -110;
   const rawErrorCode = isErrnoException(error) ? (error.errno ?? error.code) : undefined;
   return typeof rawErrorCode === "number" ? rawErrorCode : 1;
+}
+
+function normalizeMaxResponseBytes(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("curl probe maxResponseBytes must be a positive safe integer");
+  }
+  return value;
+}
+
+function isSpawnBufferOverflow(error: unknown): boolean {
+  return isErrnoException(error) && error.code === "ENOBUFS";
+}
+
+function splitBoundedCurlOutput(
+  stdout: string,
+  statusMarker: string,
+): { body: string; status: number } {
+  const markerIndex = stdout.lastIndexOf(statusMarker);
+  if (markerIndex < 0) return { body: "", status: 0 };
+  const status = Number(stdout.slice(markerIndex + statusMarker.length).trim());
+  return {
+    body: stdout.slice(0, markerIndex),
+    status: Number.isFinite(status) ? status : 0,
+  };
 }
 
 function sanitizeCurlUrl(value: string): string {
@@ -261,7 +295,16 @@ function runCurlProbeImpl(argv: string[], opts: CurlProbeOptions = {}): CurlProb
     const { args, url } = validateCurlProbeArgs(argv, opts);
     const spawnSyncImpl = opts.spawnSyncImpl ?? spawnSync;
     const timeout = resolveCurlProcessTimeoutMs(argv, opts);
-    const curlArgs = buildCurlProbeSpawnArgs(args, url, bodyFile, "json");
+    const maxResponseBytes = normalizeMaxResponseBytes(opts.maxResponseBytes);
+    const statusMarker = `${CURL_HTTP_STATUS_MARKER_PREFIX}${randomUUID()}__:`;
+    const curlArgs =
+      maxResponseBytes === null
+        ? buildCurlProbeSpawnArgs(args, url, bodyFile, "json")
+        : buildBoundedCurlProbeSpawnArgs(args, url, statusMarker);
+    const maxBuffer =
+      maxResponseBytes === null
+        ? undefined
+        : maxResponseBytes + Buffer.byteLength(`${statusMarker}999`);
     const result = spawnSyncImpl(
       "curl",
       // lgtm[js/file-access-to-http] curlArgs were validated and rebuilt from safe probe fields.
@@ -271,26 +314,54 @@ function runCurlProbeImpl(argv: string[], opts: CurlProbeOptions = {}): CurlProb
         encoding: "utf8",
         timeout,
         env: resolveCurlProbeSpawnEnv(args, opts),
+        ...(maxBuffer === undefined ? {} : { maxBuffer }),
       },
     );
-    const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, "utf8") : "";
+    const boundedOutput =
+      maxResponseBytes === null
+        ? null
+        : splitBoundedCurlOutput(String(result.stdout || ""), statusMarker);
+    const body =
+      boundedOutput?.body ?? (fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, "utf8") : "");
     if (result.error) {
-      const errorCode = normalizeSpawnErrorCode(result.error);
-      const errorMessage = compactText(
-        `${result.error.message || String(result.error)} ${String(result.stderr || "")}`,
-      );
+      const overflow = isSpawnBufferOverflow(result.error);
+      const errorCode = overflow
+        ? CURL_OVERSIZED_RESPONSE_STATUS
+        : normalizeSpawnErrorCode(result.error);
+      const errorMessage = overflow
+        ? "curl response exceeded the configured process byte limit"
+        : compactText(
+            `${result.error.message || String(result.error)} ${String(result.stderr || "")}`,
+          );
       const failure = {
         ok: false,
         httpStatus: 0,
         curlStatus: errorCode,
-        body,
+        body: overflow ? "" : body,
         stderr: errorMessage,
-        message: summarizeProbeFailure(body, 0, errorCode, errorMessage),
+        message: summarizeProbeFailure(overflow ? "" : body, 0, errorCode, errorMessage),
       };
       emitCurlResultTraceEvent({ ok: false, http_status: 0, curl_status: errorCode });
       return failure;
     }
-    const status = Number(String(result.stdout || "").trim());
+    if (maxResponseBytes !== null && Buffer.byteLength(body) > maxResponseBytes) {
+      const errorMessage = "curl response exceeded the configured process byte limit";
+      const failure = {
+        ok: false,
+        httpStatus: 0,
+        curlStatus: CURL_OVERSIZED_RESPONSE_STATUS,
+        body: "",
+        stderr: errorMessage,
+        message: summarizeCurlFailure(CURL_OVERSIZED_RESPONSE_STATUS, errorMessage),
+      };
+      emitCurlResultTraceEvent({
+        ok: false,
+        http_status: 0,
+        curl_status: CURL_OVERSIZED_RESPONSE_STATUS,
+      });
+      return failure;
+    }
+    const status = boundedOutput?.status ?? Number(String(result.stdout || "").trim());
     const probeResult = {
       ok: result.status === 0 && status >= 200 && status < 300,
       httpStatus: Number.isFinite(status) ? status : 0,
@@ -489,6 +560,8 @@ interface SseEventCaptureResult {
   eventCounts: Map<string, number>;
   /** SSE `event:` types in stream order, for sequence validation. */
   eventSequence: string[];
+  /** Captured response body, retained only for protocol-specific validation. */
+  body: string;
 }
 
 /**
@@ -543,6 +616,7 @@ function captureSseEventCounts(
         detail,
         eventCounts: new Map(),
         eventSequence: [],
+        body: "",
       };
     }
 
@@ -561,6 +635,7 @@ function captureSseEventCounts(
         ),
         eventCounts: new Map(),
         eventSequence: [],
+        body: "",
       };
     }
 
@@ -583,6 +658,7 @@ function captureSseEventCounts(
       detail: "",
       eventCounts,
       eventSequence,
+      body,
     };
   } finally {
     cleanupTempDir(bodyFile, tempPrefix);
@@ -682,7 +758,18 @@ export interface AnthropicStreamingProbeResult {
   duplicateEvents: string[];
   /** Order violations, e.g. content deltas before message_start or after message_stop. */
   sequenceErrors: string[];
+  /** Structured tool-call contract violations when a named tool is required. */
+  toolCallErrors: AnthropicStreamingToolCallError[];
   message: string;
+}
+
+export type AnthropicStreamingToolCallError =
+  | "missing-expected-tool-use"
+  | "missing-tool-use-stop-reason";
+
+export interface AnthropicStreamingExpectations {
+  /** Require one structured `tool_use` content block for this exact tool name. */
+  expectedToolName?: string;
 }
 
 /**
@@ -720,6 +807,51 @@ function anthropicSequenceErrors(eventSequence: string[]): string[] {
   return errors;
 }
 
+function anthropicToolCallErrors(
+  body: string,
+  expectedToolName: string | undefined,
+): AnthropicStreamingToolCallError[] {
+  if (!expectedToolName) return [];
+  let hasExpectedToolUse = false;
+  let hasToolUseStopReason = false;
+
+  for (const eventBlock of body.split(/\r?\n\r?\n/)) {
+    const data = eventBlock
+      .split(/\r?\n/)
+      .flatMap((line) => {
+        const match = /^data:\s?(.*)$/i.exec(line);
+        return match ? [match[1]] : [];
+      })
+      .join("\n");
+    if (!data || data === "[DONE]") continue;
+    try {
+      const payload = JSON.parse(data) as {
+        type?: unknown;
+        content_block?: { type?: unknown; name?: unknown };
+        delta?: { stop_reason?: unknown };
+      };
+      if (
+        payload.type === "content_block_start" &&
+        payload.content_block?.type === "tool_use" &&
+        payload.content_block.name === expectedToolName
+      ) {
+        hasExpectedToolUse = true;
+      }
+      if (payload.type === "message_delta" && payload.delta?.stop_reason === "tool_use") {
+        hasToolUseStopReason = true;
+      }
+    } catch {
+      // Malformed data remains covered by the required structured observations
+      // below; never interpret JSON-shaped assistant text as a tool call.
+    }
+  }
+
+  return [
+    ...(hasExpectedToolUse ? [] : (["missing-expected-tool-use"] as const)),
+    ...(hasToolUseStopReason ? [] : (["missing-tool-use-stop-reason"] as const)),
+  ];
+}
+
 /**
  * Send a streaming request to an Anthropic-compatible `/v1/messages`
  * endpoint and verify the SSE event stream is well formed: the required
@@ -734,17 +866,19 @@ function anthropicSequenceErrors(eventSequence: string[]): string[] {
 export function runAnthropicStreamingEventProbe(
   argv: string[],
   opts: CurlProbeOptions = {},
+  expectations: AnthropicStreamingExpectations = {},
 ): AnthropicStreamingProbeResult {
   return withTraceSpan(
     "nemoclaw.inference.curl_anthropic_streaming_probe",
     getCurlProbeTraceAttributes(argv, opts),
-    () => runAnthropicStreamingEventProbeImpl(argv, opts),
+    () => runAnthropicStreamingEventProbeImpl(argv, opts, expectations),
   );
 }
 
 function runAnthropicStreamingEventProbeImpl(
   argv: string[],
   opts: CurlProbeOptions = {},
+  expectations: AnthropicStreamingExpectations = {},
 ): AnthropicStreamingProbeResult {
   try {
     const capture = captureSseEventCounts(argv, opts, "nemoclaw-anthropic-streaming-probe", true);
@@ -764,6 +898,7 @@ function runAnthropicStreamingEventProbeImpl(
         missingEvents: REQUIRED_ANTHROPIC_STREAMING_EVENTS,
         duplicateEvents: [],
         sequenceErrors: [],
+        toolCallErrors: [],
         message: `Streaming probe failed: ${compactText(capture.detail).slice(0, 200)}`,
       };
     }
@@ -776,7 +911,16 @@ function runAnthropicStreamingEventProbeImpl(
     );
     const sequenceErrors =
       missing.length === 0 ? anthropicSequenceErrors(capture.eventSequence) : [];
-    if (missing.length > 0 || duplicates.length > 0 || sequenceErrors.length > 0) {
+    const toolCallErrors =
+      missing.length === 0
+        ? anthropicToolCallErrors(capture.body, expectations.expectedToolName)
+        : [];
+    if (
+      missing.length > 0 ||
+      duplicates.length > 0 ||
+      sequenceErrors.length > 0 ||
+      toolCallErrors.length > 0
+    ) {
       const problems: string[] = [];
       if (duplicates.length > 0) {
         const detail = duplicates
@@ -790,12 +934,19 @@ function runAnthropicStreamingEventProbeImpl(
       if (sequenceErrors.length > 0) {
         problems.push(`emits events out of order (${sequenceErrors.join("; ")})`);
       }
+      if (toolCallErrors.includes("missing-expected-tool-use")) {
+        problems.push("does not emit the required structured tool_use content block");
+      }
+      if (toolCallErrors.includes("missing-tool-use-stop-reason")) {
+        problems.push("does not finish the tool request with stop_reason tool_use");
+      }
       emitCurlResultTraceEvent({
         ok: false,
         http_status: capture.httpStatus,
         missing_events_count: missing.length,
         duplicate_events_count: duplicates.length,
         sequence_errors_count: sequenceErrors.length,
+        tool_call_errors_count: toolCallErrors.length,
         curl_status: capture.curlStatus,
       });
       return {
@@ -805,9 +956,10 @@ function runAnthropicStreamingEventProbeImpl(
         missingEvents: missing,
         duplicateEvents: duplicates,
         sequenceErrors,
+        toolCallErrors,
         message:
           `Anthropic Messages streaming on this endpoint ${problems.join(" and ")}. ` +
-          "Agent runs use the streaming path and would fail with an empty final response.",
+          "Agent runs use the streaming path and require native protocol events.",
       };
     }
 
@@ -817,6 +969,7 @@ function runAnthropicStreamingEventProbeImpl(
       missing_events_count: 0,
       duplicate_events_count: 0,
       sequence_errors_count: 0,
+      tool_call_errors_count: 0,
       curl_status: capture.curlStatus,
     });
     return {
@@ -826,6 +979,7 @@ function runAnthropicStreamingEventProbeImpl(
       missingEvents: [],
       duplicateEvents: [],
       sequenceErrors: [],
+      toolCallErrors: [],
       message: "",
     };
   } catch (error) {
@@ -847,6 +1001,7 @@ function runAnthropicStreamingEventProbeImpl(
       missingEvents: REQUIRED_ANTHROPIC_STREAMING_EVENTS,
       duplicateEvents: [],
       sequenceErrors: [],
+      toolCallErrors: [],
       message: `Streaming probe error: ${detail}`,
     };
   }

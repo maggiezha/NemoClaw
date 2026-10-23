@@ -154,7 +154,7 @@ function runSanitizer(source: string, output: string) {
 function scorecardData(overrides: Partial<ScorecardData> = {}): ScorecardData {
   return {
     today: "Jun 29",
-    runMode: "Scheduled E2E",
+    runMode: "Main push",
     actor: "",
     isSelectiveDispatch: false,
     requestedJobs: [],
@@ -184,12 +184,22 @@ describe("E2E scorecard", () => {
   it("loads typed scorecard helpers through the native github-script require boundary", () => {
     const script = `
       const path = require('node:path');
-      for (const file of ['analyze-trace-timing.mts', 'summarize-jobs.mts', 'build-slack-blocks.mts', 'coordinate-scorecard.mts']) {
+      for (const file of [
+        'analyze-runtime-history.mts',
+        'analyze-trace-timing.mts',
+        'summarize-jobs.mts',
+        'build-slack-blocks.mts',
+        'coordinate-scorecard.mts',
+      ]) {
         const loaded = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts/scorecard', file));
         if (Object.keys(loaded).length === 0) process.exit(2);
       }
+      const runtimeAudit = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts/audit-test-runtime.mts'));
+      if (Object.keys(runtimeAudit).length === 0) process.exit(2);
+      const artifactZip = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts/lib/read-artifact-zip.mts'));
+      if (Object.keys(artifactZip).length === 0) process.exit(2);
     `;
-    const result = spawnSync(process.execPath, ["--experimental-strip-types", "-e", script], {
+    const result = spawnSync(process.execPath, ["-e", script], {
       cwd: process.cwd(),
       encoding: "utf8",
       env: { ...process.env, GITHUB_WORKSPACE: process.cwd() },
@@ -231,6 +241,64 @@ describe("E2E scorecard", () => {
       )
       .find((block) => block.text?.text.includes("Failed jobs"));
     expect(failureSection?.text?.text).toContain(`<${failureUrl}|live (openclaw-nvidia)>`);
+  });
+
+  it("keeps every failed-job section within Slack's 3000-character limit", () => {
+    const failedJobs = Array.from({ length: 61 }, (_, index) => ({
+      name: `failure-${index}-${"x".repeat(80)}`,
+      url: `https://github.com/NVIDIA/NemoClaw/actions/runs/31962084507/job/${95201570000 + index}`,
+    }));
+    const failedJobSections = slack
+      .buildBlocks(scorecardData({ failure: failedJobs.length, perfect: false, failedJobs }))
+      .filter(
+        (block): block is typeof block & { type: "section"; text: { text: string } } =>
+          block.type === "section" && block.text?.text.includes("Failed jobs") === true,
+      );
+
+    expect(failedJobSections.length).toBeGreaterThan(1);
+    expect(failedJobSections.every((block) => block.text.text.length <= 3_000)).toBe(true);
+    const rendered = failedJobSections.map((block) => block.text.text).join("\n");
+    expect(failedJobs.every((job) => rendered.includes(`<${job.url}|${job.name}>`))).toBe(true);
+  });
+
+  it("bounds one oversized failed-job label without dropping its job link", () => {
+    const url = "https://github.com/NVIDIA/NemoClaw/actions/runs/123/job/456";
+    const failedJobSections = slack
+      .buildBlocks(
+        scorecardData({
+          failure: 1,
+          perfect: false,
+          failedJobs: [{ name: `failure-${"x".repeat(4_000)}`, url }],
+        }),
+      )
+      .filter(
+        (block): block is typeof block & { type: "section"; text: { text: string } } =>
+          block.type === "section" && block.text?.text.includes("Failed jobs") === true,
+      );
+
+    expect(failedJobSections).toHaveLength(1);
+    expect(failedJobSections[0]?.text.text.length).toBeLessThanOrEqual(3_000);
+    expect(failedJobSections[0]?.text.text).toContain(`<${url}|failure-`);
+    expect(failedJobSections[0]?.text.text).toContain("…>");
+  });
+
+  it("replaces an oversized job URL with the valid run link", () => {
+    const runUrl = "https://github.com/NVIDIA/NemoClaw/actions/runs/123";
+    const oversizedUrl = `https://example.test/${"x".repeat(4_000)}`;
+    const failedJobSection = slack
+      .buildBlocks(
+        scorecardData({
+          failure: 1,
+          perfect: false,
+          failedJobs: [{ name: "failure", url: oversizedUrl }],
+          runUrl,
+        }),
+      )
+      .find((block) => block.type === "section" && block.text?.text.includes("Failed jobs"));
+
+    expect(failedJobSection?.text?.text.length).toBeLessThanOrEqual(3_000);
+    expect(failedJobSection?.text?.text).toContain(`<${runUrl}|failure>`);
+    expect(failedJobSection?.text?.text).not.toContain(oversizedUrl);
   });
 
   it("compares only allowlisted onboard timing phases", () => {
@@ -455,13 +523,13 @@ describe("E2E scorecard", () => {
           { conclusion: "skipped", name: "jetson-nvmap-gpu", status: "completed" },
           {
             conclusion: "success",
-            name: "sandbox-rlimits-connect",
+            name: "mcp-bridge-dev",
             status: "completed",
           },
           { conclusion: "success", name: "report-to-pr", status: "completed" },
         ],
-        explicitOnlyJobNames: ["jetson-nvmap-gpu", "sandbox-rlimits-connect"],
-        explicitlySelected: ["sandbox-rlimits-connect"],
+        explicitOnlyJobNames: ["jetson-nvmap-gpu", "mcp-bridge-dev"],
+        explicitlySelected: ["mcp-bridge-dev"],
         metaJobNames: ["generate-matrix", "report-to-pr", "scorecard"],
         needs: {},
       }),
@@ -472,15 +540,48 @@ describe("E2E scorecard", () => {
       ran: 4,
       skipped: 0,
       success: 3,
+      timingRows: [],
       total: 4,
     });
   });
 
-  it("falls back to needs without counting unselected explicit-only jobs", () => {
+  it("keeps every matrix execution eligible for the timing ranking", () => {
+    const summary = scorecardJobs.summarizeJobs({
+      apiJobs: [
+        {
+          completed_at: "2026-07-24T00:00:20Z",
+          conclusion: "success",
+          created_at: "2026-07-24T00:00:00Z",
+          labels: ["ubuntu-latest"],
+          name: "matrix / fast",
+          started_at: "2026-07-24T00:00:05Z",
+          status: "completed",
+        },
+        {
+          completed_at: "2026-07-24T00:02:00Z",
+          conclusion: "success",
+          created_at: "2026-07-24T00:00:00Z",
+          labels: ["ubuntu-latest"],
+          name: "matrix / slow",
+          started_at: "2026-07-24T00:00:10Z",
+          status: "completed",
+        },
+      ],
+      explicitOnlyJobNames: [],
+      explicitlySelected: [],
+      metaJobNames: [],
+      needs: {},
+    });
+
+    expect(summary).toMatchObject({ success: 1, total: 1 });
+    expect(summary.timingRows.map(({ name }) => name)).toEqual(["matrix / slow", "matrix / fast"]);
+  });
+
+  it("falls back to needs without counting jobs omitted from the run", () => {
     expect(
       scorecardJobs.summarizeJobs({
         apiJobs: null,
-        explicitOnlyJobNames: ["jetson-nvmap-gpu", "sandbox-rlimits-connect"],
+        explicitOnlyJobNames: ["jetson-nvmap-gpu", "mcp-bridge-dev"],
         explicitlySelected: ["jetson-nvmap-gpu"],
         metaJobNames: ["generate-matrix", "report-to-pr", "scorecard"],
         needs: {
@@ -488,7 +589,7 @@ describe("E2E scorecard", () => {
           cloud: { result: "success" },
           malformed: { result: "timed_out" },
           "jetson-nvmap-gpu": { result: "skipped" },
-          "sandbox-rlimits-connect": { result: "skipped" },
+          "mcp-bridge-dev": { result: "skipped" },
           "report-to-pr": { result: "success" },
         },
       }),
@@ -499,6 +600,7 @@ describe("E2E scorecard", () => {
       ran: 2,
       skipped: 1,
       success: 1,
+      timingRows: [],
       total: 3,
     });
   });
@@ -634,82 +736,6 @@ describe("E2E scorecard", () => {
     } finally {
       rmSync(directory, { force: true, recursive: true });
     }
-  });
-
-  it("directly extracts only timing fields from the source TraceArtifact shape", () => {
-    const script = String.raw`
-import importlib.util
-import json
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location(
-    "sanitize_trace_timing",
-    Path("scripts/e2e/sanitize-trace-timing.py"),
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-artifact = {
-    "resource_spans": [{
-        "resource": {"attributes": {"service.name": "nemoclaw"}},
-        "scope_spans": [{
-            "scope": {"name": "nemoclaw.onboard", "version": "1.0.0"},
-            "spans": [
-                {
-                    "trace_id": "0123456789abcdef0123456789abcdef",
-                    "span_id": "0000000000000001",
-                    "name": "nemoclaw.onboard",
-                    "kind": "INTERNAL",
-                    "start_time_unix_nano": "1",
-                    "duration_ms": 42,
-                    "status": {"code": "OK", "message": "secret detail"},
-                    "attributes": {"api_key": "nvapi-secret"},
-                    "events": [{"name": "prompt", "attributes": {"value": "secret"}}],
-                },
-                {
-                    "trace_id": "0123456789abcdef0123456789abcdef",
-                    "span_id": "0000000000000002",
-                    "parent_span_id": "0000000000000001",
-                    "name": "nemoclaw.onboard.phase.gateway",
-                    "kind": "INTERNAL",
-                    "start_time_unix_nano": "2",
-                    "duration_ms": 7.1234,
-                    "status": {"code": "ERROR", "message": "raw error"},
-                    "attributes": {"endpoint": "https://example.test/token"},
-                    "events": [],
-                },
-            ],
-        }],
-    }],
-    "summary": {
-        "trace_id": "0123456789abcdef0123456789abcdef",
-        "generated_at": "2026-07-02T00:00:00.000Z",
-        "total_duration_ms": 42.9876,
-        "slowest_spans": [{
-            "name": "nemoclaw.onboard.phase.gateway",
-            "duration_ms": 7.1234,
-            "status": "ERROR",
-        }],
-        "output_path": "/tmp/raw-trace.json",
-    },
-}
-print(json.dumps(module.extract_candidate(artifact), sort_keys=True))
-`;
-    const result = spawnSync("python3", ["-c", script], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-    });
-
-    expect(result.status, result.stderr).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({
-      phases: { "nemoclaw.onboard.phase.gateway": 7.123 },
-      schema_version: "nemoclaw.trace_timing.v1",
-      slowest_spans: [
-        { duration_ms: 7.123, name: "nemoclaw.onboard.phase.gateway", status: "ERROR" },
-      ],
-      total_duration_ms: 42.988,
-      trace_id: "0123456789abcdef0123456789abcdef",
-    });
-    expect(result.stdout).not.toMatch(/api_key|attributes|events|output_path|raw error|secret/u);
   });
 
   it("bounds trace input count and file size before parsing", () => {

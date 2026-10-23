@@ -14,14 +14,14 @@
 #   npx prek run --all-files
 #   npx prek run --all-files --stage manual  # full CLI/plugin coverage
 #
-# Diff-only fallback for automatic commit, commit-message, and push checks:
-#   npm run check:diff
+# Routine PR validation for automatic commit, commit-message, and push checks:
+#   npm run validate:pr
 #
 # Priority groups (prek runs same-priority hooks in parallel):
 #   0  — General file fixers (whitespace, EOF, line endings)
 #   4  — SPDX header insertion (--fix)
-#   5  — Shell / JS / TS formatters (shfmt, Biome)
-#   6  — Fixes that should follow formatters (ruff check --fix, Biome lint --write)
+#   5  — Shell / JS / TS formatters (shfmt, Oxfmt)
+#   6  — Oxlint fixes after formatting
 #  10  — Linters and read-only checks
 #  20  — Project-level checks (vitest, coverage, ratchet)
 
@@ -111,22 +111,31 @@ repos:
 
   - repo: local
     hooks:
-      - id: biome-format
-        name: Biome format
-        entry: npx biome format --write --no-errors-on-unmatched
+      - id: oxfmt
+        name: Oxfmt
+        entry: npx oxfmt --write --no-error-on-unmatched-pattern
         language: system
-        files: ^(biome\.json|package(-lock)?\.json|nemoclaw/package(-lock)?\.json|commitlint\.config\.js|bin/.*\.js|scripts/.*\.js|test/.*\.js|.*\.ts)$
+        files: \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$
         pass_filenames: true
         priority: 5
 
   # ── Priority 6: auto-fix after formatting ─────────────────────────────────
   - repo: local
     hooks:
-      - id: biome-lint-fix
-        name: Biome lint fixes
-        entry: npx biome lint --write
+      - id: oxlint-fix
+        name: Oxlint fixes
+        entry: npx oxlint --fix --no-error-on-unmatched-pattern
         language: system
-        files: ^(commitlint\.config\.js|bin/.*\.js|scripts/.*\.js|test/.*\.js|.*\.ts)$
+        files: \.(cjs|cts|js|jsx|mjs|mts|ts|tsx)$
+        exclude: ^(src/lib/adapters/|nemoclaw/src/)
+        pass_filenames: true
+        priority: 6
+
+      - id: oxlint-type-aware
+        name: Oxlint type-aware rules
+        entry: npx oxlint --fix --type-aware --no-error-on-unmatched-pattern
+        language: system
+        files: ^(src/lib/adapters/|nemoclaw/src/).*\.(cts|mts|ts|tsx)$
         pass_filenames: true
         priority: 6
 
@@ -135,6 +144,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-merge-conflict
+        args: ["--assume-in-merge"]
         priority: 10
       - id: check-added-large-files
         args: ["--maxkb=2000"]
@@ -167,12 +177,29 @@ repos:
         files: ^(nemoclaw-blueprint/.*\.yaml$|nemoclaw/openclaw\.plugin\.json$|schemas/.*\.json$)
         priority: 10
 
+      - id: validate-nemoclaw-config-schema
+        name: Validate generated NemoClawConfig schema
+        entry: npm run config-schema:check
+        language: system
+        pass_filenames: false
+        files: ^(package(?:-lock)?\.json|nemoclaw/src/shared/sandbox-name\.cts|schemas/nemoclaw-config-v1\.schema\.json|scripts/config/generate-nemoclaw-config-schema\.mts|src/lib/(?:config/model|core/endpoint-contract|name-validation|sandbox-name-contract)\.ts)$
+        priority: 10
+
+      - id: validate-managed-inference-catalog
+        name: Validate managed inference catalog
+        entry: npm run catalog:check
+        language: system
+        pass_filenames: false
+        files: ^(managed-inference/(?:presets|recipes)/.*\.yaml$|managed-inference/schemas/.*\.json$|src/lib/inference/serving/(?:adapter-registry|catalog|generate-catalog|types)\.ts$)
+        priority: 10
+
       - id: repository-checks
         name: Repository checks
-        entry: npm run checks
+        entry: node --import tsx scripts/checks/run.mts --files
         language: system
-        files: ^(\.pre-commit-config\.yaml$|\.github/workflows/e2e\.yaml$|Dockerfile(?:\.base)?$|agents/openclaw/manifest\.yaml$|agents/hermes/(?:Dockerfile(?:\.base)?|manifest\.yaml|mcp-config-transaction\.py)$|docs/resources/starter-prompt\.md$|nemoclaw-blueprint/blueprint\.yaml$|nemoclaw/package\.json$|scripts/(?:brev-launchable-ci-cpu|check-installer-hash|install-openshell|update-hermes-agent)\.sh$|src/lib/actions/sandbox/openshell-child-visible-credentials\.v[0-9]+\.[0-9]+\.[0-9]+\.json$|bin/.*\.(cjs|js|mjs)$|src/.*\.(cts|mts|ts|tsx)$|scripts/.*\.(cjs|cts|js|mjs|mts|ts|tsx)$|test/.*\.(cjs|cts|js|mjs|mts|ts|tsx)$|nemoclaw/src/.*\.(cts|mts|ts|tsx)$)
-        pass_filenames: false
+        always_run: true
+        pass_filenames: true
+        require_serial: true
         priority: 10
 
       - id: env-var-docs
@@ -227,9 +254,18 @@ repos:
   # ── pre-push hooks ─────────────────────────────────────────────────────────
   - repo: local
     hooks:
+      - id: publication-validation
+        name: Publication validation
+        entry: npx tsx scripts/checks/validate-pr.mts --pre-push
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+        priority: 1
+
       - id: tsc-plugin
         name: TypeScript (plugin)
-        entry: npm --prefix nemoclaw run typecheck
+        entry: npx tsx scripts/checks/cached-command.mts tsc-plugin
         language: system
         pass_filenames: false
         files: ^nemoclaw/
@@ -238,7 +274,7 @@ repos:
 
       - id: tsc-js
         name: TypeScript (JS config)
-        entry: bash -c 'npm run build:cli && npx tsc -p jsconfig.json'
+        entry: npx tsx scripts/checks/cached-command.mts tsc-js
         language: system
         pass_filenames: false
         files: ^(bin|test|scripts)/.*\.js$|^(jsconfig\.json|package(-lock)?\.json)$
@@ -247,21 +283,15 @@ repos:
 
       - id: tsc-cli
         name: TypeScript (CLI)
-        entry: npm run typecheck:cli -- --incremental
+        entry: npx tsx scripts/checks/cached-command.mts tsc-cli
         language: system
         pass_filenames: false
         files: ^(agents/hermes|bin|scripts|src|test|tools|nemoclaw-blueprint/scripts)/.*\.(ts|tsx|mts|cts|json)$|^\.agents/skills/nemoclaw-maintainer-day/scripts/(check-gates|shared)\.ts$|^nemoclaw/src/(lib/subprocess-env|blueprint/private-networks)\.ts$|^(package(-lock)?\.json|tsconfig\.cli\.json|vitest\.config\.ts)$
         stages: [pre-push]
-        priority: 10
-
-      - id: version-tag-sync
-        name: package.json ↔ git tag version sync
-        entry: bash scripts/check-version-tag-sync.sh
-        language: system
-        always_run: true
-        pass_filenames: false
-        stages: [pre-push]
-        priority: 10
+        # build:cli now removes all stale dist output. When package or script
+        # inputs select both hooks, run this reader after tsc-js finishes its
+        # clean rebuild instead of racing the deleted output tree.
+        priority: 20
 
   # ── post-merge / post-checkout: warn about stale compiled dist/ ───────────
   # See #1958 — dist/ is gitignored, so git pull / checkout can leave stale
@@ -272,7 +302,7 @@ repos:
     hooks:
       - id: stale-dist-check
         name: Warn if dist/ is older than src/
-        entry: node --experimental-strip-types scripts/check-stale-dist.mts
+        entry: node scripts/check-stale-dist.mts
         language: system
         always_run: true
         pass_filenames: false
@@ -283,11 +313,11 @@ repos:
   - repo: local
     hooks:
       - id: e2e-semantic-phase-plans
-        name: Live E2E semantic phase plans
+        name: E2E semantic phase plans
         entry: npm run test:e2e-phases:check
         language: system
         pass_filenames: false
-        files: ^(test/e2e/live/.*\.ts|test/e2e/fixtures/(e2e-test|paths|progress)\.ts|tools/e2e/check-semantic-phases\.mts|vitest\.config\.ts|package\.json)$
+        files: ^(\.github/workflows/e2e\.yaml|test/platform/images/vllm-docker-storage\.test\.ts|test/e2e/live/.*\.ts|test/e2e/fixtures/.*\.ts|test/e2e/risk-signal-reporter\.ts|test/e2e/support/(e2e-semantic-phase-check|workflow-e2e-progress)\.test\.ts|tools/e2e/(check-semantic-phases|credential-free-tests|workflow-boundary|workflow-plan)\.mts|vitest\.config\.ts|package\.json)$
         priority: 20
 
       - id: test-cli
@@ -317,21 +347,14 @@ repos:
         files: ^(.+\.(test|spec)\.(js|ts|mjs|mts|cjs|cts)|scripts/find-source-shape-tests\.mts|ci/source-shape-test-budget\.json)$
         priority: 20
 
-      - id: test-file-size-budget
-        name: Test file size budget
-        entry: npm run test-size:check
+      - id: codebase-growth-guardrails
+        name: Codebase growth guardrails
+        entry: npx vitest run --project integration test/automation/pull-requests/growth-guardrails.test.ts
         language: system
+        always_run: true
         pass_filenames: false
-        files: ^(test/|src/.*\.(test|spec)\.(ts|js|mts|mjs|cts|cjs)$|nemoclaw/src/.*\.(test|spec)\.(ts|js|mts|mjs|cts|cjs)$|scripts/check-test-file-size-budget\.mts$|ci/test-file-size-budget\.json$)
         priority: 20
 
-      - id: test-skills-yaml
-        name: Test (skills YAML)
-        entry: npx vitest run test/skills-frontmatter.test.ts
-        language: system
-        pass_filenames: false
-        files: ^(\.agents/skills/|skills/|test/skills-frontmatter\.test\.ts$)
-        priority: 20
 
 default_language_version:
   python: python3

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --experimental-strip-types
+#!/usr/bin/env node
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,6 +14,16 @@ const logFile = process.env.NEMOCLAW_FAKE_OPENAI_LOG_FILE || "";
 const requestsFile = process.env.NEMOCLAW_FAKE_OPENAI_REQUESTS_FILE || "";
 const environmentFile = process.env.NEMOCLAW_FAKE_OPENAI_ENVIRONMENT_FILE || "";
 const model = process.env.NEMOCLAW_FAKE_OPENAI_MODEL || "test-model";
+const additionalModels = (() => {
+  try {
+    const value = JSON.parse(process.env.NEMOCLAW_FAKE_OPENAI_ADDITIONAL_MODELS || "[]");
+    return Array.isArray(value)
+      ? value.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+})();
 // Optional runtime context window advertised on /v1/models, mirroring vLLM's
 // max_model_len so onboarding can probe a real endpoint's context (#6177).
 const maxModelLen = (() => {
@@ -22,12 +32,26 @@ const maxModelLen = (() => {
 })();
 const apiKey = process.env.NEMOCLAW_FAKE_OPENAI_API_KEY || "";
 const requireAuth = process.env.NEMOCLAW_FAKE_OPENAI_REQUIRE_AUTH === "1";
+const allowMissingAuth = process.env.NEMOCLAW_FAKE_OPENAI_ALLOW_MISSING_AUTH === "1";
 // Opt-in auth enforcement on GET /v1/models specifically (real vLLM launched
 // with --api-key gates it). Separate from requireAuth so existing tests, whose
 // readiness probe hits /v1/models unauthenticated, keep working. See #6177.
 const requireAuthModels = process.env.NEMOCLAW_FAKE_OPENAI_REQUIRE_AUTH_MODELS === "1";
+const llamaCppFingerprint = process.env.NEMOCLAW_FAKE_OPENAI_LLAMA_CPP_FINGERPRINT === "1";
 const chatContent = process.env.NEMOCLAW_FAKE_OPENAI_CHAT_CONTENT || "ok";
 const responseText = process.env.NEMOCLAW_FAKE_OPENAI_RESPONSE_TEXT || chatContent;
+const replyFromPrompt = process.env.NEMOCLAW_FAKE_OPENAI_REPLY_FROM_PROMPT === "1";
+const requestCanaryMarker = process.env.NEMOCLAW_FAKE_OPENAI_REQUEST_CANARY_MARKER || "";
+const toolCallOnCanary = (() => {
+  try {
+    const value = JSON.parse(process.env.NEMOCLAW_FAKE_OPENAI_TOOL_CALL_ON_CANARY || "null");
+    return value && typeof value.name === "string" && typeof value.arguments === "string"
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+})();
 const forbiddenMarkers = (() => {
   try {
     const parsed = JSON.parse(process.env.NEMOCLAW_FAKE_OPENAI_FORBIDDEN_MARKERS || "[]");
@@ -105,7 +129,7 @@ function sendResponseSse(res: ServerResponse, text: string): void {
 }
 
 function isAuthOk(req: IncomingMessage): boolean {
-  if (!requireAuth) return true;
+  if (!requireAuth || (allowMissingAuth && req.headers.authorization === undefined)) return true;
   return req.headers.authorization === `Bearer ${apiKey}`;
 }
 
@@ -137,8 +161,118 @@ function forbiddenMarkerMatches(req: IncomingMessage, raw: Buffer): number {
   return forbiddenMarkers.filter((marker) => requestMaterial.includes(marker)).length;
 }
 
+function requestCanaryPresent(req: IncomingMessage, raw: Buffer): boolean | undefined {
+  if (!requestCanaryMarker) return undefined;
+  const headerValues = Object.values(req.headers).flatMap((value) => value ?? []);
+  const requestMaterial = [req.url ?? "", ...headerValues, raw.toString("utf8")].join("\n");
+  return requestMaterial.includes(requestCanaryMarker);
+}
+
+function latestUserPrompt(payload: JsonObject): string | null {
+  const entries = Array.isArray(payload.messages) ? payload.messages : [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry || typeof entry !== "object") continue;
+    const message = entry as JsonObject;
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+  }
+  return null;
+}
+
+function toolResultPresent(payload: JsonObject): boolean {
+  const entries = Array.isArray(payload.messages) ? payload.messages : [];
+  return entries.some(
+    (entry) => entry && typeof entry === "object" && (entry as JsonObject).role === "tool",
+  );
+}
+
+function requestedPromptReply(payload: JsonObject): string | null {
+  if (!replyFromPrompt) return null;
+  const embeddedReplies = new Set(
+    [...JSON.stringify(payload).matchAll(/NEMOCLAW_E2E_FAKE_RESPONSE=([A-Z0-9_]{1,64})/gu)].map(
+      (match) => match[1],
+    ),
+  );
+  if (embeddedReplies.size === 1) return [...embeddedReplies][0] ?? null;
+  const prompt = latestUserPrompt(payload);
+  const launchMatch = prompt?.match(
+    /^Join these four fragments with underscores and put only the result on its own line: NEMOCLAW, ([0-9A-F]{12}), (FIRST|SECOND), OK\. Do not use tools\.(?:\n\n[\s\S]+)?$/u,
+  );
+  if (launchMatch) return `NEMOCLAW_${launchMatch[1]}_${launchMatch[2]}_OK`;
+  if (
+    /^Remember this exact token: NEMOCLAW_5254_[0-9]+\. Reply with acknowledged\.(?:\n\n[\s\S]+)?$/u.test(
+      prompt ?? "",
+    )
+  ) {
+    return "acknowledged";
+  }
+  if (
+    /^(?:What is seven multiplied by eight\?|Multiply seven by eight\.) Reply with only the integer\.(?:\n\n[\s\S]+)?$/u.test(
+      prompt ?? "",
+    )
+  ) {
+    return "56";
+  }
+  const profileMarker = prompt?.match(
+    /^(N8011_[0-9a-z]{8,10}_PROFILE_(?:SEED|CONTINUE))(?:\n\n[\s\S]+)?$/u,
+  );
+  if (profileMarker) return profileMarker[1];
+  return null;
+}
+
+function requestedCanaryToolCall(payload: JsonObject, raw: Buffer): JsonObject | null {
+  if (!toolCallOnCanary || !raw.toString("utf8").includes(requestCanaryMarker)) return null;
+  const messages = Array.isArray(payload.messages) ? payload.messages : [];
+  if (
+    messages.some(
+      (entry) => entry && typeof entry === "object" && (entry as JsonObject).role === "tool",
+    )
+  )
+    return null;
+  return {
+    index: 0,
+    id: "call_nemoclaw_managed_subagent",
+    type: "function",
+    function: { name: toolCallOnCanary.name, arguments: toolCallOnCanary.arguments },
+  };
+}
+
 const server = createServer(async (req, res) => {
   const path = requestPath(req);
+
+  if (
+    llamaCppFingerprint &&
+    req.method === "GET" &&
+    ["/health", "/props", "/metrics"].includes(path)
+  ) {
+    const authorized = isAuthOk(req);
+    recordRequest({
+      method: "GET",
+      path,
+      bodyBytes: 0,
+      auth: authorized ? "ok" : "missing",
+      authorizationSent: Boolean(req.headers.authorization),
+    });
+    if (!authorized) {
+      sendJson(res, 401, { error: { message: "missing bearer credential" } });
+    } else if (path === "/health") {
+      sendJson(res, 200, { status: "ok" });
+    } else if (path === "/props") {
+      sendJson(res, 200, {
+        model_path: "/models/fake.gguf",
+        model_alias:
+          new URL(req.url || "/props", "http://fake-openai-compatible.local").searchParams.get(
+            "model",
+          ) || model,
+        total_slots: 1,
+        default_generation_settings: { params: {} },
+      });
+    } else {
+      sendJson(res, 501, { error: { type: "not_supported_error" } });
+    }
+    return;
+  }
 
   if (req.method === "GET" && ["/v1/models", "/models"].includes(path)) {
     const modelsAuthOk = !requireAuthModels || req.headers.authorization === `Bearer ${apiKey}`;
@@ -153,14 +287,27 @@ const server = createServer(async (req, res) => {
       // credential without leaking it into the requests log (#6177).
       authorizationSent: Boolean(req.headers.authorization),
       forbiddenMarkerMatches: forbiddenMarkerMatches(req, Buffer.alloc(0)),
+      requestCanaryPresent: requestCanaryPresent(req, Buffer.alloc(0)),
     });
     if (!modelsAuthOk) {
       sendJson(res, 401, { error: { message: "missing bearer credential" } });
       return;
     }
-    const modelEntry: JsonObject = { id: model, object: "model" };
-    if (maxModelLen !== null) modelEntry.max_model_len = maxModelLen;
-    sendJson(res, 200, { object: "list", data: [modelEntry] });
+    const entries = [model, ...additionalModels].map((servedModel) => {
+      const modelEntry: JsonObject = { id: servedModel, object: "model" };
+      if (llamaCppFingerprint) {
+        modelEntry.owned_by = "llamacpp";
+        modelEntry.meta = {
+          n_vocab: 32000,
+          n_ctx: maxModelLen ?? 8192,
+          n_ctx_train: 8192,
+          n_embd: 4096,
+        };
+      }
+      if (maxModelLen !== null) modelEntry.max_model_len = maxModelLen;
+      return modelEntry;
+    });
+    sendJson(res, 200, { object: "list", data: entries });
     return;
   }
 
@@ -178,6 +325,8 @@ const server = createServer(async (req, res) => {
     model: payload.model,
     stream: Boolean(payload.stream),
     forbiddenMarkerMatches: forbiddenMarkerMatches(req, raw),
+    requestCanaryPresent: requestCanaryPresent(req, raw),
+    toolResultPresent: toolResultPresent(payload),
   });
 
   if (req.method === "POST" && ["/v1/chat/completions", "/chat/completions"].includes(path)) {
@@ -188,8 +337,35 @@ const server = createServer(async (req, res) => {
       sendJson(res, 401, { error: { message: "missing bearer credential" } });
       return;
     }
+    const content = requestedPromptReply(payload) ?? chatContent;
+    const toolCall = requestedCanaryToolCall(payload, raw);
+    if (toolCall && payload.stream) {
+      const chunk = JSON.stringify({
+        id: "chatcmpl-fake-openai-compatible",
+        object: "chat.completion.chunk",
+        created: 0,
+        model,
+        choices: [
+          { index: 0, delta: { role: "assistant", tool_calls: [toolCall] }, finish_reason: null },
+        ],
+      });
+      const done = JSON.stringify({
+        id: "chatcmpl-fake-openai-compatible",
+        object: "chat.completion.chunk",
+        created: 0,
+        model,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      });
+      const body = `data: ${chunk}\n\ndata: ${done}\n\ndata: [DONE]\n\n`;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Content-Length": Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
     if (payload.stream) {
-      sendChatSse(res, chatContent);
+      sendChatSse(res, content);
       return;
     }
     sendJson(res, 200, {
@@ -200,8 +376,10 @@ const server = createServer(async (req, res) => {
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: chatContent },
-          finish_reason: "stop",
+          message: toolCall
+            ? { role: "assistant", content: null, tool_calls: [toolCall] }
+            : { role: "assistant", content },
+          finish_reason: toolCall ? "tool_calls" : "stop",
         },
       ],
     });
@@ -214,8 +392,9 @@ const server = createServer(async (req, res) => {
       sendJson(res, 401, { error: { message: "missing bearer credential" } });
       return;
     }
+    const content = requestedPromptReply(payload) ?? responseText;
     if (payload.stream) {
-      sendResponseSse(res, responseText);
+      sendResponseSse(res, content);
       return;
     }
     sendJson(res, 200, {
@@ -225,7 +404,7 @@ const server = createServer(async (req, res) => {
         {
           type: "message",
           role: "assistant",
-          content: [{ type: "output_text", text: responseText }],
+          content: [{ type: "output_text", text: content }],
         },
       ],
     });

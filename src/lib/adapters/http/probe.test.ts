@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,6 +104,92 @@ describe("http-probe helpers", () => {
     expect(outputPath).not.toBe("");
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.existsSync(path.dirname(outputPath))).toBe(false);
+  });
+
+  it("captures a response at the process byte limit without a body temp file (#8161)", () => {
+    const body = "x".repeat(1024);
+    let maxBuffer: number | undefined;
+    const result = runCurlProbe(["-sS", "https://example.test/models"], {
+      maxResponseBytes: 1024,
+      spawnSyncImpl: (_command, args, options) => {
+        maxBuffer = options.maxBuffer;
+        expect(args).not.toContain("-o");
+        const writeOut = args[args.indexOf("-w") + 1];
+        const statusMarker = writeOut.slice(0, -"%{http_code}".length);
+        return {
+          pid: 1,
+          output: [],
+          stdout: `${body}${statusMarker}200`,
+          stderr: "",
+          status: 0,
+          signal: null,
+        };
+      },
+    });
+
+    expect(result).toMatchObject({ ok: true, httpStatus: 200, curlStatus: 0, body });
+    expect(maxBuffer).toBeGreaterThan(1024);
+    expect(maxBuffer).toBeLessThan(1150);
+  });
+
+  it("maps a process buffer overflow to curl's oversized-response status (#8161)", () => {
+    const result = runCurlProbe(["-sS", "https://example.test/models"], {
+      maxResponseBytes: 1024,
+      spawnSyncImpl: () => ({
+        pid: 1,
+        output: [],
+        stdout: "partial untrusted response",
+        stderr: "partial diagnostic",
+        status: null,
+        signal: "SIGTERM",
+        error: Object.assign(new Error("spawnSync curl ENOBUFS"), { code: "ENOBUFS" }),
+      }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      httpStatus: 0,
+      curlStatus: 63,
+      body: "",
+      stderr: "curl response exceeded the configured process byte limit",
+    });
+    expect(result.message).not.toContain("partial untrusted response");
+    expect(result.message).not.toContain("partial diagnostic");
+  });
+
+  it("aborts an unknown-length chunked response at the process byte limit (#8161)", async () => {
+    const serverScript = String.raw`
+      const http = require("node:http");
+      const server = http.createServer((_request, response) => {
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Transfer-Encoding": "chunked",
+        });
+        response.write("x".repeat(128 * 1024));
+        response.end("x".repeat(128 * 1024));
+      });
+      server.listen(0, "127.0.0.1", () => {
+        process.stdout.write(String(server.address().port) + "\n");
+      });
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    `;
+    const server = spawn(process.execPath, ["-e", serverScript], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exit = once(server, "exit");
+    const [portOutput] = await once(server.stdout, "data");
+
+    try {
+      const result = runCurlProbe(
+        ["-sS", "--max-time", "5", `http://127.0.0.1:${Number(String(portOutput).trim())}/`],
+        { maxResponseBytes: 1024, pinnedAddresses: [] },
+      );
+
+      expect(result).toMatchObject({ ok: false, httpStatus: 0, curlStatus: 63, body: "" });
+    } finally {
+      server.kill("SIGTERM");
+      await exit;
+    }
   });
 
   it("lets the process wrapper outlive curl --max-time", () => {
@@ -464,49 +552,44 @@ describe("http-probe helpers", () => {
     expect(spawnedEnv?.MY_SECRET_TOKEN).toBeUndefined();
   });
 
-  it("bypasses ambient proxies when --resolve pins the validated origin (#6293)", () => {
-    let spawnedEnv: NodeJS.ProcessEnv | undefined;
-    runCurlProbe(
-      ["-sS", "--resolve", "example.test:443:93.184.216.34", "https://example.test/models"],
-      {
-        pinnedAddresses: ["93.184.216.34"],
-        replaceEnv: true,
-        env: {
-          PATH: "/usr/bin",
-          HTTP_PROXY: "http://proxy.internal:3128",
-          HTTPS_PROXY: "http://proxy.internal:3128",
-          ALL_PROXY: "socks5://proxy.internal:1080",
-          http_proxy: "http://proxy.internal:3128",
-          https_proxy: "http://proxy.internal:3128",
-          all_proxy: "socks5://proxy.internal:1080",
+  it.each(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"])(
+    "bypasses ambient proxies when --resolve pins the validated origin [%s] (#6293)",
+    (name) => {
+      let spawnedEnv: NodeJS.ProcessEnv | undefined;
+      runCurlProbe(
+        ["-sS", "--resolve", "example.test:443:93.184.216.34", "https://example.test/models"],
+        {
+          pinnedAddresses: ["93.184.216.34"],
+          replaceEnv: true,
+          env: {
+            PATH: "/usr/bin",
+            HTTP_PROXY: "http://proxy.internal:3128",
+            HTTPS_PROXY: "http://proxy.internal:3128",
+            ALL_PROXY: "socks5://proxy.internal:1080",
+            http_proxy: "http://proxy.internal:3128",
+            https_proxy: "http://proxy.internal:3128",
+            all_proxy: "socks5://proxy.internal:1080",
+          },
+          spawnSyncImpl: (_command, _args, options) => {
+            spawnedEnv = options.env as NodeJS.ProcessEnv;
+            return {
+              pid: 1,
+              output: [],
+              stdout: "200",
+              stderr: "",
+              status: 0,
+              signal: null,
+            };
+          },
         },
-        spawnSyncImpl: (_command, _args, options) => {
-          spawnedEnv = options.env as NodeJS.ProcessEnv;
-          return {
-            pid: 1,
-            output: [],
-            stdout: "200",
-            stderr: "",
-            status: 0,
-            signal: null,
-          };
-        },
-      },
-    );
+      );
 
-    for (const name of [
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "ALL_PROXY",
-      "http_proxy",
-      "https_proxy",
-      "all_proxy",
-    ]) {
       expect(spawnedEnv?.[name]).toBeUndefined();
-    }
-    expect(spawnedEnv?.NO_PROXY).toBe("*");
-    expect(spawnedEnv?.no_proxy).toBe("*");
-  });
+
+      expect(spawnedEnv?.NO_PROXY).toBe("*");
+      expect(spawnedEnv?.no_proxy).toBe("*");
+    },
+  );
 
   it.each([
     "http://127.0.0.1:8000/v1/models",
@@ -538,16 +621,11 @@ describe("http-probe helpers", () => {
       },
     });
 
-    for (const name of [
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "ALL_PROXY",
-      "http_proxy",
-      "https_proxy",
-      "all_proxy",
-    ]) {
-      expect(spawnedEnv?.[name]).toBeUndefined();
-    }
+    expect(
+      ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"].every(
+        (name) => spawnedEnv?.[name] === undefined,
+      ),
+    ).toBe(true);
     expect(spawnedEnv?.NO_PROXY).toBe("*");
     expect(spawnedEnv?.no_proxy).toBe("*");
   });
@@ -943,6 +1021,75 @@ describe("runAnthropicStreamingEventProbe", () => {
     expect(result.missingEvents).toEqual([]);
     expect(result.duplicateEvents).toEqual([]);
     expect(result.sequenceErrors).toEqual([]);
+    expect(result.toolCallErrors).toEqual([]);
+  });
+
+  it("passes when the stream emits the required native tool call", () => {
+    const nativeToolStream = [
+      "event: message_start",
+      'data: {"type":"message_start","message":{"id":"msg_1"}}',
+      "",
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"emit_ok","input":{}}}',
+      "",
+      "event: content_block_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"value\\":\\"OK\\"}"}}',
+      "",
+      "event: content_block_stop",
+      'data: {"type":"content_block_stop","index":0}',
+      "",
+      "event: message_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+      "",
+      "event: message_stop",
+      'data: {"type":"message_stop"}',
+      "",
+    ].join("\n");
+
+    const result = runAnthropicStreamingEventProbe(
+      ["-sS", "--max-time", "15", "https://example.test/v1/messages"],
+      { spawnSyncImpl: mockStreaming(nativeToolStream) },
+      { expectedToolName: "emit_ok" },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.toolCallErrors).toEqual([]);
+  });
+
+  it("rejects JSON-shaped assistant text instead of a native tool call (#7967)", () => {
+    const flattenedToolStream = [
+      "event: message_start",
+      'data: {"type":"message_start","message":{"id":"msg_1"}}',
+      "",
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      "",
+      "event: content_block_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\\"name\\":\\"emit_ok\\",\\"arguments\\":{\\"value\\":\\"OK\\"}}"}}',
+      "",
+      "event: content_block_stop",
+      'data: {"type":"content_block_stop","index":0}',
+      "",
+      "event: message_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      "",
+      "event: message_stop",
+      'data: {"type":"message_stop"}',
+      "",
+    ].join("\n");
+
+    const result = runAnthropicStreamingEventProbe(
+      ["-sS", "--max-time", "15", "https://example.test/v1/messages"],
+      { spawnSyncImpl: mockStreaming(flattenedToolStream) },
+      { expectedToolName: "emit_ok" },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.toolCallErrors).toEqual([
+      "missing-expected-tool-use",
+      "missing-tool-use-stop-reason",
+    ]);
+    expect(result.message).toContain("required structured tool_use content block");
   });
 
   it("rejects a non-2xx response even when its body looks like valid SSE", () => {

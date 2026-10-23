@@ -9,8 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   dockerRemoveVolumesByPrefix: vi.fn(),
+  resolveGatewayTeardownAuthority: vi.fn(),
   spawnSync: vi.fn(),
-  stopStaleDashboardListeners: vi.fn(),
 }));
 
 vi.mock("node:child_process", () => ({
@@ -19,10 +19,10 @@ vi.mock("node:child_process", () => ({
 vi.mock("../../adapters/docker/volume", () => ({
   dockerRemoveVolumesByPrefix: mocks.dockerRemoveVolumesByPrefix,
 }));
-vi.mock("../../onboard/stale-gateway-cleanup", () => ({
-  stopStaleDashboardListeners: mocks.stopStaleDashboardListeners,
+vi.mock("../../onboard/gateway-teardown-authority", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../onboard/gateway-teardown-authority")>()),
+  resolveGatewayTeardownAuthority: mocks.resolveGatewayTeardownAuthority,
 }));
-
 import { cleanupGatewayAfterLastSandbox } from "./destroy-gateway";
 
 describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
@@ -31,6 +31,18 @@ describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
   beforeEach(() => {
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-destroy-gateway-evidence-"));
     vi.stubEnv("NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR", stateDir);
+    mocks.resolveGatewayTeardownAuthority.mockImplementation(
+      ({ gatewayName, gatewayPort }: { gatewayName: string; gatewayPort: number }) => ({
+        gatewayName,
+        gatewayPort,
+        mode: "nemoclaw-managed",
+        source: "standalone",
+        endpoint: null,
+        stateDir: null,
+        supervisor: null,
+        requiredCapabilities: [],
+      }),
+    );
   });
 
   afterEach(() => {
@@ -40,7 +52,7 @@ describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
     fs.rmSync(stateDir, { force: true, recursive: true });
   });
 
-  it("preserves unverifiable PID evidence so final cleanup can converge on retry (#4662)", () => {
+  it("preserves unverifiable PID evidence so final cleanup can converge on retry (#4662)", async () => {
     const pid = 456;
     let pidIsAlive = true;
     const pidFile = path.join(stateDir, "openshell-gateway.pid");
@@ -51,10 +63,10 @@ describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
     const missingProcess = () => ({ status: 1, stdout: "", stderr: "" });
     const processResponses = new Map([
       [
-        `ps -p ${pid} -o pid=`,
+        `ps -p ${pid} -o stat=${process.platform === "linux" ? " -L" : ""}`,
         () => ({
           status: pidIsAlive ? 0 : 1,
-          stdout: pidIsAlive ? `${pid}\n` : "",
+          stdout: pidIsAlive ? "S\n" : "",
           stderr: "",
         }),
       ],
@@ -65,7 +77,7 @@ describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
     );
     const runOpenshell = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
 
-    expect(() => cleanupGatewayAfterLastSandbox("nemoclaw-8081", runOpenshell)).toThrow(
+    await expect(cleanupGatewayAfterLastSandbox("nemoclaw-8081", runOpenshell)).rejects.toThrow(
       /PID-file process\(es\) 456.*do not prove ownership/,
     );
     expect(fs.readFileSync(pidFile, "utf-8")).toBe(`${pid}\n`);
@@ -77,13 +89,15 @@ describe("cleanupGatewayAfterLastSandbox runtime evidence", () => {
     expect(mocks.dockerRemoveVolumesByPrefix).not.toHaveBeenCalled();
 
     pidIsAlive = false;
-    expect(() => cleanupGatewayAfterLastSandbox("nemoclaw-8081", runOpenshell)).not.toThrow();
+    await expect(
+      cleanupGatewayAfterLastSandbox("nemoclaw-8081", runOpenshell),
+    ).resolves.toBeUndefined();
     expect(fs.existsSync(pidFile)).toBe(false);
     expect(fs.existsSync(runtimeMarker)).toBe(false);
-    expect(runOpenshell).toHaveBeenCalledWith(["gateway", "remove", "nemoclaw-8081"], {
-      ignoreError: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    expect(runOpenshell).toHaveBeenCalledWith(
+      ["gateway", "remove", "nemoclaw-8081"],
+      expect.objectContaining({ ignoreError: true, stdio: ["ignore", "pipe", "pipe"] }),
+    );
     expect(mocks.dockerRemoveVolumesByPrefix).toHaveBeenCalledWith(
       "openshell-cluster-nemoclaw-8081",
       { ignoreError: true },

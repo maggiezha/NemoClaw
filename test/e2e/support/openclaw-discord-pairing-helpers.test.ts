@@ -10,15 +10,30 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  assertDiscordGatewayCapture,
+  DISCORD_GATEWAY_CLIENT_SOURCE,
+} from "../live/messaging-providers-helpers.ts";
+import {
+  closeServer,
+  createRejectedSlackForwardProxy,
+  createSlackSocketClient,
+  createSuccessfulSlackForwardProxy,
+  listenOnLoopback,
+} from "./fixtures/slack-forward-proxy.ts";
+import {
+  buildPairingAllowFromCommand,
   buildPairingApproveCommand,
   buildPairingPendingCommand,
-  DISCORD_GATEWAY_PROOF_SOURCE,
   LOAD_CONVERSATION_RUNTIME_SOURCE,
+  SLACK_PAIRING_SCRIPT,
   SLACK_PROBE_INPUT_VALIDATION_SOURCE,
 } from "../live/openclaw-pairing-helpers.ts";
 import { sandboxNode } from "../live/phase6-messaging-helpers.ts";
+import { waitForDiscordGatewayPort as waitForPort } from "./fixtures/discord-gateway-port";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
+const REVISIONED_DISCORD_PLACEHOLDER = "openshell:resolve:env:v2_DISCORD_BOT_TOKEN";
+const GATEWAY_ASSERTION_SENTINEL = "test-sentinel-discord-token";
 
 let child: ChildProcess | undefined;
 
@@ -58,18 +73,6 @@ function encodeClientText(payload: string): Buffer {
     .find(({ max }) => body.length <= max)
     ?.encode(body.length);
   return Buffer.concat([header ?? Buffer.alloc(0), mask, masked]);
-}
-
-async function waitForPort(portFile: string): Promise<number> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    try {
-      return Number(fs.readFileSync(portFile, "utf8").trim());
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  throw new Error("fake Discord Gateway did not write a port file");
 }
 
 async function sendDiscordIdentify(port: number, token: string): Promise<void> {
@@ -124,32 +127,190 @@ async function sendDiscordIdentify(port: number, token: string): Promise<void> {
   });
 }
 
+function localDiscordGatewayClientSource(): string {
+  const remoteHost = 'const host = "host.openshell.internal";';
+  const localHost = 'const host = "127.0.0.1";';
+  const source = DISCORD_GATEWAY_CLIENT_SOURCE.replace(remoteHost, localHost);
+  expect(source, "Discord Gateway client host declaration changed").not.toBe(
+    DISCORD_GATEWAY_CLIENT_SOURCE,
+  );
+  return source;
+}
+
 describe("OpenClaw Discord pairing helper contracts", () => {
+  it("sends an absolute-form fake Slack WebSocket upgrade through the proxy", async () => {
+    const targetPort = 4443;
+    const envelope = { payload: { event: { type: "message" } } };
+    const proxy = createSuccessfulSlackForwardProxy(envelope);
+    const proxyPort = await listenOnLoopback(proxy.server);
+
+    try {
+      await expect(createSlackSocketClient(proxyPort, targetPort)()).resolves.toEqual(envelope);
+      await vi.waitFor(() => expect(proxy.websocketMessages()).not.toHaveLength(0), {
+        interval: 10,
+        timeout: 1_000,
+      });
+      expect(proxy.requests).toHaveLength(1);
+      expect(proxy.requests[0]).toMatch(
+        new RegExp(
+          `^GET http://host\\.openshell\\.internal:${targetPort}/socket-mode HTTP/1\\.1`,
+          "u",
+        ),
+      );
+      expect(JSON.parse(proxy.websocketMessages()[0] ?? "{}")).toEqual({
+        type: "socket_mode_client_hello",
+        token: "openshell:resolve:env:v42_SLACK_APP_TOKEN",
+      });
+    } finally {
+      await closeServer(proxy.server);
+    }
+  });
+
+  it("rejects a non-101 fake Slack WebSocket proxy response", async () => {
+    const proxy = createRejectedSlackForwardProxy();
+    const proxyPort = await listenOnLoopback(proxy);
+
+    try {
+      await expect(createSlackSocketClient(proxyPort, 4443)()).rejects.toThrow(
+        "fake Slack websocket upgrade failed: HTTP/1.1 502 Bad Gateway",
+      );
+    } finally {
+      await closeServer(proxy);
+    }
+  });
+
   it("shell-quotes pairing code and user without command substitution", () => {
     const code = "abc$(touch /tmp/e2e-should-not-run)";
     const user = "user`touch /tmp/e2e-should-not-run`";
 
     const pendingCommand = buildPairingPendingCommand("discord", code, user);
+    const allowFromCommand = buildPairingAllowFromCommand("discord", user);
     const approveCommand = buildPairingApproveCommand("discord", code);
 
-    expect(pendingCommand).toContain("'abc$(touch /tmp/e2e-should-not-run)'");
-    expect(pendingCommand).toContain("'user`touch /tmp/e2e-should-not-run`'");
+    expect(pendingCommand).toContain(`'${JSON.stringify(["discord", code, user])}'`);
+    expect(pendingCommand).toContain("channel_pairing_requests");
+    expect(allowFromCommand).toContain("channel_pairing_allow_entries");
+    expect(allowFromCommand).toContain(`'${JSON.stringify(["discord", user])}'`);
     expect(approveCommand).toContain("'abc$(touch /tmp/e2e-should-not-run)'");
-    expect(pendingCommand).not.toContain('"abc$(touch /tmp/e2e-should-not-run)"');
+    expect(pendingCommand).not.toContain("pairing.json");
+    expect(allowFromCommand).not.toContain("allowFrom.json");
     expect(approveCommand).not.toContain('"abc$(touch /tmp/e2e-should-not-run)"');
   });
 
-  it("finds the active OpenClaw package when shell startup shadows openclaw with a function", () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-runtime-shadowed-"));
+  it.each([
+    ["slack", "team:T3730E2E:user:U3730E2E", "U3730E2E", 0],
+    ["slack", "team:TOTHER:user:U3730E2E", "U3730E2E", 1],
+    ["slack", "U3730E2E", "U3730E2E", 1],
+    ["discord", "1005536447329222676", "1005536447329222676", 0],
+  ] as const)(
+    "checks the exact %s pending and approval identity %s in SQLite",
+    (channel, storedEntry, user, expectedStatus) => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pairing-approval-state-"));
+      try {
+        const database = path.join(tmp, "openclaw.sqlite");
+        const setup = spawnSync(
+          "python3",
+          [
+            "-c",
+            [
+              "import sqlite3, sys",
+              "db = sqlite3.connect(sys.argv[1])",
+              "db.execute('CREATE TABLE channel_pairing_allow_entries (channel_key TEXT, entry TEXT)')",
+              "db.execute('INSERT INTO channel_pairing_allow_entries VALUES (?, ?)', sys.argv[2:])",
+              "db.execute('CREATE TABLE channel_pairing_requests (channel_key TEXT, code TEXT, request_id TEXT)')",
+              "db.execute('INSERT INTO channel_pairing_requests VALUES (?, ?, ?)', (sys.argv[2], 'CODE1234', sys.argv[3]))",
+              "db.commit()",
+              "db.close()",
+            ].join("\n"),
+            database,
+            channel,
+            storedEntry,
+          ],
+          { encoding: "utf8" },
+        );
+        expect(setup.status, setup.stderr).toBe(0);
+        const pending = spawnSync(
+          "sh",
+          [
+            "-c",
+            buildPairingPendingCommand(channel, "CODE1234", user).replace(
+              "/sandbox/.openclaw/state/openclaw.sqlite",
+              database,
+            ),
+          ],
+          { encoding: "utf8" },
+        );
+        expect(pending.status, pending.stderr).toBe(expectedStatus);
+        const approved = spawnSync(
+          "sh",
+          [
+            "-c",
+            buildPairingAllowFromCommand(channel, user).replace(
+              "/sandbox/.openclaw/state/openclaw.sqlite",
+              database,
+            ),
+          ],
+          { encoding: "utf8" },
+        );
+        expect(approved.status, approved.stderr).toBe(expectedStatus);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["T3730E2E", "TOTHER"])(
+    "issues a Slack request scoped to the event workspace %s",
+    (teamId) => {
+      const start = SLACK_PAIRING_SCRIPT.indexOf(
+        "const { issuePairingChallenge, upsertChannelPairingRequest } = await loadConversationRuntime();",
+      );
+      const probe = SLACK_PAIRING_SCRIPT.slice(start, SLACK_PAIRING_SCRIPT.lastIndexOf("\nNODE"));
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: `
+async function loadConversationRuntime() {
+  return {
+    issuePairingChallenge: async (params) => {
+      const result = await params.upsertPairingRequest({ id: params.senderId, meta: params.meta });
+      await params.sendPairingReply(params.senderIdLine);
+      return result;
+    },
+    upsertChannelPairingRequest: async (params) => {
+      console.log("REQUEST " + JSON.stringify(params));
+      return { code: "CODE1234", created: true };
+    },
+  };
+}
+async function receiveSlackSocketEvent() {
+  return ${JSON.stringify({ payload: { team_id: teamId, event: { type: "message", user: "U3730E2E", channel: "D3730E2E" } } })};
+}
+async function postPairingReply() {}
+${probe}
+`,
+        encoding: "utf8",
+        env: { ...process.env, SLACK_PAIRING_USER: "U3730E2E" },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      const request = result.stdout.split("\n").find((line) => line.startsWith("REQUEST "));
+      expect(JSON.parse(request?.slice("REQUEST ".length) ?? "null")).toEqual({
+        channel: "slack",
+        id: `team:${teamId}:user:U3730E2E`,
+        accountId: "default",
+        meta: {
+          accountId: "default",
+          channelId: "D3730E2E",
+          teamId,
+          senderId: "U3730E2E",
+        },
+      });
+    },
+  );
+
+  it("loads the managed OpenClaw package without starting a child shell", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-runtime-managed-root-"));
     try {
       const packageRoot = path.join(tmp, "openclaw-package");
-      const packageBin = path.join(packageRoot, "bin");
-      const pathBin = path.join(tmp, "path-bin");
-      const home = path.join(tmp, "home");
       const runtimeDir = path.join(packageRoot, "dist/plugin-sdk");
-      fs.mkdirSync(packageBin, { recursive: true });
-      fs.mkdirSync(pathBin, { recursive: true });
-      fs.mkdirSync(home, { recursive: true });
       fs.mkdirSync(runtimeDir, { recursive: true });
       fs.writeFileSync(
         path.join(packageRoot, "package.json"),
@@ -157,27 +318,75 @@ describe("OpenClaw Discord pairing helper contracts", () => {
       );
       fs.writeFileSync(
         path.join(runtimeDir, "conversation-runtime.js"),
-        "export const issuePairingChallenge = true;\n",
+        "export const issuePairingChallenge = () => true;\n",
       );
-      fs.writeFileSync(path.join(packageBin, "openclaw"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-      fs.symlinkSync(path.join(packageBin, "openclaw"), path.join(pathBin, "openclaw"));
-      fs.writeFileSync(
-        path.join(home, ".bashrc"),
-        "openclaw() { echo shadowed-shell-function; }\nexport -f openclaw\n",
-      );
-
       const result = spawnSync(process.execPath, ["--input-type=module"], {
-        input: `${LOAD_CONVERSATION_RUNTIME_SOURCE}\nconst runtime = await loadConversationRuntime();\nconsole.log(runtime.issuePairingChallenge);\n`,
+        input: `${LOAD_CONVERSATION_RUNTIME_SOURCE}\nconst runtime = await loadConversationRuntime();\nconsole.log(typeof runtime.issuePairingChallenge);\n`,
         encoding: "utf8",
         env: {
           ...process.env,
-          BASH_ENV: path.join(home, ".bashrc"),
-          PATH: `${pathBin}:${process.env.PATH ?? ""}`,
+          NEMOCLAW_E2E_OPENCLAW_PACKAGE_ROOT: packageRoot,
         },
       });
 
       expect(result.status, result.stderr).toBe(0);
-      expect(result.stdout).toContain("true");
+      expect(result.stdout).toContain("function");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("adapts the OpenClaw 2026.9.1 split channel-pairing runtime", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-runtime-split-pairing-"));
+    try {
+      const packageRoot = path.join(tmp, "openclaw-package");
+      const runtimeDir = path.join(packageRoot, "dist/plugin-sdk");
+      fs.mkdirSync(runtimeDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(packageRoot, "package.json"),
+        JSON.stringify({ name: "openclaw", type: "module" }),
+      );
+      fs.writeFileSync(
+        path.join(runtimeDir, "conversation-runtime.js"),
+        "export const upsertChannelPairingRequest = async (params) => ({ code: params.id + '-CODE', created: true });\n",
+      );
+      fs.writeFileSync(
+        path.join(runtimeDir, "channel-pairing.js"),
+        [
+          "export function createChannelPairingChallengeIssuer(bound) {",
+          "  return async (challenge) => {",
+          "    const stored = await bound.upsertPairingRequest({ id: challenge.senderId, meta: challenge.meta });",
+          "    await challenge.sendPairingReply(stored.code);",
+          "    return stored;",
+          "  };",
+          "}",
+          "",
+        ].join("\n"),
+      );
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: `${LOAD_CONVERSATION_RUNTIME_SOURCE}
+const runtime = await loadConversationRuntime();
+let reply = "";
+const paired = await runtime.issuePairingChallenge({
+  channel: "discord",
+  accountId: "default",
+  senderId: "U1",
+  senderIdLine: "Discord user id: U1",
+  meta: { channelId: "D1" },
+  upsertPairingRequest: ({ id, meta }) => runtime.upsertChannelPairingRequest({ channel: "discord", accountId: "default", id, meta }),
+  sendPairingReply: async (text) => { reply = text; },
+});
+console.log(JSON.stringify({ paired, reply }));
+`,
+        encoding: "utf8",
+        env: { ...process.env, NEMOCLAW_E2E_OPENCLAW_PACKAGE_ROOT: packageRoot },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        paired: { code: "U1-CODE", created: true },
+        reply: "U1-CODE",
+      });
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -187,21 +396,15 @@ describe("OpenClaw Discord pairing helper contracts", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-runtime-missing-"));
     try {
       const packageRoot = path.join(tmp, "openclaw-package");
-      const packageBin = path.join(packageRoot, "bin");
-      const pathBin = path.join(tmp, "path-bin");
-      fs.mkdirSync(packageBin, { recursive: true });
-      fs.mkdirSync(pathBin, { recursive: true });
+      fs.mkdirSync(packageRoot, { recursive: true });
       fs.writeFileSync(
         path.join(packageRoot, "package.json"),
         JSON.stringify({ name: "openclaw" }),
       );
-      fs.writeFileSync(path.join(packageBin, "openclaw"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-      fs.symlinkSync(path.join(packageBin, "openclaw"), path.join(pathBin, "openclaw"));
-
       const result = spawnSync(process.execPath, ["--input-type=module"], {
         input: `${LOAD_CONVERSATION_RUNTIME_SOURCE}\nawait loadConversationRuntime();\n`,
         encoding: "utf8",
-        env: { ...process.env, PATH: `${pathBin}:${process.env.PATH ?? ""}` },
+        env: { ...process.env, NEMOCLAW_E2E_OPENCLAW_PACKAGE_ROOT: packageRoot },
       });
 
       expect(result.status).not.toBe(0);
@@ -210,8 +413,6 @@ describe("OpenClaw Discord pairing helper contracts", () => {
       );
       expect(result.stderr).toEqual(expect.stringContaining(packageRoot));
       expect(result.stderr).toEqual(expect.not.stringContaining("/usr/local/bin/openclaw"));
-      expect(result.stderr).toEqual(expect.not.stringContaining("/usr/bin/openclaw"));
-      expect(result.stderr).toEqual(expect.not.stringContaining("shadowed-shell-function"));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -250,7 +451,7 @@ describe("OpenClaw Discord pairing helper contracts", () => {
     },
   ])("fails closed on invalid Slack probe input before network access: $name", ({ env, error }) => {
     const result = spawnSync(process.execPath, ["--input-type=module"], {
-      input: `${SLACK_PROBE_INPUT_VALIDATION_SOURCE}\nlet networkAttempted = false;\ntry { parseFakeSlackPort(); parseProxyTarget(); networkAttempted = true; } catch (error) { console.error(error.message); console.error("NETWORK_ATTEMPTED=" + networkAttempted); process.exit(1); }\n`,
+      input: `${SLACK_PROBE_INPUT_VALIDATION_SOURCE}\nlet networkAttempted = false;\ntry { parseFakeSlackPort("FAKE_SLACK_API_PORT"); parseProxyTarget(); networkAttempted = true; } catch (error) { console.error(error.message); console.error("NETWORK_ATTEMPTED=" + networkAttempted); process.exit(1); }\n`,
       encoding: "utf8",
       env: { ...process.env, ...env },
     });
@@ -260,15 +461,192 @@ describe("OpenClaw Discord pairing helper contracts", () => {
     expect(result.stderr).toEqual(expect.stringContaining("NETWORK_ATTEMPTED=false"));
   });
 
-  it("keeps Discord Gateway proof source valid for sandbox node heredoc", () => {
+  it.each(["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"])(
+    "accepts the revision-scoped OpenShell credential reference for %s",
+    (name) => {
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: `${SLACK_PROBE_INPUT_VALIDATION_SOURCE}\nparseManagedCredentialReference(${JSON.stringify(name)}); console.log("VALID");\n`,
+        encoding: "utf8",
+        env: { ...process.env, [name]: `openshell:resolve:env:v42_${name}` },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe("VALID\n");
+      expect(result.stdout).not.toContain("openshell:resolve:env:");
+    },
+  );
+
+  it.each([
+    { name: "missing", value: "" },
+    { name: "raw secret", value: "xapp-raw-secret" },
+    { name: "identityless canonical reference", value: "openshell:resolve:env:SLACK_APP_TOKEN" },
+    {
+      name: "identityless provider alias",
+      value: "xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN",
+    },
+    {
+      name: "wrong credential key",
+      value: "openshell:resolve:env:v42_SLACK_BOT_TOKEN",
+    },
+  ])(
+    "rejects an invalid Slack app credential reference before network access: $name",
+    ({ value }) => {
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: `${SLACK_PROBE_INPUT_VALIDATION_SOURCE}\nlet networkAttempted = false; try { parseManagedCredentialReference("SLACK_APP_TOKEN"); networkAttempted = true; } catch (error) { console.error(error.message); console.error("NETWORK_ATTEMPTED=" + networkAttempted); process.exit(1); }\n`,
+        encoding: "utf8",
+        env: { ...process.env, SLACK_APP_TOKEN: value },
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(
+        "SLACK_APP_TOKEN must be the revision-scoped OpenShell credential reference issued to the sandbox",
+      );
+      expect(result.stderr).toContain("NETWORK_ATTEMPTED=false");
+      expect(result.stderr).not.toContain(value || "xapp-raw-secret");
+    },
+  );
+
+  it("keeps the shared Discord Gateway client valid for sandbox node heredoc", () => {
     const result = spawnSync(process.execPath, ["--input-type=module", "--check"], {
-      input: DISCORD_GATEWAY_PROOF_SOURCE,
+      input: DISCORD_GATEWAY_CLIENT_SOURCE,
       encoding: "utf8",
     });
 
     expect(result.status, result.stderr).toBe(0);
-    expect(DISCORD_GATEWAY_PROOF_SOURCE).toContain('"\\r\\n"');
-    expect(DISCORD_GATEWAY_PROOF_SOURCE).toContain("IDENTIFY_SENT_PLACEHOLDER");
+    expect(DISCORD_GATEWAY_CLIENT_SOURCE).toContain('"\\r\\n"');
+    expect(DISCORD_GATEWAY_CLIENT_SOURCE).toContain("IDENTIFY_SENT_PLACEHOLDER");
+  });
+
+  it("uses distinct ports on the OpenShell host for Slack REST and websocket traffic", () => {
+    expect(SLACK_PAIRING_SCRIPT).toContain(
+      'function receiveSlackSocketEvent() {\n  const host = "host.openshell.internal";',
+    );
+    expect(SLACK_PAIRING_SCRIPT).toContain(
+      'function postPairingReply(text, channel) {\n  const host = "host.openshell.internal";',
+    );
+    expect(SLACK_PAIRING_SCRIPT).toContain('parseFakeSlackPort("FAKE_SLACK_WEBSOCKET_PORT")');
+  });
+
+  it("uses the revision-scoped Slack credential references issued to the sandbox", () => {
+    expect(SLACK_PAIRING_SCRIPT).toContain('parseManagedCredentialReference("SLACK_APP_TOKEN")');
+    expect(SLACK_PAIRING_SCRIPT).toContain('parseManagedCredentialReference("SLACK_BOT_TOKEN")');
+    expect(SLACK_PAIRING_SCRIPT).not.toContain("xapp-OPENSHELL-RESOLVE-ENV-SLACK_APP_TOKEN");
+    expect(SLACK_PAIRING_SCRIPT).not.toContain("xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN");
+  });
+
+  it.each([
+    { name: "missing", value: "" },
+    { name: "unscoped", value: "openshell:resolve:env:SLACK_APP_TOKEN" },
+    { name: "wrong credential", value: "openshell:resolve:env:v2_SLACK_BOT_TOKEN" },
+    { name: "raw token", value: "xapp-raw-slack-token" },
+  ])("rejects a $name Slack app credential before network access", ({ value }) => {
+    const result = spawnSync(process.execPath, ["--input-type=module"], {
+      input: `${SLACK_PROBE_INPUT_VALIDATION_SOURCE}\nlet networkAttempted = false;\ntry { parseManagedCredentialReference("SLACK_APP_TOKEN"); networkAttempted = true; } catch (error) { console.error(error.message); console.error("NETWORK_ATTEMPTED=" + networkAttempted); process.exit(1); }\n`,
+      encoding: "utf8",
+      env: { ...process.env, SLACK_APP_TOKEN: value },
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "SLACK_APP_TOKEN must be the revision-scoped OpenShell credential reference",
+    );
+    expect(result.stderr).toContain("NETWORK_ATTEMPTED=false");
+    expect(result.stderr).not.toContain("xapp-raw-slack-token");
+  });
+
+  it("waits for a complete Discord gateway port file", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "discord-port-publication-"));
+    const portFile = path.join(tmp, "port");
+    try {
+      fs.writeFileSync(portFile, "");
+      const observed = waitForPort(portFile);
+      fs.writeFileSync(portFile, "43210\n");
+      await expect(observed).resolves.toBe(43210);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("sends the revision-scoped Discord placeholder through the shared gateway client (#10155)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "discord-gateway-proof-revision-"));
+    const captureFile = path.join(tmp, "capture.jsonl");
+    const portFile = path.join(tmp, "port");
+    try {
+      child = spawn(
+        process.execPath,
+        [path.join(REPO_ROOT, "test/e2e/lib/fake-discord-gateway.cjs")],
+        {
+          env: {
+            ...process.env,
+            FAKE_DISCORD_GATEWAY_HOST: "127.0.0.1",
+            FAKE_DISCORD_GATEWAY_PORT: "0",
+            FAKE_DISCORD_GATEWAY_PORT_FILE: portFile,
+            FAKE_DISCORD_GATEWAY_CAPTURE_FILE: captureFile,
+            FAKE_DISCORD_GATEWAY_EXPECTED_TOKEN: REVISIONED_DISCORD_PLACEHOLDER,
+          },
+          stdio: "ignore",
+        },
+      );
+      const port = await waitForPort(portFile);
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: localDiscordGatewayClientSource(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          DISCORD_BOT_TOKEN: REVISIONED_DISCORD_PLACEHOLDER,
+          FAKE_DISCORD_IDENTIFY_MODE: "revisioned-discord-env",
+          FAKE_DISCORD_GATEWAY_PORT: String(port),
+          HTTP_PROXY: "",
+          http_proxy: "",
+        },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("IDENTIFY_SENT_PLACEHOLDER");
+      expect(result.stdout).toContain("READY");
+      expect(result.stdout).toContain("HEARTBEAT_ACK");
+
+      const identify = fs
+        .readFileSync(captureFile, "utf8")
+        .trim()
+        .split(/\n+/)
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .find((row) => row.event === "identify");
+      expect(identify).not.toHaveProperty("token");
+      expect(identify?.tokenMatchesExpected).toBe(true);
+      expect(identify?.tokenLooksPlaceholder).toBe(true);
+    } finally {
+      child?.kill("SIGTERM");
+      child = undefined;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: "missing", value: "" },
+    { name: "canonical", value: "openshell:resolve:env:DISCORD_BOT_TOKEN" },
+    { name: "wrong credential", value: "openshell:resolve:env:v2_SLACK_BOT_TOKEN" },
+    { name: "raw token", value: "raw-discord-token" },
+  ])("rejects a $name Discord proof credential before network access (#10155)", ({ value }) => {
+    const result = spawnSync(process.execPath, ["--input-type=module"], {
+      input: localDiscordGatewayClientSource(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DISCORD_BOT_TOKEN: value,
+        FAKE_DISCORD_IDENTIFY_MODE: "revisioned-discord-env",
+        FAKE_DISCORD_GATEWAY_PORT: "12345",
+        HTTP_PROXY: "",
+        http_proxy: "",
+      },
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(
+      "Discord Gateway proof requires the revision-scoped DISCORD_BOT_TOKEN placeholder",
+    );
+    expect(result.stderr).not.toContain("ECONNREFUSED");
+    expect(result.stderr).not.toContain("raw-discord-token");
   });
 
   it.each([
@@ -292,20 +670,26 @@ describe("OpenClaw Discord pairing helper contracts", () => {
       env: { HTTP_PROXY: "http://127.0.0.1:3128", http_proxy: "" },
       error: "unexpected HTTP proxy for Discord Gateway proof",
     },
-  ])("fails closed on invalid Discord Gateway proxy input before network access: $name", ({
-    env,
-    error,
-  }) => {
-    const result = spawnSync(process.execPath, ["--input-type=module"], {
-      input: `${DISCORD_GATEWAY_PROOF_SOURCE}\n`,
-      encoding: "utf8",
-      env: { ...process.env, FAKE_DISCORD_GATEWAY_PORT: "12345", ...env },
-    });
+  ])(
+    "fails closed on invalid Discord Gateway proxy input before network access: $name",
+    ({ env, error }) => {
+      const result = spawnSync(process.execPath, ["--input-type=module"], {
+        input: `${DISCORD_GATEWAY_CLIENT_SOURCE}\n`,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          DISCORD_BOT_TOKEN: REVISIONED_DISCORD_PLACEHOLDER,
+          FAKE_DISCORD_IDENTIFY_MODE: "revisioned-discord-env",
+          FAKE_DISCORD_GATEWAY_PORT: "12345",
+          ...env,
+        },
+      });
 
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toEqual(expect.stringContaining(error));
-    expect(result.stderr).not.toContain("ECONNREFUSED");
-  });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toEqual(expect.stringContaining(error));
+      expect(result.stderr).not.toContain("ECONNREFUSED");
+    },
+  );
 
   it("rejects malformed sandboxNode env keys before sandbox execution", async () => {
     const execShell = vi.fn(async () => {
@@ -349,6 +733,7 @@ describe("OpenClaw Discord pairing helper contracts", () => {
       await sendDiscordIdentify(port, sentinel);
       await new Promise((resolve) => setTimeout(resolve, 50));
 
+      assertDiscordGatewayCapture(captureFile, sentinel);
       const serialized = fs.readFileSync(captureFile, "utf8");
       const identify = serialized
         .trim()
@@ -367,4 +752,52 @@ describe("OpenClaw Discord pairing helper contracts", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    {
+      caseName: "IDENTIFY includes a token field",
+      expectedMessage: "persisted token field",
+      rows: [
+        {
+          event: "identify",
+          token: GATEWAY_ASSERTION_SENTINEL,
+          tokenMatchesExpected: true,
+          tokenLooksPlaceholder: false,
+        },
+      ],
+    },
+    {
+      caseName: "another capture row includes the raw token",
+      expectedMessage: "persisted raw token",
+      rows: [
+        { event: "identify", tokenMatchesExpected: true, tokenLooksPlaceholder: false },
+        { event: "diagnostic", value: GATEWAY_ASSERTION_SENTINEL },
+      ],
+    },
+  ])(
+    "does not include the Discord token in gateway assertion failures when $caseName",
+    (testCase) => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fake-discord-gateway-failure-"));
+      const captureFile = path.join(tmp, "capture.jsonl");
+
+      try {
+        fs.writeFileSync(
+          captureFile,
+          `${testCase.rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+        );
+        let failure: unknown;
+        try {
+          assertDiscordGatewayCapture(captureFile, GATEWAY_ASSERTION_SENTINEL);
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain(testCase.expectedMessage);
+        expect((failure as Error).message).not.toContain(GATEWAY_ASSERTION_SENTINEL);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+  );
 });

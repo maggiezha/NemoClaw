@@ -15,11 +15,7 @@
  * paired-but-idle channel cannot be mistaken for working.
  */
 
-import type {
-  ChannelHealthReport,
-  DiagnosticSeverity,
-  DiagnosticSignal,
-} from "../../channel-health";
+import type { ChannelHealthReport, DiagnosticSignal } from "../../channel-health";
 
 export type { DiagnosticSeverity, DiagnosticSignal } from "../../channel-health";
 
@@ -79,12 +75,22 @@ export type WhatsappProbeInput = {
   // depending on the system clock.
   probedAt: string;
   // Whether the whatsapp preset is recorded in the sandbox registry.
-  presetInRegistry: boolean;
+  presetApplied: boolean;
   // Whether the whatsapp preset's network policy is loaded on the gateway,
   // or null when the gateway could not be reached.
   presetOnGateway: boolean | null;
   // Whether the whatsapp channel is recorded in the registry messaging plan.
   channelEnabledInRegistry: boolean;
+  // Hermes runs the dashboard under a separate home. This probe records only
+  // whether the two expected credential files exist, never their contents.
+  sessionLocations?: WhatsappSessionLocations;
+};
+
+export type WhatsappSessionLocations = {
+  gatewaySessionCreds: boolean | null;
+  dashboardSessionCreds: boolean | null;
+  gatewaySessionPathSource?: "default" | "config" | "unsupported";
+  gatewaySessionDir?: string;
 };
 
 /**
@@ -122,6 +128,13 @@ function isParseableTimestamp(value: string | null): value is string {
   return value !== null && Number.isFinite(Date.parse(value));
 }
 
+// Successfully started current images migrate this legacy session. If the
+// compatibility probe still sees it, send the operator through the explicit
+// removal flow rather than guessing whether an older image or a migration
+// collision left two credential sets.
+const HERMES_LEGACY_DASHBOARD_SESSION_HINT =
+  "Run `nemoclaw <sandbox> channels remove whatsapp` to clear every WhatsApp session path, then `nemoclaw <sandbox> channels add whatsapp`. Pair again from the dashboard so credentials are stored in `/sandbox/.hermes/platforms/whatsapp/session`. Rerun `nemoclaw <sandbox> channels status --channel whatsapp`.";
+
 function pairingSignal(input: WhatsappProbeInput): DiagnosticSignal {
   if (!input.probeReachable) {
     return {
@@ -139,6 +152,17 @@ function pairingSignal(input: WhatsappProbeInput): DiagnosticSignal {
     };
   }
   if (input.paired === false) {
+    const dashboardOnly = hermesDashboardOnlySession(input);
+    if (input.agent === "hermes") {
+      return {
+        label: "Pairing / session",
+        severity: "warn",
+        detail: "Hermes gateway session path has no WhatsApp credentials",
+        hint: dashboardOnly
+          ? HERMES_LEGACY_DASHBOARD_SESSION_HINT
+          : "run `hermes whatsapp` inside the sandbox to display a QR code",
+      };
+    }
     const loginHint =
       input.agent === "hermes"
         ? "run `hermes whatsapp` inside the sandbox to display a QR code"
@@ -155,6 +179,98 @@ function pairingSignal(input: WhatsappProbeInput): DiagnosticSignal {
     severity: "ok",
     detail: "paired (reported by channel runtime)",
   };
+}
+
+function hermesDashboardOnlySession(input: WhatsappProbeInput): boolean {
+  return (
+    input.agent === "hermes" &&
+    input.sessionLocations?.gatewaySessionCreds === false &&
+    input.sessionLocations.dashboardSessionCreds === true &&
+    input.sessionLocations.gatewaySessionPathSource !== "config"
+  );
+}
+
+function sessionLocationSignal(input: WhatsappProbeInput): DiagnosticSignal | null {
+  const locations = input.sessionLocations;
+  if (!locations) return null;
+  const gateway = locations.gatewaySessionCreds;
+  const dashboard = locations.dashboardSessionCreds;
+  if (locations.gatewaySessionPathSource === "config" && gateway !== null) {
+    const configuredPath = locations.gatewaySessionDir
+      ? ` at \`${locations.gatewaySessionDir}\``
+      : "";
+    return gateway
+      ? {
+          label: "Session location",
+          severity: "ok",
+          detail: `the configured Hermes WhatsApp session path${configuredPath} contains credentials`,
+        }
+      : {
+          label: "Session location",
+          severity: "warn",
+          detail: `the configured Hermes WhatsApp session path${configuredPath} has no WhatsApp credentials`,
+          hint: "pair WhatsApp again, or set `platforms.whatsapp.extra.session_path` to the session path that holds the credentials",
+        };
+  }
+  if (gateway === false && dashboard === true) {
+    return {
+      label: "Session location",
+      severity: "warn",
+      detail:
+        "dashboard-home has WhatsApp credentials, but the Hermes gateway session path is empty",
+      hint: HERMES_LEGACY_DASHBOARD_SESSION_HINT,
+    };
+  }
+  if (gateway === true && dashboard === false) {
+    return {
+      label: "Session location",
+      severity: "ok",
+      detail: "Hermes gateway session path contains WhatsApp credentials",
+    };
+  }
+  if (gateway === false && dashboard === false) {
+    return {
+      label: "Session location",
+      severity: "info",
+      detail: "no WhatsApp credentials found in the Hermes gateway or dashboard session paths",
+    };
+  }
+  if (gateway === true && dashboard === true) {
+    return {
+      label: "Session location",
+      severity: "info",
+      detail: "both Hermes session paths contain WhatsApp credentials",
+      hint: "use one active WhatsApp bridge for the paired account",
+    };
+  }
+  return {
+    label: "Session location",
+    severity: "info",
+    detail: "Hermes session paths could not be inspected",
+  };
+}
+
+function sessionPathOverrideSignal(input: WhatsappProbeInput): DiagnosticSignal | null {
+  const source = input.sessionLocations?.gatewaySessionPathSource;
+  if (source === "config") {
+    return {
+      label: "Session path override",
+      severity: "info",
+      detail:
+        "the gateway session check used the path set in `platforms.whatsapp.extra.session_path`",
+      hint: "remove the override after Hermes uses one WhatsApp session path for dashboard pairing and gateway startup",
+    };
+  }
+  if (source === "unsupported") {
+    return {
+      label: "Session path override",
+      severity: "warn",
+      detail:
+        "`platforms.whatsapp.extra.session_path` is not a supported session path, so the gateway session check used the default path",
+      hint: "set `platforms.whatsapp.extra.session_path` to an absolute path under `/sandbox/.hermes` that has no `.` or `..` segment",
+    };
+  }
+  return null;
 }
 
 function websocketSignal(input: WhatsappProbeInput): DiagnosticSignal {
@@ -263,7 +379,7 @@ function inboundSignal(input: WhatsappProbeInput): DiagnosticSignal {
 }
 
 function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
-  if (input.presetOnGateway === false && input.presetInRegistry) {
+  if (input.presetOnGateway === false && input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -271,7 +387,7 @@ function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
       hint: "rebuild the sandbox so the preset is reapplied to the OpenShell gateway",
     };
   }
-  if (!input.presetInRegistry) {
+  if (!input.presetApplied) {
     // A missing local preset is a deterministic gap regardless of gateway
     // reachability — the next rebuild will not reapply WhatsApp egress and
     // the channel will eventually fail closed. Treat it as a fail so the
@@ -281,7 +397,7 @@ function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
       label: "Policy coverage",
       severity: "fail",
       detail: "whatsapp preset is not applied to the sandbox",
-      hint: "run `nemoclaw <sandbox> policy-add whatsapp` and rebuild the sandbox",
+      hint: "run `nemoclaw <sandbox> policy add whatsapp` and rebuild the sandbox",
     };
   }
   if (input.presetOnGateway === null) {
@@ -400,6 +516,13 @@ function buildHints(verdict: WhatsappVerdict, input: WhatsappProbeInput): string
       );
       break;
     case "unpaired":
+      if (hermesDashboardOnlySession(input)) {
+        hints.push(
+          "Hermes dashboard pairing wrote credentials under dashboard-home, but the gateway reads the default platforms path.",
+          HERMES_LEGACY_DASHBOARD_SESSION_HINT,
+        );
+        break;
+      }
       hints.push(
         input.agent === "hermes"
           ? "Run `hermes whatsapp` inside the sandbox and scan the QR with your phone."
@@ -429,9 +552,13 @@ function buildHints(verdict: WhatsappVerdict, input: WhatsappProbeInput): string
 }
 
 export function evaluateWhatsappDiagnostics(input: WhatsappProbeInput): WhatsappDiagnosticReport {
+  const sessionSignal = sessionLocationSignal(input);
+  const overrideSignal = sessionPathOverrideSignal(input);
   const signals: DiagnosticSignal[] = [
     configCoverageSignal(input),
     pairingSignal(input),
+    ...(sessionSignal ? [sessionSignal] : []),
+    ...(overrideSignal ? [overrideSignal] : []),
     bridgeProcessSignal(input),
     websocketSignal(input),
     inboundSignal(input),

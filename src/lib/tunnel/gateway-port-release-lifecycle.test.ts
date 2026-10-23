@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_GATEWAY_PORT } from "../core/ports";
+import type { GatewaySupervisorKind } from "../onboard/gateway-management";
 import type { HostGatewayProcessDeps } from "../onboard/host-gateway-process";
 import { releaseManagedGatewayPort } from "./gateway-port-release";
 import {
@@ -16,6 +17,54 @@ import {
 } from "./gateway-port-release-test-helpers";
 
 describe("releaseManagedGatewayPort lifecycle (#5968)", () => {
+  it.each(["systemd-system", "systemd-user"] satisfies GatewaySupervisorKind[])(
+    "does not scan or signal a %s-supervised gateway during stop (#6576)",
+    (kind) => {
+      const run = vi.fn(() => ok("123\n"));
+      const stop = stopSpy(emptyStopResult({ stopped: [123] }));
+      const log = vi.fn();
+
+      const result = releaseManagedGatewayPort(
+        { sandboxName: "alpha" },
+        {
+          ...baseDeps(),
+          log,
+          run,
+          stopHostGatewayProcesses: stop.fn,
+          getSandbox: () => ({ gatewayPort: DEFAULT_GATEWAY_PORT }),
+          resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
+            gatewayName,
+            gatewayPort,
+            mode: "externally-supervised",
+            source: "declared",
+            endpoint: `http://127.0.0.1:${String(gatewayPort)}`,
+            stateDir: "/var/lib/openshell/gateway",
+            supervisor: {
+              kind,
+              serviceName: "openshell-gateway.service",
+              execPath: "/usr/local/bin/openshell-gateway",
+            },
+            requiredCapabilities: [],
+          }),
+        },
+      );
+
+      expect(result).toEqual({
+        port: DEFAULT_GATEWAY_PORT,
+        released: false,
+        stopped: [],
+        remaining: [],
+        scanned: false,
+        skipped: true,
+      });
+      expect(run).not.toHaveBeenCalled();
+      expect(stop.fn).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("Keeping externally supervised OpenShell gateway"),
+      );
+    },
+  );
+
   it("stops lsof-discovered gateways, then reports the port released", () => {
     const lsof = lsofResponder(ok("111\n222\n"), ok(""));
     const stop = stopSpy(emptyStopResult({ stopped: [111, 222] }));
@@ -138,7 +187,7 @@ describe("releaseManagedGatewayPort lifecycle (#5968)", () => {
     expect(stop.lastOptions()?.usePidFile).toBe(false);
   });
 
-  it("warns with sudo remediation when the port stays bound after stop", () => {
+  it("requires fresh identity proof when the port stays bound after stop", () => {
     // lsof keeps reporting a listener even after the stop attempt — the orphan
     // could not be reaped (e.g. a privileged process).
     const lsof = lsofResponder(ok("333\n"));
@@ -158,7 +207,11 @@ describe("releaseManagedGatewayPort lifecycle (#5968)", () => {
 
     expect(result.released).toBe(false);
     expect(result.remaining).toEqual([333]);
-    expect(warn.mock.calls.map((c) => c[0]).join("\n")).toContain("sudo kill -9 333");
+    const warning = warn.mock.calls.map((c) => c[0]).join("\n");
+    expect(warning).toContain("Do not signal a PID from this saved output");
+    expect(warning).toContain("exact gateway on port 8080");
+    expect(warning).toContain("PID file, runtime marker, and loaded sandbox namespace");
+    expect(warning).not.toContain("kill -9");
   });
 
   it("leaves a non-matching listener alone without sudo pkill remediation", () => {

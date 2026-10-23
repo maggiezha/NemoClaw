@@ -9,11 +9,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DASHBOARD_PORT } from "../core/ports";
+import { isCuaEnabled, requireCuaEnabled } from "../cua/feature";
 import { ROOT } from "../runner";
 import {
   formatAgentAliasSuffix,
   resolveAgentNameAlias as resolveKnownAgentNameAlias,
 } from "./aliases";
+import {
+  isCandidateAgent,
+  isCandidateAgentSelectable,
+  requireCandidateAgentSelectable,
+} from "./candidate";
 import { type AgentDashboardUi, readDashboardUi } from "./dashboard-ui";
 import type {
   AgentChoice,
@@ -23,26 +29,26 @@ import type {
   AgentHealthProbe,
   AgentLegacyPaths,
   AgentMcpCapability,
-  AgentStateFile,
   AgentVersionScheme,
 } from "./definition-types";
 import {
   loadManifestRecord,
   readBoolean,
   readDashboard,
+  readDeferredOnboarding,
   readHealthProbe,
   readInference,
   readMcpCapability,
   readObject,
   readPortArray,
-  readStateFiles,
   readString,
   readStringArray,
   readStringMap,
   readUserManagedFiles,
   readVersionScheme,
 } from "./manifest-readers";
-import { type AgentRuntime, readAgentRuntime } from "./runtime-manifest";
+import { readAgentRuntime } from "./runtime-manifest";
+import { type AgentSkillIntegration, readAgentSkillIntegration } from "./skill-integration";
 import { type AgentWebAuth, readWebAuth } from "./web-auth";
 
 export type {
@@ -57,17 +63,9 @@ export type {
   AgentMcpAdapter,
   AgentMcpCapability,
   AgentMcpSupport,
-  AgentStateFile,
-  AgentStateFileStrategy,
   AgentVersionScheme,
-  StateFileFreshHeader,
-  StateFileKeyAllowlistRestoreOwnership,
-  StateFileOpenClawRestoreOwnership,
-  StateFileRestoreMerge,
-  StateFileRestoreOwnership,
-  StateFileUserKey,
-  StateFileUserKeyType,
 } from "./definition-types";
+export type { AgentSkillIntegration } from "./skill-integration";
 export type { AgentRuntime, AgentRuntimeKind } from "./runtime-manifest";
 export { getAgentRuntimeKind, isTerminalAgent } from "./runtime-manifest";
 export type { AgentWebAuth, AgentWebAuthMethod } from "./web-auth";
@@ -77,6 +75,7 @@ export const AGENTS_DIR = path.join(ROOT, "agents");
 const _cache = new Map<string, AgentDefinition>();
 
 export { agentAliasSummary } from "./aliases";
+export { requireCandidateQualificationEnabled } from "./candidate";
 
 export function resolveAgentNameAlias(
   value: string | null | undefined,
@@ -99,30 +98,53 @@ function unknownAgentMessage(
  * List available agent names by scanning agents/ for directories with
  * a manifest.yaml file.
  */
-export function listAgents(): string[] {
-  if (!fs.existsSync(AGENTS_DIR)) return [];
-  return fs
-    .readdirSync(AGENTS_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .filter((entry) => fs.existsSync(path.join(AGENTS_DIR, entry.name, "manifest.yaml")))
-    .map((entry) => entry.name)
-    .sort();
+export function listAgents(env: NodeJS.ProcessEnv = process.env): string[] {
+  const agents = fs.existsSync(AGENTS_DIR)
+    ? fs
+        .readdirSync(AGENTS_DIR, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .filter((entry) => entry.name !== "nemocua" || isCuaEnabled(env))
+        .filter(
+          (entry) => !isCandidateAgent(entry.name) || isCandidateAgentSelectable(entry.name, env),
+        )
+        .filter((entry) => fs.existsSync(path.join(AGENTS_DIR, entry.name, "manifest.yaml")))
+        .map((entry) => entry.name)
+    : [];
+  return [...new Set(agents)].sort();
+}
+
+/** Resolve a non-OpenClaw agent's required, readable baseline policy. */
+export function requireAgentPolicyAdditionsPath(
+  agent: Pick<AgentDefinition, "name" | "policyAdditionsPath">,
+): string {
+  const policyPath = agent.policyAdditionsPath;
+  try {
+    if (!policyPath || !fs.statSync(policyPath).isFile()) throw new Error("missing policy file");
+    fs.accessSync(policyPath, fs.constants.R_OK);
+    return policyPath;
+  } catch {
+    throw new Error(
+      `Agent '${agent.name}' baseline policy is unavailable; a readable policy-additions.yaml is required. Refusing to substitute the OpenClaw baseline.`,
+    );
+  }
 }
 
 /**
  * Load and parse an agent manifest.
  */
-export function loadAgent(name: string): AgentDefinition {
+export function loadAgent(name: string, env: NodeJS.ProcessEnv = process.env): AgentDefinition {
+  if (name === "nemocua") requireCuaEnabled(env);
+  requireCandidateAgentSelectable(name, env);
+  const manifestPath = path.join(AGENTS_DIR, name, "manifest.yaml");
   const cached = _cache.get(name);
   if (cached) return cached;
 
-  const manifestPath = path.join(AGENTS_DIR, name, "manifest.yaml");
   if (!fs.existsSync(manifestPath)) {
     throw new Error(`Agent '${name}' not found: ${manifestPath}`);
   }
 
   const raw = loadManifestRecord(manifestPath);
-  const agentDir = path.join(AGENTS_DIR, name);
+  const agentDir = path.dirname(manifestPath);
   const manifestName = readString(raw, "name") ?? name;
   const description = readString(raw, "description");
   const displayName = readString(raw, "display_name");
@@ -139,20 +161,20 @@ export function loadAgent(name: string): AgentDefinition {
   const config = readObject(raw, "config");
   const inference = readInference(raw);
   const mcp = readMcpCapability(raw);
-  const stateDirs = readStringArray(raw, "state_dirs");
-  const runtimeAuthStateDirs = readStringArray(raw, "runtime_auth_state_dirs");
-  for (const dir of runtimeAuthStateDirs ?? []) {
-    if (!stateDirs?.includes(dir)) {
-      throw new Error(
-        `Agent manifest field 'runtime_auth_state_dirs' entry '${dir}' must also be listed in 'state_dirs'`,
-      );
-    }
+  const skillIntegration = readAgentSkillIntegration(raw);
+  const retiredStateInventoryField = ["state_dirs", "state_files", "runtime_auth_state_dirs"].find(
+    (field) => raw[field] !== undefined,
+  );
+  if (retiredStateInventoryField) {
+    throw new Error(
+      `Agent manifest field '${retiredStateInventoryField}' is retired; native rebuilds persist the complete agent home`,
+    );
   }
-  const stateFiles = readStateFiles(raw);
   const userManagedFiles = readUserManagedFiles(raw);
   const phoneHomeHosts = readStringArray(raw, "phone_home_hosts");
   const legacyPathConfig = readStringMap(raw, "_legacy_paths");
   const dashboardUi = readDashboardUi(raw);
+  const deferredOnboarding = readDeferredOnboarding(raw);
 
   const agent: AgentDefinition = {
     ...raw,
@@ -170,11 +192,9 @@ export function loadAgent(name: string): AgentDefinition {
     forward_ports: forwardPorts,
     health_probe: healthProbe,
     config,
+    deferred_onboarding: deferredOnboarding,
     inference,
     mcp,
-    state_dirs: stateDirs,
-    runtime_auth_state_dirs: runtimeAuthStateDirs,
-    state_files: stateFiles,
     user_managed_files: userManagedFiles,
     _legacy_paths: legacyPathConfig,
     agentDir,
@@ -233,16 +253,8 @@ export function loadAgent(name: string): AgentDefinition {
       return mcp;
     },
 
-    get stateDirs(): string[] {
-      return stateDirs ?? [];
-    },
-
-    get runtimeAuthStateDirs(): string[] {
-      return runtimeAuthStateDirs ?? [];
-    },
-
-    get stateFiles(): AgentStateFile[] {
-      return stateFiles ?? [];
+    get skillIntegration(): AgentSkillIntegration | null {
+      return skillIntegration;
     },
 
     get userManagedFiles(): string[] {
@@ -287,11 +299,6 @@ export function loadAgent(name: string): AgentDefinition {
     get policyAdditionsPath(): string | null {
       const policyAdditionsPath = path.join(agentDir, "policy-additions.yaml");
       return fs.existsSync(policyAdditionsPath) ? policyAdditionsPath : null;
-    },
-
-    get policyPermissivePath(): string | null {
-      const policyPermissivePath = path.join(agentDir, "policy-permissive.yaml");
-      return fs.existsSync(policyPermissivePath) ? policyPermissivePath : null;
     },
 
     get pluginDir(): string | null {
@@ -389,6 +396,10 @@ export function resolveAgentName({
     const available = listAgents();
     const resolved = resolveAgentNameAlias(session.agent, available);
     if (!resolved) {
+      // A recorded release candidate must fail closed. Falling back to OpenClaw
+      // would silently change the agent a resumed session was created with and
+      // strand its agent-scoped state.
+      requireCandidateAgentSelectable(session.agent);
       console.error(
         `  Warning: session references unknown agent '${session.agent}', falling back to openclaw.`,
       );

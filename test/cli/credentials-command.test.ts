@@ -10,8 +10,12 @@ import { run, runWithInput } from "./helpers";
 
 vi.mock("../../src/lib/actions/global", () => ({
   forgetExtraProvider: vi.fn(),
+  listManagedMcpCredentialReservations: vi.fn(() => []),
   recordExtraProvider: vi.fn(),
   recoverNamedGatewayRuntime: vi.fn().mockResolvedValue({ recovered: true }),
+}));
+vi.mock("../../src/lib/adapters/openshell/provider-command", () => ({
+  OPENSHELL_OPERATION_TIMEOUT_MS: 30_000,
   runOpenshellProviderCommand: vi.fn(),
 }));
 
@@ -44,11 +48,11 @@ describe("credentials CLI dispatch", () => {
 
   it("credentials add declares its help usage, description, and flags", () => {
     expect(CredentialsAddCommand.usage).toContain(
-      "credentials add <PROVIDER> --type <TYPE> [--credential ENV_NAME] [--config K=V] [--from-existing]",
+      "credentials add <PROVIDER> --type <TYPE> [--agent AGENT] [--credential ENV_NAME] [--config K=V] [--from-existing]",
     );
     expect(CredentialsAddCommand.description).toContain("Register a provider credential");
     expect(Object.keys(CredentialsAddCommand.flags)).toEqual(
-      expect.arrayContaining(["type", "credential", "from-existing"]),
+      expect.arrayContaining(["type", "agent", "credential", "from-existing"]),
     );
   });
 

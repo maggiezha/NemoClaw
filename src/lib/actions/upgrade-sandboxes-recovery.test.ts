@@ -1,8 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+import type { OpenShellSandboxBufferedCommandRequest } from "../adapters/openshell/sandbox-command";
+import * as commandExecutor from "../adapters/openshell/sandbox-command-cli";
+import { loadAgent } from "../agent/defs";
+import { parseCliOpenShellSandboxInventory } from "../adapters/openshell/sandbox-observer-cli";
 import * as coreVersion from "../core/version";
 import * as sandboxList from "../openshell-sandbox-list";
 import * as sandboxVersion from "../sandbox/version";
@@ -14,30 +22,27 @@ type UpgradeSandboxes = typeof upgradeSandboxes;
 
 type ManifestAgentType = "openclaw" | "hermes";
 
-const MANIFEST_DIR_BY_AGENT: Record<ManifestAgentType, string> = {
-  openclaw: "/sandbox/.openclaw",
-  hermes: "/sandbox/.hermes",
-};
-
 function makeManifest(sandboxName: string, agentType: ManifestAgentType = "openclaw") {
   const timestamp = `2026-07-01T06-50-4${sandboxName.length}-044Z`;
   return {
-    version: 1,
+    version: 2,
     sandboxName,
     timestamp,
     agentType,
     agentVersion: "2026.5.27",
     expectedVersion: "2026.5.27",
-    stateDirs: ["workspace"],
-    backedUpDirs: ["workspace"],
-    stateFiles: [],
-    dir: MANIFEST_DIR_BY_AGENT[agentType],
+    nativeState: {
+      root: "/sandbox",
+      archive: "native-home.tar" as const,
+      sha256: "a".repeat(64),
+    },
     backupPath: `/tmp/rebuild-backups/${sandboxName}/${timestamp}`,
     blueprintDigest: null,
-    policyPresets: [],
-    customPolicies: [],
-    snapshotVersion: 1,
   };
+}
+
+function sandboxInventory(output: string) {
+  return parseCliOpenShellSandboxInventory(output);
 }
 
 function createRecoveryHarness(
@@ -58,6 +63,7 @@ function createRecoveryHarness(
           nemoclawVersion: string | null;
           fromDockerfile: string | null;
           pendingRouteReservation: true;
+          stopped: boolean;
         }>
       >
     >;
@@ -68,9 +74,14 @@ function createRecoveryHarness(
 ): {
   upgradeSandboxes: UpgradeSandboxes;
   rebuildSpy: ReturnType<typeof vi.fn>;
+  stopSpy: ReturnType<typeof vi.fn>;
   latestBackupSpy: ReturnType<typeof vi.spyOn>;
   managedEvidenceSpy: ReturnType<typeof vi.spyOn>;
+  checkAgentVersionSpy: ReturnType<typeof vi.spyOn>;
   liveListSpy: ReturnType<typeof vi.spyOn>;
+  readOnlyListSpy: ReturnType<typeof vi.spyOn>;
+  registryEntries: registry.SandboxEntry[];
+  recordStopIntentSpy: ReturnType<typeof vi.spyOn>;
 } {
   vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "1");
   vi.stubEnv(
@@ -89,32 +100,49 @@ function createRecoveryHarness(
   vi.spyOn(coreVersion, "getVersion").mockReturnValue("0.0.71");
   const liveListSpy = vi
     .spyOn(sandboxList, "captureSandboxListWithGatewayPreflightOrExit")
-    .mockResolvedValue({
-      status: 0,
-      output: options.liveOutput ?? names.map((name) => `${name} Error`).join("\n"),
-    });
-  vi.spyOn(registry, "listSandboxes").mockReturnValue({
+    .mockResolvedValue(
+      sandboxInventory(options.liveOutput ?? names.map((name) => `${name} Error`).join("\n")),
+    );
+  // #7279: check mode observes gateways through the read-only helper instead of
+  // the recovering preflight; keep both stubbed so a check-mode run never hits
+  // the real openshell adapter.
+  const readOnlyListSpy = vi
+    .spyOn(sandboxList, "captureNamedGatewaySandboxListReadOnly")
+    .mockResolvedValue(
+      sandboxInventory(options.liveOutput ?? names.map((name) => `${name} Error`).join("\n")),
+    );
+  const registryEntries: registry.SandboxEntry[] = names.map((name) => ({
+    name,
+    agent: null,
+    agentVersion: "2026.5.27",
+    gatewayName: options.gatewayNames?.[name],
+    gatewayPort: options.gatewayPort,
+    nemoclawVersion: "0.0.71",
+    ...options.registryOverrides?.[name],
+  }));
+  vi.spyOn(registry, "listSandboxes").mockImplementation(() => ({
     defaultSandbox: null,
-    sandboxes: names.map((name) => ({
-      name,
-      agent: null,
-      agentVersion: "2026.5.27",
-      gatewayName: options.gatewayNames?.[name],
-      gatewayPort: options.gatewayPort,
-      nemoclawVersion: "0.0.71",
-      ...options.registryOverrides?.[name],
-    })),
-  });
-  vi.spyOn(sandboxVersion, "checkAgentVersion").mockImplementation((...args: unknown[]) => {
-    const name = String(args[0]);
-    return {
-      sandboxVersion: options.staleNames?.includes(name) === true ? "2026.5.26" : "2026.5.27",
-      expectedVersion: "2026.5.27",
-      isStale: options.staleNames?.includes(name) === true,
-      verificationFailed: false,
-      detectionMethod: "registry",
-    };
-  });
+    sandboxes: registryEntries.map((entry) => ({ ...entry })),
+  }));
+  const recordStopIntentSpy = vi
+    .spyOn(registry, "recordSandboxStopIntent")
+    .mockImplementation((name, stopped) => {
+      const entry = registryEntries.find((candidate) => candidate.name === name);
+      Object.assign(entry ?? {}, { stopped });
+      return entry !== undefined;
+    });
+  const checkAgentVersionSpy = vi
+    .spyOn(sandboxVersion, "checkAgentVersion")
+    .mockImplementation(async (...args: unknown[]) => {
+      const name = String(args[0]);
+      return {
+        sandboxVersion: options.staleNames?.includes(name) === true ? "2026.5.26" : "2026.5.27",
+        expectedVersion: "2026.5.27",
+        isStale: options.staleNames?.includes(name) === true,
+        verificationFailed: false,
+        detectionMethod: "registry",
+      };
+    });
   const latestBackupSpy = vi
     .spyOn(sandboxState, "getLatestBackup")
     .mockImplementation((...args: unknown[]) => {
@@ -135,13 +163,21 @@ function createRecoveryHarness(
   const rebuildSpy = vi
     .spyOn(upgradeSandboxesDependencies, "rebuildSandbox")
     .mockResolvedValue(undefined);
+  const stopSpy = vi
+    .spyOn(upgradeSandboxesDependencies, "stopSandbox")
+    .mockResolvedValue({ exitCode: 0 });
 
   return {
     upgradeSandboxes,
     rebuildSpy,
+    stopSpy,
     latestBackupSpy,
     managedEvidenceSpy,
+    checkAgentVersionSpy,
     liveListSpy,
+    readOnlyListSpy,
+    registryEntries,
+    recordStopIntentSpy,
   };
 }
 
@@ -166,7 +202,7 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     expect(console.log).toHaveBeenCalledWith("  No sandboxes found in the registry.");
   });
 
-  it("recovers real sandboxes while ignoring a route-only reservation (#6500)", async () => {
+  it("recovers published sandboxes while ignoring pending registrations (#9733)", async () => {
     const harness = createRecoveryHarness(["tm", "alpha", "beta"], {
       registryOverrides: {
         tm: { pendingRouteReservation: true },
@@ -179,28 +215,196 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
-    expect(harness.latestBackupSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
+    expect(harness.checkAgentVersionSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
       "alpha",
-      "beta",
     ]);
-    expect(harness.rebuildSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual([
-      "alpha",
-      "beta",
-    ]);
+    expect(harness.latestBackupSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(["alpha"]);
+    expect(harness.rebuildSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(["alpha"]);
   });
 
-  it("passes every non-Ready sandbox's validated manifest into rebuild", async () => {
-    const harness = createRecoveryHarness(["alpha", "beta"]);
+  it.each(["alpha", "beta"])(
+    "passes every non-Ready sandbox's validated manifest into rebuild [%s]",
+    async (name) => {
+      const harness = createRecoveryHarness(["alpha", "beta"]);
 
-    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+      await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
-    expect(harness.rebuildSpy).toHaveBeenCalledTimes(2);
-    for (const name of ["alpha", "beta"]) {
+      expect(harness.rebuildSpy).toHaveBeenCalledTimes(2);
+
       expect(harness.rebuildSpy).toHaveBeenCalledWith(name, ["--yes"], {
         throwOnError: true,
         recoveryManifest: expect.objectContaining({ sandboxName: name }),
       });
-    }
+    },
+  );
+
+  it("returns a recovered sandbox to its retained pre-upgrade stopped state", async () => {
+    const harness = createRecoveryHarness(["stopped-box", "ready-box"], {
+      registryOverrides: {
+        "stopped-box": { stopped: true },
+        "ready-box": { stopped: false },
+      },
+    });
+    const sequence: string[] = [];
+    harness.rebuildSpy.mockImplementation(async (name: string) => {
+      sequence.push(`rebuild:${name}`);
+    });
+    harness.stopSpy.mockImplementation(async (name: string) => {
+      sequence.push(`stop:${name}`);
+      return { exitCode: 0 };
+    });
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(sequence).toEqual(["rebuild:stopped-box", "stop:stopped-box", "rebuild:ready-box"]);
+    expect(harness.stopSpy).toHaveBeenCalledOnce();
+    expect(harness.stopSpy).toHaveBeenCalledWith("stopped-box");
+  });
+
+  it("reconciles a current stopped sandbox without rebuilding on the installer verification pass", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      liveOutput: "stopped-box Stopped",
+      registryOverrides: { "stopped-box": { stopped: true } },
+    });
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(harness.latestBackupSpy).not.toHaveBeenCalled();
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(harness.stopSpy).toHaveBeenCalledWith("stopped-box");
+    expect(console.log).toHaveBeenCalledWith("  ✓ 1 sandbox(es) reconciled to stopped state.");
+  });
+
+  it("accepts an observed Stopped phase in check mode without mutating it", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      liveOutput: "stopped-box Stopped",
+      registryOverrides: { "stopped-box": { stopped: true } },
+    });
+
+    await expect(harness.upgradeSandboxes({ check: true })).resolves.toBeUndefined();
+
+    expect(harness.latestBackupSpy).not.toHaveBeenCalled();
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(harness.stopSpy).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("  All sandboxes are up to date.");
+  });
+
+  it("reports a Ready sandbox with retained stopped intent in check mode", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      liveOutput: "stopped-box Ready",
+      registryOverrides: { "stopped-box": { stopped: true } },
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(harness.stopSpy).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith("  1 sandbox(es) need stopped-state reconciliation.");
+  });
+
+  it("still recovers an intentionally stopped sandbox when its managed image is stale", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      liveOutput: "stopped-box Stopped",
+      registryOverrides: { "stopped-box": { stopped: true } },
+      staleNames: ["stopped-box"],
+    });
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(harness.latestBackupSpy).toHaveBeenCalledWith("stopped-box");
+    expect(harness.rebuildSpy).toHaveBeenCalledOnce();
+    expect(harness.stopSpy).toHaveBeenCalledWith("stopped-box");
+  });
+
+  it("fails recovery when the rebuilt sandbox cannot regain its stopped state", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      registryOverrides: { "stopped-box": { stopped: true } },
+    });
+    harness.stopSpy.mockResolvedValue({
+      exitCode: 1,
+      message: "OpenShell did not confirm the stopped state",
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Failed to recover 'stopped-box': OpenShell did not confirm the stopped state",
+      ),
+    );
+  });
+
+  it("fails closed before stop when rebuilt stopped intent cannot be retained", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      registryOverrides: { "stopped-box": { stopped: true } },
+    });
+    harness.recordStopIntentSpy.mockReturnValue(false);
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.stopSpy).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Failed to recover 'stopped-box': the rebuilt sandbox's pre-upgrade stopped-state intent could not be retained",
+      ),
+    );
+  });
+
+  it("retries stopped-state reconciliation without rebuilding after a post-rebuild stop failure", async () => {
+    const harness = createRecoveryHarness(["stopped-box"], {
+      liveOutput: "stopped-box Stopped",
+      registryOverrides: { "stopped-box": { stopped: true } },
+      staleNames: ["stopped-box"],
+    });
+    harness.stopSpy.mockResolvedValue({
+      exitCode: 1,
+      message: "OpenShell did not confirm the stopped state",
+    });
+    harness.rebuildSpy.mockImplementation(async (name: string) => {
+      const entry = harness.registryEntries.find((candidate) => candidate.name === name);
+      Object.assign(entry ?? {}, { stopped: false });
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+    expect(harness.registryEntries[0]?.stopped).toBe(true);
+    expect(harness.recordStopIntentSpy).toHaveBeenCalledWith(
+      "stopped-box",
+      true,
+      registry.updateSandbox,
+    );
+    expect(harness.recordStopIntentSpy.mock.invocationCallOrder[0]!).toBeLessThan(
+      harness.stopSpy.mock.invocationCallOrder[0]!,
+    );
+
+    harness.liveListSpy.mockResolvedValue(sandboxInventory("stopped-box Ready"));
+    harness.checkAgentVersionSpy.mockResolvedValue({
+      sandboxVersion: "2026.5.27",
+      expectedVersion: "2026.5.27",
+      isStale: false,
+      verificationFailed: false,
+      detectionMethod: "live",
+    });
+    harness.rebuildSpy.mockClear();
+    harness.stopSpy.mockReset().mockResolvedValue({ exitCode: 0 });
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(harness.stopSpy).toHaveBeenCalledOnce();
+    expect(harness.stopSpy).toHaveBeenCalledWith("stopped-box");
+    expect(console.log).toHaveBeenCalledWith("  ✓ 1 sandbox(es) reconciled to stopped state.");
   });
 
   it.each([
@@ -209,75 +413,68 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       options: { auto: true },
       expectedRebuilds: 2,
       expectedSequence: [
-        "warning:/sandbox/.openclaw",
-        "warning:/sandbox/.hermes",
+        "warning:/sandbox",
+        "warning:/sandbox",
         "rebuild:openclaw-box",
         "rebuild:hermes-box",
       ],
+      // #10211: an actionable --check finding now exits nonzero.
+      expectExit: false,
     },
     {
       mode: "check-only",
       options: { check: true },
       expectedRebuilds: 0,
-      expectedSequence: ["warning:/sandbox/.openclaw", "warning:/sandbox/.hermes"],
+      expectedSequence: ["warning:/sandbox", "warning:/sandbox"],
+      expectExit: true,
     },
-  ] as const)("warns with each agent's restore path before $mode mixed recovery (#7073)", async ({
-    options,
-    expectedRebuilds,
-    expectedSequence,
-  }) => {
-    const sequence: string[] = [];
-    const warningMessages: string[] = [];
-    const statePaths = ["/sandbox/.openclaw", "/sandbox/.hermes"];
-    const harness = createRecoveryHarness(["openclaw-box", "hermes-box"], {
-      manifestAgentTypes: { "openclaw-box": "openclaw", "hermes-box": "hermes" },
-      registryOverrides: {
-        "openclaw-box": { agent: "openclaw" },
-        "hermes-box": { agent: "hermes" },
-      },
-    });
-    vi.mocked(console.log).mockImplementation((...args) => {
-      const message = String(args[0]);
-      warningMessages.push(...[message].filter((entry) => entry.includes("⚠ Recovery restores")));
-      sequence.push(
-        ...statePaths
-          .filter((candidate) =>
-            message.includes(`Recovery restores ${JSON.stringify(candidate)} state only`),
-          )
-          .map((statePath) => `warning:${statePath}`),
-      );
-    });
-    harness.rebuildSpy.mockImplementation(async (name: string) => {
-      sequence.push(`rebuild:${name}`);
-    });
+  ] as const)(
+    "warns about each complete native archive before $mode mixed recovery (#7073)",
+    async ({ options, expectedRebuilds, expectedSequence, expectExit }) => {
+      const sequence: string[] = [];
+      const warningMessages: string[] = [];
+      const harness = createRecoveryHarness(["openclaw-box", "hermes-box"], {
+        manifestAgentTypes: { "openclaw-box": "openclaw", "hermes-box": "hermes" },
+        registryOverrides: {
+          "openclaw-box": { agent: "openclaw" },
+          "hermes-box": { agent: "hermes" },
+        },
+      });
+      vi.mocked(console.log).mockImplementation((...args) => {
+        const message = String(args[0]);
+        warningMessages.push(...[message].filter((entry) => entry.includes("⚠ Recovery restores")));
+        sequence.push(
+          ...[message]
+            .filter((entry) =>
+              entry.includes('complete native home/workspace archive rooted at "/sandbox"'),
+            )
+            .map(() => "warning:/sandbox"),
+        );
+      });
+      harness.rebuildSpy.mockImplementation(async (name: string) => {
+        sequence.push(`rebuild:${name}`);
+      });
+      expectExit &&
+        vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+          throw new Error(`process.exit(${code})`);
+        }) as never);
 
-    await expect(harness.upgradeSandboxes(options)).resolves.toBeUndefined();
+      await (expectExit
+        ? expect(harness.upgradeSandboxes(options)).rejects.toThrow("process.exit(1)")
+        : expect(harness.upgradeSandboxes(options)).resolves.toBeUndefined());
 
-    expect(warningMessages).toHaveLength(statePaths.length);
-    expect(
-      warningMessages.map((message) =>
-        statePaths.filter((statePath) =>
-          message.includes(`Recovery restores ${JSON.stringify(statePath)} state only`),
-        ),
-      ),
-    ).toEqual(statePaths.map((statePath) => [statePath]));
-    for (const statePath of statePaths) {
-      expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining(
-          `Recovery restores ${JSON.stringify(statePath)} state only for this sandbox`,
-        ),
-      );
-    }
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("Files outside this recorded managed state path"),
-    );
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("/sandbox/user-data"));
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("NOT preserved by the recreate"),
-    );
-    expect(harness.rebuildSpy).toHaveBeenCalledTimes(expectedRebuilds);
-    expect(sequence).toEqual(expectedSequence);
-  });
+      expect(warningMessages).toEqual([
+        expect.stringContaining('complete native home/workspace archive rooted at "/sandbox"'),
+        expect.stringContaining('complete native home/workspace archive rooted at "/sandbox"'),
+      ]);
+      expect(warningMessages).toEqual([
+        expect.stringContaining("OpenShell-owned credential stores and host-only secrets"),
+        expect.stringContaining("OpenShell-owned credential stores and host-only secrets"),
+      ]);
+      expect(harness.rebuildSpy).toHaveBeenCalledTimes(expectedRebuilds);
+      expect(sequence).toEqual(expectedSequence);
+    },
+  );
 
   it("continues through all eligible sandboxes before reporting a recovery failure", async () => {
     const harness = createRecoveryHarness(["alpha", "beta"]);
@@ -293,6 +490,26 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining("Failed to recover 'alpha': alpha failed"),
     );
+  });
+
+  it("restores stale live sandboxes from the validated pre-upgrade backup (#7615, #7798)", async () => {
+    const names = ["alpha", "beta"];
+    const harness = createRecoveryHarness(names, {
+      liveOutput: names.map((name) => `${name} Ready`).join("\n"),
+      staleNames: names,
+    });
+
+    await expect(harness.upgradeSandboxes(["--auto"])).resolves.toBeUndefined();
+
+    expect(harness.rebuildSpy).toHaveBeenNthCalledWith(1, "alpha", ["--yes"], {
+      recoveryManifest: expect.objectContaining({ sandboxName: "alpha" }),
+      throwOnError: true,
+    });
+    expect(harness.rebuildSpy).toHaveBeenNthCalledWith(2, "beta", ["--yes"], {
+      recoveryManifest: expect.objectContaining({ sandboxName: "beta" }),
+      throwOnError: true,
+    });
+    expect(harness.rebuildSpy).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed for a probed v0.0.55 custom image with matching backup agent version", async () => {
@@ -370,6 +587,193 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     });
   });
 
+  it("recovers a confirmed legacy sandbox when Ready cannot be version-verified (#7475)", async () => {
+    const harness = createRecoveryHarness(["legacy-box"], {
+      liveOutput: "legacy-box Ready",
+      confirmedLegacyManagedNames: ["legacy-box"],
+      registryOverrides: {
+        "legacy-box": { agent: "openclaw", nemoclawVersion: undefined },
+      },
+      useRealManagedEvidence: true,
+    });
+    harness.checkAgentVersionSpy.mockResolvedValue({
+      sandboxVersion: null,
+      expectedVersion: "2026.5.27",
+      isStale: false,
+      verificationFailed: true,
+      detectionMethod: "unknown",
+      unavailableReason: "probe-failed",
+    });
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(harness.rebuildSpy).toHaveBeenCalledExactlyOnceWith("legacy-box", ["--yes"], {
+      throwOnError: true,
+      recoveryManifest: expect.objectContaining({ sandboxName: "legacy-box" }),
+      allowLegacyManagedImageRecovery: true,
+    });
+  });
+
+  it.each([
+    { confirmed: true, probeStatus: 42, rebuilds: 1 },
+    { confirmed: false, probeStatus: 42, rebuilds: 0 },
+    { confirmed: true, probeStatus: 0, rebuilds: 0 },
+  ])(
+    "selects recovery from an executed probe with status $probeStatus and confirmation $confirmed (#7475)",
+    async ({ confirmed, probeStatus, rebuilds }) => {
+      const expectedVersion = loadAgent("openclaw").expectedVersion!;
+      const harness = createRecoveryHarness(["legacy-box"], {
+        liveOutput: "legacy-box Ready",
+        confirmedLegacyManagedNames: confirmed ? ["legacy-box"] : [],
+        registryOverrides: {
+          "legacy-box": { agent: "openclaw", agentVersion: expectedVersion, nemoclawVersion: null },
+        },
+        useRealManagedEvidence: true,
+      });
+      harness.checkAgentVersionSpy.mockRestore();
+      vi.spyOn(registry, "getSandbox").mockReturnValue(harness.registryEntries[0]!);
+      vi.spyOn(registry, "updateSandbox").mockReturnValue(true);
+      const directory = mkdtempSync(join(tmpdir(), "legacy-version-probe-"));
+      onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+      writeFileSync(
+        join(directory, "openclaw"),
+        `#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 99
+printf '%s\\n' '${expectedVersion}'
+exit ${probeStatus}
+`,
+        { mode: 0o700 },
+      );
+      // Run the production transport command locally; only the OpenShell execution boundary is replaced.
+      const runBuffered = vi.fn(async (request: OpenShellSandboxBufferedCommandRequest) => {
+        const [command, ...args] = request.command;
+        const result = spawnSync(command!, args, {
+          encoding: "utf8",
+          timeout: 5_000,
+          env: { HOME: directory, PATH: `${directory}:/usr/bin:/bin` },
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(probeStatus);
+        return {
+          outcome: { kind: "completed" as const, exitCode: result.status! },
+          stdout: result.stdout,
+          stderr: result.stderr,
+        };
+      });
+      vi.spyOn(commandExecutor, "createCliOpenShellSandboxCommandExecutor").mockReturnValue({
+        runBuffered,
+        probeDirectory: vi.fn().mockRejectedValue(new Error("Unexpected directory probe")),
+        runStreaming: vi.fn().mockRejectedValue(new Error("Unexpected streaming command")),
+      });
+
+      await harness.upgradeSandboxes({ auto: true });
+
+      expect(runBuffered).toHaveBeenCalledTimes(1);
+      expect(harness.rebuildSpy).toHaveBeenCalledTimes(rebuilds);
+    },
+  );
+
+  it.each([
+    { condition: "confirmation is absent", confirmedLegacyManagedNames: [] },
+    { condition: "another name is confirmed", confirmedLegacyManagedNames: ["other-box"] },
+    { condition: "restore intent is absent", restoreIntent: "" },
+    { condition: "its gateway differs", gatewayNames: { "legacy-box": "nemoclaw-18080" } },
+    { condition: "its managed fingerprint is current", nemoclawVersion: "0.0.71" },
+    {
+      condition: "its agent version is verified",
+      versionCheck: {
+        sandboxVersion: "2026.5.27",
+        expectedVersion: "2026.5.27",
+        isStale: false,
+        verificationFailed: false,
+        detectionMethod: "openshell-exec" as const,
+      },
+    },
+    { condition: "no expected version exists", unavailableReason: "no-expected-version" as const },
+    { condition: "the probe was skipped", unavailableReason: "skip-probe" as const },
+    { condition: "its agent is outside the OpenClaw recovery scope", agent: "hermes" as const },
+  ])(
+    "does not recover an unverified Ready legacy row when $condition (#7475)",
+    async (scenario) => {
+      const harness = createRecoveryHarness(["legacy-box"], {
+        liveOutput: "legacy-box Ready",
+        confirmedLegacyManagedNames: scenario.confirmedLegacyManagedNames ?? ["legacy-box"],
+        gatewayNames: scenario.gatewayNames,
+        registryOverrides: {
+          "legacy-box": {
+            agent: scenario.agent ?? "openclaw",
+            nemoclawVersion: scenario.nemoclawVersion,
+          },
+        },
+        useRealManagedEvidence: true,
+      });
+      vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", scenario.restoreIntent ?? "1");
+      harness.checkAgentVersionSpy.mockResolvedValue(
+        scenario.versionCheck ?? {
+          sandboxVersion: null,
+          expectedVersion: "2026.5.27",
+          isStale: false,
+          verificationFailed: true,
+          detectionMethod: scenario.unavailableReason ? "unavailable" : "unknown",
+          unavailableReason: scenario.unavailableReason ?? "probe-failed",
+        },
+      );
+
+      await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+      expect(harness.latestBackupSpy).not.toHaveBeenCalled();
+      expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { condition: "missing backup", latestBackup: null },
+    { condition: "custom image", fromDockerfile: "/tmp/custom.Dockerfile" },
+    {
+      condition: "invalid manifest",
+      validation: {
+        ok: false as const,
+        reason: "manifest sandbox does not match the requested sandbox",
+      },
+    },
+  ])(
+    "rejects confirmed Ready legacy recovery with $condition before rebuild (#7475)",
+    async (scenario) => {
+      const harness = createRecoveryHarness(["legacy-box"], {
+        liveOutput: "legacy-box Ready",
+        confirmedLegacyManagedNames: ["legacy-box"],
+        latestBackup: scenario.latestBackup,
+        registryOverrides: {
+          "legacy-box": {
+            agent: "openclaw",
+            nemoclawVersion: undefined,
+            fromDockerfile: scenario.fromDockerfile,
+          },
+        },
+        useRealManagedEvidence: true,
+      });
+      harness.checkAgentVersionSpy.mockResolvedValue({
+        sandboxVersion: null,
+        expectedVersion: "2026.5.27",
+        isStale: false,
+        verificationFailed: true,
+        detectionMethod: "unknown",
+        unavailableReason: "probe-failed",
+      });
+      vi.mocked(sandboxState.validateRebuildRecoveryManifest).mockReturnValue(
+        scenario.validation ?? { ok: true, manifest: makeManifest("legacy-box") },
+      );
+      vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
+
+      await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+
+      expect(harness.latestBackupSpy).toHaveBeenCalledWith("legacy-box");
+      expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not apply legacy confirmation to another sandbox name (#6114)", async () => {
     const harness = createRecoveryHarness(["legacy-box"], {
       confirmedLegacyManagedNames: ["other-box"],
@@ -391,26 +795,25 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     );
   });
 
-  it.each([
-    "not-json",
-    '{"legacy-box":true}',
-    '["legacy-box",1]',
-  ])("rejects malformed scoped confirmation %s (#6114)", async (confirmedLegacyManagedNames) => {
-    const harness = createRecoveryHarness(["legacy-box"], {
-      confirmedLegacyManagedNames,
-      registryOverrides: {
-        "legacy-box": { agent: null, nemoclawVersion: null },
-      },
-      useRealManagedEvidence: true,
-    });
-    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`process.exit(${code})`);
-    }) as never);
+  it.each(["not-json", '{"legacy-box":true}', '["legacy-box",1]'])(
+    "rejects malformed scoped confirmation %s (#6114)",
+    async (confirmedLegacyManagedNames) => {
+      const harness = createRecoveryHarness(["legacy-box"], {
+        confirmedLegacyManagedNames,
+        registryOverrides: {
+          "legacy-box": { agent: null, nemoclawVersion: null },
+        },
+        useRealManagedEvidence: true,
+      });
+      vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
 
-    await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+      await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
 
-    expect(harness.rebuildSpy).not.toHaveBeenCalled();
-  });
+      expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not let legacy confirmation override a recorded custom image (#6114)", async () => {
     const harness = createRecoveryHarness(["custom-box"], {
@@ -451,11 +854,11 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
   });
 
   it("warns and does not recover a stale registered sandbox absent from the selected gateway", async () => {
-    const harness = createRecoveryHarness(["registered-elsewhere"], {
-      gatewayNames: { "registered-elsewhere": "gateway-b" },
+    const harness = createRecoveryHarness(["registered-away"], {
+      gatewayNames: { "registered-away": "gateway-b" },
       liveOutput: "selected-gateway-box Ready",
       latestBackup: null,
-      staleNames: ["registered-elsewhere"],
+      staleNames: ["registered-away"],
     });
     const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code})`);
@@ -506,7 +909,7 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       liveOutput: "other-box Ready",
     });
     vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "0");
-    vi.spyOn(sandboxVersion, "checkAgentVersion").mockReturnValue({
+    vi.spyOn(sandboxVersion, "checkAgentVersion").mockResolvedValue({
       sandboxVersion: null,
       expectedVersion: "2026.5.27",
       isStale: false,
@@ -529,12 +932,106 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       staleNames: ["my-assistant"],
     });
     vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "0");
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
 
-    await expect(harness.upgradeSandboxes({ check: true })).resolves.toBeUndefined();
+    // #10211: an actionable --check finding exits nonzero rather than 0.
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
 
     expect(harness.rebuildSpy).not.toHaveBeenCalled();
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining("were not found on their recorded gateway: my-assistant"),
+    );
+  });
+
+  it("keeps both absent-sandbox listings read-only in --check mode (#7279)", async () => {
+    const harness = createRecoveryHarness(["my-assistant"], {
+      liveOutput: "other-box Ready",
+      latestBackup: null,
+      staleNames: ["my-assistant"],
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    // #10211: an actionable --check finding exits nonzero rather than 0.
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.readOnlyListSpy).toHaveBeenCalledTimes(2);
+    expect(harness.readOnlyListSpy).toHaveBeenNthCalledWith(
+      1,
+      {
+        action: "checking sandbox upgrade state",
+        command: "nemoclaw upgrade-sandboxes",
+      },
+      "nemoclaw",
+    );
+    expect(harness.readOnlyListSpy).toHaveBeenNthCalledWith(
+      2,
+      {
+        action: "confirming sandboxes absent from the selected gateway",
+        command: "nemoclaw upgrade-sandboxes",
+      },
+      "nemoclaw",
+    );
+    expect(harness.liveListSpy).not.toHaveBeenCalled();
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+  });
+
+  it("exits nonzero from --check when a live sandbox is stale (#10211)", async () => {
+    const harness = createRecoveryHarness(["stale-box"], {
+      liveOutput: "stale-box Ready",
+      staleNames: ["stale-box"],
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("1 sandbox(es) need upgrading."),
+    );
+  });
+
+  it("exits nonzero from --check when a live sandbox version is unknown (#10211)", async () => {
+    const harness = createRecoveryHarness(["unknown-box"], {
+      liveOutput: "unknown-box Ready",
+    });
+    harness.checkAgentVersionSpy.mockResolvedValue({
+      sandboxVersion: null,
+      expectedVersion: "2026.5.27",
+      isStale: false,
+      verificationFailed: true,
+      detectionMethod: "registry",
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Unknown version"));
+  });
+
+  it("exits nonzero from --check when backup recovery is blocked (#10211)", async () => {
+    const harness = createRecoveryHarness(["broken-box"], {
+      latestBackup: null,
+      liveOutput: "broken-box Error",
+      staleNames: ["broken-box"],
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ check: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("cannot be recovered automatically"),
     );
   });
 
@@ -560,8 +1057,8 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
   });
 
   it("does not flag a sandbox bound to another live gateway as orphaned (#6520)", async () => {
-    const harness = createRecoveryHarness(["registered-elsewhere"], {
-      gatewayNames: { "registered-elsewhere": "gateway-b" },
+    const harness = createRecoveryHarness(["registered-away"], {
+      gatewayNames: { "registered-away": "gateway-b" },
       liveOutput: "selected-box Ready",
     });
     vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "0");
@@ -579,8 +1076,8 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       staleNames: ["reconnecting-box"],
     });
     harness.liveListSpy
-      .mockResolvedValueOnce({ status: 0, output: "other-box Ready" })
-      .mockResolvedValueOnce({ status: 0, output: "reconnecting-box Ready" });
+      .mockResolvedValueOnce(sandboxInventory("other-box Ready"))
+      .mockResolvedValueOnce(sandboxInventory("reconnecting-box Ready"));
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
@@ -617,10 +1114,10 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
   });
 
   it("does not recover an absent sandbox bound to a different gateway even when a validated backup exists", async () => {
-    const harness = createRecoveryHarness(["registered-elsewhere"], {
-      gatewayNames: { "registered-elsewhere": "gateway-b" },
+    const harness = createRecoveryHarness(["registered-away"], {
+      gatewayNames: { "registered-away": "gateway-b" },
       liveOutput: "selected-box Ready",
-      staleNames: ["registered-elsewhere"],
+      staleNames: ["registered-away"],
     });
     const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code})`);
@@ -642,8 +1139,8 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       liveOutput: "other-box Ready",
     });
     harness.liveListSpy
-      .mockResolvedValueOnce({ status: 0, output: "other-box Ready" })
-      .mockResolvedValueOnce({ status: 0, output: "still-other-box Ready" });
+      .mockResolvedValueOnce(sandboxInventory("other-box Ready"))
+      .mockResolvedValueOnce(sandboxInventory("still-other-box Ready"));
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
@@ -666,8 +1163,8 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     const harness = createRecoveryHarness(["healthy-box"], { gatewayPort: 12345 });
     harness.liveListSpy.mockImplementation(async (...args: unknown[]) =>
       (args[1] as { gatewayName?: string } | undefined)?.gatewayName === targetGatewayName
-        ? { status: 0, output: "healthy-box Ready" }
-        : { status: 0, output: "default-other-box Ready" },
+        ? sandboxInventory("healthy-box Ready")
+        : sandboxInventory("default-other-box Ready"),
     );
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
@@ -715,9 +1212,9 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
   });
 
   it("does not recover a non-Ready sandbox bound to another valid gateway (#6114)", async () => {
-    const harness = createRecoveryHarness(["registered-elsewhere"], {
-      gatewayNames: { "registered-elsewhere": "nemoclaw-12345" },
-      liveOutput: "registered-elsewhere Provisioning",
+    const harness = createRecoveryHarness(["registered-away"], {
+      gatewayNames: { "registered-away": "nemoclaw-12345" },
+      liveOutput: "registered-away Provisioning",
     });
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
@@ -733,8 +1230,8 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
       staleNames: ["reconnecting-box"],
     });
     harness.liveListSpy
-      .mockResolvedValueOnce({ status: 0, output: "other-box Ready" })
-      .mockResolvedValueOnce({ status: 0, output: "reconnecting-box Ready" });
+      .mockResolvedValueOnce(sandboxInventory("other-box Ready"))
+      .mockResolvedValueOnce(sandboxInventory("reconnecting-box Ready"));
 
     await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
@@ -746,28 +1243,28 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     );
   });
 
-  it.each([
-    "Provisioning",
-    "Error",
-  ])("recovers an absent sandbox when confirmation reports the %s phase (#6114)", async (phase) => {
-    const harness = createRecoveryHarness(["orphaned-box"], {
-      liveOutput: "other-box Ready",
-    });
-    harness.liveListSpy
-      .mockResolvedValueOnce({ status: 0, output: "other-box Ready" })
-      .mockResolvedValueOnce({ status: 0, output: `orphaned-box ${phase}` });
+  it.each(["Provisioning", "Error"])(
+    "recovers an absent sandbox when confirmation reports the %s phase (#6114)",
+    async (phase) => {
+      const harness = createRecoveryHarness(["orphaned-box"], {
+        liveOutput: "other-box Ready",
+      });
+      harness.liveListSpy
+        .mockResolvedValueOnce(sandboxInventory("other-box Ready"))
+        .mockResolvedValueOnce(sandboxInventory(`orphaned-box ${phase}`));
 
-    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+      await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
 
-    expect(harness.liveListSpy).toHaveBeenCalledTimes(2);
-    expect(harness.latestBackupSpy).toHaveBeenCalledWith("orphaned-box");
-    expect(harness.rebuildSpy).toHaveBeenCalledWith("orphaned-box", ["--yes"], {
-      throwOnError: true,
-      recoveryManifest: expect.objectContaining({ sandboxName: "orphaned-box" }),
-    });
-  });
+      expect(harness.liveListSpy).toHaveBeenCalledTimes(2);
+      expect(harness.latestBackupSpy).toHaveBeenCalledWith("orphaned-box");
+      expect(harness.rebuildSpy).toHaveBeenCalledWith("orphaned-box", ["--yes"], {
+        throwOnError: true,
+        recoveryManifest: expect.objectContaining({ sandboxName: "orphaned-box" }),
+      });
+    },
+  );
 
-  it("attempts both a live stale rebuild and a prepared non-Ready recovery", async () => {
+  it("uses prepared recovery for both stale live and non-Ready sandboxes", async () => {
     const harness = createRecoveryHarness(["stale-box", "recovery-box"], {
       liveOutput: "stale-box Ready\nrecovery-box Error",
       staleNames: ["stale-box"],
@@ -778,12 +1275,46 @@ describe("upgrade-sandboxes prepared backup recovery (#6114)", () => {
     expect(harness.rebuildSpy).toHaveBeenCalledTimes(2);
     expect(harness.rebuildSpy).toHaveBeenNthCalledWith(1, "stale-box", ["--yes"], {
       throwOnError: true,
-      recoveryManifest: undefined,
+      recoveryManifest: expect.objectContaining({ sandboxName: "stale-box" }),
     });
     expect(harness.rebuildSpy).toHaveBeenNthCalledWith(2, "recovery-box", ["--yes"], {
       throwOnError: true,
       recoveryManifest: expect.objectContaining({ sandboxName: "recovery-box" }),
     });
+  });
+
+  it("takes a fresh backup for stale live sandboxes outside installer restore intent", async () => {
+    const harness = createRecoveryHarness(["stale-box"], {
+      liveOutput: "stale-box Ready",
+      staleNames: ["stale-box"],
+    });
+    vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "0");
+
+    await expect(harness.upgradeSandboxes({ auto: true })).resolves.toBeUndefined();
+
+    expect(harness.latestBackupSpy).not.toHaveBeenCalled();
+    expect(harness.rebuildSpy).toHaveBeenCalledWith("stale-box", ["--yes"], {
+      throwOnError: true,
+      recoveryManifest: undefined,
+    });
+  });
+
+  it("fails closed when a stale live sandbox has no validated pre-upgrade backup", async () => {
+    const harness = createRecoveryHarness(["stale-box"], {
+      latestBackup: null,
+      liveOutput: "stale-box Ready",
+      staleNames: ["stale-box"],
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(harness.upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
+
+    expect(harness.rebuildSpy).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("no validated pre-upgrade backup was found"),
+    );
   });
 
   it("fails closed for a live Error sandbox with no latest backup", async () => {

@@ -41,73 +41,11 @@ export const TRACING_ENABLE_ENV_NAMES = [
 ] as const;
 export const ANALYTICS_DISABLE_ENV_NAMES = ["LANGGRAPH_CLI_NO_ANALYTICS"] as const;
 
-export function makeStartScriptFixture(
-  tempDir: string,
-  original: string,
-): {
-  envFile: string;
-  scriptPath: string;
-} {
-  const envFile = path.join(tempDir, "proxy-env.sh");
-  const scriptPath = path.join(tempDir, "start.sh");
-  const rlimitLib = path.join(tempDir, "sandbox-rlimits.sh");
-  const hostFile = path.join(tempDir, "trusted-proxy-host");
-  const portFile = path.join(tempDir, "trusted-proxy-port");
-  const caFile = path.join(tempDir, "trusted-ca-bundle.pem");
-  const markerDir = path.join(tempDir, "persistent-dcode-state");
-  expect(original).toContain("local target=/tmp/nemoclaw-proxy-env.sh");
-  expect(original).toContain('tmp="$(mktemp /tmp/nemoclaw-proxy-env.XXXXXX)"');
-  expect(original).toContain("local marker_dir=/sandbox/.deepagents");
-  const fixture = original
-    .replace("/usr/local/lib/nemoclaw/sandbox-rlimits.sh", rlimitLib)
-    .replace(
-      'readonly MANAGED_PROXY_HOST_FILE="/usr/local/share/nemoclaw/dcode-proxy-host"',
-      `readonly MANAGED_PROXY_HOST_FILE="${hostFile}"`,
-    )
-    .replace(
-      'readonly MANAGED_PROXY_PORT_FILE="/usr/local/share/nemoclaw/dcode-proxy-port"',
-      `readonly MANAGED_PROXY_PORT_FILE="${portFile}"`,
-    )
-    .replace(
-      'readonly MANAGED_FETCH_CA_BUNDLE_FILE="/etc/openshell-tls/ca-bundle.pem"',
-      `readonly MANAGED_FETCH_CA_BUNDLE_FILE="${caFile}"`,
-    )
-    .replace(
-      "readonly MANAGED_PROXY_OWNER_UID=0",
-      `readonly MANAGED_PROXY_OWNER_UID=${process.getuid?.() ?? 0}`,
-    )
-    .replace("local target=/tmp/nemoclaw-proxy-env.sh", `local target="${envFile}"`)
-    .replace(
-      'tmp="$(mktemp /tmp/nemoclaw-proxy-env.XXXXXX)"',
-      `tmp="$(mktemp "${tempDir}/nemoclaw-proxy-env.XXXXXX")"`,
-    )
-    .replace("local marker_dir=/sandbox/.deepagents", `local marker_dir="${markerDir}"`);
-  expect(fixture).toContain(`local target="${envFile}"`);
-  expect(fixture).toContain(`tmp="$(mktemp "${tempDir}/nemoclaw-proxy-env.XXXXXX")"`);
-  expect(fixture).not.toContain("local target=/tmp/nemoclaw-proxy-env.sh");
-  expect(fixture).not.toContain('tmp="$(mktemp /tmp/nemoclaw-proxy-env.XXXXXX)"');
-  expect(fixture).toContain(`local marker_dir="${markerDir}"`);
-  expect(fixture).not.toContain("local marker_dir=/sandbox/.deepagents");
-  fs.writeFileSync(hostFile, "10.200.0.1\n", "utf8");
-  fs.writeFileSync(portFile, "3128\n", "utf8");
-  fs.writeFileSync(caFile, "trusted CA bundle\n", "utf8");
-  fs.writeFileSync(
-    rlimitLib,
-    "harden_resource_limits() { :; }\nverify_resource_limits_exact() { :; }\n",
-    "utf8",
-  );
-  fs.chmodSync(hostFile, 0o444);
-  fs.chmodSync(portFile, 0o444);
-  fs.chmodSync(caFile, 0o444);
-  fs.writeFileSync(scriptPath, fixture, "utf8");
-  fs.chmodSync(scriptPath, 0o755);
-  return { envFile, scriptPath };
-}
-
 type HeadlessCheckOperation =
   | "classify-output"
   | "contains-secret"
   | "entrypoint-rlimits"
+  | "inference-route-contract"
   | "managed-placeholder"
   | "managed-route"
   | "positive-integer";
@@ -118,6 +56,7 @@ type HeadlessCheckEnvironment = Partial<
     | "DCODE_EXIT"
     | "DEEPAGENTS_HEADLESS_TIMEOUT"
     | "HEADLESS_OUTPUT"
+    | "NEMOCLAW_ENDPOINT_URL"
     | "PROC_ROOT"
     | "TOKEN",
     string
@@ -132,6 +71,9 @@ case "$1" in
     ;;
   managed-placeholder)
     printf "%s" "$CONFIG" | references_managed_placeholder_key && printf key
+    ;;
+  inference-route-contract)
+    printf "%s" "$CONFIG" | configured_inference_route_contract
     ;;
   classify-output)
     if classification="$(classify_headless_output "$DCODE_EXIT" "$HEADLESS_OUTPUT")"; then
@@ -211,7 +153,9 @@ export function runHeadlessCheckHelper(
       DCODE_EXIT: env.DCODE_EXIT ?? "",
       DEEPAGENTS_HEADLESS_TIMEOUT: env.DEEPAGENTS_HEADLESS_TIMEOUT ?? "",
       HEADLESS_OUTPUT: env.HEADLESS_OUTPUT ?? "",
-      PATH: "/usr/bin:/bin",
+      NEMOCLAW_ENDPOINT_URL: env.NEMOCLAW_ENDPOINT_URL ?? "",
+      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      REPO: repoRoot,
       PROC_ROOT: env.PROC_ROOT ?? "",
       TOKEN: env.TOKEN ?? "",
     },
@@ -225,10 +169,15 @@ export function runHeadlessCheckSnippet(
 ): string {
   const source = fs
     .readFileSync(sourcePath, "utf8")
-    .replace("${BASH_SOURCE[0]}", "${BASH_SOURCE[0]-}");
+    .replaceAll("${BASH_SOURCE[0]}", "${BASH_SOURCE[0]-}");
   return execFileSync("/bin/bash", ["-s"], {
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    env: {
+      ...process.env,
+      REPO: repoRoot,
+      ...env,
+      PATH: `${env.PATH ?? process.env.PATH ?? "/usr/bin:/bin"}:${path.dirname(process.execPath)}`,
+    },
     input: `${source}\n${snippet}\n`,
   });
 }

@@ -15,7 +15,12 @@
  */
 
 import { HOST_GATEWAY_URL } from "../inference/local";
-import { DEFAULT_MODEL_ROUTER_CREDENTIAL_ENV, loadBlueprintProfile } from "./model-router";
+import { withModelRouterPortLifecycleLock } from "../inference/gateway-route-mutation-lock";
+import {
+  DEFAULT_MODEL_ROUTER_CREDENTIAL_ENV,
+  loadBlueprintProfile,
+  resolveModelRouterPort,
+} from "./model-router";
 
 export type UpsertProviderResult = {
   ok: boolean;
@@ -30,7 +35,7 @@ export type RoutedProviderDeps = {
     credentialEnv: string,
     baseUrl: string | null,
     env: NodeJS.ProcessEnv,
-  ) => UpsertProviderResult;
+  ) => UpsertProviderResult | Promise<UpsertProviderResult>;
   hydrateCredentialEnv: (credentialEnv: string) => string | null | undefined;
 };
 
@@ -99,17 +104,17 @@ export function resolveRoutedCredentialEnv(
  * Upsert the routed provider into the gateway with a normalized, sandbox-facing
  * base URL. Used by both fresh routed setup and resume repair.
  */
-export function upsertRoutedProvider(
+export async function upsertRoutedProvider(
   provider: string,
   endpointUrl: string | null,
   credentialEnv: string | null,
   deps: RoutedProviderDeps,
-): RoutedProviderUpsert {
+): Promise<RoutedProviderUpsert> {
   const resolvedCredentialEnv = resolveRoutedCredentialEnv(credentialEnv);
   const normalizedEndpoint = normalizeRoutedEndpointUrl(endpointUrl);
   const credentialValue = deps.hydrateCredentialEnv(resolvedCredentialEnv);
   const env = credentialValue ? { [resolvedCredentialEnv]: credentialValue } : {};
-  const result = deps.upsertProvider(
+  const result = await deps.upsertProvider(
     provider,
     "openai",
     resolvedCredentialEnv,
@@ -122,4 +127,19 @@ export function upsertRoutedProvider(
     resolvedCredentialEnv,
     result,
   };
+}
+
+export function withRoutedInferencePortLock<T>(
+  routed: boolean,
+  operation: () => Promise<T> | T,
+  deps: {
+    withModelRouterPortLifecycleLock?: typeof withModelRouterPortLifecycleLock;
+    getModelRouterPort?: typeof resolveModelRouterPort;
+  },
+): Promise<T> | T {
+  if (!routed) return operation();
+  return (deps.withModelRouterPortLifecycleLock ?? withModelRouterPortLifecycleLock)(
+    (deps.getModelRouterPort ?? resolveModelRouterPort)(),
+    operation,
+  );
 }

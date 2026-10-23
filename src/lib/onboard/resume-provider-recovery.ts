@@ -9,6 +9,9 @@
 // recorded `provider`/`model`, leaving the sandbox rebuild to fail with an
 // authentication error (#3278).
 
+import { fixedNativeProvider } from "../inference/native-provider/fixed";
+import { getRemoteProviderConfigForName } from "./inference-providers/provider-selection-keys";
+
 export type RemoteProviderConfigEntry = {
   label: string;
   providerName: string;
@@ -25,7 +28,7 @@ export type ResumeProviderRecoveryDeps = {
   remoteProviderConfig: Record<string, RemoteProviderConfigEntry>;
   defaultRouteCredentialEnv: string;
   isRoutedInferenceProvider: (provider: string) => boolean;
-  providerExistsInGateway: (name: string) => boolean;
+  providerExistsInGateway: (name: string) => boolean | Promise<boolean>;
   hydrateCredentialEnv: (envName: string) => string | null;
   getProviderLabel: (key: string) => string;
   isNonInteractive: () => boolean;
@@ -38,28 +41,18 @@ export type ResumeProviderRecoveryDeps = {
     label: string,
     helpUrl: string | null,
     validator: (value: string) => string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<unknown>;
+  revalidateSandboxIdentity?: (operation: string) => void;
   validateNvidiaApiKeyValue: (key: string, credentialEnv: string) => string | null;
 };
 
 export type ResumeProviderRecoveryResult = {
+  /** Route recovery through native setup; this is not evidence of credential ownership. */
+  nativeCustomSetup?: boolean;
   forceInferenceSetup: boolean;
   credentialEnv: string | null;
 };
-
-/**
- * Resolve a persisted OpenShell provider name back to its onboard provider config.
- */
-export function getRemoteProviderConfigForName(
-  provider: string | null | undefined,
-  remoteProviderConfig: Record<string, RemoteProviderConfigEntry>,
-): RemoteProviderConfigEntry | null {
-  if (!provider) return null;
-  if (provider === "nvidia-nim") return remoteProviderConfig.build;
-  return (
-    Object.values(remoteProviderConfig).find((entry) => entry.providerName === provider) || null
-  );
-}
 
 /**
  * Choose the credential env used to recreate a missing provider during resume.
@@ -82,6 +75,8 @@ export function getResumeProviderCredentialEnv(
  * Returns `forceInferenceSetup: true` when the caller must re-run the
  * inference setup step (provider was missing and credential was hydrated or
  * just re-entered). `credentialEnv` is the env var resolved for that recovery.
+ * Fixed native hosted providers always re-enter setup to verify their persisted
+ * ownership; NVIDIA and Hermes retain their separate credential recovery paths.
  *
  * In non-interactive mode with a missing credential, calls `deps.exit(1)`.
  */
@@ -90,11 +85,21 @@ export async function ensureResumeProviderReady(
   credentialEnv: string | null | undefined,
   deps: ResumeProviderRecoveryDeps,
 ): Promise<ResumeProviderRecoveryResult> {
+  const native = fixedNativeProvider(provider);
+  if (
+    native &&
+    native.logicalProvider !== "nvidia-prod" &&
+    native.logicalProvider !== "hermes-provider"
+  ) {
+    // Native setup verifies the persisted provider identity. The logical name
+    // is not a gateway provider, and its presence cannot authorize skipping setup.
+    return { forceInferenceSetup: true, credentialEnv: native.credentialEnv };
+  }
   const config = getRemoteProviderConfigForName(provider, deps.remoteProviderConfig);
   if (!provider || (!config && !deps.isRoutedInferenceProvider(provider))) {
     return { forceInferenceSetup: false, credentialEnv: credentialEnv ?? null };
   }
-  if (deps.providerExistsInGateway(provider)) {
+  if (await deps.providerExistsInGateway(provider)) {
     return { forceInferenceSetup: false, credentialEnv: credentialEnv ?? null };
   }
 
@@ -140,6 +145,7 @@ export async function ensureResumeProviderReady(
       `${providerLabel} API key`,
       helpUrl,
       (value) => deps.validateNvidiaApiKeyValue(value, resolvedCredentialEnv),
+      deps.revalidateSandboxIdentity,
     );
   } else {
     deps.note(`  [resume] Provider '${provider}' is missing from the gateway; recreating it.`);

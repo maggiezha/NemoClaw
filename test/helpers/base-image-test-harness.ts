@@ -25,7 +25,11 @@ export function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefini
   return {
     name: "hermes",
     displayName: "Hermes Agent",
-    healthProbe: { url: "http://127.0.0.1:8642/health", port: 8642, timeout_seconds: 90 },
+    healthProbe: {
+      url: "http://127.0.0.1:8642/health",
+      port: 8642,
+      timeout_seconds: 90,
+    },
     forwardPort: 8642,
     dashboard: {
       kind: "api",
@@ -46,19 +50,15 @@ export function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefini
       support: "disabled",
       reason: "test fixture",
     },
-    stateDirs: [],
-    runtimeAuthStateDirs: [],
-    stateFiles: [],
     userManagedFiles: [],
     versionCommand: "hermes --version",
-    expectedVersion: "2026.4.30",
+    expectedVersion: "0.21.3",
     hasDevicePairing: false,
     phoneHomeHosts: [],
     dockerfileBasePath: "/test/root/agents/hermes/Dockerfile.base",
     dockerfilePath: path.resolve(import.meta.dirname, "../../agents/hermes/Dockerfile"),
     startScriptPath: null,
     policyAdditionsPath: null,
-    policyPermissivePath: null,
     pluginDir: null,
     legacyPaths: null,
     agentDir: "/repo/root/agents/hermes",
@@ -71,7 +71,9 @@ export function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefini
 export function withMockedDocker<T>(
   run: (deps: {
     ensureAgentBaseImage: AgentOnboardModule["ensureAgentBaseImage"];
+    createAgentSandbox: AgentOnboardModule["createAgentSandbox"];
     bindLocalAgentBaseImageToPinnedProvenance: AgentOnboardModule["bindLocalAgentBaseImageToPinnedProvenance"];
+    pinTrustedAgentBaseImageOverrideForOperation: AgentOnboardModule["pinTrustedAgentBaseImageOverrideForOperation"];
     pinAgentSandboxBaseImageRef: AgentOnboardModule["pinAgentSandboxBaseImageRef"];
     dockerBuildMock: ReturnType<typeof vi.fn>;
     dockerCaptureMock: ReturnType<typeof vi.fn>;
@@ -86,7 +88,11 @@ export function withMockedDocker<T>(
 ): T {
   const dockerRunModule = requireSource("../adapters/docker/run.js") as DockerRunModule;
   const originalDockerCapture = dockerRunModule.dockerCapture;
-  const dockerCaptureMock = vi.fn().mockReturnValue("nemoclaw-hermes-mcp-runtime-ok");
+  const dockerCaptureMock = vi.fn((args: readonly string[]) =>
+    args.includes("/opt/hermes/.venv/bin/python")
+      ? "nemoclaw-hermes-mcp-runtime-ok"
+      : "nemoclaw-security-inventory-ok",
+  );
   dockerRunModule.dockerCapture = dockerCaptureMock as DockerRunModule["dockerCapture"];
 
   const dockerImageModule = requireSource("../adapters/docker/image.js") as DockerImageModule;
@@ -146,8 +152,11 @@ export function withMockedDocker<T>(
     const agentOnboardModule = requireSource("./onboard.js") as AgentOnboardModule;
     return run({
       ensureAgentBaseImage: agentOnboardModule.ensureAgentBaseImage,
+      createAgentSandbox: agentOnboardModule.createAgentSandbox,
       bindLocalAgentBaseImageToPinnedProvenance:
         agentOnboardModule.bindLocalAgentBaseImageToPinnedProvenance,
+      pinTrustedAgentBaseImageOverrideForOperation:
+        agentOnboardModule.pinTrustedAgentBaseImageOverrideForOperation,
       pinAgentSandboxBaseImageRef: agentOnboardModule.pinAgentSandboxBaseImageRef,
       dockerBuildMock,
       dockerCaptureMock,
