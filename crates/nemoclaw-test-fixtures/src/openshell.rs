@@ -83,6 +83,9 @@ pub struct State {
     pub sandbox_create_delay: std::time::Duration,
     pub active_sandbox_creates: usize,
     pub peak_sandbox_creates: usize,
+    /// When set, each CreateSandbox waits for a permit and takes one; a test
+    /// adds permits to let held creates finish one at a time.
+    pub sandbox_create_permits: Option<usize>,
     pub fail_read: Option<(&'static str, tonic::Code)>,
     /// Reject one RPC before its handler can mutate fixture state.
     pub reject_rpc: Option<(&'static str, tonic::Code, String)>,
@@ -254,16 +257,30 @@ impl State {
         self.sandbox_create_delay = std::time::Duration::from_millis(
             declared["sandbox_create_delay_ms"].as_u64().unwrap_or(0),
         );
+        self.delete_delay = std::time::Duration::from_millis(
+            declared["sandbox_delete_delay_ms"].as_u64().unwrap_or(0),
+        );
         let change = &declared["change"];
-        if let Some(name) = change["stop_agent_runtime"].as_str() {
-            let id = self
+        let sandbox_id = |state: &Self, name: &str| {
+            state
                 .sandboxes
                 .values()
                 .filter_map(|sandbox| sandbox.metadata.as_ref())
                 .find(|metadata| metadata.name == name)
-                .map(|metadata| metadata.id.clone());
+                .map(|metadata| metadata.id.clone())
+        };
+        if let Some(name) = change["stop_agent_runtime"].as_str() {
+            let id = sandbox_id(self, name);
             self.fabric_runtimes
                 .retain(|_, sandbox| Some(&*sandbox) != id.as_ref());
+        }
+        // Someone changes the agent's model inside its sandbox, outside OpenTofu.
+        if let Some(name) = change["change_agent_model"].as_str()
+            && let Some(id) = sandbox_id(self, name)
+            && let Some(configuration) = self.fabric_configurations.get_mut(&id)
+        {
+            configuration["models"]["default"]["model"] =
+                serde_json::json!("changed-inside-the-sandbox");
         }
         if change["forget_registrations"] == true {
             self.providers.clear();
@@ -387,6 +404,7 @@ impl State {
             // Gateway mutations so far, which an unchanged apply leaves as they were.
             "effects": self.effects,
             "peak_sandbox_creates": self.peak_sandbox_creates,
+            "sandbox_deletes": self.delete_calls,
             // What the gateway holds now: sandbox IDs by name, registration
             // names and their credentials' sources, and provider profiles by ID.
             "sandboxes": live, "registrations": registrations,
@@ -505,6 +523,20 @@ impl tower::Service<http::Request<Body>> for Service {
                     };
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
+                    }
+                    loop {
+                        {
+                            let mut state = state.lock().unwrap();
+                            match &mut state.sandbox_create_permits {
+                                None => break,
+                                Some(permits) if *permits > 0 => {
+                                    *permits -= 1;
+                                    break;
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     let response = unary(request, state.clone(), create_sandbox).await;
                     state.lock().unwrap().active_sandbox_creates -= 1;

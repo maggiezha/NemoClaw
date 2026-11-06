@@ -28,8 +28,12 @@ mod support;
 mod transport;
 mod travel_team;
 
+#[path = "agent_runtimes.rs"]
+mod agent_runtimes;
 #[path = "agent_tools.rs"]
 mod agent_tools;
+#[path = "application_container.rs"]
+mod application_container;
 #[path = "compile.rs"]
 mod compile;
 #[path = "config.rs"]
@@ -133,8 +137,6 @@ mod managed_auth;
 mod managed_gateway_config;
 #[path = "managed_hermes.rs"]
 mod managed_hermes;
-#[path = "managed_live.rs"]
-mod managed_live;
 #[path = "managed_podman.rs"]
 mod managed_podman;
 #[path = "model_selection.rs"]

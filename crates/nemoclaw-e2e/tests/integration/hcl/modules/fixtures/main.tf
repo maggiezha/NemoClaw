@@ -22,6 +22,18 @@ variable "compute_driver" {
   default     = null
 }
 
+variable "sandbox_create_delay_ms" {
+  description = "How long the gateway takes to create each sandbox."
+  type        = number
+  default     = 0
+}
+
+variable "sandbox_delete_delay_ms" {
+  description = "How long the gateway takes to answer each sandbox deletion."
+  type        = number
+  default     = 0
+}
+
 locals {
   spec   = yamldecode(file(var.document)).spec
   owner  = yamldecode(file(var.document)).metadata.uid
@@ -35,9 +47,14 @@ locals {
   ])
   services = {
     for name in sort(keys(try(local.spec.services, {}))) : name => {
-      service       = local.spec.services[name]
-      container_id  = "fixture-${name}-container"
-      container     = local.spec.services[name].kind == "vllm" ? "${local.prefix}-inference-${name}" : "${local.prefix}-ollama-${name}"
+      service      = local.spec.services[name]
+      container_id = "fixture-${name}-container"
+      container = lookup({
+        vllm        = "${local.prefix}-inference-${name}"
+        ollamaProxy = "${local.prefix}-ollama-proxy-${name}"
+      }, local.spec.services[name].kind, "${local.prefix}-ollama-${name}")
+      # An Ollama proxy keeps its key in its retained /data volume.
+      proxy         = local.spec.services[name].kind == "ollamaProxy"
       authenticated = try(local.spec.services[name].authentication, "") == "bearer"
     }
   }
@@ -65,6 +82,11 @@ output "prefix" {
   value       = local.prefix
 }
 
+output "key" {
+  description = "The key every authenticated service holds, which must never reach OpenTofu state."
+  value       = local.key
+}
+
 output "services" {
   description = "Each service's container name and ID, by service."
   value       = { for name, service in local.services : name => { name = service.container, id = service.container_id } }
@@ -72,50 +94,60 @@ output "services" {
 
 output "declare" {
   description = "The declaration for the fixture_state data source."
-  value = !local.docker ? jsonencode({ compute_driver = local.driver }) : jsonencode({
-    compute_driver = local.driver
-    images = concat(
-      [for reference in local.sandbox_images : { reference = reference, id = local.image_id, fabric_catalog = true }],
-      [for name, service in local.services : {
-        reference = service.service.image
-        id        = local.image_id
-        # A service built for another architecture, such as amd64 vLLM, says so.
-        architecture = try(service.service.hardware.architecture, null)
-        labels = merge(
-          { "org.nemoclaw.backend" = service.service.kind },
-          service.authenticated ? {
-            "org.nemoclaw.inference.authentication" = "bearer-v1"
-            "org.nemoclaw.inference.routes"         = "openai-v2"
-          } : {}
-        )
-      }],
-    )
-    containers = concat(
-      [{
-        id      = "fixture-gateway-container"
-        name    = "${local.prefix}-gateway"
-        image   = local.image_id
-        labels  = { "nemoclaw.nvidia.com/uid" = local.owner }
-        running = true
-      }],
-      [for name, service in local.services : {
-        id      = service.container_id
-        name    = service.container
-        image   = local.image_id
-        labels  = { "nemoclaw.nvidia.com/uid" = local.owner }
-        running = true
-        # OpenShell finds an authenticated service by name for its key.
-        by_name    = service.authenticated
-        started_at = "2026-01-01T00:00:00Z"
-        mounts = merge(
-          { "/data" = "${service.container}-data" },
-          service.authenticated ? { "/credentials" = "${service.container}-auth" } : {}
-        )
-        files = merge(
-          { "/data/status.json" = jsonencode({ phase = "ready", updated = "2026-01-01T00:00:05Z", detail = "serving", pid = 7 }) },
-          service.authenticated ? { "/credentials/inference-key" = local.key } : {}
-        )
-      }],
-    )
-  })
+  value = jsonencode(merge({
+    compute_driver          = local.driver
+    sandbox_create_delay_ms = var.sandbox_create_delay_ms
+    sandbox_delete_delay_ms = var.sandbox_delete_delay_ms
+    # The models an Ollama proxy's existing daemon lists.
+    models = [
+      for service in values(try(local.spec.services, {})) :
+      { name = service.upstream.model.name, digest = service.upstream.model.digest }
+      if service.kind == "ollamaProxy"
+    ]
+    # Only a managed Docker gateway's engine holds images and containers.
+    }, [for docker in [local.docker] : {
+      images = concat(
+        [for reference in local.sandbox_images : { reference = reference, id = local.image_id, fabric_catalog = true }],
+        [for name, service in local.services : {
+          reference = service.service.image
+          id        = local.image_id
+          # A service built for another architecture, such as amd64 vLLM, says so.
+          architecture = try(service.service.hardware.architecture, null)
+          labels = merge(
+            { "org.nemoclaw.backend" = service.service.kind },
+            service.authenticated ? {
+              "org.nemoclaw.inference.authentication" = "bearer-v1"
+              "org.nemoclaw.inference.routes"         = "openai-v2"
+            } : {}
+          )
+        }],
+      )
+      containers = concat(
+        [{
+          id      = "fixture-gateway-container"
+          name    = "${local.prefix}-gateway"
+          image   = local.image_id
+          labels  = { "nemoclaw.nvidia.com/uid" = local.owner }
+          running = true
+        }],
+        [for name, service in local.services : {
+          id      = service.container_id
+          name    = service.container
+          image   = local.image_id
+          labels  = { "nemoclaw.nvidia.com/uid" = local.owner }
+          running = true
+          # OpenShell finds an authenticated service by name for its key.
+          by_name    = service.authenticated || service.proxy
+          started_at = "2026-01-01T00:00:00Z"
+          mounts = service.proxy ? tomap({ "/data" = "${service.container}-auth" }) : tomap(merge(
+            { "/data" = "${service.container}-data" },
+            service.authenticated ? { "/credentials" = "${service.container}-auth" } : {}
+          ))
+          files = service.proxy ? tomap({ "/data/inference-key" = local.key }) : tomap(merge(
+            { "/data/status.json" = jsonencode({ phase = "ready", updated = "2026-01-01T00:00:05Z", detail = "serving", pid = 7 }) },
+            service.authenticated ? { "/credentials/inference-key" = local.key } : {}
+          ))
+        }],
+      )
+  } if docker]...))
 }
