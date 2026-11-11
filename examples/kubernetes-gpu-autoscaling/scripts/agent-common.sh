@@ -42,7 +42,11 @@ agent_common_print_laptop_client_usage() {
 agent_common_hpa_metric() {
   local metric="${HPA_METRIC:-}"
   if [[ -z "${metric}" ]] && command -v kubectl >/dev/null 2>&1; then
-    metric="$(kubectl get hpa "${HPA_NAME:-nemoclaw-gpu-metrics-proxy}" \
+    local hpa_name="${HPA_NAME:-}"
+    if [[ -z "${hpa_name}" ]] && declare -F hpa_common_metrics_proxy_deployment >/dev/null; then
+      hpa_name="$(hpa_common_metrics_proxy_deployment)"
+    fi
+    metric="$(kubectl get hpa "${hpa_name:-nemoclaw-gpu-metrics-proxy}" \
       -n "${NAMESPACE:-nemoclaw-gpu}" \
       -o jsonpath='{.spec.metrics[0].pods.metric.name}' 2>/dev/null || true)"
   fi
@@ -157,16 +161,19 @@ agent_common_print_load_banner() {
   local duration="${1:?}"
   local _hold="${2:?}"
   local agent="${3:-openclaw}"
+  local runtime="${INFERENCE_RUNTIME:-$(agent_common_default_inference_runtime "${agent}")}"
+  local pairing
+  pairing="$(agent_common_pairing_label "${agent}" "${runtime}")"
   case "${HPA_METRIC:-}" in
     *latency*)
       if [[ "${agent}" == "openclaw" ]]; then
-        echo "Latency: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until 6 GPUs, then short prompts, stop at 8."
+        echo "${pairing} latency: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until 6 GPUs, then short prompts, stop at 8."
       else
-        echo "Latency: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until stop at 8."
+        echo "${pairing} latency: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until stop at 8."
       fi
       ;;
     *)
-      echo "GPU util: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until stop at 8."
+      echo "${pairing} GPU util: INFLIGHT=${INFLIGHT} MAX_TOKENS=${MAX_TOKENS} until stop at 8."
       ;;
   esac
   echo "Send ceiling: ${duration}s (stops earlier when HPA reaches 8 GPUs)."
@@ -234,13 +241,13 @@ agent_common_start_hpa_timeline() {
     nohup python3 "${here}/e2e-hpa-timeline.py" \
       --output "${dir}/hpa-timeline.jsonl" \
       --namespace "${NAMESPACE:-nemoclaw-gpu}" \
-      --hpa-name "${HPA_NAME:-nemoclaw-gpu-metrics-proxy}" \
+      --hpa-name "${HPA_NAME:-$(declare -F hpa_common_metrics_proxy_deployment >/dev/null && hpa_common_metrics_proxy_deployment || echo nemoclaw-gpu-metrics-proxy)}" \
       --truncate >/dev/null 2>&1 &
   else
     nohup python3 "${here}/e2e-hpa-timeline.py" \
       --output "${dir}/hpa-timeline.jsonl" \
       --namespace "${NAMESPACE:-nemoclaw-gpu}" \
-      --hpa-name "${HPA_NAME:-nemoclaw-gpu-metrics-proxy}" \
+      --hpa-name "${HPA_NAME:-$(declare -F hpa_common_metrics_proxy_deployment >/dev/null && hpa_common_metrics_proxy_deployment || echo nemoclaw-gpu-metrics-proxy)}" \
       >/dev/null 2>&1 &
   fi
   echo $! >"${pidfile}"
@@ -427,6 +434,48 @@ agent_common_display_name() {
     hermes) echo "NemoClaw/Hermes" ;;
     deepagents) echo "NemoClaw/Deep Agents Code" ;;
   esac
+}
+
+# Documented example pairing for a GPU chart runtime (ollama|vllm|nim).
+agent_common_agent_for_runtime() {
+  local runtime="${1:?}"
+  local agent r
+  while IFS=$'\t' read -r agent r _; do
+    if [[ "${r}" == "${runtime}" ]]; then
+      printf '%s\n' "${agent}"
+      return 0
+    fi
+  done < <(agent_common_example_pairings)
+  return 1
+}
+
+# 6d release namespaces encode the runtime: nemoclaw-gpu-ollama, -vllm, -nim.
+agent_common_runtime_from_namespace() {
+  local ns="${1:?}"
+  case "${ns}" in
+    *-ollama) printf '%s\n' ollama ;;
+    *-vllm) printf '%s\n' vllm ;;
+    *-nim) printf '%s\n' nim ;;
+    *) return 1 ;;
+  esac
+}
+
+# Terminal label: "openclaw + ollama". Both identifiers, no extra words.
+agent_common_pairing_label() {
+  local agent="${1:?}"
+  local runtime="${2:?}"
+  agent_common_validate "${agent}" || return 1
+  agent_common_validate_inference_runtime "${runtime}" || return 1
+  printf '%s + %s\n' "${agent}" "${runtime}"
+}
+
+# Kubernetes Deployment/HPA name: "openclaw-ollama".
+agent_common_pairing_slug() {
+  local agent="${1:?}"
+  local runtime="${2:?}"
+  agent_common_validate "${agent}" || return 1
+  agent_common_validate_inference_runtime "${runtime}" || return 1
+  printf '%s-%s\n' "${agent}" "${runtime}"
 }
 
 agent_common_default_sandbox_name() {

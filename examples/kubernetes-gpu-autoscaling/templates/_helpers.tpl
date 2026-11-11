@@ -191,6 +191,23 @@ up the active runtime's config with `index .Values (include "nemoclaw-gpu.runtim
 {{- $runtime -}}
 {{- end }}
 
+{{- /* Documented Fabric agent for inference.runtime: ollama→openclaw, vllm→hermes, nim→deepagents. */}}
+{{- define "nemoclaw-gpu.agent" -}}
+{{- $runtime := include "nemoclaw-gpu.runtime" . -}}
+{{- if eq $runtime "ollama" -}}
+openclaw
+{{- else if eq $runtime "vllm" -}}
+hermes
+{{- else if eq $runtime "nim" -}}
+deepagents
+{{- end -}}
+{{- end }}
+
+{{- /* GPU Deployment and HPA name (hermes-vllm). Service DNS stays {fullname}-metrics-proxy. */}}
+{{- define "nemoclaw-gpu.workloadName" -}}
+{{- printf "%s-%s" (include "nemoclaw-gpu.agent" .) (include "nemoclaw-gpu.runtime" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
 {{- /* Renders a `repository:tag@digest` image reference, tolerating a blank tag or digest
 (some registries, e.g. nvcr.io NIM/vLLM images, are referenced by digest only). */}}
 {{- define "nemoclaw-gpu.imageRef" -}}

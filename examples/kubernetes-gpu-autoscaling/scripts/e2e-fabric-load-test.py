@@ -159,6 +159,40 @@ def should_stop_after_hold(
 
 SANDBOX_NS = os.environ.get("V1_NAMESPACE", "nemoclaw-v1-gpu-autoscaling")
 
+_PAIRINGS = {
+    "openclaw": "ollama",
+    "hermes": "vllm",
+    "deepagents": "nim",
+}
+_RUNTIME_TO_AGENT = {runtime: agent for agent, runtime in _PAIRINGS.items()}
+
+
+def agent_kind(kind: str | None = None) -> str:
+    raw = (kind if kind is not None else os.environ.get("V1_AGENT_KIND") or "hermes").strip().lower()
+    return raw if raw in _PAIRINGS else "hermes"
+
+
+def inference_runtime(kind: str | None = None, runtime: str | None = None) -> str:
+    raw = (runtime if runtime is not None else os.environ.get("INFERENCE_RUNTIME") or "").strip().lower()
+    if raw in _RUNTIME_TO_AGENT:
+        return raw
+    return _PAIRINGS[agent_kind(kind)]
+
+
+def pairing_label(kind: str | None = None, runtime: str | None = None) -> str:
+    agent = agent_kind(kind)
+    gpu = inference_runtime(kind=agent, runtime=runtime)
+    return f"{agent} + {gpu}"
+
+
+def print_load_header(users: int, inflight_start: int, inflight_per_user: int) -> None:
+    print("=" * 70)
+    print(f"  {pairing_label()}")
+    print(f"  {users} end users → {users} agents (1:1)")
+    print("  Each user sends chats to that user's sandbox.")
+    print(f"  Concurrent chats per user: {inflight_start}→{inflight_per_user}")
+    print("=" * 70)
+
 
 def stop_sandbox_chats(prefix: str, users: int) -> None:
     """Nothing to stop: each fabric-agent-ctl invoke ends with its own timeout."""
@@ -210,8 +244,8 @@ def print_chat_table(
     print("")
     print(
         "Path in use: user → kubectl exec (development-profile bypass) → "
-        "fabric-agent-ctl invoke (agent in a v1 sandbox) → "
-        "GPU chart Service /v1 (Envoy / metrics-proxy) → vLLM or NIM."
+        f"fabric-agent-ctl invoke ({pairing_label()} in a v1 sandbox) → "
+        "GPU chart Service /v1 (Envoy / metrics-proxy)."
     )
 
 
@@ -439,11 +473,7 @@ async def run_test(args: argparse.Namespace) -> int:
     max_replicas = 0
     reached_target = False
 
-    print("=" * 70)
-    print(f"  {args.users} end users → {args.users} Hermes agents (1:1)")
-    print("  Each user sends chats to that user's sandbox.")
-    print(f"  Concurrent chats per user: {args.inflight_start}→{args.inflight_per_user}")
-    print("=" * 70)
+    print_load_header(args.users, args.inflight_start, args.inflight_per_user)
     stop_sandbox_chats(args.prefix, args.users)
 
     try:
@@ -570,7 +600,11 @@ async def run_test(args: argparse.Namespace) -> int:
     tokens = sum(int(r.get("tokens") or 0) for r in normalized)
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "path": "user -> kubectl exec (development-profile bypass) -> fabric-agent-ctl invoke -> Hermes in v1 sandbox -> GPU chart Service /v1 -> vLLM HPA",
+        "path": (
+            "user -> kubectl exec (development-profile bypass) -> "
+            f"fabric-agent-ctl invoke -> {pairing_label()} in v1 sandbox -> "
+            "GPU chart Service /v1"
+        ),
         "users": args.users,
         "target_pods": args.target_pods,
         "hpa_max_replicas": max_replicas,
@@ -585,7 +619,10 @@ async def run_test(args: argparse.Namespace) -> int:
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print_chat_table(normalized, args.duration, args.inflight_start, args.inflight_per_user)
     if successful < 1:
-        print("No successful user→sandbox Hermes queries.", file=sys.stderr)
+        print(
+            f"No successful user→sandbox queries for {pairing_label()}.",
+            file=sys.stderr,
+        )
         return 1
     if not summary["reached_target"]:
         print(
@@ -601,7 +638,7 @@ async def run_test(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Hermes + vLLM client: N users send hermes -z into N sandboxes; pass --users"
+        description="Fabric load client: N users send chats into N sandboxes; pass --users"
     )
     parser.add_argument("--users", type=int, required=True)
     parser.add_argument(

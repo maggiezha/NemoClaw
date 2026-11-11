@@ -3,7 +3,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "nemoclaw-gpu.fullname" . }}-metrics-proxy
+  name: {{ include "nemoclaw-gpu.workloadName" . }}
   namespace: {{ include "nemoclaw-gpu.namespace" . }}
   labels:
     {{- include "nemoclaw-gpu.labels" . | nindent 4 }}

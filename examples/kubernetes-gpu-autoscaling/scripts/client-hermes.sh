@@ -17,7 +17,7 @@
 # INFLIGHT=1 MAX_TOKENS=2048 in the code and ignores leftovers.
 #   INFLIGHT=2 MAX_TOKENS=1024 E2E_USERS=10 ./scripts/client-hermes.sh
 #   E2E_USERS=10 ./scripts/client-hermes.sh
-# The DGX prints the HPA with ./scripts/get-hpa.sh -n nemoclaw-gpu -w.
+# The DGX prints the HPA with ./scripts/get-hpa.sh -w.
 # This client does not set maxReplicas and does not print the HPA.
 #
 # Env: NEMOCLAW_V1_STATE_DIR (default .local/gpu-autoscaling), V1_NAMESPACE,
@@ -50,7 +50,7 @@ agent_common_validate_inference_runtime "${INFERENCE_RUNTIME}"
 INFERENCE_MODEL="$(agent_common_resolve_inference_model "${INFERENCE_RUNTIME}")"
 export INFERENCE_MODEL
 export NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
-export HPA_NAME="${HPA_NAME:-nemoclaw-gpu-metrics-proxy}"
+export HPA_NAME="${HPA_NAME:-$(hpa_common_metrics_proxy_deployment)}"
 export DURATION_SEC="${DURATION_SEC:-900}"
 export E2E_PROMPT_TIMEOUT_SEC="${E2E_PROMPT_TIMEOUT_SEC:-180}"
 agent_common_export_demo_workload "${AGENT_KIND}"
@@ -81,7 +81,7 @@ hpa_common_require_live_runtime "${NAMESPACE}" "${HPA_NAME}" "${INFERENCE_RUNTIM
 hpa_max="$(kubectl get hpa "${HPA_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.maxReplicas}' 2>/dev/null || true)"
 [[ "${hpa_max}" =~ ^[1-9][0-9]*$ ]] || fail "HPA ${NAMESPACE}/${HPA_NAME} has no maxReplicas. Set the ceiling on the DGX with install-hpa.sh."
 
-echo "Client: ${E2E_USERS} end users → sandboxes ${E2E_USER_OFFSET} through $((E2E_USER_OFFSET + E2E_USERS - 1)) (1:1 ${AGENT_KIND})."
+echo "Client: $(agent_common_pairing_label "${AGENT_KIND}" "${INFERENCE_RUNTIME}"). ${E2E_USERS} end users → sandboxes ${E2E_USER_OFFSET} through $((E2E_USER_OFFSET + E2E_USERS - 1)) (1:1)."
 echo "inflight/user: ${INFLIGHT}  max_tokens: ${MAX_TOKENS}  HPA maxReplicas: ${hpa_max}"
 agent_common_print_load_banner "${DURATION_SEC}" "${MAX_REPLICAS_HOLD_SEC}" "${AGENT_KIND}"
 

@@ -18,8 +18,6 @@ hpa_common_load_local_env "${CHART_DIR}"
 NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
 RELEASE="${RELEASE:-nemoclaw-gpu}"
 JOB_NAME="${JOB_NAME:-nemoclaw-gpu-hpa-load-test}"
-DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
-HPA_NAME="${HPA_NAME:-${DEPLOYMENT}}"
 REINSTALL_HELM="${REINSTALL_HELM:-1}"
 SKIP_HELM="${SKIP_HELM:-0}"
 DELETE_DEPLOYMENT="${DELETE_DEPLOYMENT:-0}"
@@ -34,6 +32,8 @@ MAX_REPLICAS="${MAX_REPLICAS:-}"
 GPU_TARGET="${GPU_TARGET:-40}"
 INFERENCE_MODEL="${INFERENCE_MODEL:-llama3.2:3b}"
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
+DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
+HPA_NAME="${HPA_NAME:-${DEPLOYMENT}}"
 # Preserve a previously configured Ingress host across reset — without this, the helm
 # upgrade below leaves ingress.host unset and Helm falls back to values.yaml's default,
 # silently changing the route clients use to reach the metrics-proxy.

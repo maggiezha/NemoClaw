@@ -75,10 +75,17 @@ else
     block "Agent Sandbox CRD sandboxes.agents.x-k8s.io is missing"
   fi
 
-  if kubectl -n "${GPU_NS}" get deploy nemoclaw-gpu-metrics-proxy >/dev/null 2>&1; then
-    ok "GPU metrics-proxy Deployment exists in ${GPU_NS}"
+  gpu_deploy=""
+  for name in hermes-vllm openclaw-ollama deepagents-nim nemoclaw-gpu-metrics-proxy; do
+    if kubectl -n "${GPU_NS}" get deploy "${name}" >/dev/null 2>&1; then
+      gpu_deploy="${name}"
+      break
+    fi
+  done
+  if [[ -n "${gpu_deploy}" ]]; then
+    ok "GPU Deployment ${gpu_deploy} exists in ${GPU_NS}"
   else
-    block "GPU chart metrics-proxy Deployment missing in ${GPU_NS}"
+    block "GPU chart Deployment missing in ${GPU_NS} (expected hermes-vllm, openclaw-ollama, or deepagents-nim)"
   fi
 
   gpu_images="$(kubectl -n "${GPU_NS}" get pods -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' 2>/dev/null || true)"

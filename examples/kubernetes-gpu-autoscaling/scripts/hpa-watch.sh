@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Live HPA watch with normalized GPU % (not kubectl Quantity milliform like 32500m/40).
+# One-terminal watch: HPA, pods, and GPU index, with agent + runtime on every row.
 # Same as: ./scripts/get-hpa.sh -w
 # Interval: HPA_WATCH_INTERVAL_SEC (default 2)
 

@@ -3,7 +3,57 @@
 # SPDX-License-Identifier: Apache-2.0
 # Shared helpers for nemoclaw-gpu Kubernetes HPA scripts
 
+_HPA_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! declare -F agent_common_pairing_label >/dev/null 2>&1; then
+  # shellcheck source=agent-common.sh
+  source "${_HPA_COMMON_DIR}/agent-common.sh"
+fi
+
 hpa_common_log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+# "openclaw + ollama" for a GPU namespace. Uses V1_AGENT_KIND / INFERENCE_RUNTIME
+# when set, else the 6d namespace suffix, else the documented pairing for the
+# live runtime. Prints nothing (exit 1) when the pairing is unknown.
+hpa_common_pairing_label_for_namespace() {
+  local ns="${1:?namespace}"
+  local agent="${V1_AGENT_KIND:-}"
+  local runtime="${INFERENCE_RUNTIME:-}"
+  if [[ -z "${runtime}" ]]; then
+    runtime="$(agent_common_runtime_from_namespace "${ns}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${runtime}" ]] && command -v kubectl >/dev/null 2>&1; then
+    runtime="$(hpa_common_live_runtime_in_namespace "${ns}" || true)"
+  fi
+  if [[ -z "${agent}" && -n "${runtime}" ]]; then
+    agent="$(agent_common_agent_for_runtime "${runtime}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${runtime}" && -n "${agent}" ]]; then
+    runtime="$(agent_common_default_inference_runtime "${agent}")"
+  fi
+  if [[ -z "${agent}" || -z "${runtime}" ]]; then
+    return 1
+  fi
+  agent_common_pairing_label "${agent}" "${runtime}"
+}
+
+hpa_common_print_pairing_line() {
+  local ns="${1:?namespace}"
+  local label
+  label="$(hpa_common_pairing_label_for_namespace "${ns}" 2>/dev/null || true)"
+  [[ -n "${label}" ]] || return 0
+  printf '%s\n' "${label}"
+}
+
+hpa_common_live_runtime_line() {
+  local runtime="${1:?runtime}"
+  local agent
+  agent="$(agent_common_agent_for_runtime "${runtime}" 2>/dev/null || true)"
+  if [[ -n "${agent}" ]]; then
+    printf 'Live pairing: %s\n' "$(agent_common_pairing_label "${agent}" "${runtime}")"
+  else
+    printf 'Live GPU runtime is %s\n' "${runtime}"
+  fi
+}
 
 # Load recipe-local defaults from ${chart_dir}/local.env when present (gitignored).
 # Does not override variables already set in the environment. Safe to call from any cwd —
@@ -151,13 +201,18 @@ hpa_common_format_hpa() {
   local ns="${1:?namespace}"
   local headers="${2:-1}"
   local style="${3:-script}"
-  python3 - "${ns}" "${headers}" "${style}" <<'PY'
+  python3 - "${ns}" "${headers}" "${style}" "${_HPA_COMMON_DIR}/hpa-watch-format.py" <<'PY'
+import importlib.util
 import json, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 
 ns, headers = sys.argv[1], sys.argv[2] == "1"
 style = sys.argv[3] if len(sys.argv) > 3 else "script"
+_fmt_spec = importlib.util.spec_from_file_location("hpa_watch_format", sys.argv[4])
+_fmt = importlib.util.module_from_spec(_fmt_spec)
+assert _fmt_spec.loader is not None
+_fmt_spec.loader.exec_module(_fmt)
 
 def qty(raw):
     """Parse a Kubernetes resource.Quantity (e.g. 40, 30250m, 3k)."""
@@ -345,13 +400,11 @@ def print_row(h, col_w=22):
     meta = h["metadata"]
     spec = h["spec"]
     status = h.get("status") or {}
-    ref = spec["scaleTargetRef"]
-    ref_str = f"{ref['kind']}/{ref['name']}"
     tgt = targets(h)
+    label = _fmt.display_name(meta.get("name") or "", ns)
     if style == "kubectl":
         print(
-            f"{meta['name']:<20} "
-            f"{ref_str:<31} "
+            f"{label:<24} "
             f"{tgt:<22} "
             f"{spec.get('minReplicas', ''):<9} "
             f"{spec.get('maxReplicas', ''):<9} "
@@ -360,8 +413,7 @@ def print_row(h, col_w=22):
         )
     else:
         print(
-            f"{meta['name']:<22} "
-            f"{ref_str:<31} "
+            f"{label:<24} "
             f"{tgt:<{col_w}} "
             f"{spec.get('minReplicas', ''):<8} "
             f"{spec.get('maxReplicas', ''):<8} "
@@ -399,13 +451,13 @@ else:
 if headers:
     if style == "kubectl":
         print(
-            f"{'NAME':<20} {'REFERENCE':<31} {'TARGETS':<22} "
+            f"{'NAME':<24} {'TARGETS':<22} "
             f"{'MINPODS':<9} {'MAXPODS':<9} {'REPLICAS':<10} AGE"
         )
     else:
         print(subtitle)
         print(
-            f"{'NAME':<22} {'REFERENCE':<31} {col:<{col_w}} "
+            f"{'NAME':<24} {col:<{col_w}} "
             f"{'MINPODS':<8} {'MAXPODS':<8} {'REPLICAS':<10} AGE"
         )
 
@@ -422,32 +474,44 @@ hpa_common_print_hpa() {
   fi
 }
 
+# One screen: every GPU-chart HPA, metrics-proxy pod, and DCGM GPU index.
+# Empty namespace lists all nemoclaw-gpu* HPAs. Rows use hermes-vllm, not metrics-proxy.
+hpa_common_print_cluster() {
+  local ns="${1:-}"
+  local args=(python3 "${_HPA_COMMON_DIR}/hpa-watch-format.py" --live)
+  if [[ -n "${ns}" ]]; then
+    args+=(--namespace "${ns}")
+  fi
+  "${args[@]}"
+}
+
+hpa_common_watch_cluster() {
+  local ns="${1:-}"
+  local interval="${HPA_WATCH_INTERVAL_SEC:-2}"
+  while true; do
+    clear 2>/dev/null || true
+    hpa_common_print_cluster "${ns}" || true
+    sleep "${interval}"
+  done
+}
+
 # Live watch with the same normalized TARGETS column (kubectl Quantity m/k suffixes hidden).
 hpa_common_watch_hpa() {
-  local ns="${1:?namespace}"
-  local interval="${HPA_WATCH_INTERVAL_SEC:-2}"
-  local last=""
-  local line=""
-  # Header once
-  hpa_common_format_hpa "${ns}" 1 "script" || true
-  last="$(hpa_common_format_hpa "${ns}" 0 "script" 2>/dev/null | head -1 || true)"
-  while true; do
-    sleep "${interval}"
-    line="$(hpa_common_format_hpa "${ns}" 0 "script" 2>/dev/null | head -1 || true)"
-    if [[ -n "${line}" && "${line}" != "${last}" ]]; then
-      printf '%s\n' "${line}"
-      last="${line}"
-    fi
-  done
+  hpa_common_watch_cluster "${1:-}"
 }
 
 # GPU metrics-proxy pods + per-pod GPU % (same namespace as HPA).
 hpa_common_print_metrics_proxy_pods() {
   local ns="${1:?namespace}"
-  python3 - "${ns}" <<'PY'
+  python3 - "${ns}" "${_HPA_COMMON_DIR}/hpa-watch-format.py" <<'PY'
+import importlib.util
 import json, subprocess, sys
 
 ns = sys.argv[1]
+_fmt_spec = importlib.util.spec_from_file_location("hpa_watch_format", sys.argv[2])
+_fmt = importlib.util.module_from_spec(_fmt_spec)
+assert _fmt_spec.loader is not None
+_fmt_spec.loader.exec_module(_fmt)
 
 def qty(raw):
     """Parse a Kubernetes resource.Quantity (e.g. 40, 30250m, 3k)."""
@@ -538,18 +602,19 @@ except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError):
     items = []
 
 print()
-print("metrics-proxy pods (avg GPU util per pod):")
+print("GPU pods (avg GPU util per pod):")
 if not items:
-    print("  (no gpu-metrics-proxy pods)")
+    print("  (no GPU pods)")
 else:
     print(
-        f"{'NAME':<42} {'READY':<7} {'STATUS':<11} {'RESTARTS':<9} "
-        f"{'GPU UTIL':<10} AGE"
+        f"{'NAME':<24} {'READY':<7} {'STATUS':<11} "
+        f"{'RESTARTS':<9} {'GPU UTIL':<10} AGE"
     )
     for pod in sorted(items, key=lambda p: p["metadata"]["name"]):
         meta = pod["metadata"]
         status = pod.get("status") or {}
         name = meta["name"]
+        label = _fmt.display_name(name, ns)
         ready = sum(
             1 for c in (status.get("containerStatuses") or [])
             if c.get("ready")
@@ -561,7 +626,7 @@ else:
             (c.get("restartCount") or 0) for c in (status.get("containerStatuses") or [])
         )
         print(
-            f"{name:<42} {ready_s:<7} {phase:<11} {restarts:<9} "
+            f"{label:<24} {ready_s:<7} {phase:<11} {restarts:<9} "
             f"{gpu.get(name, '<unknown>'):<10} {age(meta.get('creationTimestamp'))}"
         )
 
@@ -639,12 +704,35 @@ hpa_common_release_fullname() {
   fi
 }
 
-hpa_common_metrics_proxy_deployment() {
+# Historical Service/Gateway DNS. Mixed sandboxes still call this name.
+hpa_common_legacy_metrics_proxy_name() {
   echo "$(hpa_common_release_fullname)-metrics-proxy"
 }
 
+# GPU Deployment and HPA: openclaw-ollama, hermes-vllm, deepagents-nim.
+hpa_common_workload_name() {
+  local runtime="${INFERENCE_RUNTIME:-}"
+  local agent="${V1_AGENT_KIND:-${AGENT_NAME:-}}"
+  local ns="${NAMESPACE:-${RELEASE:-}}"
+  if [[ -z "${runtime}" ]]; then
+    runtime="$(agent_common_runtime_from_namespace "${ns}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${agent}" && -n "${runtime}" ]]; then
+    agent="$(agent_common_agent_for_runtime "${runtime}" 2>/dev/null || true)"
+  fi
+  if [[ -n "${agent}" && -n "${runtime}" ]]; then
+    agent_common_pairing_slug "${agent}" "${runtime}"
+    return 0
+  fi
+  hpa_common_legacy_metrics_proxy_name
+}
+
+hpa_common_metrics_proxy_deployment() {
+  hpa_common_workload_name
+}
+
 hpa_common_metrics_proxy_service() {
-  echo "$(hpa_common_release_fullname)-metrics-proxy"
+  hpa_common_legacy_metrics_proxy_name
 }
 
 # Live Deployment container, not `helm get values`. A failed upgrade can leave
@@ -655,6 +743,15 @@ hpa_common_live_inference_runtime() {
   kubectl get deploy "${deploy}" -n "${ns}" \
     -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null \
     | grep -E '^(ollama|vllm|nim)$' | head -n 1
+}
+
+# First ollama|vllm|nim container in the namespace. Used when the namespace
+# is the shared nemoclaw-gpu release rather than a 6d *-ollama/*-vllm suffix.
+hpa_common_live_runtime_in_namespace() {
+  local ns="${1:?namespace}"
+  kubectl get deploy -n "${ns}" \
+    -o jsonpath='{range .items[*]}{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{end}' \
+    2>/dev/null | grep -E '^(ollama|vllm|nim)$' | head -n 1
 }
 
 # Model the metrics-proxy ConfigMap gives the GPU container. The Deployment
@@ -705,7 +802,7 @@ hpa_common_require_live_runtime() {
     echo "Set INFERENCE_RUNTIME=${expected} and re-run ./scripts/install-hpa.sh so Helm points this same release at ${expected}." >&2
     return 1
   fi
-  echo "Live GPU runtime is ${expected}"
+  hpa_common_live_runtime_line "${expected}"
 }
 
 # True when HPA current/desired match want. Latency HPA with no custom-metric
@@ -891,7 +988,7 @@ hpa_common_metrics_proxy_service_base_url() {
   local service="${2:-}"
   local port="${3:-${SERVICE_PORT:-8081}}"
   if [[ -z "${service}" ]]; then
-    service="$(RELEASE="${RELEASE:-nemoclaw-gpu}" hpa_common_metrics_proxy_deployment)"
+    service="$(RELEASE="${RELEASE:-nemoclaw-gpu}" hpa_common_metrics_proxy_service)"
   fi
   [[ "${ns}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
     || { echo "invalid namespace for metrics-proxy Service URL: ${ns}" >&2; return 1; }
@@ -915,10 +1012,10 @@ hpa_common_openshell_inference_base_url() {
   local service="${3:-}"
   local port="${4:-${SERVICE_PORT:-8081}}"
   if [[ -z "${gateway_name}" ]]; then
-    gateway_name="$(RELEASE="${RELEASE:-nemoclaw-gpu}" hpa_common_metrics_proxy_deployment)"
+    gateway_name="$(RELEASE="${RELEASE:-nemoclaw-gpu}" hpa_common_legacy_metrics_proxy_name)"
   fi
   if [[ -z "${service}" ]]; then
-    service="${gateway_name}"
+    service="$(RELEASE="${RELEASE:-nemoclaw-gpu}" hpa_common_metrics_proxy_service)"
   fi
 
   case "${ENABLE_ENVOY_LB:-}" in
@@ -1682,7 +1779,9 @@ hpa_common_gpu_helm_upgrade() {
   # Helm 4 server-side apply then fails: conflict with "kubectl-patch" on maxReplicas.
   # The metrics ConfigMap hits the same class of conflict on .data.metrics-proxy-metrics.ts.
   # Drop the HPA only (GPU Deployment stays). Helm recreates it with min/max from this upgrade.
-  kubectl delete hpa "$(RELEASE="${release}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)" \
+  kubectl delete hpa \
+    "$(RELEASE="${release}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)" \
+    "$(RELEASE="${release}" CHART_NAME=nemoclaw-gpu hpa_common_legacy_metrics_proxy_name)" \
     -n "${ns}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
   helm "${helm_args[@]}" >/dev/null

@@ -92,6 +92,7 @@ SCALE_UP_WAIT_LOOPS="${SCALE_UP_WAIT_LOOPS:-60}"
 HPA_VALUES="${HPA_VALUES:-${CHART_DIR}/values.yaml}"
 SCALE_DOWN_WAIT_LOOPS="${SCALE_DOWN_WAIT_LOOPS:-40}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-900}"
+INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
 DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
 SERVICE="${SERVICE:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)}"
 SERVICE_PORT="${SERVICE_PORT:-8081}"
@@ -114,7 +115,6 @@ if ! hpa_common_ensure_metrics_proxy_ready "${NAMESPACE}" "${RELEASE}" "${CHART_
   exit 1
 fi
 
-INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
 INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 HPA_HELM_ARGS=(
   upgrade --install "${RELEASE}" "${CHART_DIR}"

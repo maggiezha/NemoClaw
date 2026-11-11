@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Per-pod GPU metrics-proxy status (READY, GPU UTIL %, load-test generators).
-# Use alongside: kubectl get hpa -n nemoclaw-gpu -w
+# Prefer ./scripts/get-hpa.sh -w for HPA, pods, and GPU index in one terminal.
 #
 # Usage:
 #   ./scripts/get-metrics-proxy-pods.sh -n nemoclaw-gpu
@@ -34,9 +34,9 @@ while [[ $# -gt 0 ]]; do
 Usage: $(basename "$0") [-n NAMESPACE] [-w]
 
 metrics-proxy pods with per-pod GPU utilization (not HPA average).
-
-Watch HPA in another terminal:
-  kubectl get hpa -n nemoclaw-gpu -w
+Each row is hermes-vllm / openclaw-ollama. For HPA + pods + GPU index
+in one terminal:
+  ./scripts/get-hpa.sh -w
 
 Examples:
   $(basename "$0") -n nemoclaw-gpu

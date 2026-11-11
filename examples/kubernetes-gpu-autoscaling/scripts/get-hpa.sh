@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# One-shot or live GPU HPA with readable percentage current/target values
-# (30.25%/40%, not Kubernetes Quantity milli-units such as 30250m/40).
+# One terminal: GPU-chart HPAs, metrics-proxy pods, and DCGM GPU index.
+# Each row is hermes-vllm / openclaw-ollama, not a metrics-proxy object name.
 #
 # Usage:
-#   ./scripts/get-hpa.sh -n nemoclaw-gpu
-#   ./scripts/get-hpa.sh -n nemoclaw-gpu -w
+#   ./scripts/get-hpa.sh
+#   ./scripts/get-hpa.sh -w
+#   ./scripts/get-hpa.sh -n nemoclaw-gpu-vllm -w
 #   HPA_WATCH_INTERVAL_SEC=5 ./scripts/get-hpa.sh -w
 
 set -euo pipefail
@@ -16,7 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=hpa-common.sh
 source "${SCRIPT_DIR}/hpa-common.sh"
 
-NAMESPACE="${NAMESPACE:-nemoclaw-gpu}"
+hpa_common_load_local_env "$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Only -n pins a namespace. Do not inherit NAMESPACE from install scripts.
+NAMESPACE=""
 WATCH=0
 
 while [[ $# -gt 0 ]]; do
@@ -33,20 +37,17 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: $(basename "$0") [-n NAMESPACE] [-w]
 
-One-shot or live watch with a normalized GPU utilization column
-(30.25%/40%, not kubectl's 30250m/40 Quantity form).
+One screen for every nemoclaw-gpu* HPA: hermes-vllm / openclaw-ollama,
+replica count, GPU pods, and which GPU index runs which pairing.
 
-  HPA_WATCH_INTERVAL_SEC   poll interval for -w (default 2)
-
-Raw kubectl stream (unnormalized):
-  kubectl get hpa -n nemoclaw-gpu -w
-
-Per-pod GPU breakdown (second terminal):
-  ./scripts/get-metrics-proxy-pods.sh -n nemoclaw-gpu -w
+  -n NAMESPACE            one GPU-chart namespace; default is all nemoclaw-gpu*
+  -w                      refresh in this terminal
+  HPA_WATCH_INTERVAL_SEC  poll interval for -w (default 2)
 
 Examples:
-  $(basename "$0") -n nemoclaw-gpu
-  $(basename "$0") -n nemoclaw-gpu -w
+  $(basename "$0")
+  $(basename "$0") -w
+  $(basename "$0") -n nemoclaw-gpu-ollama -w
 EOF
       exit 0
       ;;
@@ -58,10 +59,11 @@ EOF
 done
 
 require_cmd kubectl
+require_cmd python3
 
 if [[ "${WATCH}" -eq 1 ]]; then
-  hpa_common_watch_hpa "${NAMESPACE}"
+  hpa_common_watch_cluster "${NAMESPACE}"
   exit 0
 fi
 
-hpa_common_print_hpa "${NAMESPACE}"
+hpa_common_print_cluster "${NAMESPACE}"

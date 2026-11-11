@@ -51,8 +51,6 @@ ADAPTER_CHART_VERSION="${ADAPTER_CHART_VERSION:-5.3.0}"
 # shellcheck disable=SC1091
 source "${CHART_DIR}/versions.env"
 ENVOY_GATEWAY_CHART_VERSION="${ENVOY_GATEWAY_CHART_VERSION:-v1.8.3}"
-DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
-HPA_NAME="${HPA_NAME:-${DEPLOYMENT}}"
 HPA_VALUES="${HPA_VALUES:-${CHART_DIR}/values.yaml}"
 MIN_REPLICAS="${MIN_REPLICAS:-1}"
 # Empty → resolve to allocatable GPU count after GPU nodes are verified (MAX_REPLICAS=N).
@@ -60,6 +58,8 @@ MAX_REPLICAS="${MAX_REPLICAS:-}"
 # ollama | vllm | nim — see README runtime comparison table. Switching runtimes usually also
 # means changing INFERENCE_MODEL to match (e.g. an HF repo id for vllm, a NIM catalog id for nim).
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-ollama}"
+DEPLOYMENT="${DEPLOYMENT:-$(RELEASE="${RELEASE}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_deployment)}"
+HPA_NAME="${HPA_NAME:-${DEPLOYMENT}}"
 INFERENCE_MODEL="${INFERENCE_MODEL:-$(agent_common_default_inference_model "${INFERENCE_RUNTIME}")}"
 # NIM first-profile download can exceed the 900s Ollama/vLLM wait.
 if [[ -z "${ROLLOUT_TIMEOUT:-}" ]]; then
@@ -498,10 +498,11 @@ if [[ ! "${HPA_APPLY_MAX_REPLICAS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ "${ENABLE_AUTOSCALING}" == "1" ]]; then
   echo "HPA maxReplicas=${HPA_APPLY_MAX_REPLICAS}"
-  kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter 2>/dev/null | grep -q Running || {
+  if ! kubectl get pods -n "${DCGM_NAMESPACE}" -l app=nvidia-dcgm-exporter \
+    -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -qx Running; then
     echo "nvidia-dcgm-exporter not running in namespace ${DCGM_NAMESPACE} — GPU HPA metric unavailable" >&2
     exit 1
-  }
+  fi
 else
   echo "ENABLE_AUTOSCALING=0: one GPU replica, no HorizontalPodAutoscaler."
 fi
