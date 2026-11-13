@@ -41,6 +41,12 @@ if [[ -z "${STATE_DIR}" ]]; then
   exit 2
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=agent-common.sh
+source "${SCRIPT_DIR}/agent-common.sh"
+if resolved="$(agent_common_resolve_state_dir "${STATE_DIR}")"; then
+  STATE_DIR="${resolved}"
+fi
 STATE_FILE="${STATE_DIR}/terraform.tfstate"
 if [[ ! -f "${STATE_FILE}" ]]; then
   echo "missing ${STATE_FILE}. Apply the v1 YAML before invoke." >&2

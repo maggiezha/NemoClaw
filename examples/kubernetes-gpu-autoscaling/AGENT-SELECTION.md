@@ -5,7 +5,7 @@
 
 # Agent selection
 
-Apply one pairing file in this directory. Each file is one NemoClaw config: a managed OpenShell gateway, Fabric sandboxes, and the GPU chart Service `/v1`. The chart and HPA are the Helm release in this directory; Envoy is optional. See the [README quick start](README.md#quick-start).
+The [README quick start](README.md#quick-start) applies OpenClaw, Hermes, and Deep Agents together. Each pairing file in this directory is the template for that harness: a managed OpenShell gateway, Fabric sandboxes, and the GPU chart Service `/v1`. [`render-mixed-sandboxes.sh`](scripts/render-mixed-sandboxes.sh) combines them. Envoy is optional.
 
 | | OpenClaw + Ollama | Hermes + vLLM | Deep Agents + NIM |
 | --- | --- | --- | --- |
@@ -13,12 +13,8 @@ Apply one pairing file in this directory. Each file is one NemoClaw config: a ma
 | `harness.kind` | `nvidia.fabric.openclaw` | `nvidia.fabric.hermes` | `nvidia.fabric.langchain.deepagents` |
 | Chart `INFERENCE_RUNTIME` | `ollama` | `vllm` | `nim` |
 | GPU Deployment / HPA | `openclaw-ollama` | `hermes-vllm` | `deepagents-nim` |
-| Namespace | `nemoclaw-v1-gpu-autoscaling-openclaw` | `nemoclaw-v1-gpu-autoscaling` | `nemoclaw-v1-gpu-autoscaling-dagent` |
-| State directory | `.local/gpu-autoscaling-openclaw` | `.local/gpu-autoscaling` | `.local/gpu-autoscaling-deepagents` |
-| Load client | [`client-openclaw.sh`](scripts/client-openclaw.sh) | [`client-hermes.sh`](scripts/client-hermes.sh) | [`client-deepagents.sh`](scripts/client-deepagents.sh) |
+| Sandboxes in mixed apply | `user-0000`–`user-0002` | `user-0003`–`user-0005` | `user-0006`–`user-0008` |
 
-OpenClaw and Deep Agents use their own namespaces, so either can stay up beside the Hermes deployment.
-
-Step 6d keeps OpenClaw, Hermes, and Deep Agents in namespace `nemoclaw-v1-gpu-autoscaling-mixed`. [`install-two-runtimes.sh`](scripts/install-two-runtimes.sh) installs Helm release `nemoclaw-gpu-ollama` (Deployment `openclaw-ollama`), release `nemoclaw-gpu-vllm` (Deployment `hermes-vllm`), and release `nemoclaw-gpu-nim` (Deployment `deepagents-nim`), each with `maxReplicas` 8. Watch all three with [`get-hpa.sh -w`](scripts/get-hpa.sh). [`render-mixed-sandboxes.sh`](scripts/render-mixed-sandboxes.sh) prints 3 OpenClaw sandboxes, 3 Hermes sandboxes, and 3 Deep Agents sandboxes.
+Agents run in namespace `nemoclaw-v1-agents`. [`install-runtimes.sh`](scripts/install-runtimes.sh) installs Helm releases `nemoclaw-gpu-ollama`, `nemoclaw-gpu-vllm`, and `nemoclaw-gpu-nim` in namespace `nemoclaw-gpu`, each with `maxReplicas` 8. Watch all three with [`get-hpa.sh -w`](scripts/get-hpa.sh). Load all three with [`client.sh`](scripts/client.sh).
 
 GPU utilization and LLM latency use the same client. Switch the chart metric with [`set-hpa-metric.sh`](scripts/set-hpa-metric.sh). Recorded Hermes and Deep Agents runs are in [`RESULTS-6b.md`](RESULTS-6b.md) and [`RESULTS-6c.md`](RESULTS-6c.md).

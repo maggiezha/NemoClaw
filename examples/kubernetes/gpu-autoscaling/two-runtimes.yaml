@@ -3,7 +3,7 @@
 # yaml-language-server: $schema=../../../schemas/nemoclaw-v1alpha1.schema.json
 # A Hermes sandbox on the chart's vLLM release and an OpenClaw sandbox on its
 # Ollama release, which the nemoclaw-community kubernetes-gpu-autoscaling
-# chart's install-two-runtimes.sh installs on shared GPUs. The gateway uses the
+# chart's install-runtimes.sh installs on shared GPUs. The gateway uses the
 # oidc profile so that you, and load.sh, can reach the agents through the
 # OpenShell CLI. Hermes serves its OpenAI-compatible API, published at a URL
 # the gateway serves. NemoClaw creates nothing for the chart; see README.md.

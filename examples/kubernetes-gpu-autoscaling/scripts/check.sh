@@ -113,10 +113,22 @@ else
       ;;
   esac
 
-  if kubectl -n "${GPU_NS}" get secret nemoclaw-gpu-metrics-proxy-inference-api >/dev/null 2>&1; then
+  gpu_secret=""
+  for name in \
+    nemoclaw-gpu-metrics-proxy-inference-api \
+    nemoclaw-gpu-vllm-metrics-proxy-inference-api \
+    nemoclaw-gpu-ollama-metrics-proxy-inference-api \
+    nemoclaw-gpu-nim-metrics-proxy-inference-api
+  do
+    if kubectl -n "${GPU_NS}" get secret "${name}" >/dev/null 2>&1; then
+      gpu_secret="${name}"
+      break
+    fi
+  done
+  if [[ -n "${gpu_secret}" ]]; then
     ok "inference API Secret exists (value not printed)"
   else
-    block "missing Secret nemoclaw-gpu-metrics-proxy-inference-api"
+    block "missing inference API Secret in ${GPU_NS}"
   fi
 
   envoy="$(kubectl -n envoy-gateway-system get svc -l app.kubernetes.io/component=proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"

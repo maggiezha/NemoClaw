@@ -100,9 +100,12 @@ hpa_common_verify_metrics_proxy_servicemonitor_release() {
   local expected="${HPA_SERVICEMONITOR_RELEASE:-}"
   [[ -n "${expected}" ]] || return 0
 
-  local sm got
+  local sm got selector="app.kubernetes.io/name=nemoclaw-gpu"
+  if [[ -n "${RELEASE:-}" ]]; then
+    selector+=",app.kubernetes.io/instance=${RELEASE}"
+  fi
   sm="$(kubectl get servicemonitor -n "${ns}" \
-    -l 'app.kubernetes.io/name=nemoclaw-gpu' \
+    -l "${selector}" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
   if [[ -z "${sm}" ]]; then
     echo "metrics-proxy ServiceMonitor not found in ${ns}; Prometheus cannot scrape latency metrics." >&2

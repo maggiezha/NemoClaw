@@ -15,6 +15,22 @@ agent_common_validate() {
   esac
 }
 
+# Directory that contains terraform.tfstate. Accepts the apply --state-dir
+# when the file is there, or that directory's state/ subdirectory.
+agent_common_resolve_state_dir() {
+  local dir="${1:-}"
+  [[ -n "${dir}" ]] || return 1
+  if [[ -f "${dir}/terraform.tfstate" ]]; then
+    printf '%s\n' "${dir}"
+    return 0
+  fi
+  if [[ -f "${dir}/state/terraform.tfstate" ]]; then
+    printf '%s\n' "${dir}/state"
+    return 0
+  fi
+  return 1
+}
+
 # Laptop clients talk HTTP to dgx-ip (published host ports). See
 # ../README.md#6a-openclaw-with-ollama
 agent_common_print_laptop_client_usage() {

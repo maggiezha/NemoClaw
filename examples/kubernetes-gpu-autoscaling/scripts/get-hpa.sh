@@ -8,7 +8,7 @@
 # Usage:
 #   ./scripts/get-hpa.sh
 #   ./scripts/get-hpa.sh -w
-#   ./scripts/get-hpa.sh -n nemoclaw-gpu-vllm -w
+#   ./scripts/get-hpa.sh -n nemoclaw-gpu -w
 #   HPA_WATCH_INTERVAL_SEC=5 ./scripts/get-hpa.sh -w
 
 set -euo pipefail
@@ -47,7 +47,7 @@ replica count, GPU pods, and which GPU index runs which pairing.
 Examples:
   $(basename "$0")
   $(basename "$0") -w
-  $(basename "$0") -n nemoclaw-gpu-ollama -w
+  $(basename "$0") -n nemoclaw-gpu -w
 EOF
       exit 0
       ;;

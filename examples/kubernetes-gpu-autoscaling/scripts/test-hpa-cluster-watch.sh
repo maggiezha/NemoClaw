@@ -38,7 +38,7 @@ for name, want in cases:
 snapshot = {
     "hpas": [
         {
-            "namespace": "nemoclaw-gpu-vllm",
+            "namespace": "nemoclaw-gpu",
             "name": "nemoclaw-gpu-vllm-metrics-proxy",
             "targets": "0%/40%",
             "minReplicas": 1,
@@ -48,7 +48,7 @@ snapshot = {
             "metric_kind": "gpu_utilization",
         },
         {
-            "namespace": "nemoclaw-gpu-ollama",
+            "namespace": "nemoclaw-gpu",
             "name": "nemoclaw-gpu-ollama-metrics-proxy",
             "targets": "0%/40%",
             "minReplicas": 1,
@@ -60,7 +60,7 @@ snapshot = {
     ],
     "pods": [
         {
-            "namespace": "nemoclaw-gpu-vllm",
+            "namespace": "nemoclaw-gpu",
             "name": "nemoclaw-gpu-vllm-metrics-proxy-c9c4bcf65-r94hm",
             "ready": "2/2",
             "status": "Running",
@@ -69,7 +69,7 @@ snapshot = {
             "age": "16h",
         },
         {
-            "namespace": "nemoclaw-gpu-ollama",
+            "namespace": "nemoclaw-gpu",
             "name": "nemoclaw-gpu-ollama-metrics-proxy-5c5cd5bc5-45jjq",
             "ready": "2/2",
             "status": "Running",
@@ -82,14 +82,14 @@ snapshot = {
         {
             "index": "0",
             "node": "dgx-19",
-            "namespace": "nemoclaw-gpu-vllm",
+            "namespace": "nemoclaw-gpu",
             "pod": "nemoclaw-gpu-vllm-metrics-proxy-c9c4bcf65-r94hm",
             "util": "0",
         },
         {
             "index": "1",
             "node": "dgx-19",
-            "namespace": "nemoclaw-gpu-ollama",
+            "namespace": "nemoclaw-gpu",
             "pod": "nemoclaw-gpu-ollama-metrics-proxy-5c5cd5bc5-45jjq",
             "util": "0",
         },

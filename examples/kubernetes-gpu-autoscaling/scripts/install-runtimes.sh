@@ -3,15 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Install three copies of this chart: vLLM for Hermes, Ollama for OpenClaw,
-# and NIM for Deep Agents. Each Horizontal Pod Autoscaler ceiling is
-# MAX_REPLICAS (default 8). The node still has one pool of GPUs. A pod that
-# does not fit stays Pending. NIM also needs NGC Secrets in its namespace
-# before Helm runs.
+# and NIM for Deep Agents. All three Helm releases share namespace
+# nemoclaw-gpu (override with GPU_NAMESPACE). Each Horizontal Pod Autoscaler
+# ceiling is MAX_REPLICAS (default 8). The node still has one pool of GPUs.
+# A pod that does not fit stays Pending. NIM also needs NGC Secrets in that
+# namespace before Helm runs.
 #
-#   DCGM_NAMESPACE=gpu-operator ./scripts/install-two-runtimes.sh
+#   DCGM_NAMESPACE=gpu-operator ./scripts/install-runtimes.sh
 #   ENABLE_ENVOY_LB=0 skips Envoy; sandboxes use each release's metrics-proxy Service.
-#
-# Leaves the existing nemoclaw-gpu release in place.
 
 set -euo pipefail
 
@@ -27,6 +26,7 @@ DCGM_NAMESPACE="${DCGM_NAMESPACE:-gpu-operator}"
 VLLM_RELEASE="${VLLM_RELEASE:-nemoclaw-gpu-vllm}"
 OLLAMA_RELEASE="${OLLAMA_RELEASE:-nemoclaw-gpu-ollama}"
 NIM_RELEASE="${NIM_RELEASE:-nemoclaw-gpu-nim}"
+GPU_NAMESPACE="${GPU_NAMESPACE:-nemoclaw-gpu}"
 
 ensure_nim_secrets() {
   local namespace="${1:?namespace}"
@@ -55,7 +55,7 @@ install_one() {
   local skip_monitoring="${3:?skip}"
   echo "Installing ${release} runtime=${runtime} maxReplicas=${MAX_REPLICAS}"
   RELEASE="${release}" \
-    NAMESPACE="${release}" \
+    NAMESPACE="${GPU_NAMESPACE}" \
     INFERENCE_RUNTIME="${runtime}" \
     MAX_REPLICAS="${MAX_REPLICAS}" \
     HPA_SHARED_GPU_CEILING=1 \
@@ -69,13 +69,34 @@ service_url() {
   local release="${1:?release}"
   local service
   service="$(RELEASE="${release}" CHART_NAME=nemoclaw-gpu hpa_common_metrics_proxy_service)"
-  printf 'http://%s.%s.svc.cluster.local:8081/v1\n' "${service}" "${release}"
+  printf 'http://%s.%s.svc.cluster.local:8081/v1\n' "${service}" "${GPU_NAMESPACE}"
 }
 
-ensure_nim_secrets "${NIM_RELEASE}"
+if helm status nemoclaw-gpu --namespace "${GPU_NAMESPACE}" >/dev/null 2>&1; then
+  echo "WARNING: Helm release nemoclaw-gpu is already in ${GPU_NAMESPACE}. Its Deployment names collide with these three releases. Uninstall it first, or set GPU_NAMESPACE." >&2
+fi
+
+uninstall_legacy_namespace() {
+  local release="${1:?release}"
+  if [[ "${release}" == "${GPU_NAMESPACE}" ]]; then
+    return 0
+  fi
+  if ! helm status "${release}" --namespace "${release}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Uninstalling leftover Helm release ${release} from namespace ${release}; inference now runs in ${GPU_NAMESPACE}."
+  helm uninstall "${release}" --namespace "${release}" --wait --timeout 10m || true
+}
+
+ensure_nim_secrets "${GPU_NAMESPACE}"
 install_one "${VLLM_RELEASE}" vllm 0
 install_one "${OLLAMA_RELEASE}" ollama 1
 install_one "${NIM_RELEASE}" nim 1
+if [[ "${UNINSTALL_LEGACY_NAMESPACES:-0}" == "1" ]]; then
+  uninstall_legacy_namespace "${VLLM_RELEASE}"
+  uninstall_legacy_namespace "${OLLAMA_RELEASE}"
+  uninstall_legacy_namespace "${NIM_RELEASE}"
+fi
 
 echo "Hermes inference: $(service_url "${VLLM_RELEASE}")"
 echo "OpenClaw inference: $(service_url "${OLLAMA_RELEASE}")"

@@ -42,6 +42,9 @@ export E2E_USERS="${E2E_USERS:-10}"
 export E2E_USER_OFFSET="${E2E_USER_OFFSET:-0}"
 export V1_NAMESPACE="${V1_NAMESPACE:-nemoclaw-v1-gpu-autoscaling}"
 export NEMOCLAW_V1_STATE_DIR="${NEMOCLAW_V1_STATE_DIR:-${RECIPE_DIR}/.local/gpu-autoscaling}"
+if resolved="$(agent_common_resolve_state_dir "${NEMOCLAW_V1_STATE_DIR}")"; then
+  export NEMOCLAW_V1_STATE_DIR="${resolved}"
+fi
 # hermes (default) or deepagents. client-deepagents.sh sets it.
 AGENT_KIND="${V1_AGENT_KIND:-hermes}"
 INFERENCE_RUNTIME="${INFERENCE_RUNTIME:-$(agent_common_default_inference_runtime "${AGENT_KIND}")}"

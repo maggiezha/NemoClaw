@@ -13,11 +13,12 @@ Setup and load-test steps live in [`../README.md`](../README.md). Pairing files 
 | `validate-yaml.py` | Schema check used by `check.sh`. |
 | `render-sandboxes.sh` | Print a pairing file expanded to `E2E_USERS` sandboxes. Does not apply. |
 | `render-mixed-sandboxes.sh` | Print 3 OpenClaw, 3 Hermes, and 3 Deep Agents sandboxes for step 6d. Does not apply. |
-| `install-two-runtimes.sh` | Install vLLM (`hermes-vllm`), Ollama (`openclaw-ollama`), and NIM (`deepagents-nim`), each with ceiling 8. `ENABLE_ENVOY_LB=0` skips Envoy. NIM needs `secrets.env`. |
+| `install-runtimes.sh` | Install vLLM (`hermes-vllm`), Ollama (`openclaw-ollama`), and NIM (`deepagents-nim`) in namespace `nemoclaw-gpu`, each with ceiling 8. `ENABLE_ENVOY_LB=0` skips Envoy. NIM needs `secrets.env`. |
 | `invoke.sh` | One operator prompt through `openshell sandbox exec` after `oidc`. |
-| `client-openclaw.sh` | OpenClaw client. Flags: GPU utilization `INFLIGHT=4 MAX_TOKENS=2048`. Latency omits them. Does not print the HPA. |
-| `client-hermes.sh` | Hermes client. Flags: GPU utilization `INFLIGHT=2 MAX_TOKENS=1024`. Latency omits them (`INFLIGHT=1 MAX_TOKENS=2048` in the code). Does not print the HPA. |
-| `client-deepagents.sh` | Deep Agents client. GPU utilization `INFLIGHT=3`. Does not print the HPA. |
+| `client.sh` | Mixed load client. Starts OpenClaw, Hermes, and Deep Agents together. `./scripts/client.sh gpu_utilization` or `./scripts/client.sh latency_avg`. Does not print the HPA. |
+| `client-openclaw.sh` | OpenClaw client used by `client.sh`. Flags: GPU utilization `INFLIGHT=4 MAX_TOKENS=2048`. Latency omits them. |
+| `client-hermes.sh` | Hermes client used by `client.sh`. Flags: GPU utilization `INFLIGHT=2 MAX_TOKENS=1024`. Latency omits them (`INFLIGHT=1 MAX_TOKENS=2048` in the code). |
+| `client-deepagents.sh` | Deep Agents client used by `client.sh`. GPU utilization `INFLIGHT=3`. |
 | `e2e-fabric-load-test.py` | Per-user driver used by the three clients. |
 | `set-hpa-metric.sh` | Switch the chart HPA between `gpu_utilization` and `latency_avg`. |
 | `install-hpa.sh` | Monitoring, this chart, HPA, and Envoy when enabled. |
@@ -40,3 +41,5 @@ Setup and load-test steps live in [`../README.md`](../README.md). Pairing files 
 | `test-workload-name.sh` | Helm names the GPU Deployment and HPA `hermes-vllm` / `openclaw-ollama`. |
 | `hpa-watch-format.py` | Formats that watch. Do not run it directly. |
 | `test-render-mixed-sandboxes.sh` | Step 6d renders 3 OpenClaw, 3 Hermes, and 3 Deep Agents sandboxes on separate Services. |
+| `test-state-dir.sh` | Load clients find `terraform.tfstate` in the apply `--state-dir` or its `state/` subdirectory. |
+| `test-client.sh` | Step 6d `client.sh` starts OpenClaw, Hermes, and Deep Agents for GPU utilization and latency. |

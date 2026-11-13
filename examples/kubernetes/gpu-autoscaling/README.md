@@ -92,15 +92,15 @@ NemoClaw itself doesn't place NIM ([#12649](https://github.com/NVIDIA/NemoClaw/i
 
 ### Run Two Runtimes on Shared GPUs
 
-To serve Hermes with vLLM and OpenClaw with Ollama from the same GPUs, install the chart twice with its `install-two-runtimes.sh` instead of `install-hpa.sh`:
+To serve Hermes with vLLM and OpenClaw with Ollama from the same GPUs, install the chart with its `install-runtimes.sh` instead of `install-hpa.sh`:
 
 ```sh
-DCGM_NAMESPACE=gpu-operator MAX_REPLICAS=8 ./scripts/install-two-runtimes.sh
+DCGM_NAMESPACE=gpu-operator MAX_REPLICAS=8 ./scripts/install-runtimes.sh
 ```
 
-It installs the release `nemoclaw-gpu-vllm` in the namespace of the same name, and `nemoclaw-gpu-ollama` likewise, each with its own autoscaler whose ceiling is `MAX_REPLICAS`.
+It installs the releases `nemoclaw-gpu-vllm` and `nemoclaw-gpu-ollama` in namespace `nemoclaw-gpu`, each with its own autoscaler whose ceiling is `MAX_REPLICAS`.
 Both ceilings count the same GPUs, so a pod that doesn't fit stays Pending until the other runtime scales down.
-For each release, use its name as the namespace and release in [Find the Service and Key](#find-the-service-and-key): its Gateway is `<release>-metrics-proxy` and its key Secret is `<release>-metrics-proxy-inference-api`.
+For each release, use namespace `nemoclaw-gpu` in [Find the Service and Key](#find-the-service-and-key): its Gateway is `<release>-metrics-proxy` and its key Secret is `<release>-metrics-proxy-inference-api`.
 In the configuration, declare one inference provider and one inference per release, each with that release's key variable and model, and point each sandbox's `agent.inferenceRef` at the inference for its pairing, as [two-runtimes.yaml](two-runtimes.yaml) does with `GPU_VLLM_API_KEY` and `GPU_OLLAMA_API_KEY`.
 
 ## Deploy the Sandboxes

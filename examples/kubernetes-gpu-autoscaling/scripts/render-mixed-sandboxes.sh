@@ -10,8 +10,10 @@
 #
 # Defaults: 3 OpenClaw sandboxes (user-0000 through user-0002), 3 Hermes
 # sandboxes (user-0003 through user-0005), and 3 Deep Agents sandboxes
-# (user-0006 through user-0008). Image digests come from
-# openclaw-ollama.yaml, hermes-vllm.yaml, and deepagents-nim.yaml.
+# (user-0006 through user-0008). Image digests come from OPENCLAW_IMAGE_REF,
+# HERMES_IMAGE_REF, and DEEPAGENTS_IMAGE_REF, or from the pairing files.
+# Gateway context comes from GATEWAY_CONTEXT or kubectl. NEMOCLAW_TARGET_NODE
+# pins sandboxes and sets allow_driver_config.
 
 set -euo pipefail
 
@@ -24,6 +26,7 @@ DEEPAGENTS_USERS="${DEEPAGENTS_USERS:-3}"
 VLLM_RELEASE="${VLLM_RELEASE:-nemoclaw-gpu-vllm}"
 OLLAMA_RELEASE="${OLLAMA_RELEASE:-nemoclaw-gpu-ollama}"
 NIM_RELEASE="${NIM_RELEASE:-nemoclaw-gpu-nim}"
+GPU_NAMESPACE="${GPU_NAMESPACE:-nemoclaw-gpu}"
 
 if [[ ! "${OPENCLAW_USERS}" =~ ^[0-9]+$ || ! "${HERMES_USERS}" =~ ^[0-9]+$ || ! "${DEEPAGENTS_USERS}" =~ ^[0-9]+$ ]]; then
   echo "OPENCLAW_USERS, HERMES_USERS, and DEEPAGENTS_USERS must be integers" >&2
@@ -39,9 +42,11 @@ if ((OPENCLAW_USERS + HERMES_USERS + DEEPAGENTS_USERS > 32)); then
 fi
 
 python3 - "${EXAMPLE_DIR}" "${OPENCLAW_USERS}" "${HERMES_USERS}" "${DEEPAGENTS_USERS}" \
-  "${OLLAMA_RELEASE}" "${VLLM_RELEASE}" "${NIM_RELEASE}" <<'PY'
+  "${OLLAMA_RELEASE}" "${VLLM_RELEASE}" "${NIM_RELEASE}" "${GPU_NAMESPACE}" <<'PY'
 import copy
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,6 +59,7 @@ deepagents_users = int(sys.argv[4])
 ollama_release = sys.argv[5]
 vllm_release = sys.argv[6]
 nim_release = sys.argv[7]
+gpu_namespace = sys.argv[8]
 
 
 class DumpWithoutAliases(yaml.SafeDumper):
@@ -77,7 +83,7 @@ def first_sandbox(doc: dict, path_name: str) -> dict:
 
 def service_url(release: str) -> str:
     return (
-        f"http://{release}-metrics-proxy.{release}.svc.cluster.local:8081/v1"
+        f"http://{release}-metrics-proxy.{gpu_namespace}.svc.cluster.local:8081/v1"
     )
 
 
@@ -89,12 +95,34 @@ hermes_template = first_sandbox(hermes, "hermes-vllm.yaml")
 deepagents_template = first_sandbox(deepagents, "deepagents-nim.yaml")
 
 doc = copy.deepcopy(openclaw)
-doc["metadata"]["name"] = os.environ.get("MIXED_NAME") or "gpu-autoscaling-openclaw-hermes-deepagents"
+doc["metadata"]["name"] = os.environ.get("MIXED_NAME") or "gpu-autoscaling-mixed"
 doc["metadata"]["uid"] = os.environ.get("MIXED_UID") or "a7c3e1b2-4d58-4f0a-9c6e-2b8f0d1e6a44"
 gateway = doc["spec"]["gateway"]
 gateway["endpoint"] = "https://127.0.0.1:17673"
-gateway["kubernetes"]["namespace"] = "nemoclaw-v1-gpu-autoscaling-mixed"
+gateway["kubernetes"]["namespace"] = os.environ.get("V1_NAMESPACE") or "nemoclaw-v1-agents"
+context = (os.environ.get("GATEWAY_CONTEXT") or "").strip()
+if not context and shutil.which("kubectl"):
+    try:
+        got = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        context = (got.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        context = ""
+if context:
+    gateway["kubernetes"]["context"] = context
 target_node = (os.environ.get("NEMOCLAW_TARGET_NODE") or "").strip()
+if target_node:
+    drivers = (
+        gateway.setdefault("config", {})
+        .setdefault("openshell.drivers.kubernetes", {})
+    )
+    drivers["allow_driver_config"] = True
+    drivers["image_pull_policy"] = "if_not_present"
 
 
 def provider(source_name: str, source: dict, endpoint: str, credential_env: str) -> dict:
@@ -129,9 +157,19 @@ doc["spec"]["inferenceProviders"] = {
 }
 
 
+image_refs = {
+    "gpu-ollama": (os.environ.get("OPENCLAW_IMAGE_REF") or "").strip(),
+    "gpu-vllm": (os.environ.get("HERMES_IMAGE_REF") or "").strip(),
+    "gpu-nim": (os.environ.get("DEEPAGENTS_IMAGE_REF") or "").strip(),
+}
+
+
 def place(template: dict, provider_ref: str, metadata_env: str) -> dict:
     sandbox = copy.deepcopy(template)
     sandbox["image"]["metadata"] = {"env": metadata_env}
+    image_ref = image_refs.get(provider_ref) or ""
+    if image_ref:
+        sandbox["image"]["ref"] = image_ref
     routes = sandbox["agent"]["inference"]["routes"]
     routes[0]["providerRef"] = provider_ref
     if target_node:
