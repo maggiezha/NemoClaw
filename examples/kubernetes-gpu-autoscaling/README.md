@@ -214,7 +214,7 @@ NEMOCLAW_V1_STATE_DIR=.local/gpu-autoscaling-mixed ./scripts/invoke.sh
 
 The cluster serves inference and prints the HPA. A client only sends chats. The same client flags work from any host with kubectl and the apply state directory. The client does not set `maxReplicas` and does not print the HPA.
 
-Leave this watch running. It prints every GPU-chart HPA, pod, and GPU index in one terminal. Rows use the pairing names (`hermes-vllm`, `openclaw-ollama`, `deepagents-nim`).
+Leave this watch running. It prints every GPU-chart HPA, pod, and GPU index in one terminal. Rows use the pairing names (`hermes-vllm`, `openclaw-ollama`, `deepagents-nim`). GPU UTIL, LATENCY, and TOK/S are always shown. Only `gpu_utilization` or `latency_avg` is the HPA scale signal; TOK/S is display-only. When a runtime omits `usage.completion_tokens`, TOK/S estimates from reply length / 4.
 
 ```bash
 cd "$NEMOCLAW_ROOT/examples/kubernetes-gpu-autoscaling"

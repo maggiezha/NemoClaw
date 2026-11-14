@@ -7,9 +7,9 @@
 
 import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { llmMetricsLines, recordLlmLatency } from "./metrics-proxy-metrics.ts";
+import { completionTokensFromUpstream, llmMetricsLines, recordLlmLatency } from "./metrics-proxy-metrics.ts";
 
 const PORT = Number(process.env.PORT || 8081);
 const BASE_URL = (process.env.INFERENCE_BASE_URL || "http://127.0.0.1:11434/v1").replace(/\/$/, "");
@@ -141,6 +141,9 @@ async function proxyChatCompletions(req, res) {
   body.model = MODEL;
   const llmStart = performance.now();
   let llmOk = false;
+  let contentType = "application/json";
+  const tapChunks = [];
+  let tapSize = 0;
   try {
     const hubRes = await fetch(`${BASE_URL}/chat/completions`, {
       method: "POST",
@@ -152,10 +155,22 @@ async function proxyChatCompletions(req, res) {
     // Pipe the upstream body straight through (don't buffer with .text()) so
     // "stream": true chat-completions reach the client incrementally, and forward
     // its real content-type instead of forcing application/json on SSE responses.
-    const contentType = hubRes.headers.get("content-type") || "application/json";
+    // Copy a bounded prefix for tokens/sec; that gauge is display-only.
+    contentType = hubRes.headers.get("content-type") || "application/json";
     res.writeHead(hubRes.status, { "content-type": contentType });
     if (hubRes.body) {
-      await pipeline(Readable.fromWeb(hubRes.body), res);
+      const tap = new Transform({
+        transform(chunk, _enc, cb) {
+          if (tapSize < MAX_BODY_BYTES) {
+            const room = MAX_BODY_BYTES - tapSize;
+            const part = chunk.length > room ? chunk.subarray(0, room) : chunk;
+            tapChunks.push(part);
+            tapSize += part.length;
+          }
+          cb(null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(hubRes.body), tap, res);
     } else {
       res.end();
     }
@@ -170,7 +185,10 @@ async function proxyChatCompletions(req, res) {
       res.destroy();
     }
   } finally {
-    recordLlmLatency(performance.now() - llmStart, llmOk);
+    const tokens = llmOk
+      ? completionTokensFromUpstream(Buffer.concat(tapChunks).toString("utf8"), contentType)
+      : 0;
+    recordLlmLatency(performance.now() - llmStart, llmOk, tokens);
   }
 }
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Format one GPU-chart watch: HPA, pods, and GPU index.
+"""Format one GPU-chart watch: HPA, pods, GPU index, and observed metrics.
 
 Rows use hermes-vllm / openclaw-ollama, not Kubernetes metrics-proxy names.
+GPU UTIL, LATENCY, and TOK/S are always printed. Only one of util or latency
+is the HPA scale signal; TOK/S is never an HPA metric.
 """
 
 from __future__ import annotations
@@ -112,6 +114,42 @@ def fmt_ms(n: float | None) -> str:
     return f"{n:.2f}".rstrip("0").rstrip(".")
 
 
+def parse_prom_gauge(text: str | None, name: str) -> float | None:
+    if not text or not name:
+        return None
+    prefix = f"{name} "
+    for line in str(text).splitlines():
+        if not line.startswith(prefix):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            return None
+        try:
+            return float(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def fmt_toks(n: float | None) -> str:
+    if n is None:
+        return "?"
+    if abs(n - round(n)) < 1e-6:
+        return f"{int(round(n))}/s"
+    return f"{n:.2f}".rstrip("0").rstrip(".") + "/s"
+
+
+def parse_tokens_per_second(text: str | None) -> str:
+    """Read the display-only tokens/sec gauge from a Prometheus text scrape."""
+    return fmt_toks(parse_prom_gauge(text, "nemoclaw_llm_tokens_per_second"))
+
+
+def parse_latency_ms(text: str | None) -> str:
+    """Read the LLM latency gauge from a Prometheus text scrape."""
+    n = parse_prom_gauge(text, "nemoclaw_llm_latency_avg_milliseconds")
+    return "?" if n is None else fmt_ms(n)
+
+
 def age(ts: str | None) -> str:
     if not ts:
         return "?"
@@ -186,14 +224,20 @@ def snapshot_from_hpa_objects(items: list[dict[str, Any]]) -> list[dict[str, Any
                 "replicas": status.get("currentReplicas", ""),
                 "age": age(meta.get("creationTimestamp")),
                 "metric_kind": metric_kind(hpa_metric_name(hpa)),
+                "gpu_util": "?",
+                "latency": "?",
+                "tokens_per_sec": "?",
             }
         )
     return rows
 
 
 def snapshot_from_pod_objects(
-    items: list[dict[str, Any]], gpu_util: dict[str, str]
+    items: list[dict[str, Any]],
+    gpu_util: dict[str, str],
+    tokens_per_sec: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    tok = tokens_per_sec or {}
     rows = []
     for pod in sorted(items, key=lambda p: (p.get("metadata") or {}).get("name") or ""):
         meta = pod.get("metadata") or {}
@@ -210,6 +254,14 @@ def snapshot_from_pod_objects(
                 "status": status.get("phase") or "?",
                 "restarts": sum((c.get("restartCount") or 0) for c in containers),
                 "gpu_util": gpu_util.get(name, "<unknown>"),
+                "latency": (tok.get(name) or {}).get("latency", "?")
+                if isinstance(tok.get(name), dict)
+                else "?",
+                "tokens_per_sec": (
+                    (tok.get(name) or {}).get("tokens_per_sec", "?")
+                    if isinstance(tok.get(name), dict)
+                    else tok.get(name, "?")
+                ),
                 "age": age(meta.get("creationTimestamp")),
             }
         )
@@ -225,14 +277,19 @@ def format_cluster(snapshot: dict[str, Any]) -> str:
     if hpas:
         kind = hpas[0].get("metric_kind") or "gpu_utilization"
         if kind == "latency":
-            subtitle = "HPA — LLM latency (avg per pod): current / target (ms)"
-            metric_col = "LATENCY ms"
+            subtitle = (
+                "HPA — scaling on LLM latency (current / target ms). "
+                "GPU UTIL and TOK/S are display-only."
+            )
         else:
-            subtitle = "HPA — GPU utilization (avg per pod): current / target"
-            metric_col = "GPU UTIL %"
+            subtitle = (
+                "HPA — scaling on GPU utilization (current / target). "
+                "LATENCY and TOK/S are display-only."
+            )
         lines.append(subtitle)
         lines.append(
-            f"{'NAME':<{NAME_W}} {metric_col:<12} "
+            f"{'NAME':<{NAME_W}} {'HPA':<12} "
+            f"{'GPU UTIL':<10} {'LATENCY':<8} {'TOK/S':<8} "
             f"{'MINPODS':<8} {'MAXPODS':<8} {'REPLICAS':<10} AGE"
         )
         for hpa in hpas:
@@ -240,6 +297,9 @@ def format_cluster(snapshot: dict[str, Any]) -> str:
             lines.append(
                 f"{label:<{NAME_W}} "
                 f"{str(hpa.get('targets') or '?'):<12} "
+                f"{str(hpa.get('gpu_util') or '?'):<10} "
+                f"{str(hpa.get('latency') or '?'):<8} "
+                f"{str(hpa.get('tokens_per_sec') or '?'):<8} "
                 f"{str(hpa.get('minReplicas', '')):<8} "
                 f"{str(hpa.get('maxReplicas', '')):<8} "
                 f"{str(hpa.get('replicas', '')):<10} "
@@ -253,7 +313,7 @@ def format_cluster(snapshot: dict[str, Any]) -> str:
     else:
         lines.append(
             f"{'NAME':<{NAME_W}} {'READY':<7} "
-            f"{'STATUS':<11} {'GPU UTIL':<10} AGE"
+            f"{'STATUS':<11} {'GPU UTIL':<10} {'LATENCY':<8} {'TOK/S':<8} AGE"
         )
         for pod in pods:
             label = display_name(str(pod.get("name") or ""), str(pod.get("namespace") or ""))
@@ -261,7 +321,9 @@ def format_cluster(snapshot: dict[str, Any]) -> str:
                 f"{label:<{NAME_W}} "
                 f"{str(pod.get('ready') or '?'):<7} "
                 f"{str(pod.get('status') or '?'):<11} "
-                f"{str(pod.get('gpu_util') or '<'):<10} "
+                f"{str(pod.get('gpu_util') or '?'):<10} "
+                f"{str(pod.get('latency') or '?'):<8} "
+                f"{str(pod.get('tokens_per_sec') or '?'):<8} "
                 f"{pod.get('age') or '?'}"
             )
         lines.append("")
@@ -354,6 +416,87 @@ def _pod_gpu_util(namespaces: list[str]) -> dict[str, str]:
     return gpu
 
 
+def _metrics_port(pod: dict[str, Any]) -> str:
+    # kubectl pod proxy by port name (`:http`) fails on this cluster; use the number.
+    for container in (pod.get("spec") or {}).get("containers") or []:
+        if container.get("name") != "metrics-proxy":
+            continue
+        for port in container.get("ports") or []:
+            if port.get("containerPort") is not None:
+                return str(port["containerPort"])
+            if port.get("name"):
+                return str(port["name"])
+    return "8081"
+
+
+def _pod_proxy_metrics(pods: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for pod in pods:
+        meta = pod.get("metadata") or {}
+        ns = str(meta.get("namespace") or "")
+        name = str(meta.get("name") or "")
+        if not ns or not name:
+            continue
+        port = _metrics_port(pod)
+        data = _kubectl(
+            ["get", "--raw", f"/api/v1/namespaces/{ns}/pods/{name}:{port}/proxy/metrics"],
+            timeout=3,
+        )
+        text = data if isinstance(data, str) else ""
+        out[name] = {
+            "latency": parse_latency_ms(text),
+            "tokens_per_sec": parse_tokens_per_second(text),
+        }
+    return out
+
+
+def _mean_display(values: list[str], kind: str) -> str:
+    nums: list[float] = []
+    for raw in values:
+        s = str(raw or "").strip()
+        if not s or s in ("?", "<unknown>"):
+            continue
+        try:
+            if kind == "pct":
+                nums.append(float(s.rstrip("%")))
+            elif kind == "tok":
+                nums.append(float(s.rstrip("/s")))
+            else:
+                nums.append(float(s))
+        except ValueError:
+            continue
+    if not nums:
+        return "?"
+    mean = sum(nums) / len(nums)
+    if kind == "pct":
+        return fmt_pct(mean)
+    if kind == "tok":
+        return fmt_toks(mean)
+    return fmt_ms(mean)
+
+
+def _attach_observed_metrics(
+    hpa_rows: list[dict[str, Any]], pod_rows: list[dict[str, Any]]
+) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for pod in pod_rows:
+        key = pairing_for_name(str(pod.get("name") or ""), str(pod.get("namespace") or ""))
+        if not key:
+            continue
+        groups.setdefault(key, []).append(pod)
+    for hpa in hpa_rows:
+        key = pairing_for_name(str(hpa.get("name") or ""), str(hpa.get("namespace") or ""))
+        members = groups.get(key) or []
+        if hpa.get("gpu_util") in (None, "", "?"):
+            hpa["gpu_util"] = _mean_display([str(p.get("gpu_util") or "") for p in members], "pct")
+        if hpa.get("latency") in (None, "", "?"):
+            hpa["latency"] = _mean_display([str(p.get("latency") or "") for p in members], "ms")
+        if hpa.get("tokens_per_sec") in (None, "", "?"):
+            hpa["tokens_per_sec"] = _mean_display(
+                [str(p.get("tokens_per_sec") or "") for p in members], "tok"
+            )
+
+
 def _prometheus_proxy_paths() -> list[str]:
     monitoring_ns = os.environ.get("MONITORING_NS") or ""
     release = os.environ.get("PROM_RELEASE") or "kube-prometheus-stack"
@@ -423,9 +566,13 @@ def live_snapshot(namespace: str = "") -> dict[str, Any]:
     if namespace and namespace not in namespaces:
         namespaces.insert(0, namespace)
     pods = _gpu_chart_pods(namespaces)
+    pod_rows = snapshot_from_pod_objects(
+        pods, _pod_gpu_util(namespaces), _pod_proxy_metrics(pods)
+    )
+    _attach_observed_metrics(hpa_rows, pod_rows)
     return {
         "hpas": hpa_rows,
-        "pods": snapshot_from_pod_objects(pods, _pod_gpu_util(namespaces)),
+        "pods": pod_rows,
         "gpus": _gpu_map(namespaces),
     }
 

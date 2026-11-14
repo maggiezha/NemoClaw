@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Shared Prometheus helpers for metrics-proxy /metrics (LLM latency, HTTP counters).
+// Shared Prometheus helpers for metrics-proxy /metrics (LLM latency, tokens/sec, HTTP counters).
 // HPA latency_avg is the mean of samples in the recent window (not all-time).
+// Tokens/sec is display-only: do not wire it as an HPA metric.
 
 // After this many ms with no new samples, clear the HPA average so it reports 0
 // (below target) instead of retaining the last high latency. 0 disables idle
@@ -19,7 +20,7 @@ const configuredWindowMs = Number(process.env.LLM_LATENCY_WINDOW_MS ?? "30000");
 const LLM_LATENCY_WINDOW_MS =
   Number.isFinite(configuredWindowMs) && configuredWindowMs >= 0 ? configuredWindowMs : 30_000;
 
-type HpaSample = { atMs: number; durationMs: number };
+type HpaSample = { atMs: number; durationMs: number; completionTokens: number };
 
 let hpaSamples: HpaSample[] = [];
 let llmDurationSumSec = 0;
@@ -55,10 +56,11 @@ function pruneHpaSamples(nowMs = nowMsProvider()) {
   }
 }
 
-export function recordLlmLatency(durationMs, ok) {
+export function recordLlmLatency(durationMs, ok, completionTokens = 0) {
   // Normalize once so the HPA average and the cumulative counters/histogram
   // below always agree on the same finite, non-negative value.
   const normalizedMs = Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0;
+  const tokens = Number.isFinite(completionTokens) ? Math.max(0, completionTokens) : 0;
   const sec = normalizedMs / 1000;
   llmDurationSumSec += sec;
   llmDurationCount += 1;
@@ -66,7 +68,7 @@ export function recordLlmLatency(durationMs, ok) {
   else llmRequestsError += 1;
 
   const atMs = nowMsProvider();
-  hpaSamples.push({ atMs, durationMs: normalizedMs });
+  hpaSamples.push({ atMs, durationMs: normalizedMs, completionTokens: tokens });
   lastLlmSampleAtMs = atMs;
   llmEverSampled = true;
   pruneHpaSamples(atMs);
@@ -83,6 +85,78 @@ function llmLatencyAvgMs() {
   if (!hpaSamples.length) return 0;
   const sum = hpaSamples.reduce((total, sample) => total + sample.durationMs, 0);
   return sum / hpaSamples.length;
+}
+
+function llmTokensPerSecond() {
+  pruneHpaSamples();
+  const tokenSamples = hpaSamples.filter((sample) => sample.completionTokens > 0);
+  if (!tokenSamples.length) return 0;
+  const tokens = tokenSamples.reduce((total, sample) => total + sample.completionTokens, 0);
+  const oldestMs = tokenSamples[0].atMs;
+  const maxDurationMs = tokenSamples.reduce((max, sample) => Math.max(max, sample.durationMs), 0);
+  const elapsedMs = Math.max(nowMsProvider() - oldestMs, maxDurationMs, 1);
+  return tokens / (elapsedMs / 1000);
+}
+
+function assistantTextFromCompletion(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  return choices
+    .map((choice) => {
+      if (!choice || typeof choice !== "object") return "";
+      const message = choice.message && typeof choice.message === "object" ? choice.message : {};
+      const delta = choice.delta && typeof choice.delta === "object" ? choice.delta : {};
+      return String(message.content || delta.content || choice.text || "");
+    })
+    .join("");
+}
+
+function usageCompletionTokens(payload) {
+  if (!payload || typeof payload !== "object") return 0;
+  const usage = payload.usage && typeof payload.usage === "object" ? payload.usage : {};
+  const n = Number(usage.completion_tokens);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function estimateTokensFromText(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return 0;
+  return Math.max(1, Math.floor(trimmed.length / 4));
+}
+
+function completionTokensFromSse(body) {
+  let usageTokens = 0;
+  let content = "";
+  for (const line of String(body || "").split(/\r?\n/)) {
+    const data = line.startsWith("data:") ? line.slice(5).trim() : "";
+    if (!data || data === "[DONE]") continue;
+    try {
+      const payload = JSON.parse(data);
+      usageTokens = Math.max(usageTokens, usageCompletionTokens(payload));
+      content += assistantTextFromCompletion(payload);
+    } catch {
+      // Skip a malformed SSE data line and keep reading later events.
+    }
+  }
+  return usageTokens > 0 ? usageTokens : estimateTokensFromText(content);
+}
+
+/** Completion tokens from an OpenAI-compatible chat body, or reply length / 4. */
+export function completionTokensFromUpstream(body, contentType = "") {
+  const text = String(body || "");
+  if (!text.trim()) return 0;
+  const type = String(contentType || "").toLowerCase();
+  if (type.includes("text/event-stream") || /^\s*data:/m.test(text)) {
+    return completionTokensFromSse(text);
+  }
+  try {
+    const payload = JSON.parse(text);
+    const usageTokens = usageCompletionTokens(payload);
+    if (usageTokens > 0) return usageTokens;
+    return estimateTokensFromText(assistantTextFromCompletion(payload));
+  } catch {
+    return estimateTokensFromText(text);
+  }
 }
 
 export function llmMetricsLines() {
@@ -115,6 +189,9 @@ export function llmMetricsLines() {
       "# HELP nemoclaw_llm_latency_avg_milliseconds Average LLM latency of samples in the recent window",
       "# TYPE nemoclaw_llm_latency_avg_milliseconds gauge",
       `nemoclaw_llm_latency_avg_milliseconds ${Math.round(avg)}`,
+      "# HELP nemoclaw_llm_tokens_per_second Completed completion tokens per second in the recent window (display only; not an HPA metric)",
+      "# TYPE nemoclaw_llm_tokens_per_second gauge",
+      `nemoclaw_llm_tokens_per_second ${Math.round(llmTokensPerSecond())}`,
     );
   }
   return lines;

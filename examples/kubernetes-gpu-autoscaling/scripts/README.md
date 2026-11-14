@@ -27,17 +27,19 @@ Setup and load-test steps live in [`../README.md`](../README.md). Pairing files 
 | `hpa-load-test-dgx-8xh100.sh` | HPA-only Job for 8× H100. Does not create sandboxes. |
 | `hpa-load-test-brev-4xl40s.sh` | Same HPA-only Job for 4× L40S. |
 | `hpa-reset.sh` | Restore an idle HPA without deleting the release. |
-| `hpa-watch.sh` / `get-hpa.sh` | One terminal for every `nemoclaw-gpu*` HPA, pod, and GPU index. `./scripts/get-hpa.sh -w`. Rows are `hermes-vllm` / `openclaw-ollama` / `deepagents-nim`. Clients do not run this. |
+| `hpa-watch.sh` / `get-hpa.sh` | One terminal for every `nemoclaw-gpu*` HPA, pod, GPU index, GPU UTIL, LATENCY, and TOK/S. `./scripts/get-hpa.sh -w`. Rows are `hermes-vllm` / `openclaw-ollama` / `deepagents-nim`. HPA scales on one metric; the other two columns are display-only. Clients do not run this. |
 | `get-metrics-proxy-pods.sh` | Pods only. Prefer `get-hpa.sh -w`. |
 | `cluster-recover.sh` | Destructive recovery for the selected release. Read the script before use. |
 | `agent-common.sh` / `hpa-common.sh` | Shared settings. Do not run them directly. |
 | `e2e_timeline.py` / `e2e-hpa-timeline.py` | Timeline rows written beside a load run. |
 | `test-inference-auth-contract.ts` | Metrics-proxy requires the inference API key and rejects non-object chat bodies. |
 | `test-metrics-proxy-metrics-contract.ts` | Rolling `latency_avg` uses a 30s window and expires so HPA can scale down. |
+| `test-metrics-proxy-tokens-contract.ts` | Display-only `tokens/sec` follows completed chats and idle-expires. Not an HPA metric. |
+| `test-metrics-proxy-tokens-http-contract.ts` | Chat completions export `tokens/sec` from upstream `usage.completion_tokens`. |
 | `test-metrics-proxy-newest-sample-window.ts` | The 30s window ages from the newest sample. |
 | `test-hpa-idle-replicas-contract.sh` | Idle latency HPA `1/0` is a ready baseline. |
 | `test-pairing-labels.sh` | Watches and clients print both the agent (`openclaw` / `hermes` / `deepagents`) and the GPU runtime (`ollama` / `vllm` / `nim`). |
-| `test-hpa-cluster-watch.sh` | One watch labels rows `hermes-vllm` / `openclaw-ollama`, not `metrics-proxy`. |
+| `test-hpa-cluster-watch.sh` | One watch labels rows `hermes-vllm` / `openclaw-ollama`, not `metrics-proxy`, and always prints GPU UTIL, LATENCY, and TOK/S. |
 | `test-workload-name.sh` | Helm names the GPU Deployment and HPA `hermes-vllm` / `openclaw-ollama`. |
 | `hpa-watch-format.py` | Formats that watch. Do not run it directly. |
 | `test-render-mixed-sandboxes.sh` | Step 6d renders 3 OpenClaw, 3 Hermes, and 3 Deep Agents sandboxes on separate Services. |

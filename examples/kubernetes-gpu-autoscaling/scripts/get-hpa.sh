@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# One terminal: GPU-chart HPAs, metrics-proxy pods, and DCGM GPU index.
+# One terminal: GPU-chart HPAs, pods, DCGM GPU index, GPU UTIL, LATENCY, TOK/S.
 # Each row is hermes-vllm / openclaw-ollama, not a metrics-proxy object name.
+# Only gpu_utilization or latency_avg is the HPA scale signal. TOK/S is display-only.
 #
 # Usage:
 #   ./scripts/get-hpa.sh
@@ -38,7 +39,8 @@ while [[ $# -gt 0 ]]; do
 Usage: $(basename "$0") [-n NAMESPACE] [-w]
 
 One screen for every nemoclaw-gpu* HPA: hermes-vllm / openclaw-ollama,
-replica count, GPU pods, and which GPU index runs which pairing.
+replica count, GPU pods, GPU UTIL, LATENCY, TOK/S, and which GPU index
+runs which pairing. HPA still scales on one metric. TOK/S is display-only.
 
   -n NAMESPACE            one GPU-chart namespace; default is all nemoclaw-gpu*
   -w                      refresh in this terminal
